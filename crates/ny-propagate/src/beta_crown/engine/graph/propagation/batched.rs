@@ -1815,7 +1815,7 @@ impl BetaCrownVerifier {
                     }
                 });
                 if let Some(results) = batched {
-                    if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+                    if crate::beta_gpu_probe_armed() {
                         eprintln!(
                             "[beta-gpu-batched:{probe_tag}] BATCHED n_domains={n_domains} num_specs={num_specs} od={output_dim}"
                         );
@@ -2112,7 +2112,7 @@ impl BetaCrownVerifier {
             optimized_betas.push(opt_beta);
         }
 
-        if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+        if crate::beta_gpu_probe_armed() {
             let n_opt = optimized_betas.iter().filter(|b| b.is_some()).count();
             eprintln!(
                 "[beta-gpu-batched:{probe_tag}] SUCCESS n_domains={n_domains} num_specs={num_specs} od={output_dim} beta_opt={n_opt}"
@@ -2211,7 +2211,7 @@ impl BetaCrownVerifier {
         {
             return None;
         }
-        let probe = std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1");
+        let probe = crate::beta_gpu_probe_armed();
         // Default 3 iterations for the multi-objective GPU lane (#w4-split-
         // tightening, measured): the analytic β ascent converges in ~2-3 steps
         // per domain on the cifar100 resnets; 10 (the CPU-loop default) buys
@@ -2511,7 +2511,7 @@ impl BetaCrownVerifier {
             return None;
         }
         let nsp = num_specs;
-        let probe = std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1");
+        let probe = crate::beta_gpu_probe_armed();
         // Default 3 = serial-lane parity. `NY_MO_GPU_BETA_ITERS` scales ONLY
         // this wide β/α ascent (its documented purpose; the serial fallback
         // lane keeps its own default / `NY_MO_GPU_BETA_ITERS_SERIAL`, so
@@ -3929,7 +3929,7 @@ impl BetaCrownVerifier {
         let refined_caches = refined.map(|outcome| outcome.caches);
         let bounds_caches = refined_caches.as_deref().unwrap_or(bounds_caches);
 
-        if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+        if crate::beta_gpu_probe_armed() {
             eprintln!("[driver] core n_domains={n_domains} output_dim={output_dim}");
         }
         // #lsnc-shared-fwd: the shared backward helpers borrow per-domain caches
@@ -4976,7 +4976,7 @@ impl BetaCrownVerifier {
                     }
                 }
             }
-            if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+            if crate::beta_gpu_probe_armed() {
                 eprintln!(
                     "[graft] n_domains={} folded_rows={folded_rows} wide_rows={wide_rows} max_lower_gain={max_gain:.5}",
                     results.len(),
@@ -5065,7 +5065,7 @@ impl BetaCrownVerifier {
         })?;
         let output_dim = ibp_output.len();
         let output_shape = vec![1usize];
-        if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+        if crate::beta_gpu_probe_armed() {
             eprintln!("[driver] per_domain_obj n_domains={n_domains} output_dim={output_dim}");
         }
 

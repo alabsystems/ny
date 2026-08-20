@@ -646,6 +646,57 @@ pub struct SignSpaceLimits {
     pub max_lp_nonzeros: usize,
     /// Cap on LP solves.
     pub max_lp_solves: usize,
+    /// Abandon the search after this many realizability LPs have been solved
+    /// without EVER accepting a flip. `0` disables the rule.
+    ///
+    /// #bnn-lp-stall. This is a BUDGET rule, not a correctness one: the search
+    /// can only ever end in `Candidate` or `Exhausted`, and stopping early
+    /// reaches `Exhausted` sooner. It exists because the greedy walk is a
+    /// PREFIX search — it ranks every unlocked free bit once and then pays one
+    /// LP per ranked candidate until one is realizable — so a run that has
+    /// accepted nothing has not narrowed anything, and the next LP costs what
+    /// the last one did.
+    ///
+    /// MEASURED (`reports/measured-2026/traffic_signs_recognition_2023_NOTES.md`):
+    /// on all nine open 48x48/64x64 rows the walk pays 127-207 LPs over the
+    /// full 217 s lane budget and accepts **0** flips, every time; on the three
+    /// `model_30` rows the lane owns it accepts its first flip inside the first
+    /// handful of LPs and goes on to 78-99 flips. So the two populations are
+    /// separated by a wide margin at any threshold in between, and the deeper
+    /// nets stop paying ~210 s for a result they were always going to reach.
+    ///
+    /// CORRECTION, MEASURED 2026-08-17 AT HEAD, both dark levers at their
+    /// shipped defaults: the "0 flips on all nine open rows, every time" claim
+    /// above is NOT true of `model_48_idx_1703_eps_1`, which accepts **34**
+    /// flips over 370 LPs, reaches best margin -82, produces no candidate and
+    /// spends its whole 217.52 s lane budget — this rule never fires there,
+    /// because `flips == 0` is false from the first accepted flip.
+    /// `model_64_idx_1703_eps_1` DID stop here, at 32 LPs / 53.56 s. One of the
+    /// nine was measured each way; the other seven are unmeasured. See
+    /// [`Self::stall_margin_lp_solves`] for the rule that asks the question
+    /// this one cannot.
+    pub stall_lp_solves: usize,
+    /// Abandon the search after this many realizability LPs have been solved
+    /// without the best pattern margin STRICTLY improving. `0` disables it.
+    ///
+    /// #lane-value-stall. [`Self::stall_lp_solves`] is a NEVER-STARTED test:
+    /// it asks whether the walk has accepted a flip, and a walk that accepts
+    /// flips forever while the margin stands still disarms it permanently.
+    /// MEASURED on `model_48_idx_1703_eps_1`: 370 LPs, 34 accepted flips, best
+    /// margin -82, no candidate, the full 217.52 s lane budget spent — the
+    /// stall rule never fired because `flips != 0`. This rule asks the
+    /// question that actually prices the walk: has the thing the search is
+    /// trying to move MOVED?
+    ///
+    /// Budget-only, exactly like its sibling: the two reachable ends are
+    /// `Candidate` and `Exhausted`, and this can only bring `Exhausted`
+    /// forward. It can never turn a SAT into anything else.
+    ///
+    /// DEFAULT 0 (disabled), so the shipped walk is byte-identical. It is
+    /// armed only by the marginal-value lane scheduler, behind
+    /// `NY_LANE_VALUE_SCHEDULER`, and the threshold it arms is not yet
+    /// measured on the nine open rows.
+    pub stall_margin_lp_solves: usize,
     /// Wall-clock budget for the whole call.
     pub max_wall_time: Duration,
     /// Per-LP time limit handed to `ay-milp`.
@@ -696,6 +747,18 @@ impl Default for SignSpaceLimits {
             max_lp_rows: SIGN_SPACE_HARD_MAX_LP_ROWS,
             max_lp_nonzeros: 4_000_000,
             max_lp_solves: 20_000,
+            // #bnn-lp-stall. 32 is chosen to sit far above the shallow path's
+            // demonstrated need and far below the deep path's demonstrated
+            // futility: the three `model_30` rows accept their first flip
+            // early enough that this threshold does not change their
+            // trajectory AT ALL (same flips, same LP count, same candidate —
+            // pinned by the NOTES re-measurement), while the nine open 48/64
+            // rows reach it after ~40-60 s instead of burning the full 217 s
+            // to reach the same `Exhausted`.
+            stall_lp_solves: 32,
+            // DISABLED by default: see `stall_margin_lp_solves`. Arming it is
+            // the lane scheduler's job and is dark.
+            stall_margin_lp_solves: 0,
             // Measured: the three banked `model_30` eps=1 rows are recovered
             // in 58-110s on a 2026 laptop, so a 2-minute default would clip
             // the slowest of them.
@@ -922,6 +985,13 @@ pub enum SignSpaceOutcome {
     Exhausted {
         /// Best pre-softmax margin reached in pattern space (`<= 0`).
         best_logit_margin: i64,
+        /// MARGINAL VALUE, in the lane's own unit: how far the best pattern
+        /// margin moved over the whole walk (`best - initial`, `>= 0`).
+        ///
+        /// This is the number the walk can honestly price itself by, and it is
+        /// NOT `flips`: a walk can accept 34 flips and move the margin
+        /// nowhere. Denominator: [`Self::Exhausted::lp_solves`].
+        margin_gain: i64,
         /// FREE unit count from the exact prepass.
         free_units: usize,
         /// Accepted flips.
@@ -3107,7 +3177,7 @@ impl Admitted<'_> {
                     if trace && (trust.radius.is_some() || trust.expansions > 0) {
                         eprintln!(
                             "NY_BNN_SIGN_SPACE_TRACE trust radius={} expansions={} feasible",
-                            trust.radius.map_or(f64::INFINITY, |r| r),
+                            trust.radius.unwrap_or(f64::INFINITY),
                             trust.expansions,
                         );
                     }
@@ -3125,7 +3195,7 @@ impl Admitted<'_> {
                     if trace {
                         eprintln!(
                             "NY_BNN_SIGN_SPACE_TRACE trust expand to radius={} expansions={}",
-                            trust.radius.map_or(f64::INFINITY, |r| r),
+                            trust.radius.unwrap_or(f64::INFINITY),
                             trust.expansions,
                         );
                     }
@@ -3165,7 +3235,7 @@ impl Admitted<'_> {
             if Instant::now() >= deadline || lo >= hi {
                 break;
             }
-            let mid = 0.5 * (lo + hi);
+            let mid = lo.midpoint(hi);
             if !mid.is_finite() || mid <= lo || mid >= hi {
                 break;
             }
@@ -3428,7 +3498,7 @@ pub fn falsify_bnn_sign_suffix_unwired(
 
     // --- the reference point, already in the bytes a replay would read.
     let midpoint: Vec<f64> = (0..admitted.n_pixels)
-        .map(|p| 0.5 * (admitted.lo[p] + admitted.hi[p]))
+        .map(|p| admitted.lo[p].midpoint(admitted.hi[p]))
         .collect();
     let start = request.reference_input.unwrap_or(&midpoint);
     let Some(x0) = admitted.to_replay_bytes(start) else {
@@ -3466,10 +3536,30 @@ pub fn falsify_bnn_sign_suffix_unwired(
     let mut flips = 0usize;
     let mut lp_solves = 0usize;
     let (mut best_margin, _) = admitted.margin(&engine.logits);
+    // #lane-value-stall. The walk's own VALUE unit is the movement of this
+    // margin; the denominator is `lp_solves`. Both are reported on `Exhausted`
+    // so the lane can price itself without the scheduler guessing.
+    let initial_margin = best_margin;
+    let mut last_gain_lp = 0usize;
     let mut batch = 1usize;
     // The first window of the ranked-head walk; it widens through the tail
     // when the head is exhausted (see the walk below).
     let head = limits.candidate_head.max(1);
+
+    // #bnn-lp-stall. "This walk has paid `stall_lp_solves` LPs and accepted
+    // NOTHING." Budget-only: the two reachable ends are `Candidate` and
+    // `Exhausted`, and this can only bring `Exhausted` forward, so it cannot
+    // turn a SAT into anything else — it can only decline to keep paying for a
+    // search that has not moved once. See `SignSpaceLimits::stall_lp_solves`.
+    //
+    // #lane-value-stall adds the SECOND question, `stall_margin_lp_solves`:
+    // "this walk has paid that many LPs since the margin last MOVED". Disabled
+    // by default, so the shipped rule is exactly the one above.
+    let stalled = |flips: usize, lp_solves: usize, last_gain_lp: usize| {
+        (limits.stall_lp_solves > 0 && flips == 0 && lp_solves >= limits.stall_lp_solves)
+            || (limits.stall_margin_lp_solves > 0
+                && lp_solves.saturating_sub(last_gain_lp) >= limits.stall_margin_lp_solves)
+    };
 
     // The reference point's own pattern is realizable by the reference point,
     // so a violation already present there is a candidate immediately.
@@ -3495,7 +3585,10 @@ pub fn falsify_bnn_sign_suffix_unwired(
     }
 
     loop {
-        if Instant::now() >= deadline || lp_solves >= limits.max_lp_solves {
+        if Instant::now() >= deadline
+            || lp_solves >= limits.max_lp_solves
+            || stalled(flips, lp_solves, last_gain_lp)
+        {
             break;
         }
 
@@ -3519,7 +3612,10 @@ pub fn falsify_bnn_sign_suffix_unwired(
                 Ok(Realizability::Realizable { slack, x }) => {
                     flips += applied.len();
                     let (margin, _) = admitted.margin(&engine.logits);
-                    best_margin = best_margin.max(margin);
+                    if margin > best_margin {
+                        best_margin = margin;
+                        last_gain_lp = lp_solves;
+                    }
                     if margin > 0 {
                         if let Some(candidate) = finalize(
                             &admitted,
@@ -3578,7 +3674,10 @@ pub fn falsify_bnn_sign_suffix_unwired(
         while start < ranked.len() && !accepted {
             let stop = (start + window).min(ranked.len());
             for &(candidate_margin, slot) in &ranked[start..stop] {
-                if Instant::now() >= deadline || lp_solves >= limits.max_lp_solves {
+                if Instant::now() >= deadline
+                    || lp_solves >= limits.max_lp_solves
+                    || stalled(flips, lp_solves, last_gain_lp)
+                {
                     break;
                 }
                 let u = free[slot];
@@ -3590,7 +3689,10 @@ pub fn falsify_bnn_sign_suffix_unwired(
                         locked[slot] = true;
                         flips += 1;
                         accepted = true;
-                        best_margin = best_margin.max(candidate_margin);
+                        if candidate_margin > best_margin {
+                            best_margin = candidate_margin;
+                            last_gain_lp = lp_solves;
+                        }
                         if candidate_margin > 0 {
                             if let Some(candidate) = finalize(
                                 &admitted,
@@ -3613,7 +3715,10 @@ pub fn falsify_bnn_sign_suffix_unwired(
                     }
                 }
             }
-            if Instant::now() >= deadline || lp_solves >= limits.max_lp_solves {
+            if Instant::now() >= deadline
+                || lp_solves >= limits.max_lp_solves
+                || stalled(flips, lp_solves, last_gain_lp)
+            {
                 break;
             }
             start = stop;
@@ -3627,6 +3732,7 @@ pub fn falsify_bnn_sign_suffix_unwired(
 
     Ok(SignSpaceOutcome::Exhausted {
         best_logit_margin: best_margin,
+        margin_gain: best_margin.saturating_sub(initial_margin).max(0),
         free_units: free.len(),
         flips,
         lp_solves,
@@ -3903,6 +4009,16 @@ pub fn realizability_probe_unwired(
         Ok(Realizability::Rejected) | Err(_) => Ok(None),
     }
 }
+
+/// The STE-PGD falsification lane over the SAME admitted fragment.
+///
+/// A child module so it can reuse this module's PRIVATE, already-validated
+/// machinery — `admit`, the exact `Admitted` forward, and the `finalize`
+/// witness gate — instead of standing up a second extraction of the same net.
+#[path = "bnn_ste_pgd.rs"]
+mod bnn_ste_pgd;
+
+pub use bnn_ste_pgd::{falsify_bnn_ste_pgd_unwired, StePgdLimits};
 
 #[cfg(test)]
 #[path = "bnn_sign_space_tests.rs"]

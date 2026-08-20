@@ -312,6 +312,7 @@ fn test_streaming_batched_crown_unsupported_logsumexp_falls_back_to_regular() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_streaming_batched_crown_elementwise_activations() {
+    let _env = crate::tests::lock_env_shared();
     use crate::layers::{
         AbsLayer, ArctanLayer, CeilLayer, CeluLayer, ClipLayer, CosLayer, EluLayer, ExpLayer,
         FloorLayer, HardSigmoidLayer, HardSwishLayer, LeakyReLULayer, LogLayer, MishLayer,

@@ -1098,6 +1098,7 @@ mod zero_padding_count_include_pad_tests {
     /// tightening, not a box restored by the IBP intersection.
     #[test]
     fn zero_padding_cip_false_relation_is_finite_and_encloses_avgpool() {
+        let _env = crate::tests::lock_env_shared();
         let pb = as_patches(run(false).expect("zero padding + count_include_pad=false admitted"));
         let dense = pb.to_dense().expect("materialize the admitted relation");
         assert_eq!(dense.num_outputs(), 4, "one row per output position");

@@ -453,6 +453,22 @@ pub(crate) struct SweepRow {
     /// branch writes entries.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) from_cache: bool,
+    /// True when this row's `timeout` is a BUDGET OVERRUN — the child was
+    /// hard-stopped at its own deadline after committing and verifying its
+    /// `timeout` token — rather than a clean in-budget timeout.
+    ///
+    /// This is what makes an un-measured row distinguishable from a genuine
+    /// crash in the bank. It is a FLAG rather than a fifth `SweepVerdict`
+    /// variant deliberately: the official CSV must stay inside the organizers'
+    /// four-token vocabulary (`budgetoverrun` is not a legal token, `timeout`
+    /// is), and every consumer that reasons about timeouts — the reseed
+    /// selector, `solved()`, the scoring deadline — must keep treating an
+    /// overrun as the unsolved row it is, with no new arm to forget.
+    ///
+    /// Omitted when false, so a clean row and every pre-flag bank round-trip
+    /// byte-identically.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) budget_overrun: bool,
     /// Retained SAT witness (#witness-retention-gap). Absent on non-sat rows
     /// and on banks written before retention existed; an explicit `null` on a
     /// sat row whose witness could not be extracted or copied — that gap is
@@ -473,6 +489,12 @@ pub(crate) struct SweepSummary {
     pub(crate) timeout: usize,
     pub(crate) unknown: usize,
     pub(crate) error: usize,
+    /// Of `timeout`, how many were BUDGET OVERRUNS (hard-stopped at their own
+    /// deadline) rather than clean in-budget timeouts. Counted separately so an
+    /// operator can see "this family is bankable, but N rows only just fit"
+    /// instead of it vanishing into the timeout bucket — or, as before this
+    /// existed, into `error`.
+    pub(crate) budget_overrun: usize,
     pub(crate) capped_rows: usize,
     /// Sat rows banked without a retained witness (#witness-retention-gap):
     /// organizer-style replay cannot revalidate these rows.
@@ -495,6 +517,9 @@ impl SweepSummary {
             SweepVerdict::Timeout => self.timeout += 1,
             SweepVerdict::Unknown => self.unknown += 1,
             SweepVerdict::Error => self.error += 1,
+        }
+        if row.budget_overrun {
+            self.budget_overrun += 1;
         }
         if row.capped_from.is_some() {
             self.capped_rows += 1;
@@ -1311,6 +1336,82 @@ pub(crate) fn enforce_scoring_deadline(
     }
 }
 
+/// The token the child's own deadline machinery writes, verifies on disk, and
+/// then hard-stops on. Only this exact token can be promoted below.
+const CHILD_DEADLINE_TOKEN: &str = "timeout";
+
+/// Promote a HARD-STOPPED-AT-ITS-OWN-BUDGET row out of `Error`.
+///
+/// # The defect
+///
+/// A row that overruns its per-instance budget is stopped by the CHILD's
+/// in-process watchdog at `budget + WATCHDOG_GRACE_SECS`. That watchdog writes
+/// `timeout` into the result file, RE-READS it to confirm the token landed, and
+/// then hard-stops the process by signal. The sweep's outer watchdog is a
+/// wider `budget + CHILD_WATCHDOG_GRACE`, so it has NOT fired; the child simply
+/// exited by signal, `ran_ok` is `false`, and [`SweepVerdict::classify`]
+/// correctly refuses to take a verdict from a failed child — collapsing the row
+/// to `Error`.
+///
+/// Measured consequence: seven `traffic_signs_recognition_2023` rows exited at
+/// 485.2-485.9s against a 480s budget and were banked as `error`. Those rows
+/// are UN-MEASURED, not crashed, and a family containing them is not bankable.
+/// The asymmetry is the bug: [`enforce_scoring_deadline`] already demotes a
+/// LATE DECIDED result to `Timeout`, and does nothing at all for `Error`.
+///
+/// # Why this is the right seam
+///
+/// [`SweepVerdict::classify`] is left ALONE. Its rule — "a partial verdict from
+/// a failed child has no authority" — is correct, and is what
+/// `missing_or_partial_results_are_errors_even_after_child_exit` protects: it
+/// exists because recording a crashed sweep as `timeout` once turned a wholly
+/// broken run into a plausible-looking negative result. So this is a sibling of
+/// `enforce_scoring_deadline` at the same call site, applied AFTER it.
+///
+/// # What survives as a genuine error
+///
+/// Promotion needs EVERY one of: the row already classified `Error`; the outer
+/// watchdog did NOT fire (that path is already `Timeout`); the child exited
+/// non-successfully; the result file's first line is EXACTLY
+/// [`CHILD_DEADLINE_TOKEN`], which is the only token the deadline machinery
+/// self-writes and confirms; and the child ran to at least its own budget.
+/// Everything else stays `Error`: a rejected flag, a segfault in teardown, an
+/// OOM kill, a missing or empty result file, an unrecognized token, and a
+/// `sat`/`unsat`/`unknown` token from a failed child are all untouched. A crash
+/// BEFORE the budget cannot be promoted because of the elapsed test, and a
+/// crash after it cannot be promoted unless the child had already committed and
+/// verified its own `timeout`.
+///
+/// `timeout` is a no-score token, so promotion can never manufacture a verdict:
+/// the worst case is that an unmeasured row reads as unsolved instead of broken,
+/// which is exactly what it is.
+pub(crate) fn enforce_budget_overrun(
+    verdict: SweepVerdict,
+    result_first_line: Option<&str>,
+    ran_ok: bool,
+    watchdog_fired: bool,
+    elapsed: Duration,
+    budget_secs: u64,
+) -> (SweepVerdict, Option<String>, bool) {
+    let promotable = verdict == SweepVerdict::Error
+        && !watchdog_fired
+        && !ran_ok
+        && result_first_line.map(str::trim) == Some(CHILD_DEADLINE_TOKEN)
+        && elapsed >= Duration::from_secs(budget_secs);
+    if !promotable {
+        return (verdict, None, false);
+    }
+    (
+        SweepVerdict::Timeout,
+        Some(format!(
+            "budget overrun: child hard-stopped at {:.3}s of a {budget_secs}s budget after \
+             committing `{CHILD_DEADLINE_TOKEN}`; the row is UN-MEASURED, not a crash",
+            elapsed.as_secs_f64()
+        )),
+        true,
+    )
+}
+
 fn resolve_instance_arguments(
     category_dir: &Path,
     inst: &SweepInstance,
@@ -1443,6 +1544,8 @@ fn read_flight_sidecar(result_file: &Path) -> Option<serde_json::Value> {
 /// Everything one child run hands back to the banking loop.
 struct InstanceOutcome {
     verdict: SweepVerdict,
+    /// See [`SweepRow::budget_overrun`].
+    budget_overrun: bool,
     seconds: f64,
     detail: Option<String>,
     flight: Option<serde_json::Value>,
@@ -1477,6 +1580,7 @@ fn run_instance(
         Err(error) => {
             return Ok(InstanceOutcome {
                 verdict: SweepVerdict::Error,
+                budget_overrun: false,
                 seconds: 0.0,
                 detail: Some(format!("resolve instance arguments: {error:#}")),
                 flight: None,
@@ -1539,11 +1643,24 @@ fn run_instance(
         SweepVerdict::classify(first_line.as_deref(), ran_ok)
     };
     let (verdict, deadline_detail) = enforce_scoring_deadline(initial_verdict, elapsed, budget);
+    // Applied AFTER the scoring deadline, and only ever to what is still
+    // `Error`: a row the deadline check already demoted is a DECIDED result and
+    // must not be relabelled as an overrun.
+    let (verdict, overrun_detail, budget_overrun) = enforce_budget_overrun(
+        verdict,
+        first_line.as_deref(),
+        ran_ok,
+        watchdog_fired,
+        elapsed,
+        budget,
+    );
     let detail = if watchdog_fired {
         Some(format!(
             "outer watchdog stopped child after {:.1}s",
             watchdog.as_secs_f64()
         ))
+    } else if overrun_detail.is_some() {
+        overrun_detail
     } else if deadline_detail.is_some() {
         deadline_detail
     } else {
@@ -1558,6 +1675,7 @@ fn run_instance(
         .flatten();
     Ok(InstanceOutcome {
         verdict,
+        budget_overrun,
         seconds: elapsed.as_secs_f64(),
         detail,
         flight,
@@ -1908,6 +2026,9 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
                     occurrence: entry.identity.3,
                     instance_index: entry.instance_index,
                     verdict: cached.verdict,
+                    // Carried from the cached measurement: the flag describes
+                    // HOW that row ended, which a replay does not change.
+                    budget_overrun: cached.budget_overrun,
                     seconds: cached.seconds,
                     budget_secs: entry.budget_secs,
                     capped_from: entry.capped_from,
@@ -1951,6 +2072,7 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
                     occurrence: entry.identity.3,
                     instance_index: entry.instance_index,
                     verdict: outcome.verdict,
+                    budget_overrun: outcome.budget_overrun,
                     seconds: outcome.seconds,
                     budget_secs: entry.budget_secs,
                     capped_from: entry.capped_from,
@@ -2007,6 +2129,7 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
                     occurrence: entry.identity.3,
                     instance_index: entry.instance_index,
                     verdict: SweepVerdict::Unknown,
+                    budget_overrun: false,
                     seconds: 0.0,
                     budget_secs: entry.budget_secs,
                     capped_from: entry.capped_from,
@@ -2058,6 +2181,15 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
                 "WARNING: {} row(s) failed to run. These are NOT negative results — \
                  investigate before reading anything into this sweep.",
                 summary.error
+            );
+        }
+        if summary.budget_overrun > 0 {
+            println!(
+                "NOTE: {} of those timeout(s) were BUDGET OVERRUNS — the child was \
+                 hard-stopped at its own deadline after committing `timeout`. They are \
+                 un-measured rows, not crashes, and the bank marks each one \
+                 `budget_overrun`.",
+                summary.budget_overrun
             );
         }
         if summary.sat_rows_without_witness > 0 {
@@ -2310,6 +2442,263 @@ mod tests {
         );
     }
 
+    /// The exact measured signature: a `traffic_signs_recognition_2023` row at a
+    /// 480s budget whose child's in-process watchdog committed `timeout` at
+    /// 485s and then hard-stopped the process by signal. The outer watchdog
+    /// (budget + 30s = 510s) has NOT fired, so `watchdog_fired` is false and
+    /// `ran_ok` is false.
+    fn overrun_signature() -> (
+        SweepVerdict,
+        Option<&'static str>,
+        bool,
+        bool,
+        Duration,
+        u64,
+    ) {
+        (
+            SweepVerdict::Error,
+            Some("timeout"),
+            false,
+            false,
+            Duration::from_secs_f64(485.4),
+            480,
+        )
+    }
+
+    /// (c) A BUDGET OVERRUN classifies as `Timeout`, flagged `budget_overrun`,
+    /// with a detail string that says so. It is an UN-MEASURED row, not a crash.
+    #[test]
+    fn a_budget_overrun_classifies_as_a_flagged_timeout() {
+        let (verdict, line, ran_ok, watchdog, elapsed, budget) = overrun_signature();
+        let (promoted, detail, overrun) =
+            enforce_budget_overrun(verdict, line, ran_ok, watchdog, elapsed, budget);
+
+        assert_eq!(
+            promoted,
+            SweepVerdict::Timeout,
+            "a row hard-stopped at its own budget is unsolved, not broken"
+        );
+        assert!(overrun, "the row must be FLAGGED as a budget overrun");
+        let detail = detail.expect("a promoted row must carry its reason");
+        assert!(
+            detail.contains("budget overrun") && detail.contains("485.400"),
+            "detail must name the defect and the overrun time: {detail}"
+        );
+
+        // The scored token stays inside the organizers' vocabulary: an overrun
+        // is an unsolved row, and `budgetoverrun` is not a legal CSV token.
+        assert_eq!(promoted.as_str(), "timeout");
+
+        // Every trailing-whitespace shape of the committed token is the same
+        // token; the child writes it with a newline.
+        for written in ["timeout", "timeout\n", " timeout ", "timeout\r\n"] {
+            let (promoted, _, overrun) = enforce_budget_overrun(
+                SweepVerdict::Error,
+                Some(written),
+                false,
+                false,
+                elapsed,
+                budget,
+            );
+            assert_eq!(promoted, SweepVerdict::Timeout, "{written:?}");
+            assert!(overrun, "{written:?}");
+        }
+
+        // Exactly at the budget is still an overrun (the child's own watchdog
+        // fires at budget + grace, so `elapsed >= budget` always holds there).
+        let (promoted, _, overrun) = enforce_budget_overrun(
+            SweepVerdict::Error,
+            Some("timeout"),
+            false,
+            false,
+            Duration::from_secs(budget),
+            budget,
+        );
+        assert_eq!(promoted, SweepVerdict::Timeout);
+        assert!(overrun);
+    }
+
+    /// (c) A GENUINE CRASH still classifies as `Error`, and is never flagged.
+    /// Each case below removes exactly one leg of the overrun signature.
+    #[test]
+    fn a_genuine_crash_still_classifies_as_an_error() {
+        let (_, _, _, _, late, budget) = overrun_signature();
+        let early = Duration::from_secs_f64(12.0);
+
+        let cases: Vec<(&str, SweepVerdict, Option<&str>, bool, bool, Duration)> = vec![
+            // A rejected CLI flag: exits non-zero, writes no result file at all.
+            (
+                "no result file",
+                SweepVerdict::Error,
+                None,
+                false,
+                false,
+                late,
+            ),
+            // A crashed child that produced an empty result file.
+            (
+                "empty result",
+                SweepVerdict::Error,
+                Some(""),
+                false,
+                false,
+                late,
+            ),
+            // A crashed child whose result file holds an unrecognized token.
+            (
+                "unrecognized token",
+                SweepVerdict::Error,
+                Some("not-a-verdict"),
+                false,
+                false,
+                late,
+            ),
+            // A partial DECIDED verdict from a failed child: never rehabilitated.
+            (
+                "partial sat",
+                SweepVerdict::Error,
+                Some("sat"),
+                false,
+                false,
+                late,
+            ),
+            (
+                "partial unsat",
+                SweepVerdict::Error,
+                Some("unsat"),
+                false,
+                false,
+                late,
+            ),
+            (
+                "partial unknown",
+                SweepVerdict::Error,
+                Some("unknown"),
+                false,
+                false,
+                late,
+            ),
+            // The child's own explicit `error` token.
+            (
+                "explicit error token",
+                SweepVerdict::Error,
+                Some("error"),
+                false,
+                false,
+                late,
+            ),
+            // A SIGSEGV at 12s on a row with a stale `timeout` on disk: far
+            // inside the budget, so the elapsed test refuses it.
+            (
+                "crash before budget",
+                SweepVerdict::Error,
+                Some("timeout"),
+                false,
+                false,
+                early,
+            ),
+            // A child that SUCCEEDED but wrote nothing recognizable: a harness
+            // fault, not an overrun, even though it ran long.
+            (
+                "successful child, no token",
+                SweepVerdict::Error,
+                None,
+                true,
+                false,
+                late,
+            ),
+        ];
+
+        for (name, verdict, line, ran_ok, watchdog, elapsed) in cases {
+            let (out, detail, overrun) =
+                enforce_budget_overrun(verdict, line, ran_ok, watchdog, elapsed, budget);
+            assert_eq!(
+                out,
+                SweepVerdict::Error,
+                "{name}: must stay a genuine error"
+            );
+            assert!(detail.is_none(), "{name}: must carry no overrun detail");
+            assert!(!overrun, "{name}: must not be flagged as a budget overrun");
+        }
+
+        // A row the OUTER watchdog stopped is already `Timeout` on its own
+        // path; the promoter must not relabel it as a budget overrun.
+        let (out, _, overrun) = enforce_budget_overrun(
+            SweepVerdict::Timeout,
+            Some("timeout"),
+            false,
+            true,
+            late,
+            budget,
+        );
+        assert_eq!(out, SweepVerdict::Timeout);
+        assert!(
+            !overrun,
+            "an outer-watchdog timeout is not a budget overrun"
+        );
+
+        // And a DECIDED verdict is never touched, at any elapsed time.
+        for decided in [
+            SweepVerdict::Sat,
+            SweepVerdict::Unsat,
+            SweepVerdict::Unknown,
+        ] {
+            let (out, detail, overrun) =
+                enforce_budget_overrun(decided, Some("timeout"), false, false, late, budget);
+            assert_eq!(out, decided, "{decided:?} must be left alone");
+            assert!(detail.is_none() && !overrun);
+        }
+    }
+
+    /// (c) The two are DISTINGUISHABLE in the bank: an overrun row serializes
+    /// `budget_overrun: true` into the metadata sidecar while keeping the
+    /// organizer-legal `timeout` token in the official CSV; a clean timeout and
+    /// a genuine error both omit the field entirely, so every pre-existing bank
+    /// round-trips byte-identically.
+    #[test]
+    fn the_bank_distinguishes_a_budget_overrun_from_a_crash_and_a_clean_timeout() {
+        let mut overrun = metadata_row("traffic", 0, SweepVerdict::Timeout);
+        overrun.budget_overrun = true;
+        overrun.detail = Some("budget overrun: child hard-stopped at 485.400s".into());
+        let clean = metadata_row("traffic", 1, SweepVerdict::Timeout);
+        let crashed = metadata_row("traffic", 2, SweepVerdict::Error);
+
+        let overrun_json = serde_json::to_string(&overrun).expect("serialize");
+        assert!(
+            overrun_json.contains("\"budget_overrun\":true"),
+            "an overrun must be machine-readable in the bank: {overrun_json}"
+        );
+        for row in [&clean, &crashed] {
+            let json = serde_json::to_string(row).expect("serialize");
+            assert!(
+                !json.contains("budget_overrun"),
+                "a non-overrun row must omit the flag entirely: {json}"
+            );
+        }
+
+        // Round-trip, including a legacy row written before the flag existed.
+        let parsed: SweepRow = serde_json::from_str(&overrun_json).expect("round-trip");
+        assert!(parsed.budget_overrun);
+        let legacy = serde_json::to_string(&clean).expect("serialize");
+        let parsed_legacy: SweepRow = serde_json::from_str(&legacy).expect("legacy round-trip");
+        assert!(
+            !parsed_legacy.budget_overrun,
+            "a bank written before the flag existed must read as not-an-overrun"
+        );
+
+        // The summary counts overruns separately from timeouts and errors,
+        // WITHOUT removing them from the timeout bucket — an overrun is still
+        // an unsolved row for every downstream consumer.
+        let mut summary = SweepSummary::default();
+        summary.record(&overrun);
+        summary.record(&clean);
+        summary.record(&crashed);
+        assert_eq!(summary.timeout, 2);
+        assert_eq!(summary.error, 1);
+        assert_eq!(summary.budget_overrun, 1);
+        assert_eq!(summary.solved(), 0);
+    }
+
     #[test]
     fn classifies_the_organizer_verdict_vocabulary() {
         assert_eq!(SweepVerdict::classify(Some("sat"), true), SweepVerdict::Sat);
@@ -2361,6 +2750,7 @@ mod tests {
     fn metadata_row(category: &str, occurrence: usize, verdict: SweepVerdict) -> SweepRow {
         SweepRow {
             arm: Vec::new(),
+            budget_overrun: false,
             category: category.into(),
             onnx: "model.onnx".into(),
             vnnlib: "property.vnnlib".into(),
@@ -2767,6 +3157,7 @@ mod tests {
         );
         let row = SweepRow {
             // No arm: this fixture is about the metadata sidecar, not lever arming.
+            budget_overrun: false,
             arm: Vec::new(),
             category: "c".into(),
             onnx: "m.onnx".into(),
@@ -3129,6 +3520,7 @@ mod tests {
         ] {
             s.record(&SweepRow {
                 arm: Vec::new(),
+                budget_overrun: false,
                 category: "c".into(),
                 onnx: "o".into(),
                 vnnlib: "v".into(),

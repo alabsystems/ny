@@ -121,6 +121,32 @@ fn serve_truncated_collection_cache_enabled() -> bool {
     )
 }
 
+/// #cgan-truncated-serve-telemetry: tagged stderr breadcrumbs for the
+/// default-dark truncated-reuse lane.
+///
+/// WHY stderr and not `debug!`: every wrong inference in the collection-cache
+/// investigation came from log ABSENCE under a misconfigured filter
+/// (`docs/CGAN_COLLECTION_CACHE_DEFECTS_2026-08-03.md`, "the logging mechanism
+/// was the whole problem"). Engagement telemetry for a dark lever must survive
+/// the vnncomp log filter, or a null measurement is vacuous (measurement
+/// parity R7/R9). Emits nothing unless `NY_CROWN_SERVE_TRUNCATED_CACHE=1`, so
+/// a default run's stderr is byte-identical; production callers of the scope
+/// builder and the truncated lookup branch are additionally unreachable with
+/// the gate off. Rate-limited (first 64 events, then powers of two) because
+/// per-child input-split collections can reach the store path thousands of
+/// times per run.
+fn truncated_lane_event(stage: &str, detail: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if !serve_truncated_collection_cache_enabled() {
+        return;
+    }
+    static EVENTS: AtomicUsize = AtomicUsize::new(0);
+    let n = EVENTS.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if n <= 64 || n.is_power_of_two() {
+        eprintln!("[NY_CROWN_TRUNCATED_SERVE_V1] stage={stage} n={n} {detail}");
+    }
+}
+
 fn crown_ibp_tightening_deadline(
     now: Instant,
     outer_deadline: Option<Instant>,
@@ -689,24 +715,72 @@ impl GraphNetwork {
         tightening_budget: Option<Duration>,
         prefix_cost_admission_enabled: bool,
     ) -> Option<crate::network::core::graph::CrownIbpTruncatedReuseScope> {
-        let tightening_budget = tightening_budget.filter(|budget| !budget.is_zero())?;
-        if Self::crown_ibp_result_crown_count(result) == 0
-            || target_backward::crown_cut_segment_from_env() != 0
-        {
+        // Every refusal below names itself on the armed lane
+        // (#cgan-truncated-serve-telemetry): the Aug-03 investigation measured
+        // 7 of 48 lookups failing with `current=None` and could only NARROW the
+        // cause to two candidate early-returns; these markers make the next
+        // armed run decisive instead of inferential.
+        let Some(tightening_budget) = tightening_budget.filter(|budget| !budget.is_zero()) else {
+            truncated_lane_event("scope-refused", "reason=zero-tightening-budget");
+            return None;
+        };
+        if Self::crown_ibp_result_crown_count(result) == 0 {
+            truncated_lane_event("scope-refused", "reason=no-crown-nodes");
+            return None;
+        }
+        if target_backward::crown_cut_segment_from_env() != 0 {
+            truncated_lane_event("scope-refused", "reason=cut-segment-armed");
             return None;
         }
 
         let output_name = if self.output_name().is_empty() {
-            self.exec_order().ok()?.last()?.as_str()
+            let Some(last) = self.exec_order().ok().and_then(|order| order.last()) else {
+                truncated_lane_event("scope-refused", "reason=no-output-node-name");
+                return None;
+            };
+            last.as_str()
         } else {
             self.output_name()
         };
-        let output_dim = result.bounds.get(output_name)?.len();
         // A published margin subset is objective-specific. Refuse even though
         // its scattered map is sound; the dark lane must not let one
         // objective's row selection become another objective's quality state.
-        if crate::output_margin_seed::margin_subset_indices(output_dim).is_some() {
-            return None;
+        //
+        // #cgan-truncated-scope-output-dim (2026-08-18, defect (E) of
+        // `docs/CGAN_COLLECTION_CACHE_DEFECTS_2026-08-03.md`): this guard used
+        // to read the output dimension from `result.bounds`, so a
+        // deadline-truncated map that happened to lack the OUTPUT node's entry
+        // silently refused to build a scope at all (`?` on the map lookup) —
+        // measured as the `current=None` residue that kept `scope_match=false`
+        // after every other cache defect was fixed. The dimension exists only
+        // to consult this guard, and when it is unavailable the guard is
+        // consulted on the STRICTLY more conservative predicate "any margin
+        // publication exists on this thread" (see
+        // `output_margin_seed::margin_subset_published`): every map the
+        // dim-consulted guard refuses is still refused, so the objective-leak
+        // cannot slip through, and the documented-unsound shortcut of skipping
+        // the guard outright is not taken. When the map DOES contain the
+        // output node, behavior is bit-identical to the historical path.
+        match result.bounds.get(output_name) {
+            Some(output_bounds) => {
+                if crate::output_margin_seed::margin_subset_indices(output_bounds.len()).is_some() {
+                    truncated_lane_event("scope-refused", "reason=margin-subset-engaged");
+                    return None;
+                }
+            }
+            None => {
+                if crate::output_margin_seed::margin_subset_published() {
+                    truncated_lane_event(
+                        "scope-refused",
+                        "reason=margin-published-output-dim-unknown",
+                    );
+                    return None;
+                }
+                truncated_lane_event(
+                    "scope-built-without-output-node",
+                    &format!("output_node={output_name}"),
+                );
+            }
         }
 
         let budget =
@@ -865,6 +939,33 @@ impl GraphNetwork {
             let covers_graph =
                 scope_matches && self.crown_ibp_truncated_result_covers_graph(&entry.result);
             if !covers_graph {
+                // #cgan-truncated-serve-telemetry: on the ARMED lane, name the
+                // failing predicate and how many exec-order nodes the entry is
+                // missing, so one run distinguishes a scope defect from a
+                // genuinely partial map (the two candidate residuals the
+                // Aug-03/Aug-11 investigations could not separate from logs).
+                if allow_truncated {
+                    let missing_nodes = self.exec_order().map_or(usize::MAX, |order| {
+                        order
+                            .iter()
+                            .filter(|name| {
+                                !(entry.result.bounds.contains_key(*name)
+                                    && entry.result.provenance.contains_key(*name))
+                            })
+                            .count()
+                    });
+                    truncated_lane_event(
+                        "miss",
+                        &format!(
+                            "key={key:016x} stored_scope={} current_scope={} \
+                             scope_match={scope_matches} missing_nodes={missing_nodes} \
+                             crown={}",
+                            entry.truncated_reuse_scope.is_some(),
+                            current_scope.is_some(),
+                            entry.crown_count,
+                        ),
+                    );
+                }
                 debug!(
                     "CROWN-IBP DAG: cached collection for key {key:016x} is truncated \
                      ({} crown nodes) — re-running (allow_truncated={}, scope_match={}, \
@@ -891,6 +992,14 @@ impl GraphNetwork {
                 entry.crown_count,
                 entry.result.fallback_events.len(),
                 key,
+            );
+            truncated_lane_event(
+                "serve",
+                &format!(
+                    "key={key:016x} nodes={} crown={}",
+                    entry.result.bounds.len(),
+                    entry.crown_count,
+                ),
             );
             return Some((*entry.result).clone());
         }
@@ -2240,6 +2349,92 @@ mod collection_cache_key_tests {
             .read()
             .expect("cache lock");
         assert!(!cache.first().expect("stored partial entry").complete);
+    }
+
+    /// #cgan-truncated-scope-output-dim (defect (E) of
+    /// `docs/CGAN_COLLECTION_CACHE_DEFECTS_2026-08-03.md`): a truncated map
+    /// that lacks the OUTPUT node's bounds must still build a reuse scope when
+    /// no margin publication exists — the historical `?` on the map lookup
+    /// silently refused, which kept `scope_match=false` (measured
+    /// `current=None` on 7/48 cgan lookups) after every other cache defect was
+    /// fixed. With a publication held, the scope must refuse (the documented
+    /// UNSOUND shortcut is skipping the guard; the sound fallback is the
+    /// strictly more conservative "any publication refuses").
+    #[test]
+    fn truncated_scope_builds_when_map_lacks_output_node() {
+        ny_test_utils::env::with_env_edits(|env| {
+            env.remove(SERVE_TRUNCATED_COLLECTION_CACHE_ENV);
+            env.remove("NY_CROWN_CUT_SEGMENT");
+
+            let graph = small_graph();
+            let input = unit_box();
+            let completed = graph
+                .collect_crown_ibp_bounds_dag_with_status(&input)
+                .expect("complete fixture collection");
+            let mut result = deadline_mixed_result(&graph, &input, completed);
+            // Drop only the OUTPUT node's BOUNDS entry: provenance keeps its
+            // Crown tag so `crown_ibp_result_crown_count` stays positive and
+            // the scope decision isolates the output-dim lookup.
+            assert!(
+                result.bounds.remove("relu").is_some(),
+                "fixture must have had the output node's bounds to remove"
+            );
+
+            let scope =
+                graph.crown_ibp_truncated_reuse_scope(&result, Some(Duration::from_mins(1)));
+            assert!(
+                scope.is_some(),
+                "a map lacking the output node's bounds must still build a scope \
+                 when no margin publication exists (defect (E))"
+            );
+
+            {
+                let _publication =
+                    crate::output_margin_seed::MarginOutputSeedGuard::publish(vec![0]);
+                assert!(
+                    graph
+                        .crown_ibp_truncated_reuse_scope(&result, Some(Duration::from_mins(1)))
+                        .is_none(),
+                    "with the output dim unknown, ANY live margin publication must \
+                     refuse the scope (conservative form of the objective-leak guard)"
+                );
+            }
+            assert!(
+                graph
+                    .crown_ibp_truncated_reuse_scope(&result, Some(Duration::from_mins(1)))
+                    .is_some(),
+                "dropping the publication guard must restore scope construction"
+            );
+        });
+    }
+
+    /// When the map DOES contain the output node, the guard stays
+    /// dim-consulted and bit-identical to the historical path: a publication
+    /// that would not engage for the node's true width (here dim 2, far below
+    /// `MARGIN_SUBSET_MIN_OUTPUT_DIM`) must not refuse the scope.
+    #[test]
+    fn truncated_scope_with_output_node_keeps_dim_consulted_guard() {
+        ny_test_utils::env::with_env_edits(|env| {
+            env.remove(SERVE_TRUNCATED_COLLECTION_CACHE_ENV);
+            env.remove("NY_CROWN_CUT_SEGMENT");
+
+            let graph = small_graph();
+            let input = unit_box();
+            let completed = graph
+                .collect_crown_ibp_bounds_dag_with_status(&input)
+                .expect("complete fixture collection");
+            let result = deadline_mixed_result(&graph, &input, completed);
+            assert!(result.bounds.contains_key("relu"));
+
+            let _publication = crate::output_margin_seed::MarginOutputSeedGuard::publish(vec![0]);
+            assert!(
+                graph
+                    .crown_ibp_truncated_reuse_scope(&result, Some(Duration::from_mins(1)))
+                    .is_some(),
+                "a publication below the subset's minimum output width must not \
+                 refuse a map whose output-node width is known"
+            );
+        });
     }
 
     /// The dark lookup must not promote a malformed partial target set, must

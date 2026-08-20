@@ -115,6 +115,18 @@ pub(crate) fn core_call_count() -> usize {
     CORE_CALLS.load(Ordering::Relaxed)
 }
 
+/// Counts every call that actually reaches
+/// [`ny_mip::falsify_bnn_ste_pgd_unwired`], for the same reason
+/// [`CORE_CALLS`] exists: the STE-PGD lane's default-off contract is asserted
+/// on a CODE PATH rather than on a log line.
+static STE_CORE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many times the STE-PGD core has been entered in this process.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn ste_core_call_count() -> usize {
+    STE_CORE_CALLS.load(Ordering::Relaxed)
+}
+
 /// Whether the `NY_BNN_SIGN_SPACE` gate is armed, given the typed preset
 /// answer for this category (`attack.bnn_sign_space`).
 ///
@@ -154,6 +166,44 @@ pub(crate) fn sign_space_falsify_armed_from(raw: Option<&str>, config: Option<bo
     let owned = raw.map(str::to_owned);
     ny_levers::read_over_config_with(
         &ny_levers::decls::dark_probes::BNN_SIGN_SPACE_LANE,
+        move |_| owned,
+        config.map(ny_levers::LeverValue::Bool),
+    )
+    .map(|resolved| resolved.value.as_bool())
+    .unwrap_or(false)
+}
+
+/// Whether the `NY_BNN_STE_PGD` gate is armed, under the environment and the
+/// category preset's `attack.bnn_ste_pgd`.
+///
+/// SAME declaration, SAME parser, SAME chokepoint discipline and SAME
+/// precedence as [`sign_space_falsify_armed`]: the environment WINS in both
+/// directions where it is present, the typed preset answers when it is not,
+/// and the declaration default (`false`) answers when neither does.
+///
+/// Exact `"1"` arms it, exact `"0"` disarms it, and any other byte sequence is
+/// a recorded rejection that falls back through the same order. This fails
+/// CLOSED.
+pub(crate) fn ste_pgd_falsify_armed(config: Option<bool>) -> bool {
+    ny_levers::read_over_config(
+        &ny_levers::decls::dark_probes::BNN_STE_PGD_LANE,
+        config.map(ny_levers::LeverValue::Bool),
+    )
+    .map(|resolved| resolved.value.as_bool())
+    .unwrap_or(false)
+}
+
+/// The arming rule as a pure predicate over one raw environment string and one
+/// typed preset answer.
+///
+/// Same declaration and same parser as [`ste_pgd_falsify_armed`] — only the
+/// lookup is injected — so a test of this function is a test of the production
+/// arming rule and not of a re-implementation of it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn ste_pgd_falsify_armed_from(raw: Option<&str>, config: Option<bool>) -> bool {
+    let owned = raw.map(str::to_owned);
+    ny_levers::read_over_config_with(
+        &ny_levers::decls::dark_probes::BNN_STE_PGD_LANE,
         move |_| owned,
         config.map(ny_levers::LeverValue::Bool),
     )
@@ -228,6 +278,12 @@ pub(crate) enum SignSpaceLaneOutcome {
     Exhausted {
         /// Best pre-Softmax margin reached in pattern space (`<= 0`).
         best_logit_margin: i64,
+        /// MARGINAL VALUE in the lane's own unit: how far that margin moved
+        /// over the whole consultation (`best - initial`, `>= 0`). Priced
+        /// against `lp_solves`, never against seconds — measured 0.42 / 0.59 /
+        /// 1.67 s per LP on three rows of ONE family, so seconds are the wrong
+        /// denominator for this lane.
+        margin_gain: i64,
         /// FREE first-layer unit count from the exact prepass.
         free_units: usize,
         /// Accepted sign flips.
@@ -271,12 +327,14 @@ impl SignSpaceLaneOutcome {
             Self::Refused(reason) => format!("core refused: {reason}"),
             Self::Exhausted {
                 best_logit_margin,
+                margin_gain,
                 free_units,
                 flips,
                 lp_solves,
             } => format!(
                 "exhausted (best pattern-space margin {best_logit_margin}, \
-                 {free_units} free units, {flips} flips, {lp_solves} LP solves)"
+                 margin gain +{margin_gain} over {lp_solves} LP solves, \
+                 {free_units} free units, {flips} flips)"
             ),
             Self::SolverError(error) => format!("realizability LP failed: {error}"),
             Self::Candidate(candidate) => format!(
@@ -314,6 +372,90 @@ const LANE_WALL_CAP: Duration = Duration::from_mins(4);
 /// Fraction of the remaining instance budget the lane may take.
 const LANE_BUDGET_FRACTION: f64 = 0.5;
 
+/// Wall clock the STE-PGD lane leaves behind it, on top of
+/// [`LANE_SAFETY_MARGIN`], for everything downstream: the upfront
+/// surrogate-gradient attack and then BaB.
+///
+/// #ste-pgd-budget. The two BNN falsification lanes cannot both take
+/// [`LANE_BUDGET_FRACTION`] of what they are handed — compounding the halves
+/// leaves the SECOND lane a quarter of the instance, which is what starved
+/// this one to 108 s of a 480 s row and cost three rows it can otherwise take.
+/// So the second lane sizes itself by SUBTRACTION instead: take everything
+/// that is left, minus what the lanes behind it are measured to need, capped
+/// by [`LANE_WALL_CAP`].
+///
+/// 100 s is that measured need. The upfront attack takes half of what remains
+/// to it (`#bnn-attack-budget`), and it is the lane that takes all fifteen
+/// banked 48x48/64x64 `sat` rows — in 2.0-39.6 s each
+/// (`reports/measured-2026/traffic_signs_recognition_2023.csv`). Leaving 100 s
+/// leaves it ~50 s of attack, comfortably above the 39.6 s worst case, and
+/// leaves BaB the rest.
+const DOWNSTREAM_RESERVE: Duration = Duration::from_secs(100);
+
+/// FREE first-layer units the LP-guided sign-space walk will accept.
+///
+/// #bnn-lp-scope. This is the ceiling the LP lane SHIPPED WITH and under which
+/// its 30/45 sweep was banked. `ny_mip`'s own default was widened to
+/// [`STE_LANE_MAX_FREE_UNITS`] so the STE lane could reach the deeper nets at
+/// all; that widening is right for THAT lane and wrong for this one, so the
+/// two ceilings are stated separately here instead of one lane silently
+/// inheriting the other's.
+///
+/// WHY THE LP LANE KEEPS THE NARROW SCOPE. Two measured facts:
+///
+/// * it cannot USE the wider fragment. On all nine open 48x48/64x64 rows
+///   (4011-12918 free units) the walk accepts **0** flips, every time, and
+///   reaches `Exhausted` having narrowed nothing. On the three `model_30`
+///   eps=1 rows it owns (488-999 free units) it accepts 78-99. The ceiling
+///   separates exactly those two populations;
+/// * inheriting the wide ceiling REGRESSES rows ny already scores. Free units
+///   grow with the box, so on `model_30` at large eps the count runs to 4880 —
+///   inside the wide ceiling, outside this one. Measured on
+///   `model_30_idx_1703_eps_15`: with the wide ceiling the walk is admitted and
+///   spends 122.1 s to accept 0 flips before the ordinary lanes run, taking a
+///   row banked at **1.3 s** to **139.4 s**. With this ceiling it is refused in
+///   0.03 s and the row is unchanged.
+///
+/// The refusal is [`ny_mip::SignSpaceRefusal::LimitExceeded`], raised in the
+/// exact prepass before any LP is built, and the call site maps every
+/// non-`Candidate` outcome to `None`. So this can only ever turn a `Candidate`
+/// into a fall-through — it cannot affect soundness, only which lane spends
+/// the slice.
+const LP_LANE_MAX_FREE_UNITS: usize = 4_096;
+
+/// FREE first-layer units the STE-PGD lane will accept.
+///
+/// The pooled first layer is 22x22x32 on `model_48` and 30x30x32 on
+/// `model_64`, so the deeper nets need this ceiling to be reached at all — and
+/// unlike the LP walk, this lane USES them: the rows it takes have witnesses
+/// 483-1584 first-layer flips from the box centre. This is `ny_mip`'s own
+/// default, restated here so the two lanes' scopes sit side by side.
+const STE_LANE_MAX_FREE_UNITS: usize = 32_768;
+
+/// The publication margin every lane in the attack slice must leave behind.
+///
+/// Re-exported for the marginal-value lane scheduler, which sizes its whole
+/// pool as `remaining - this` so that no reallocation can ever cross it.
+pub(crate) const LANE_PUBLICATION_MARGIN: Duration = LANE_SAFETY_MARGIN;
+
+/// The reserve the trailing lane leaves for everything after it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LANE_DOWNSTREAM_RESERVE: Duration = DOWNSTREAM_RESERVE;
+
+/// The LP lane's own cost plan, as a function of LIVE remaining budget.
+///
+/// This is the SAME function the unscheduled lane uses; exposing it is what
+/// lets the scheduler predict the lane's cost without re-deriving (and drifting
+/// from) its rule.
+pub(crate) fn lp_lane_plan(remaining: Option<Duration>) -> Option<Duration> {
+    lane_budget(remaining)
+}
+
+/// The STE lane's own cost plan, as a function of LIVE remaining budget.
+pub(crate) fn ste_lane_plan(remaining: Option<Duration>) -> Option<Duration> {
+    trailing_lane_budget(remaining)
+}
+
 /// Wall-clock budget for one lane consultation, or `None` when the remaining
 /// budget is too small to be worth spending.
 fn lane_budget(remaining: Option<Duration>) -> Option<Duration> {
@@ -322,6 +464,22 @@ fn lane_budget(remaining: Option<Duration>) -> Option<Duration> {
     };
     let usable = remaining.checked_sub(LANE_SAFETY_MARGIN)?;
     let budget = usable.mul_f64(LANE_BUDGET_FRACTION).min(LANE_WALL_CAP);
+    (budget >= MIN_LANE_BUDGET).then_some(budget)
+}
+
+/// Wall-clock budget for the SECOND falsification lane in the attack slice.
+///
+/// See [`DOWNSTREAM_RESERVE`] for why this subtracts rather than halving.
+/// Returns `None` on exactly the same terms as [`lane_budget`]: when what is
+/// left cannot fund a consultation worth starting.
+fn trailing_lane_budget(remaining: Option<Duration>) -> Option<Duration> {
+    let Some(remaining) = remaining else {
+        return Some(LANE_WALL_CAP);
+    };
+    let budget = remaining
+        .checked_sub(LANE_SAFETY_MARGIN)?
+        .checked_sub(DOWNSTREAM_RESERVE)?
+        .min(LANE_WALL_CAP);
     (budget >= MIN_LANE_BUDGET).then_some(budget)
 }
 
@@ -354,6 +512,27 @@ pub(crate) fn run_sign_space_lane(
             remaining
         ));
     };
+    run_sign_space_lane_granted(onnx, vnnlib, budget, 0)
+}
+
+/// The LP lane with the window CHOSEN BY THE CALLER.
+///
+/// Split out of [`run_sign_space_lane`] so the marginal-value lane scheduler
+/// can hand this lane a cap it planned against the LIVE remaining budget,
+/// instead of the lane re-deriving a private fraction of whatever it was
+/// handed. The arming gate is the CALLER's here — the scheduler only ever
+/// reaches this after [`sign_space_falsify_armed`] has already said yes — so
+/// there is no second arming decision to get out of step with the first.
+///
+/// `value_stall_lp_solves` is the lane's own YIELD rule in its own units: stop
+/// after that many realizability LPs with no strict improvement in the pattern
+/// margin. `0` is the shipped walk.
+pub(crate) fn run_sign_space_lane_granted(
+    onnx: &Path,
+    vnnlib: &Path,
+    budget: Duration,
+    value_stall_lp_solves: usize,
+) -> SignSpaceLaneOutcome {
     // PROPERTY FIRST, ON PURPOSE. Parsing the VNN-LIB is far cheaper than
     // loading and shape-inferring an ONNX graph, and the argmax-complement test
     // rejects most benchmark families outright. Ordering it first means an
@@ -379,7 +558,78 @@ pub(crate) fn run_sign_space_lane(
         Ok(problem) => problem,
         Err(reason) => return SignSpaceLaneOutcome::NotAdmitted(reason),
     };
-    problem.solve(budget)
+    problem.solve(budget, value_stall_lp_solves)
+}
+
+/// Consult the STE-PGD falsification lane.
+///
+/// Identical contract to [`run_sign_space_lane`] in every respect that matters:
+/// it returns a CLAIMED counterexample or a reason it declined, NEVER a
+/// verdict, and on the disarmed arm it returns
+/// [`SignSpaceLaneOutcome::Disarmed`] before touching `onnx` or `vnnlib` at
+/// all — so an unarmed run pays nothing and behaves identically.
+///
+/// It shares the LP lane's EXTRACTION (`SignSpaceProblem::assemble`) and
+/// therefore its STRUCTURAL admission: a net outside the binarized fragment is
+/// declined by the same reader on the same evidence, at the same cost. Nothing
+/// here looks at a filename, a directory or a benchmark category.
+pub(crate) fn run_ste_pgd_lane(
+    onnx: &Path,
+    vnnlib: &Path,
+    remaining: Option<Duration>,
+    config: Option<bool>,
+) -> SignSpaceLaneOutcome {
+    // THE GATE. Everything below this line is unreachable on the dark arm.
+    if !ste_pgd_falsify_armed(config) {
+        return SignSpaceLaneOutcome::Disarmed;
+    }
+    // TRAILING lane: it sizes itself by subtraction, not by halving what the
+    // LP lane left it. See `DOWNSTREAM_RESERVE`.
+    let Some(budget) = trailing_lane_budget(remaining) else {
+        return SignSpaceLaneOutcome::NotAdmitted(format!(
+            "remaining budget {remaining:?} leaves less than {MIN_LANE_BUDGET:?} after the \
+             {LANE_SAFETY_MARGIN:?} publication margin and the {DOWNSTREAM_RESERVE:?} \
+             downstream reserve"
+        ));
+    };
+    run_ste_pgd_lane_granted(onnx, vnnlib, budget)
+}
+
+/// The STE-PGD lane with the window CHOSEN BY THE CALLER.
+///
+/// Same split, same reason, same arming contract as
+/// [`run_sign_space_lane_granted`]. This lane is BUDGET-PARAMETERIZED — its
+/// stage boundary is `started + max_wall_time * (1 - climb_fraction)`, measured
+/// at 88.1 s under a 117.51 s cap and 180.1 s under a 240.10 s cap — so it must
+/// be handed a CAP it can plan against and never a dribble of leftover seconds.
+pub(crate) fn run_ste_pgd_lane_granted(
+    onnx: &Path,
+    vnnlib: &Path,
+    budget: Duration,
+) -> SignSpaceLaneOutcome {
+    // Property first, for the same reason as the LP lane: it is far cheaper
+    // than an ONNX load and rejects most families outright.
+    let spec = match ny_onnx::vnnlib::load_vnnlib(vnnlib) {
+        Ok(spec) => spec,
+        Err(error) => {
+            return SignSpaceLaneOutcome::NotAdmitted(format!("property parse failed: {error}"))
+        }
+    };
+    let property = match ExtractedProperty::extract(&spec) {
+        Ok(property) => property,
+        Err(reason) => return SignSpaceLaneOutcome::NotAdmitted(reason),
+    };
+    let model = match ny_onnx::load_onnx(onnx) {
+        Ok(model) => model,
+        Err(error) => {
+            return SignSpaceLaneOutcome::NotAdmitted(format!("model load failed: {error}"))
+        }
+    };
+    let problem = match SignSpaceProblem::assemble(&model, &spec, property) {
+        Ok(problem) => problem,
+        Err(reason) => return SignSpaceLaneOutcome::NotAdmitted(reason),
+    };
+    problem.solve_ste_pgd(budget)
 }
 
 // ---------------------------------------------------------------------------
@@ -506,8 +756,19 @@ impl SignSpaceProblem {
         )
     }
 
-    /// Build the request and hand it to the core.
-    fn solve(&self, budget: Duration) -> SignSpaceLaneOutcome {
+    /// Build the plain-data request and the limits, then hand BOTH to `run`.
+    ///
+    /// A closure rather than a return value because the request BORROWS the
+    /// lowered `stages` vector, which lives only for this call. Both search
+    /// lanes go through here, so they cannot drift apart on what the network,
+    /// the box or the property is.
+    fn with_request<R>(
+        &self,
+        budget: Duration,
+        max_free_units: usize,
+        value_stall_lp_solves: usize,
+        run: impl FnOnce(&SignSpaceRequest<'_>, &SignSpaceLimits) -> R,
+    ) -> R {
         let conv1 = ConvSpec::valid_unit_stride(
             &self.conv1_weights,
             self.conv1.out_channels,
@@ -602,34 +863,97 @@ impl SignSpaceProblem {
         };
         let limits = SignSpaceLimits {
             max_wall_time: budget,
+            max_free_units,
             tolerance: self.tolerance(),
             segment_move: self.segment_move(),
             trust_region: self.trust_region(),
+            // #lane-value-stall. 0 everywhere except under the marginal-value
+            // lane scheduler, and 0 is the shipped walk.
+            stall_margin_lp_solves: value_stall_lp_solves,
             ..SignSpaceLimits::default()
         };
-        // The one and only entry to the search core.
-        CORE_CALLS.fetch_add(1, Ordering::Relaxed);
-        match ny_mip::falsify_bnn_sign_suffix_unwired(&request, &limits) {
-            Ok(SignSpaceOutcome::Candidate(candidate)) => {
-                SignSpaceLaneOutcome::Candidate(candidate)
-            }
-            Ok(SignSpaceOutcome::Exhausted {
-                best_logit_margin,
-                free_units,
-                flips,
-                lp_solves,
-                ..
-            }) => SignSpaceLaneOutcome::Exhausted {
-                best_logit_margin,
-                free_units,
-                flips,
-                lp_solves,
+        run(&request, &limits)
+    }
+
+    /// Build the request and hand it to the LP-guided search core.
+    ///
+    /// `value_stall_lp_solves` is `SignSpaceLimits::stall_margin_lp_solves`:
+    /// `0` (every caller but the marginal-value lane scheduler) is the shipped
+    /// walk, byte for byte.
+    fn solve(&self, budget: Duration, value_stall_lp_solves: usize) -> SignSpaceLaneOutcome {
+        self.with_request(
+            budget,
+            LP_LANE_MAX_FREE_UNITS,
+            value_stall_lp_solves,
+            |request, limits| {
+                // The one and only entry to the search core.
+                CORE_CALLS.fetch_add(1, Ordering::Relaxed);
+                match ny_mip::falsify_bnn_sign_suffix_unwired(request, limits) {
+                    Ok(SignSpaceOutcome::Candidate(candidate)) => {
+                        SignSpaceLaneOutcome::Candidate(candidate)
+                    }
+                    Ok(SignSpaceOutcome::Exhausted {
+                        best_logit_margin,
+                        margin_gain,
+                        free_units,
+                        flips,
+                        lp_solves,
+                        ..
+                    }) => SignSpaceLaneOutcome::Exhausted {
+                        best_logit_margin,
+                        margin_gain,
+                        free_units,
+                        flips,
+                        lp_solves,
+                    },
+                    Ok(SignSpaceOutcome::Refused(refusal)) => {
+                        SignSpaceLaneOutcome::Refused(format!("{refusal:?}"))
+                    }
+                    Err(error) => SignSpaceLaneOutcome::SolverError(error.to_string()),
+                }
             },
-            Ok(SignSpaceOutcome::Refused(refusal)) => {
-                SignSpaceLaneOutcome::Refused(format!("{refusal:?}"))
+        )
+    }
+
+    /// Hand the SAME request to the STE-PGD core instead of the LP search.
+    ///
+    /// Everything about the request — geometry, tensors, folded thresholds,
+    /// the vnnlib `lo`/`hi`, the target and the challengers — is built by the
+    /// SAME [`Self::request`] the LP lane uses, so the two lanes cannot drift
+    /// apart on what the network is. Only the search differs.
+    fn solve_ste_pgd(&self, budget: Duration) -> SignSpaceLaneOutcome {
+        let schedule = ny_mip::StePgdLimits {
+            max_wall_time: budget,
+            ..ny_mip::StePgdLimits::default()
+        };
+        // The STE search has no LP walk, so the LP value-stall rule does not
+        // apply to it: it prices itself on probes, not realizability solves.
+        self.with_request(budget, STE_LANE_MAX_FREE_UNITS, 0, |request, limits| {
+            // The one and only entry to the STE-PGD core.
+            STE_CORE_CALLS.fetch_add(1, Ordering::Relaxed);
+            match ny_mip::falsify_bnn_ste_pgd_unwired(request, limits, &schedule) {
+                SignSpaceOutcome::Candidate(candidate) => {
+                    SignSpaceLaneOutcome::Candidate(candidate)
+                }
+                SignSpaceOutcome::Exhausted {
+                    best_logit_margin,
+                    margin_gain,
+                    free_units,
+                    flips,
+                    lp_solves,
+                    ..
+                } => SignSpaceLaneOutcome::Exhausted {
+                    best_logit_margin,
+                    margin_gain,
+                    free_units,
+                    flips,
+                    lp_solves,
+                },
+                SignSpaceOutcome::Refused(refusal) => {
+                    SignSpaceLaneOutcome::Refused(format!("{refusal:?}"))
+                }
             }
-            Err(error) => SignSpaceLaneOutcome::SolverError(error.to_string()),
-        }
+        })
     }
 
     /// Join the already-checked property to the binarized conv suffix of a
@@ -1723,6 +2047,7 @@ mod tests {
             SignSpaceLaneOutcome::Refused("CompositeActivationNotBinary".into()),
             SignSpaceLaneOutcome::Exhausted {
                 best_logit_margin: -102,
+                margin_gain: 18,
                 free_units: 488,
                 flips: 250,
                 lp_solves: 1234,
@@ -1755,6 +2080,83 @@ mod tests {
             }
         }
         assert!(is_falsification_only(&SignSpaceLaneOutcome::Disarmed));
+    }
+
+    /// (d) DEFAULTS UNCHANGED: with no lever set the STE-PGD lane is dark, and
+    /// darkness is asserted on a CODE PATH, not on a log line.
+    ///
+    /// Two independent witnesses, exactly as for the LP lane: the returned
+    /// variant is `Disarmed`, reachable from the single `return` above every
+    /// model load, property parse and request construction in
+    /// `run_ste_pgd_lane`; and the STE core's own invocation counter does not
+    /// move. The paths handed in DO NOT EXIST, so a bypassed gate could not
+    /// come back `Disarmed` — it would have to reach `load_vnnlib` and answer
+    /// `NotAdmitted`.
+    #[test]
+    fn unset_lever_never_constructs_the_ste_pgd_search() {
+        assert!(
+            !ste_pgd_falsify_armed_from(None, None),
+            "an absent NY_BNN_STE_PGD and a silent preset must leave the lane dark"
+        );
+        let before = ste_core_call_count();
+        let outcome = run_ste_pgd_lane(
+            Path::new("/nonexistent/ste-pgd/model.onnx"),
+            Path::new("/nonexistent/ste-pgd/property.vnnlib"),
+            Some(Duration::from_mins(8)),
+            None,
+        );
+        assert!(
+            matches!(outcome, SignSpaceLaneOutcome::Disarmed),
+            "unarmed lane must short-circuit before any load; got {}",
+            outcome.describe()
+        );
+        assert_eq!(
+            ste_core_call_count(),
+            before,
+            "the STE-PGD core must not be entered with the lane unarmed"
+        );
+        // And the DISARMED outcome carries nothing publishable, so even a
+        // caller that ignored the variant could not emit a witness from it.
+        assert!(outcome.candidate_input().is_none());
+    }
+
+    /// (d) EXACT-`"1"` SEMANTICS for the STE-PGD lever. Anything else is OFF —
+    /// not trimmed, not case-folded, not truthy-parsed — so a typo is a kill
+    /// switch rather than a silent arming of a new `sat` source.
+    #[test]
+    fn only_the_single_character_one_arms_the_ste_pgd_lane() {
+        assert!(ste_pgd_falsify_armed_from(Some("1"), None));
+        for off in [
+            "", "0", "01", "true", "on", " 1", "1 ", "TRUE", "yes", "2", "-1",
+        ] {
+            assert!(
+                !ste_pgd_falsify_armed_from(Some(off), None),
+                "{off:?} must not arm NY_BNN_STE_PGD"
+            );
+            // ... and the same token must not arm it OVER a preset that asked
+            // for the lane either: a typo falls back to the DECLARATION
+            // default, suppressing the preset rather than promoting it.
+            assert!(
+                !ste_pgd_falsify_armed_from(Some(off), Some(true)),
+                "{off:?} must suppress a preset-armed NY_BNN_STE_PGD, not promote it"
+            );
+        }
+        // BOTH DIRECTIONS, which is the whole contract now that
+        // `configs/vnncomp25/traffic_signs_recognition_2023.yaml` carries
+        // `attack.bnn_ste_pgd: true`: the preset arms the lane with the
+        // variable absent, and an exact `"0"` still kills it.
+        assert!(
+            ste_pgd_falsify_armed_from(None, Some(true)),
+            "attack.bnn_ste_pgd: true must arm the lane with NY_BNN_STE_PGD absent"
+        );
+        assert!(
+            !ste_pgd_falsify_armed_from(Some("0"), Some(true)),
+            "NY_BNN_STE_PGD=0 must disarm a preset-armed lane"
+        );
+        assert!(
+            ste_pgd_falsify_armed_from(Some("1"), Some(false)),
+            "NY_BNN_STE_PGD=1 must arm a lane the preset declined"
+        );
     }
 
     /// The budget policy never starts a run it cannot finish and never eats the

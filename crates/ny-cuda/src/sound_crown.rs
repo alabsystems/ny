@@ -492,9 +492,7 @@ pub(crate) fn concretize_f64(
     // host. It only ever WIDENS (finite → ±inf), so arming it can lose a
     // verdict but can never create a wrong one. Whoever has an NVIDIA box
     // should arm and measure it.
-    let guard = std::env::var("NY_CUDA_CONCRETIZE_SENTINEL_GUARD")
-        .ok()
-        .is_some_and(|v| v == "1");
+    let guard = std::env::var("NY_CUDA_CONCRETIZE_SENTINEL_GUARD").is_ok_and(|v| v == "1");
     let mut lo = vec![0.0f32; num_specs];
     let mut hi = vec![0.0f32; num_specs];
     for s in 0..num_specs {

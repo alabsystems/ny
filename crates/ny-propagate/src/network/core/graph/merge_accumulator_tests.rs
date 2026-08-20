@@ -420,6 +420,7 @@ fn test_merge_error_addition_rounds_up_per_addend() {
 
 #[test]
 fn test_crown_merge_accumulator_downcasts_with_directed_rounding_2657() {
+    let _env = crate::tests::lock_env_shared();
     let lower_half_ulp = 2.0_f32.powi(-24);
     let lower_quarter_ulp = 2.0_f32.powi(-25);
     let upper_half_ulp = 2.0_f32.powi(-24);
@@ -628,6 +629,7 @@ fn soft_deadline_keeps_compatible_patches_merge_native_but_hard_deadline_does_no
 /// #4382 regression: merge_crown with incompatible patches (different stride)
 /// promotes to Dense without panicking.
 fn test_crown_merge_accumulator_merge_crown_incompatible_patches_promotes_dense_4382() {
+    let _env = crate::tests::lock_env_shared();
     use crate::bounds::patches::PatchesData;
     use crate::bounds::patches::PatchesLinearBounds;
     use ndarray::{Array1, ArrayD, IxDyn};
@@ -693,6 +695,12 @@ fn test_crown_merge_accumulator_merge_crown_incompatible_patches_promotes_dense_
 #[test]
 /// #4382 regression: merge_crown with mixed Dense+Patches promotes to Dense.
 fn test_crown_merge_accumulator_merge_crown_mixed_dense_patches_promotes_4382() {
+    // Excluded from overlapping an env WRITER. `NY_DENSE_BUDGET_MB` is read
+    // process-globally by `crown_memory::explicit_cpu_crown_dense_budget_bytes`;
+    // a concurrent test setting it to 0 starves this one's dense path, which
+    // surfaced here as `budget_bytes: 0` / bounds no tighter than IBP rather
+    // than as the race it is. Observed at --test-threads=8.
+    let _env = crate::tests::lock_env_shared();
     use crate::bounds::patches::PatchesData;
     use crate::bounds::patches::PatchesLinearBounds;
     use ndarray::{Array1, ArrayD, IxDyn};
@@ -942,6 +950,7 @@ fn third_patches_parent_accounts_for_live_merged_sidecar_and_refuses_atomically(
 
 #[test]
 fn test_crown_merge_accumulator_indexed_network_input_dense_promotion_4296() {
+    let _env = crate::tests::lock_env_shared();
     let exec_order = vec!["output".to_string()];
     let mut accumulator = CrownMergeAccumulator::new_indexed(&exec_order);
     accumulator.insert(

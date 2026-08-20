@@ -2,7 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(any(feature = "benchmarks", feature = "external-whisper"))]
+// Only `tests/whisper/` uses this, and that module is external-whisper
+// content; under `benchmarks` alone the import was present but unused.
+#[cfg(feature = "external-whisper")]
 use crate::MultiBlockConfig;
 use crate::{
     load_decoder, load_onnx, load_whisper, onnx_proto, AttributeValue, DataType,

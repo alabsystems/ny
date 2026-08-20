@@ -65,4 +65,25 @@
 #                   declaration. The authoritative ny-cuda parser remains
 #                   direct and fail-closed because it must reject every value
 #                   other than exact 0 or 1: 727 var + 94 var_os.
-821
+# 2026-08-19  805   Governed all TWENTY open-coded readers of
+#                   `NY_BETA_GPU_PROBE` through one crate-level chokepoint in
+#                   ny-propagate. The lever was ALREADY declared; this file's
+#                   own ReaderSite entry recorded the gap, saying those sites
+#                   "still sample the process environment directly and remain
+#                   visible to the raw-read migration ratchet".
+#
+#                   The gate had drifted RED at 824 against the 821 above --
+#                   three counted reads arrived somewhere around HEAD~25 and
+#                   nobody migrated them. Raising the baseline to 824 is
+#                   forbidden by the rule at the top of this file, and would
+#                   have been the wrong trade anyway: this migration was
+#                   sitting in plain sight and pays 19 back.
+#
+#                   Not only debt. `ny-cli`'s beta_gpu_probe_armed already read
+#                   through the declaration, so the two halves of one switch
+#                   disagreed: `NY_BETA_GPU_PROBE=true` armed the CLI wide-lane
+#                   readout while every propagation marker stayed dark, the
+#                   open-coded form having accepted the single spelling "1".
+#                   Both halves now answer with the declared Bool parser:
+#                   711 var + 94 var_os.
+805

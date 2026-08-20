@@ -38,7 +38,16 @@ fn run_python(program: &str) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    String::from_utf8(output.stdout).expect("Python contract output must be UTF-8")
+    // NORMALIZE LINE ENDINGS. Python's `print` terminates with the platform
+    // newline, so every line of this stdout arrives CRLF-terminated on Windows
+    // while every assertion below is written against "\n" — `contains("...\n")`
+    // then matches nothing and all five contracts fail for a reason that has
+    // nothing to do with what they check. These assertions are about the tool's
+    // CONTENT, not its line-ending convention, so the convention is normalized
+    // away here at the single point where output is captured.
+    String::from_utf8(output.stdout)
+        .expect("Python contract output must be UTF-8")
+        .replace("\r\n", "\n")
 }
 
 #[test]

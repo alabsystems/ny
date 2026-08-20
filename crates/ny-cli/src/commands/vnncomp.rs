@@ -41,6 +41,11 @@
 //! we write `unknown` (always sound). `error` is reserved for genuine failures
 //! (missing input file, model-load failure with no verdict produced).
 
+/// The `ny-falsify` seam. A child module so it can reuse this module's already
+/// audited box construction, margin and property predicates rather than growing
+/// a second copy of any of them; it adds no new acceptance rule.
+mod falsify_portfolio;
+
 use anyhow::{anyhow, Context, Result};
 use std::ffi::OsStr;
 use std::fs;
@@ -245,6 +250,55 @@ fn beta_gpu_probe_armed() -> bool {
     ny_levers::read(&ny_levers::decls::telemetry::BETA_GPU_PROBE)
         .value
         .as_bool()
+}
+
+/// Dark gate for the GENERAL pre-Softmax attack-scoring objective
+/// (`NY_ATTACK_PRE_SOFTMAX_OBJECTIVE`).
+///
+/// Disarmed — the shipped default — this returns `false` before anything reads
+/// the model, the property, or any pre-Softmax tensor, so the attack lane's
+/// objective, direction row and DLR denominator are the historical
+/// post-Softmax ones and the path is byte-identical to the unwired tree.
+fn pre_softmax_attack_objective_armed() -> bool {
+    ny_levers::read(&ny_levers::decls::dark_probes::ATTACK_PRE_SOFTMAX_OBJECTIVE)
+        .value
+        .as_bool()
+}
+
+/// Run the PROVEN terminal-Softmax strip guard as an ATTACK-SCORING admission.
+///
+/// Returns `None` on every refusal, after LOGGING the refusal reason once —
+/// a silent refusal here is a debugging trap, and the whole point of the lever
+/// is to be able to tell "the guard said no" from "the guard said yes and the
+/// search still found nothing".
+///
+/// The check itself is CHEAP: `ny_onnx::admit_pre_softmax_attack_scoring` is a
+/// handful of shape and constraint-shape tests over already-parsed metadata —
+/// no forward pass and no tensor arithmetic. It is called with a model this
+/// lane had to load anyway, so an armed refusal costs no extra I/O and a
+/// disarmed run never reaches it at all.
+fn admit_pre_softmax_attack_objective(
+    model: &ny_onnx::OnnxModel,
+    spec: &ny_onnx::vnnlib::VnnLibSpec,
+) -> Option<ny_onnx::PreSoftmaxAttackAdmission> {
+    match ny_onnx::admit_pre_softmax_attack_scoring(model, spec) {
+        Ok(admission) => {
+            println!(
+                "ORT-refine grad lane: pre-Softmax attack objective ADMITTED \
+                 (tensor {}, {} outputs, true label {}); acceptance is unchanged \
+                 (trusted ORT forward on the ORIGINAL graph)",
+                admission.pre_softmax_tensor, admission.num_outputs, admission.true_label
+            );
+            Some(admission)
+        }
+        Err(reason) => {
+            println!(
+                "ORT-refine grad lane: pre-Softmax attack objective REFUSED ({reason}); \
+                 keeping the historical post-Softmax objective"
+            );
+            None
+        }
+    }
 }
 
 /// Typed VNN-COMP routing receipt for the traffic terminal-Softmax experiment.
@@ -3071,12 +3125,21 @@ pub(crate) fn handle_vnncomp_command(
                 // without this projection the run's evidence would record the
                 // declaration default while a new `sat` SOURCE was live.
                 let bnn_sign_space = loaded.attack.bnn_sign_space;
+                // Same obligation for the STE-PGD lane, which is armed from the
+                // preset on the scored path too (#bnn-ste-pgd).
+                let bnn_ste_pgd = loaded.attack.bnn_ste_pgd;
                 crate::flight::global().materialize_levers(|decl| {
                     if std::ptr::eq(
                         decl,
                         &raw const ny_levers::decls::dark_probes::BNN_SIGN_SPACE_LANE,
                     ) {
                         return bnn_sign_space.map(ny_levers::LeverValue::Bool);
+                    }
+                    if std::ptr::eq(
+                        decl,
+                        &raw const ny_levers::decls::dark_probes::BNN_STE_PGD_LANE,
+                    ) {
+                        return bnn_ste_pgd.map(ny_levers::LeverValue::Bool);
                     }
                     std::ptr::eq(
                         decl,
@@ -4160,6 +4223,24 @@ fn load_relational_graphs_or_unknown(
 /// Load an ONNX model as a `GraphNetwork` (the dual-network / ground-truth
 /// difference path loader; also reused by `ny gt verify`).
 pub(crate) fn load_graph_network(path: &Path) -> Result<GraphNetwork> {
+    let (graph, _) = load_graph_network_retaining_model(path, false)?;
+    Ok(graph)
+}
+
+/// As [`load_graph_network`], optionally handing back the parsed
+/// [`ny_onnx::OnnxModel`] the conversion was made from.
+///
+/// The flag exists so the historical caller keeps its exact memory profile:
+/// with `retain_model == false` the model is dropped at the end of this
+/// function exactly as before, and nothing is live across the caller's search
+/// that was not live at HEAD. It is set only by a caller that has a use for
+/// the model — currently the dark pre-Softmax attack-objective admission,
+/// which needs the graph-level metadata the guard reads and must not pay for a
+/// SECOND load of the same file to get it.
+pub(crate) fn load_graph_network_retaining_model(
+    path: &Path,
+    retain_model: bool,
+) -> Result<(GraphNetwork, Option<ny_onnx::OnnxModel>)> {
     // Crash-isolate ORT shape inference (see `cli_shape_infer_backend`).
     let load_config = OnnxLoadConfig::default()
         .with_shape_infer_backend(crate::commands::cli_shape_infer_backend());
@@ -4168,7 +4249,8 @@ pub(crate) fn load_graph_network(path: &Path) -> Result<GraphNetwork> {
         compound_node_policy: CompoundNodePolicy::DecomposeNormalization,
         ..GraphNetworkOptions::default()
     };
-    Ok(model.to_graph_network_with_options(options)?)
+    let graph = model.to_graph_network_with_options(options)?;
+    Ok((graph, retain_model.then_some(model)))
 }
 
 fn directed_lower_f32(v: f64) -> f32 {
@@ -6620,8 +6702,121 @@ fn run_and_translate(
         .as_ref()
         .and_then(BetaCrownPresetSnapshot::loaded)
         .and_then(|preset| preset.attack.bnn_sign_space);
-    if let Some(sat) = sign_space_lane_verdict(
-        try_sign_space_falsify(onnx, vnnlib, post_beta_deadline, sign_space_preset),
+    let ste_pgd_preset = preset_snapshot
+        .as_ref()
+        .and_then(BetaCrownPresetSnapshot::loaded)
+        .and_then(|preset| preset.attack.bnn_ste_pgd);
+    // The upfront lane's admission route is a pure function of the frozen
+    // preset snapshot and one environment string. It is resolved HERE, before
+    // the attack slice starts, because the Layer-A allocator below has to know
+    // whether that lane is consulted at all in order to size the pool it may
+    // redistribute. Moving the binding earlier changes nothing about it: it is
+    // side-effect free and the same value reaches the same call site.
+    let upfront_wrapper_route = upfront_wrapper_route_from_snapshot(
+        preset_snapshot.as_ref(),
+        std::env::var_os("NY_UPFRONT_ATTACK").as_deref(),
+    );
+
+    // LANE BUDGET ALLOCATOR, LAYER A (`NY_LANE_BUDGET_ALLOCATOR`, DARK BY
+    // DEFAULT). Armed, the three lanes that actually hold the attack-slice
+    // budget — the LP sign-space walk, STE-PGD and the upfront DLR-APGD attack
+    // — are committed to caps chosen JOINTLY and UP FRONT by a multiple-choice
+    // knapsack instead of each taking a private fraction of whatever it was
+    // handed. Disarmed — which is every scored run, since a competition harness
+    // exports no `NY_*` and this lever has no typed preset key —
+    // `lane_allocation` is `None`, the objective probe is never taken, no
+    // request is built, the solver is never entered, and every lane's window
+    // comes back `LaneWindow::Private`, which is the value each call site
+    // matches to take exactly the helper it takes today.
+    //
+    // IT STANDS DOWN UNDER `#lane-value-scheduler`. That mechanism owns the two
+    // BNN lanes in flight; this one owns the caps up front. They compose, but
+    // only one may hold a lane's cap at a time, so the scheduler wins where
+    // both are armed.
+    //
+    // IT ALSO STANDS DOWN UNDER THE TRAFFIC TERMINAL-SOFTMAX PEEL, on purpose:
+    // that route rewrites the objective the upfront lane steers on, so the
+    // probe below would be measuring a function that lane is not using.
+    let lane_allocation = if crate::commands::lane_allocation::allocator_admitted(
+        crate::commands::lane_allocation::lane_budget_allocator_armed(),
+        crate::commands::lane_schedule::lane_value_scheduler_armed(),
+        traffic_terminal_softmax_peel,
+    ) {
+        plan_attack_slice_allocation(
+            onnx,
+            vnnlib,
+            post_beta_deadline,
+            sign_space_preset,
+            ste_pgd_preset,
+            upfront_wrapper_route,
+        )
+    } else {
+        None
+    };
+    let sign_space_window = crate::commands::lane_allocation::lane_window(
+        lane_allocation.as_ref(),
+        crate::commands::lane_allocation::AllocatedLane::SignSpace,
+    );
+    let ste_pgd_window = crate::commands::lane_allocation::lane_window(
+        lane_allocation.as_ref(),
+        crate::commands::lane_allocation::AllocatedLane::StePgd,
+    );
+    let upfront_window = crate::commands::lane_allocation::lane_window(
+        lane_allocation.as_ref(),
+        crate::commands::lane_allocation::AllocatedLane::UpfrontAttack,
+    );
+    //
+    // #lane-value-scheduler (`NY_LANE_VALUE_SCHEDULER`, DARK BY DEFAULT). Armed,
+    // the two BNN lanes below run under ONE marginal-value ledger instead of
+    // this chain of private fixed fractions, and the two `if let` blocks that
+    // follow are SKIPPED. Disarmed -- which is every scored run, since a
+    // competition harness exports no `NY_*` -- `scheduled_bnn` is `None`, the
+    // scheduler module is never entered, no ledger is built, and the two blocks
+    // below run exactly as they do today, in the same order, on the same
+    // windows, from the same helpers.
+    let scheduled_bnn = if crate::commands::lane_schedule::lane_value_scheduler_armed() {
+        Some(run_bnn_lane_schedule(
+            onnx,
+            vnnlib,
+            post_beta_deadline,
+            sign_space_preset,
+            ste_pgd_preset,
+        ))
+    } else {
+        None
+    };
+    if let Some(scheduled) = scheduled_bnn.as_ref() {
+        // The SAME routing rule the unscheduled lanes use: a claimed witness
+        // becomes a verdict ONLY by passing the unchanged trusted-oracle gate,
+        // and anything else falls through to the ordinary path.
+        if let Some((lane, witness)) = scheduled {
+            if let Some(sat) = falsification_lane_verdict(
+                lane,
+                "Scheduled BNN falsification",
+                Some(witness.clone()),
+                |witness| {
+                    gate_sat_with_trusted_oracle(onnx, vnnlib, Some(witness), instance_deadline)
+                },
+            ) {
+                crate::flight::note(
+                    lane,
+                    crate::flight::FlightStatus::Ran,
+                    Some(
+                        "sat: trusted-oracle gate confirmed the scheduled lane's candidate"
+                            .to_string(),
+                    ),
+                );
+                return sat;
+            }
+        }
+    } else if let Some(sat) = sign_space_lane_verdict(
+        try_sign_space_falsify(
+            onnx,
+            vnnlib,
+            post_beta_deadline,
+            sign_space_preset,
+            sign_space_window,
+        ),
         |witness| gate_sat_with_trusted_oracle(onnx, vnnlib, Some(witness), instance_deadline),
     ) {
         crate::flight::note(
@@ -6632,18 +6827,154 @@ fn run_and_translate(
         return sat;
     }
 
-    let upfront_wrapper_route = upfront_wrapper_route_from_snapshot(
-        preset_snapshot.as_ref(),
-        std::env::var_os("NY_UPFRONT_ATTACK").as_deref(),
-    );
-    let upfront_witness = try_upfront_falsify(
-        onnx,
-        vnnlib,
-        post_beta_deadline,
-        upfront_wrapper_route,
-        traffic_terminal_softmax_peel,
-        &mut traffic_upfront_softmax_execution,
-    );
+    // STE-PGD FALSIFICATION LANE (#bnn-ste-pgd, `attack.bnn_ste_pgd`, override
+    // `NY_BNN_STE_PGD`).
+    //
+    // ARMED BY DEFAULT ON THE SCORED PATH, THROUGH THE CATEGORY PRESET, on the
+    // same terms and by the same route as the LP lane above: a competition
+    // harness exports no `NY_*`, so the typed key is what turns the seven
+    // captured 48x48/64x64 rows into an actual score. With the key absent AND
+    // the variable unset, `run_ste_pgd_lane` returns `Disarmed` before it loads
+    // the model or parses the property, so an unarmed category is
+    // byte-identical to the tree without this lane. `NY_BNN_STE_PGD` still WINS
+    // wherever it is present, in both directions.
+    //
+    // PLACED AFTER THE LP LANE, ON PURPOSE — and MEASURED, not assumed. The two
+    // lanes are complementary: on the three `model_30` eps=1 rows the LP search
+    // owns, this lane was measured `exhausted` (best margin -222 after 97 flips
+    // and 24755 probes over its whole budget), because at eps=1 the box is one
+    // grey level wide and its pixel-space step degenerates to the flip-at-a-time
+    // move the LP search already makes. Running it first would therefore spend
+    // the slice that recovers those three rows on a search that cannot recover
+    // them.
+    //
+    // IT DOES NOT PAY FOR THAT PLACEMENT IN BUDGET. As the TRAILING lane it
+    // sizes itself by subtraction rather than halving what it is handed
+    // (`DOWNSTREAM_RESERVE`, `#ste-pgd-budget`), so it reaches its full 4-minute
+    // cap instead of the quarter-instance the compounding halves left it — the
+    // difference between four of these rows and seven. It still pays out of the
+    // same `attack_start` subtraction, so it cannot push BaB past the deadline,
+    // and the reserve keeps the upfront attack the ~50 s it needs for the
+    // fifteen deeper rows it already takes.
+    //
+    // WHY IT IS HERE AT ALL. `Sign` is piecewise constant, so its true
+    // derivative is zero almost everywhere — but the STRAIGHT-THROUGH ESTIMATOR
+    // runs the REAL `Sign` forward and substitutes a surrogate derivative in
+    // the backward pass only, which is the standard technique for binarized
+    // nets. The witnesses this reaches sit 483-1483 first-layer flips from the
+    // box centre, a distance the LP lane's 7-16 accepted flips per lane cannot
+    // cover (`docs/BNN_SIGN_SPACE_FALSIFICATION_2026-08-12.md` sections 5, 10).
+    //
+    // SOUNDNESS. Identical to the LP lane's, by sharing its machinery: the lane
+    // returns a claimed counterexample INPUT and never a verdict
+    // (`ny_mip::SignSpaceOutcome` has no verified/unsat variant by
+    // construction), admission is the SAME structural `admit` on the SAME
+    // extracted request, and the candidate becomes a `sat` only by passing the
+    // EXISTING, UNCHANGED `gate_sat_with_trusted_oracle`. Every other outcome
+    // is `None` here and falls through with no behaviour change — the shared
+    // `falsification_lane_verdict` rule, which is unit-tested.
+    if scheduled_bnn.is_none() {
+        if let Some(sat) = falsification_lane_verdict(
+            "bnn_ste_pgd",
+            "STE-PGD falsification",
+            try_ste_pgd_falsify(
+                onnx,
+                vnnlib,
+                post_beta_deadline,
+                ste_pgd_preset,
+                ste_pgd_window,
+            ),
+            |witness| gate_sat_with_trusted_oracle(onnx, vnnlib, Some(witness), instance_deadline),
+        ) {
+            crate::flight::note(
+                "bnn_ste_pgd",
+                crate::flight::FlightStatus::Ran,
+                Some("sat: trusted-oracle gate confirmed the STE-PGD candidate".to_string()),
+            );
+            return sat;
+        }
+    }
+
+    // FALSIFICATION PORTFOLIO LANE (`NY_FALSIFY_PORTFOLIO`, DARK BY DEFAULT).
+    //
+    // The ported `ny-falsify` chassis: S1 `special` (declared corners, centre,
+    // parity patterns, bound/centre midpoints) and S9 `square` (random block
+    // sign-flip hill climbing). Both come from
+    // `scripts/audit_unsat_by_falsification.py`, which has run as a one-sided
+    // unsat AUDITOR for months and has never influenced a verdict; its
+    // self-test refuted 75 of 100 known-SAT rows with SIX strategies and no
+    // dominance among them (`reports/falsification_audit/selftest_calibration.json`).
+    // These two are the ones ny ships no equivalent of: the corner lane above
+    // is capped at five variable dimensions and emits vertices only, while
+    // `special` won a 200-free-input row and four of its eight patterns are
+    // interior; `square` is the only strategy that ever cracked soundnessbench
+    // and it works against a FLAT objective, the `#deadlane` case where every
+    // estimated gradient is identically zero.
+    //
+    // PLACED LAST INSIDE THE ATTACK SLICE, before the ordinary upfront attack.
+    // It pays out of the same `attack_start` subtraction, so arming it cannot
+    // push BaB past the scored deadline, and its 8%-of-remaining slice is the
+    // fraction the upfront attack already takes.
+    //
+    // DARK, AND IT STAYS DARK UNTIL A SWEEP SAYS OTHERWISE. There is no typed
+    // `attack.*` key for it, deliberately: a competition harness exports no
+    // `NY_*`, so an env-only lever cannot reach a scored run. The measurement
+    // that gated the port returned zero counterexamples on 42 open-row
+    // measurements, and a default does not move without one.
+    //
+    // SOUNDNESS. `ny-falsify` has NO dependency on any workspace crate, so
+    // `VnncompResult` is not nameable inside it and its `Proposal` type has no
+    // verdict-bearing variant by construction; a `Candidate` carries INPUTS
+    // ONLY, so no search arithmetic can reach a published witness. The
+    // candidate becomes a `sat` only by passing the EXISTING, UNCHANGED
+    // `gate_sat_with_trusted_oracle`, through the SAME shared
+    // `falsification_lane_verdict` rule the two BNN lanes use; every other
+    // outcome is `None` here and falls through with no behaviour change.
+    if let Some(sat) = falsification_lane_verdict(
+        "falsify_portfolio",
+        "Falsification portfolio",
+        falsify_portfolio::try_portfolio_falsify(onnx, vnnlib, post_beta_deadline),
+        |witness| gate_sat_with_trusted_oracle(onnx, vnnlib, Some(witness), instance_deadline),
+    ) {
+        crate::flight::note(
+            "falsify_portfolio",
+            crate::flight::FlightStatus::Ran,
+            Some("sat: trusted-oracle gate confirmed the portfolio candidate".to_string()),
+        );
+        return sat;
+    }
+
+    // A lane the allocator granted ZERO seconds is SKIPPED, not run under a
+    // small cap: it is not slow on this instance, it is structurally blind, and
+    // its seconds are already committed to another lane's grant or to the
+    // branch-and-bound residual.
+    let upfront_witness = if upfront_window == crate::commands::lane_allocation::LaneWindow::Skip {
+        crate::flight::note(
+            "upfront_attack",
+            crate::flight::FlightStatus::Skipped,
+            Some(
+                "lane budget allocator granted 0s on a structurally FLAT objective tier \
+                 (one distinct f32 over the in-box probe); an exact-gradient search has \
+                 no direction to find here"
+                    .to_string(),
+            ),
+        );
+        eprintln!(
+            "Upfront attack: SKIPPED — the lane budget allocator granted it 0s on a FLAT \
+             objective tier; its seconds are committed elsewhere in this instance's plan"
+        );
+        None
+    } else {
+        try_upfront_falsify(
+            onnx,
+            vnnlib,
+            post_beta_deadline,
+            upfront_wrapper_route,
+            traffic_terminal_softmax_peel,
+            &mut traffic_upfront_softmax_execution,
+            upfront_window,
+        )
+    };
     note_traffic_upfront_softmax_execution(traffic_upfront_softmax_execution);
     if let Some(witness) = upfront_witness {
         let gated = gate_sat_with_trusted_oracle(onnx, vnnlib, Some(&witness), instance_deadline);
@@ -11081,6 +11412,214 @@ fn upfront_attack_admission(
     .then_some(UpfrontAttackAdmission::PresetRelationalConjunction)
 }
 
+/// The cap TODAY'S rules would give the upfront lane, computed WITHOUT running it.
+///
+/// An exact mirror of the branch inside [`try_upfront_falsify`]: same admission
+/// test on the same parsed spec, same `Sign`-net exception, same auto-disjunction
+/// clamp, same helpers. It exists so the Layer-A allocator can size its pool from
+/// what today would spend, and it is a mirror rather than a refactor of the lane
+/// because the lane must stay byte-identical on the disarmed arm.
+///
+/// `remaining` is the budget PREDICTED to be left when this lane starts, i.e.
+/// after the lanes ahead of it spend their full caps. That is an UNDER-estimate
+/// whenever an upstream lane declines early, and under-estimating is the safe
+/// direction: it can only make the allocator's pool smaller, which can only
+/// leave MORE for the branch-and-bound residual claimant.
+#[cfg(feature = "mip")]
+fn upfront_today_cap(
+    onnx: &Path,
+    vnnlib: &Path,
+    remaining: Option<std::time::Duration>,
+    wrapper_route: UpfrontWrapperRoute,
+) -> Option<std::time::Duration> {
+    if !wrapper_route.attack_enabled() {
+        return None;
+    }
+    let spec = ny_onnx::vnnlib::load_vnnlib(vnnlib).ok()?;
+    let admission = upfront_attack_admission(&spec, wrapper_route)?;
+    let b = upfront_attack_budget(remaining)?;
+    if net_is_sign_network(onnx) {
+        Some(match remaining {
+            Some(rem) => rem
+                .saturating_sub(UPFRONT_ATTACK_SAFETY_MARGIN)
+                .mul_f64(bnn_attack_budget_fraction())
+                .min(bnn_attack_wall_cap())
+                .max(b),
+            None => bnn_attack_wall_cap(),
+        })
+    } else if !matches!(admission, UpfrontAttackAdmission::AutoDisjunction) {
+        Some(b)
+    } else {
+        Some(b.min(auto_disjunction_attack_wall_cap()))
+    }
+}
+
+/// The in-box objective probe, on the objective the UPFRONT exact-gradient lane
+/// steers on: the property margin over a real ONNX Runtime forward on the model
+/// as loaded.
+///
+/// This is the ONE per-instance structural fact Layer A measures, and it is
+/// measured rather than assumed: `ObjectiveQuality` has been a type in the tree
+/// for months with its single caller hard-coding `Informative`.
+///
+/// WHOSE OBJECTIVE THIS IS, precisely, because the answer decides which lanes it
+/// may zero. It is the post-terminal-op margin the upfront DLR-APGD lane scores
+/// against on the shipped path. It is NOT the objective either BNN lane uses:
+/// `SignSpaceProblem::assemble` strips a terminal Softmax (monotone, so it
+/// cannot change the argmax) and both the LP walk and STE-PGD steer on the
+/// pre-Softmax integer logit margin. A flat verdict here is therefore evidence
+/// about one lane and is applied to exactly that one lane.
+///
+/// Fails toward "not flat" on every uncertainty — an unparseable property, an
+/// unbuildable box, an unavailable ORT session, a non-finite margin, or a probe
+/// that ran out of wall before [`OBJECTIVE_PROBE_MIN_POINTS`] points. A `Flat`
+/// verdict takes a lane to zero seconds, so it must never rest on an absence.
+#[cfg(feature = "mip")]
+fn probe_flat_objective_tier(onnx: &Path, vnnlib: &Path) -> bool {
+    use crate::commands::lane_allocation::{
+        probe_objective, probe_points, OBJECTIVE_PROBE_POINTS, OBJECTIVE_PROBE_WALL,
+    };
+    let Ok(spec) = ny_onnx::vnnlib::load_vnnlib(vnnlib) else {
+        return false;
+    };
+    let Some((box_lo, box_hi, _emit_pin)) = build_search_box(&spec) else {
+        return false;
+    };
+    let Ok(mut forward) = ny_onnx::diff::OrtForward::from_path(onnx, box_lo.len()) else {
+        return false;
+    };
+    let points = probe_points(&box_lo, &box_hi, OBJECTIVE_PROBE_POINTS);
+    let started = std::time::Instant::now();
+    let probe = probe_objective(&points, OBJECTIVE_PROBE_WALL, started, |point| {
+        let outputs = forward.run(point).ok()?;
+        let outputs64: Vec<f64> = outputs.iter().map(|&v| f32_to_f64_exact(v)).collect();
+        Some(property_margin(&spec, point, &outputs64))
+    });
+    match probe {
+        Some(probe) => {
+            eprintln!(
+                "Lane allocation: objective probe took {} in-box points, {} distinct f32 \
+                 value(s), tier={} [{:.3}s]",
+                probe.points,
+                probe.distinct_values,
+                if probe.is_flat() {
+                    "FLAT"
+                } else {
+                    "informative"
+                },
+                started.elapsed().as_secs_f64(),
+            );
+            probe.is_flat()
+        }
+        None => {
+            eprintln!(
+                "Lane allocation: objective probe INCONCLUSIVE (unevaluable or non-finite \
+                 margin); no lane is zeroed"
+            );
+            false
+        }
+    }
+}
+
+/// Build and solve this instance's Layer-A allocation. `None` means fail open:
+/// every lane keeps its private fraction and the run is exactly today's.
+#[cfg(feature = "mip")]
+fn plan_attack_slice_allocation(
+    onnx: &Path,
+    vnnlib: &Path,
+    post_beta_deadline: Option<std::time::Instant>,
+    sign_space_preset: Option<bool>,
+    ste_pgd_preset: Option<bool>,
+    upfront_wrapper_route: UpfrontWrapperRoute,
+) -> Option<crate::commands::lane_allocation::AttackSliceAllocation> {
+    use super::beta_crown::sign_space_falsify::{
+        lp_lane_plan, sign_space_falsify_armed, ste_lane_plan, ste_pgd_falsify_armed,
+    };
+    use crate::commands::lane_allocation::{plan_attack_slice, TodaySlices};
+
+    let started = std::time::Instant::now();
+    let remaining = post_beta_deadline.map(|d| d.saturating_duration_since(started));
+
+    // TODAY'S SLICES, from TODAY'S HELPERS, in TODAY'S ORDER. `lp_lane_plan`
+    // and `ste_lane_plan` are the very functions the unallocated lanes call, so
+    // the pool cannot drift from the policy it is meant to bound.
+    let sign_space = sign_space_falsify_armed(sign_space_preset)
+        .then(|| lp_lane_plan(remaining))
+        .flatten();
+    let after_lp = remaining.map(|r| r.saturating_sub(sign_space.unwrap_or_default()));
+    let ste_pgd = ste_pgd_falsify_armed(ste_pgd_preset)
+        .then(|| ste_lane_plan(after_lp))
+        .flatten();
+    let after_ste = after_lp.map(|r| r.saturating_sub(ste_pgd.unwrap_or_default()));
+    let upfront = upfront_today_cap(onnx, vnnlib, after_ste, upfront_wrapper_route);
+
+    let today = TodaySlices {
+        sign_space,
+        ste_pgd,
+        upfront,
+    };
+    // The probe costs an ORT session and up to 33 forwards, so it is not taken
+    // when the only lane it could zero is not consulted anyway.
+    let objective_is_flat = upfront.is_some() && probe_flat_objective_tier(onnx, vnnlib);
+
+    match plan_attack_slice(today, objective_is_flat, ny_mip::ALLOC_SOLVE_CAP) {
+        Ok(plan) => {
+            eprintln!(
+                "{} [planned in {:.3}s]",
+                plan.ledger(),
+                started.elapsed().as_secs_f64()
+            );
+            // THE RESIDUAL IS NAMED, not left unowned. Whatever the knapsack
+            // does not grant is not lost and is not held by this module: the
+            // attack slice simply returns earlier, and every ungranted second
+            // reaches branch-and-bound through the SAME `attack_start`
+            // subtraction that charges the lanes today.
+            eprintln!(
+                "Lane allocation: {:.2}s of the {:.2}s attack-slice pool is committed to \
+                 lanes; the remaining {:.2}s is claimed by the branch-and-bound residual \
+                 claimant through the same `attack_start` subtraction that charges the \
+                 lanes today",
+                plan.granted().as_secs_f64(),
+                plan.pool().as_secs_f64(),
+                plan.residual_to_bab().as_secs_f64(),
+            );
+            crate::flight::note(
+                "lane_budget_allocator",
+                crate::flight::FlightStatus::Ran,
+                Some(plan.ledger().to_string()),
+            );
+            Some(plan)
+        }
+        Err(reason) => {
+            eprintln!(
+                "Lane allocation: falling open to today's plan ({reason:?}) \
+                 [{:.3}s]",
+                started.elapsed().as_secs_f64()
+            );
+            crate::flight::note(
+                "lane_budget_allocator",
+                crate::flight::FlightStatus::Skipped,
+                Some(format!("fell open to today's plan: {reason:?}")),
+            );
+            None
+        }
+    }
+}
+
+/// Non-mip build: `ny-mip` is not linked, so there is no allocator to consult.
+/// Identical `None` contract, so the call site is unchanged.
+#[cfg(not(feature = "mip"))]
+fn plan_attack_slice_allocation(
+    _onnx: &Path,
+    _vnnlib: &Path,
+    _post_beta_deadline: Option<std::time::Instant>,
+    _sign_space_preset: Option<bool>,
+    _ste_pgd_preset: Option<bool>,
+    _upfront_wrapper_route: UpfrontWrapperRoute,
+) -> Option<crate::commands::lane_allocation::AttackSliceAllocation> {
+    None
+}
+
 /// Compute the upfront-attack wall budget from the remaining scored budget.
 fn upfront_attack_budget(remaining: Option<std::time::Duration>) -> Option<std::time::Duration> {
     let budget = match remaining {
@@ -11569,18 +12108,34 @@ fn sign_space_lane_verdict(
     witness: Option<String>,
     gate: impl FnOnce(&str) -> VnncompResult,
 ) -> Option<VnncompResult> {
+    falsification_lane_verdict("bnn_sign_space", "Sign-space falsification", witness, gate)
+}
+
+/// [`sign_space_lane_verdict`] with the lane's receipt key and stderr prefix
+/// injected, so the STE-PGD lane obeys the SAME rule rather than a copy of it.
+///
+/// Every clause of the contract above applies verbatim to every lane routed
+/// through here: no witness and a downgraded witness both produce `None`, and
+/// the ONLY way to terminate an instance is a witness the caller's UNCHANGED
+/// [`gate_sat_with_trusted_oracle`] upholds as `sat`.
+fn falsification_lane_verdict(
+    lane: &'static str,
+    label: &str,
+    witness: Option<String>,
+    gate: impl FnOnce(&str) -> VnncompResult,
+) -> Option<VnncompResult> {
     let witness = witness?;
     let gated = gate(&witness);
     if matches!(gated, VnncompResult::Sat { .. }) {
         return Some(gated);
     }
     crate::flight::note(
-        "bnn_sign_space",
+        lane,
         crate::flight::FlightStatus::Ran,
         Some("candidate rejected by the trusted-oracle gate; fell through".to_string()),
     );
     eprintln!(
-        "Sign-space falsification: candidate rejected by the trusted-oracle gate; falling \
+        "{label}: candidate rejected by the trusted-oracle gate; falling \
          through to the full verification path (verdict-neutral lane)"
     );
     None
@@ -11601,13 +12156,38 @@ fn try_sign_space_falsify(
     vnnlib: &Path,
     instance_deadline: Option<std::time::Instant>,
     preset_armed: Option<bool>,
+    window: crate::commands::lane_allocation::LaneWindow,
 ) -> Option<String> {
-    use super::beta_crown::sign_space_falsify::{run_sign_space_lane, SignSpaceLaneOutcome};
+    use super::beta_crown::sign_space_falsify::{
+        run_sign_space_lane, run_sign_space_lane_granted, sign_space_falsify_armed,
+        SignSpaceLaneOutcome,
+    };
+    use crate::commands::lane_allocation::LaneWindow;
 
     let remaining = instance_deadline
         .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
     let started = std::time::Instant::now();
-    let outcome = run_sign_space_lane(onnx, vnnlib, remaining, preset_armed);
+    let outcome = match window {
+        // The disarmed arm, and the ONLY arm a scored run reaches: the lane
+        // derives exactly the window it derives today, from its own helper.
+        LaneWindow::Private => run_sign_space_lane(onnx, vnnlib, remaining, preset_armed),
+        LaneWindow::Skip => return None,
+        LaneWindow::Cap(cap) => {
+            if !sign_space_falsify_armed(preset_armed) {
+                return None;
+            }
+            // A committed cap is still clamped to the LIVE remaining budget
+            // before it is handed over. The allocator planned against a
+            // prediction; the deadline is the fact, and no row may exceed its
+            // official budget because an upstream lane overran its own cap.
+            let cap = crate::commands::lane_allocation::clamp_to_live_remaining(
+                cap,
+                remaining,
+                super::beta_crown::sign_space_falsify::LANE_PUBLICATION_MARGIN,
+            )?;
+            run_sign_space_lane_granted(onnx, vnnlib, cap, 0)
+        }
+    };
     if matches!(outcome, SignSpaceLaneOutcome::Disarmed) {
         // Unarmed arm: no receipt entry, no stderr, no behaviour.
         return None;
@@ -11645,6 +12225,316 @@ fn try_sign_space_falsify(
     }
 }
 
+/// #lane-value-scheduler: run the two binarized-net attack lanes under ONE
+/// marginal-value ledger instead of a chain of private fixed fractions.
+///
+/// DARK. Reached only when `NY_LANE_VALUE_SCHEDULER` is armed; the caller
+/// keeps the unscheduled call sites otherwise, so the default path is the
+/// unwired tree.
+///
+/// Returns the receipt key of the lane that produced a CLAIMED counterexample
+/// and the witness itself. Never a verdict: the caller still routes it through
+/// the unchanged [`gate_sat_with_trusted_oracle`], via the same
+/// [`falsification_lane_verdict`] rule the unscheduled lanes use.
+///
+/// WHAT THE SCHEDULE CHANGES, and it is only the budget:
+///
+/// * both lanes are planned by their OWN unchanged rules
+///   (`lp_lane_plan` / `ste_lane_plan`), re-derived from the LIVE remaining
+///   budget at each lane's own admission, so a yield upstream arrives
+///   downstream as a bigger CAP rather than as unclaimed pool;
+/// * the aggregate is bounded by one pool, `remaining - the 45 s publication
+///   margin`, so no reallocation and no overrun can cross the wall that makes a
+///   family bankable;
+/// * each lane reports its actual cost and its progress in its own work units,
+///   and the ledger is printed rather than inferred from stderr — the survey
+///   found the flight sidecar records NOTHING between the TLL probe and the
+///   post-attack marker, a 406.01 s hole on the row it measured.
+///
+/// ORDER IS PRESERVED, because it is measured: on the three `model_30` eps=1
+/// rows the LP lane owns, the STE lane was measured `exhausted` over its whole
+/// budget, and with the LP lane disabled entirely STE returned the SAME rows.
+#[cfg(feature = "mip")]
+fn run_bnn_lane_schedule(
+    onnx: &Path,
+    vnnlib: &Path,
+    post_beta_deadline: Option<std::time::Instant>,
+    sign_space_preset: Option<bool>,
+    ste_pgd_preset: Option<bool>,
+) -> Option<(&'static str, String)> {
+    use super::beta_crown::sign_space_falsify::{
+        lp_lane_plan, run_sign_space_lane_granted, run_ste_pgd_lane_granted,
+        sign_space_falsify_armed, ste_lane_plan, ste_pgd_falsify_armed, SignSpaceLaneOutcome,
+        LANE_PUBLICATION_MARGIN,
+    };
+    use crate::commands::lane_schedule::{
+        candidate_block, declined_block, lane_schedule_pool, measured_block, run_lane_schedule,
+        DeadlineBudget, LaneBudgetSource, LaneSpec,
+    };
+    use ny_core::phase_yield::DeclineReason;
+
+    let budget = DeadlineBudget {
+        deadline: post_beta_deadline,
+    };
+    // Sized off the LIVE remaining budget, not off a precomputed total: a pool
+    // derived from a stale deadline is exactly how an `error` row appears.
+    let pool = lane_schedule_pool(budget.remaining(), LANE_PUBLICATION_MARGIN)?;
+
+    // Which lane produced the witness, for the receipt key.
+    let winner: std::rc::Rc<std::cell::RefCell<Option<&'static str>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+
+    let mut lanes: Vec<LaneSpec> = Vec::with_capacity(2);
+    if sign_space_falsify_armed(sign_space_preset) {
+        let onnx = onnx.to_path_buf();
+        let vnnlib = vnnlib.to_path_buf();
+        let winner = std::rc::Rc::clone(&winner);
+        lanes.push(LaneSpec {
+            name: "bnn_sign_space",
+            plan: Box::new(lp_lane_plan),
+            // Measured prior: this lane produced the candidate on 3 of the 3
+            // `model_30` eps=1 rows and on none of the 9 open deeper rows.
+            prior_value: 3.0,
+            run: Box::new(move |window| {
+                let started = std::time::Instant::now();
+                let outcome = run_sign_space_lane_granted(
+                    &onnx,
+                    &vnnlib,
+                    window,
+                    LP_LANE_VALUE_STALL_LP_SOLVES,
+                );
+                let elapsed = started.elapsed();
+                eprintln!(
+                    "Sign-space falsification: {} [{:.2}s of a {:.2}s scheduled cap]",
+                    outcome.describe(),
+                    elapsed.as_secs_f64(),
+                    window.as_secs_f64(),
+                );
+                match &outcome {
+                    SignSpaceLaneOutcome::Exhausted {
+                        margin_gain,
+                        lp_solves,
+                        ..
+                    } => {
+                        // The lane's OWN unit: pattern-margin movement over
+                        // realizability LPs. NOT flips -- 34 flips bought
+                        // 217.52 s and delivered nothing on the row measured.
+                        let (gain, units) = (*margin_gain as f64, *lp_solves as u64);
+                        measured_block(gain, units, elapsed)
+                    }
+                    SignSpaceLaneOutcome::Candidate(_) => {
+                        match outcome
+                            .candidate_input()
+                            .map(|input| format_smtlib_witness_f64(input, &[]))
+                            .and_then(|input_only| {
+                                rehydrate_original_witness_outputs(&onnx, &input_only).ok()
+                            }) {
+                            Some(witness) => {
+                                *winner.borrow_mut() = Some("bnn_sign_space");
+                                candidate_block(witness, elapsed)
+                            }
+                            None => {
+                                // A candidate whose ORIGINAL-model re-forward
+                                // failed is DROPPED, exactly as unscheduled.
+                                declined_block(DeclineReason::Empty, elapsed)
+                            }
+                        }
+                    }
+                    _ => declined_block(DeclineReason::Empty, elapsed),
+                }
+            }),
+        });
+    }
+    if ste_pgd_falsify_armed(ste_pgd_preset) {
+        let onnx = onnx.to_path_buf();
+        let vnnlib = vnnlib.to_path_buf();
+        let winner = std::rc::Rc::clone(&winner);
+        lanes.push(LaneSpec {
+            name: "bnn_ste_pgd",
+            plan: Box::new(ste_lane_plan),
+            prior_value: 2.0,
+            run: Box::new(move |window| {
+                let started = std::time::Instant::now();
+                let outcome = run_ste_pgd_lane_granted(&onnx, &vnnlib, window);
+                let elapsed = started.elapsed();
+                eprintln!(
+                    "STE-PGD falsification: {} [{:.2}s of a {:.2}s scheduled cap]",
+                    outcome.describe(),
+                    elapsed.as_secs_f64(),
+                    window.as_secs_f64(),
+                );
+                match &outcome {
+                    SignSpaceLaneOutcome::Exhausted {
+                        margin_gain,
+                        lp_solves,
+                        ..
+                    } => {
+                        // This lane's denominator is PROBES, which it reports
+                        // in the `lp_solves` slot. It is honest only for stage
+                        // B: `probes` is not incremented in stage A, which is
+                        // 75% of its budget.
+                        measured_block(*margin_gain as f64, *lp_solves as u64, elapsed)
+                    }
+                    SignSpaceLaneOutcome::Candidate(_) => {
+                        match outcome
+                            .candidate_input()
+                            .map(|input| format_smtlib_witness_f64(input, &[]))
+                            .and_then(|input_only| {
+                                rehydrate_original_witness_outputs(&onnx, &input_only).ok()
+                            }) {
+                            Some(witness) => {
+                                *winner.borrow_mut() = Some("bnn_ste_pgd");
+                                candidate_block(witness, elapsed)
+                            }
+                            None => declined_block(DeclineReason::Empty, elapsed),
+                        }
+                    }
+                    _ => declined_block(DeclineReason::Empty, elapsed),
+                }
+            }),
+        });
+    }
+    if lanes.is_empty() {
+        return None;
+    }
+
+    let (witness, ledger) = run_lane_schedule(
+        lanes,
+        Box::new(DeadlineBudget {
+            deadline: post_beta_deadline,
+        }),
+        pool,
+        LANE_SCHEDULE_FLOOR,
+    );
+    eprintln!("{}", ledger.describe());
+    crate::flight::note(
+        "lane_value_scheduler",
+        crate::flight::FlightStatus::Ran,
+        Some(ledger.describe()),
+    );
+    let lane = (*winner.borrow())?;
+    witness.map(|w| (lane, w))
+}
+
+/// Non-mip build: neither lane exists, so the schedule cannot.
+#[cfg(not(feature = "mip"))]
+fn run_bnn_lane_schedule(
+    _onnx: &Path,
+    _vnnlib: &Path,
+    _post_beta_deadline: Option<std::time::Instant>,
+    _sign_space_preset: Option<bool>,
+    _ste_pgd_preset: Option<bool>,
+) -> Option<(&'static str, String)> {
+    None
+}
+
+/// The LP walk's VALUE-based yield rule under the scheduler, in LP solves.
+///
+/// The shipped rule (`stall_lp_solves: 32`) asks "has this walk accepted ANY
+/// flip", which is a never-started test: measured on
+/// `model_48_idx_1703_eps_1`, the walk accepted 34 flips, moved the margin to
+/// -82, produced nothing, and burned all 217.52 s with the rule permanently
+/// disarmed. This one asks whether the margin has MOVED.
+///
+/// NOT MEASURED on the nine open rows, and deliberately loose: at 64 it is
+/// twice the shipped never-started threshold, so a walk that is still finding
+/// improving flips at the rate the three `model_30` rows do (78-99 flips over
+/// 311 LPs) is nowhere near it. Reachable only with the scheduler armed.
+#[cfg(feature = "mip")]
+const LP_LANE_VALUE_STALL_LP_SOLVES: usize = 64;
+
+/// Minimum window worth admitting a scheduled lane with. Mirrors the lanes'
+/// own `MIN_LANE_BUDGET`.
+#[cfg(feature = "mip")]
+const LANE_SCHEDULE_FLOOR: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Consult the dark STE-PGD falsifier and render any candidate as an
+/// ORIGINAL-MODEL SMT-LIB witness for the caller's trusted-oracle gate.
+///
+/// Byte-for-byte the same publication path as [`try_sign_space_falsify`]: the
+/// candidate is emitted INPUT-ONLY, its `Y_j` values come from
+/// [`rehydrate_original_witness_outputs`] (a real ONNX Runtime forward on the
+/// ORIGINAL graph), and a failed re-forward DROPS the candidate rather than
+/// publishing the search's own arithmetic. Returns `None` for every
+/// non-candidate outcome, including the default disarmed one.
+#[cfg(feature = "mip")]
+fn try_ste_pgd_falsify(
+    onnx: &Path,
+    vnnlib: &Path,
+    instance_deadline: Option<std::time::Instant>,
+    preset_armed: Option<bool>,
+    window: crate::commands::lane_allocation::LaneWindow,
+) -> Option<String> {
+    use super::beta_crown::sign_space_falsify::{
+        run_ste_pgd_lane, run_ste_pgd_lane_granted, ste_pgd_falsify_armed, SignSpaceLaneOutcome,
+    };
+    use crate::commands::lane_allocation::LaneWindow;
+
+    let remaining = instance_deadline
+        .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+    let started = std::time::Instant::now();
+    let outcome = match window {
+        LaneWindow::Private => run_ste_pgd_lane(onnx, vnnlib, remaining, preset_armed),
+        LaneWindow::Skip => return None,
+        LaneWindow::Cap(cap) => {
+            if !ste_pgd_falsify_armed(preset_armed) {
+                return None;
+            }
+            let cap = crate::commands::lane_allocation::clamp_to_live_remaining(
+                cap,
+                remaining,
+                super::beta_crown::sign_space_falsify::LANE_PUBLICATION_MARGIN,
+            )?;
+            run_ste_pgd_lane_granted(onnx, vnnlib, cap)
+        }
+    };
+    if matches!(outcome, SignSpaceLaneOutcome::Disarmed) {
+        // Unarmed arm: no receipt entry, no stderr, no behaviour.
+        return None;
+    }
+    // The elapsed time is on the REFUSAL lines too, for the same reason it is
+    // on the sign-space lane's: a structural decline is only "free" if it is
+    // measured to be, and that number is what decides whether this lever can
+    // ever become a typed preset key.
+    eprintln!(
+        "STE-PGD falsification: {} [{:.2}s]",
+        outcome.describe(),
+        started.elapsed().as_secs_f64()
+    );
+    let input = outcome.candidate_input()?;
+    let input_only = format_smtlib_witness_f64(input, &[]);
+    match rehydrate_original_witness_outputs(onnx, &input_only) {
+        Ok(witness) => Some(witness),
+        Err(error) => {
+            crate::flight::note(
+                "bnn_ste_pgd",
+                crate::flight::FlightStatus::Ran,
+                Some(format!(
+                    "candidate dropped: original-model re-forward failed ({error})"
+                )),
+            );
+            eprintln!(
+                "STE-PGD falsification: could not re-forward the candidate through the \
+                 ORIGINAL model ({error}); dropping it and continuing on the normal path"
+            );
+            None
+        }
+    }
+}
+
+/// Non-mip build: `ny-mip` is not linked, so the lane does not exist. Identical
+/// `None` contract, so the call site is unchanged.
+#[cfg(not(feature = "mip"))]
+fn try_ste_pgd_falsify(
+    _onnx: &Path,
+    _vnnlib: &Path,
+    _instance_deadline: Option<std::time::Instant>,
+    _preset_armed: Option<bool>,
+    _window: crate::commands::lane_allocation::LaneWindow,
+) -> Option<String> {
+    None
+}
+
 /// Non-mip build: `ny-mip` is not linked, so the lane does not exist. Identical
 /// `None` contract, so the call site is unchanged.
 #[cfg(not(feature = "mip"))]
@@ -11653,6 +12543,7 @@ fn try_sign_space_falsify(
     _vnnlib: &Path,
     _instance_deadline: Option<std::time::Instant>,
     _preset_armed: Option<bool>,
+    _window: crate::commands::lane_allocation::LaneWindow,
 ) -> Option<String> {
     None
 }
@@ -11669,6 +12560,7 @@ fn try_upfront_falsify(
     wrapper_route: UpfrontWrapperRoute,
     traffic_terminal_softmax_peel: bool,
     traffic_execution: &mut TrafficUpfrontSoftmaxExecution,
+    window: crate::commands::lane_allocation::LaneWindow,
 ) -> Option<String> {
     // STRUCTURAL GATE (#upfront-apgd-disjunction, the REAL falsifier fix): the prior
     // default-OFF was because the lane's 8% budget was stolen from BaB on EVERY
@@ -11748,7 +12640,17 @@ fn try_upfront_falsify(
         .as_ref()
         .map(|objective| objective.graph.has_sign_layer())
         .unwrap_or_else(|| net_is_sign_network(onnx));
-    let budget = {
+    let budget = if let crate::commands::lane_allocation::LaneWindow::Cap(cap) = window {
+        // The allocator committed this lane to a cap chosen against every other
+        // lane's cap at once. Clamp it to the LIVE remaining budget and take it
+        // instead of the private fraction below; `Skip` never reaches here,
+        // because the caller does not call this lane at all.
+        crate::commands::lane_allocation::clamp_to_live_remaining(
+            cap,
+            remaining,
+            UPFRONT_ATTACK_SAFETY_MARGIN,
+        )?
+    } else {
         let b = upfront_attack_budget(remaining)?;
         if sign_net {
             match remaining {
@@ -14022,23 +14924,51 @@ fn gradient_guided_falsify_with_traffic_objective(
     }
 
     // ny's exact-gradient oracle. Any load failure -> keep today's behavior.
-    let (graph, traffic_rewritten_spec) = match traffic_objective {
+    // #pre-softmax-objective (attack-only, soundness-neutral, DARK by default).
+    // `NY_ATTACK_PRE_SOFTMAX_OBJECTIVE` is read BEFORE the graph load so the
+    // disarmed arm never asks the loader to retain a model: the request is a
+    // pure lever read, and `pre_softmax_requested == false` reproduces the
+    // historical load exactly, including which objects are live across the
+    // search.
+    //
+    // The lever deliberately does NOT engage on the traffic-pinned
+    // `traffic_objective` route. That route already runs its own authenticated
+    // logit micro-leg against a REWRITTEN spec on a PEELED graph; scoring the
+    // ordinary schedule in a third coordinate system on top of it is exactly
+    // the "two coordinate systems in one trajectory" hazard the micro-leg
+    // documents. The general route below is the one this capability is for.
+    let pre_softmax_requested = pre_softmax_attack_objective_armed();
+    let (graph, traffic_rewritten_spec, mut pre_softmax_admission) = match traffic_objective {
         Some(objective) => {
             if objective.receipt != AppliedTerminalPeel::Softmax {
                 *traffic_execution = TrafficUpfrontSoftmaxExecution::Invalidated;
                 return None;
             }
-            (objective.graph, Some(objective.rewritten_spec))
+            if pre_softmax_requested {
+                println!(
+                    "ORT-refine grad lane: pre-Softmax attack objective NOT APPLIED \
+                     (the authenticated traffic terminal-Softmax route owns this run's \
+                     logit coordinate system)"
+                );
+            }
+            (objective.graph, Some(objective.rewritten_spec), None)
         }
         None => {
-            let graph = match load_graph_network(onnx) {
-                Ok(graph) => graph,
-                Err(err) => {
-                    eprintln!("ORT-refine grad lane: graph load failed ({err}); no escalation");
-                    return None;
-                }
-            };
-            (graph, None)
+            let (graph, model) =
+                match load_graph_network_retaining_model(onnx, pre_softmax_requested) {
+                    Ok(loaded) => loaded,
+                    Err(err) => {
+                        eprintln!("ORT-refine grad lane: graph load failed ({err}); no escalation");
+                        return None;
+                    }
+                };
+            // Refusal is cheap and logged; the model is dropped either way
+            // before the search allocates its working set.
+            let admission = model
+                .as_ref()
+                .and_then(|model| admit_pre_softmax_attack_objective(model, spec));
+            drop(model);
+            (graph, None, admission)
         }
     };
     if Instant::now() >= deadline {
@@ -14360,7 +15290,66 @@ fn gradient_guided_falsify_with_traffic_objective(
                 }
                 break;
             }
-            let margin = property_margin(spec, &x, &out64);
+            // #pre-softmax-objective (attack-only, soundness-neutral, DARK by
+            // default). ACCEPTANCE above is untouched and still reads the
+            // trusted ORT forward of the ORIGINAL graph. What changes here — and
+            // ONLY when the proven strip guard admitted this network AND this
+            // property — is the SCALAR the search hill-climbs.
+            //
+            // WHY. Softmax over ONE normalization group is strictly
+            // order-preserving with a COMMON denominator, so a property built
+            // from pairwise comparisons between two outputs of that SAME softmax
+            // ranks candidate points identically in either space. But the f32
+            // forward does not: on a confident net `expf` UNDERFLOWS to exactly
+            // `0.0f`, and the objective collapses to a constant. Measured on
+            // traffic_signs: 42 of 43 outputs are bit-exactly `0.0f` and
+            // `property_margin` returns the SAME f64 at every sampled point of
+            // every row, so `best_x` freezes at the seed, `stall` fires forever
+            // and the clause pick degenerates to the last tied clause. Confirmed
+            // through ORT on all three shipped nets at 64 random points of the
+            // eps=1 box: the post-Softmax vector holds exactly TWO distinct
+            // values there, while the pre-Softmax logits hold 27-43 and span
+            // hundreds to thousands of units.
+            //
+            // Fail-soft: any structural miss, a width disagreement with the
+            // trusted output, or a non-finite entry falls back to `out64` for
+            // that step rather than mixing coordinate systems within one margin
+            // comparison.
+            let pre_softmax_scores = pre_softmax_admission.as_ref().and_then(|_| {
+                let x_arr = ArrayD::from_shape_vec(IxDyn(&input_shape), x.clone()).ok()?;
+                let logits = graph.attack_pre_softmax_logits(&x_arr, Some(deadline))?;
+                (logits.len() == out64.len() && logits.iter().all(|value| value.is_finite()))
+                    .then_some(logits)
+            });
+            // A guard that ADMITTED but a reader that cannot deliver is a
+            // silent degradation, and silence here is indistinguishable from
+            // "the objective is working and the row is just hard". So the FIRST
+            // structural miss retires the admission outright, with one log line:
+            // the lane then runs the historical schedule end to end — including
+            // the tie-break the admitted arm skips — instead of a hybrid nobody
+            // measured. A deadline-expired read is NOT a structural miss; the
+            // loop is about to exit anyway.
+            if pre_softmax_admission.is_some()
+                && pre_softmax_scores.is_none()
+                && Instant::now() < deadline
+            {
+                eprintln!(
+                    "ORT-refine grad lane: pre-Softmax logits unavailable from the converted \
+                     graph despite admission; reverting this instance to the historical \
+                     post-Softmax objective"
+                );
+                pre_softmax_admission = None;
+            }
+            // Borrowed, never copied: on the dark arm this IS `&out64`, so the
+            // three uses below are the historical calls verbatim.
+            let scores: &[f64] = pre_softmax_scores.as_deref().unwrap_or(&out64);
+            // Conditioned on the ADMISSION, not on the clock: the dark arm must
+            // not gain even a clock read here, or "byte-identical to today"
+            // stops being true under a deadline race.
+            if pre_softmax_admission.is_some() && Instant::now() >= deadline {
+                break;
+            }
+            let margin = property_margin(spec, &x, scores);
             if margin > best_margin {
                 best_margin = margin;
                 best_x = x.clone();
@@ -14422,7 +15411,13 @@ fn gradient_guided_falsify_with_traffic_objective(
             // restart-0-only scoping.
             let ranked_targets =
                 std::env::var("NY_LOGIT_TARGET_RANKED").ok().as_deref() != Some("0");
+            // When the pre-Softmax objective is admitted, `scores` ALREADY is
+            // the logit vector, so this once-per-restart tie-break would
+            // re-rank exactly-tied clauses by a STALE copy of the same
+            // quantity. Skip it and save the forward; on the dark arm the
+            // condition is the historical one verbatim.
             if sign_net
+                && pre_softmax_admission.is_none()
                 && (ranked_targets || restart_idx == 0)
                 && logit_guide.is_none()
                 && !logit_guide_unavailable
@@ -14444,7 +15439,7 @@ fn gradient_guided_falsify_with_traffic_objective(
             let margin_row = match margin_subgradient_row_ranked(
                 spec,
                 &x,
-                &out64,
+                scores,
                 logit_guide.as_deref(),
                 target_rank,
             ) {
@@ -14452,7 +15447,12 @@ fn gradient_guided_falsify_with_traffic_objective(
                 None => break, // no finite direction here — next restart
             };
             let row = if use_dlr {
-                dlr_grad_row(&margin_row, margin, &out64)
+                // The DLR denominator is the spread between the largest and
+                // 3rd-largest SCORES. On the dark arm those are the historical
+                // probabilities; on the admitted arm they are the logits, which
+                // is the space DLR was defined in — dividing by a saturated
+                // one-hot probability vector is what made this term degenerate.
+                dlr_grad_row(&margin_row, margin, scores)
             } else {
                 margin_row
             };
@@ -14995,7 +15995,7 @@ fn try_nonlinear_sat(
                                 let (mut a, mut b) = (*pt, base[axis]);
                                 let sa = py[j] > 0.0;
                                 for _ in 0..60 {
-                                    let m = 0.5 * (a + b);
+                                    let m = a.midpoint(b);
                                     if !m.is_finite() || m <= a.min(b) || m >= a.max(b) {
                                         break;
                                     }
@@ -15272,7 +16272,7 @@ fn try_nonlinear_unsat(
                     acc
                 }
             });
-        let mid = 0.5 * (bl[widest] + bu[widest]);
+        let mid = bl[widest].midpoint(bu[widest]);
         if !mid.is_finite() || mid <= bl[widest] || mid >= bu[widest] {
             // The box has collapsed to the f64 grid and is still undecided.
             return None;
@@ -15877,6 +16877,9 @@ mod tests {
                 // 8 minutes IS the official VNN-COMP per-instance budget (480s).
                 Some(std::time::Instant::now() + std::time::Duration::from_mins(8)),
                 preset_armed,
+                // The lane-allocator window every scored run sees: no allocation
+                // in force, so the lane takes exactly its own private fraction.
+                crate::commands::lane_allocation::LaneWindow::Private,
             );
             assert!(
                 witness.is_none(),
@@ -15944,6 +16947,64 @@ mod tests {
         assert_eq!(
             armed, armed_by_design,
             "attack.bnn_sign_space is scoped to the category whose armed sweep is banked \
+             (reports/measured-2026/traffic_signs_recognition_2023_NOTES.md); adding a \
+             category needs its own measured refusal cost"
+        );
+    }
+
+    /// THE SHIPPED PRESET IS THE ARMING ROUTE, for the STE-PGD lane too.
+    ///
+    /// The sibling of [`only_the_traffic_signs_preset_arms_the_sign_space_lane`]
+    /// over `attack.bnn_ste_pgd`, and it pins the same two things: that the
+    /// category's shipped YAML really carries the key the call site projects
+    /// (`preset.attack.bnn_ste_pgd`), and that NO other shipped preset does.
+    ///
+    /// The scope matters for the same reason it does there — armed, this lane
+    /// takes everything left after the publication margin and the downstream
+    /// reserve, capped at 4 minutes, out of the attack slice. That spend is
+    /// measured on this category and nowhere else.
+    #[test]
+    fn only_the_traffic_signs_preset_arms_the_ste_pgd_lane() {
+        let configs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs");
+        let armed_by_design = ["traffic_signs_recognition_2023.yaml"];
+        let mut armed = Vec::new();
+        for year in fs::read_dir(&configs).expect("list configs/") {
+            let year = year.expect("configs entry").path();
+            let is_vnncomp = year
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("vnncomp"));
+            if !is_vnncomp || !year.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(&year).expect("list preset dir") {
+                let path = entry.expect("preset entry").path();
+                if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let preset = crate::preset::load_preset(&path)
+                    .unwrap_or_else(|e| panic!("load {}: {e}", path.display()));
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .expect("preset file name")
+                    .to_string();
+                match preset.attack.bnn_ste_pgd {
+                    Some(true) => armed.push(name),
+                    Some(false) => panic!(
+                        "{name} sets attack.bnn_ste_pgd: false; omit the key instead. \
+                         Absent and false resolve to the same disarmed lane, so an explicit \
+                         false reads as a kill switch it is not — `NY_BNN_STE_PGD=1` \
+                         overrides both."
+                    ),
+                    None => {}
+                }
+            }
+        }
+        armed.sort();
+        assert_eq!(
+            armed, armed_by_design,
+            "attack.bnn_ste_pgd is scoped to the category whose armed sweep is banked \
              (reports/measured-2026/traffic_signs_recognition_2023_NOTES.md); adding a \
              category needs its own measured refusal cost"
         );
@@ -19530,6 +20591,185 @@ mod tests {
         // A tie-break vector of the wrong length is ignored (historical pick).
         let row = margin_subgradient_row(&spec, &[0.5], &saturated, Some(&[1.0, 2.0])).unwrap();
         assert_eq!(row, vec![0.0, 0.0, 1.0, -1.0]);
+    }
+
+    /// Reference `softmax` in f64, max-subtracted exactly as ORT does it.
+    fn softmax_f64(logits: &[f64]) -> Vec<f64> {
+        let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = logits.iter().map(|z| (z - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        exps.iter().map(|e| e / sum).collect()
+    }
+
+    /// #pre-softmax-objective CORRECTNESS CHECK.
+    ///
+    /// On an ADMITTED net+spec (one normalization group, argmax-complement
+    /// disjunction of bare pairwise atoms), scoring the search on pre-Softmax
+    /// LOGITS must rank candidate points EXACTLY as scoring them on
+    /// post-Softmax PROBABILITIES does — because softmax over one group is
+    /// strictly order-preserving and the property is built only from
+    /// comparisons within that group.
+    ///
+    /// The case is deliberately UNSATURATED: every probability is a distinct
+    /// positive number and every candidate's post-Softmax margin is distinct,
+    /// so the post-Softmax ranking is a real ranking and the agreement is a
+    /// genuine check rather than a comparison against a constant. The final
+    /// block then shows the SATURATED case the lever exists for, where the
+    /// post-Softmax ranking collapses and the logit ranking survives.
+    #[test]
+    fn pre_softmax_scoring_preserves_the_post_softmax_ranking_when_unsaturated() {
+        // Argmax complement over 4 outputs with true label 3 — the admitted
+        // shape, and the shape `ny_onnx::admit_pre_softmax_attack_scoring`
+        // requires.
+        let spec = spec_with(
+            4,
+            vec![
+                vec![OC::GreaterEq(0, 3)],
+                vec![OC::GreaterEq(1, 3)],
+                vec![OC::GreaterEq(2, 3)],
+            ],
+            true,
+            vec![(0.0, 1.0)],
+        );
+
+        // Small, well-separated logits: softmax stays far from f32 underflow.
+        let candidates: Vec<(&str, Vec<f64>)> = vec![
+            ("far", vec![-2.0, -3.0, -2.5, 1.0]),
+            ("mid", vec![-0.5, -1.5, -1.0, 1.0]),
+            ("near", vec![0.6, -1.0, 0.2, 1.0]),
+            ("violating", vec![1.4, -1.0, 0.2, 1.0]),
+            ("between", vec![0.1, -0.7, -0.2, 1.0]),
+        ];
+
+        let mut pre: Vec<(&str, f64)> = Vec::new();
+        let mut post: Vec<(&str, f64)> = Vec::new();
+        for (name, logits) in &candidates {
+            let probabilities = softmax_f64(logits);
+            // The case must not be saturated, or the test proves nothing.
+            assert!(
+                probabilities.iter().all(|p| *p > 1e-3),
+                "{name}: fixture must be UNSATURATED, got {probabilities:?}"
+            );
+            pre.push((name, property_margin(&spec, &[0.5], logits)));
+            post.push((name, property_margin(&spec, &[0.5], &probabilities)));
+        }
+
+        // The post-Softmax margins must themselves be all-distinct, otherwise
+        // "the rankings agree" would be satisfiable by a degenerate ordering.
+        for i in 0..post.len() {
+            for j in (i + 1)..post.len() {
+                assert!(
+                    (post[i].1 - post[j].1).abs() > 1e-9,
+                    "post-Softmax fixture margins must be distinct: {:?} vs {:?}",
+                    post[i],
+                    post[j]
+                );
+            }
+        }
+
+        let mut pre_order = pre.clone();
+        pre_order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let mut post_order = post.clone();
+        post_order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let pre_names: Vec<&str> = pre_order.iter().map(|(n, _)| *n).collect();
+        let post_names: Vec<&str> = post_order.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            pre_names, post_names,
+            "pre-Softmax scoring must induce the SAME ranking as post-Softmax \
+             scoring on an admitted net+spec\npre  {pre:?}\npost {post:?}"
+        );
+
+        // Order preservation is pointwise, not merely aggregate: the SIGN of
+        // every margin agrees too, so the two spaces also agree on which
+        // candidates are violations. (This is the property that makes a
+        // logit-scored search hunt for the same region ORT will confirm.)
+        for ((name, pre_margin), (_, post_margin)) in pre.iter().zip(post.iter()) {
+            assert_eq!(
+                *pre_margin >= 0.0,
+                *post_margin >= 0.0,
+                "{name}: violation status must agree across the two spaces"
+            );
+        }
+
+        // And the case the lever exists for: with CONFIDENT logits the f32
+        // forward underflows, the post-Softmax margin is the same value at
+        // every candidate, and only the logit ranking carries information.
+        let saturating: Vec<Vec<f64>> = vec![
+            vec![-900.0, -1400.0, -1100.0, 300.0],
+            vec![-500.0, -1400.0, -1100.0, 300.0],
+            vec![-100.0, -1400.0, -1100.0, 300.0],
+        ];
+        let saturated_post: Vec<f64> = saturating
+            .iter()
+            .map(|logits| {
+                // f32 is what the trusted forward actually returns.
+                let probabilities: Vec<f64> = softmax_f64(logits)
+                    .iter()
+                    .map(|p| f32_to_f64_exact(*p as f32))
+                    .collect();
+                property_margin(&spec, &[0.5], &probabilities)
+            })
+            .collect();
+        assert!(
+            saturated_post.windows(2).all(|w| w[0] == w[1]),
+            "the defect: post-Softmax margins must be bit-identical here, got {saturated_post:?}"
+        );
+        let saturated_pre: Vec<f64> = saturating
+            .iter()
+            .map(|logits| property_margin(&spec, &[0.5], logits))
+            .collect();
+        assert!(
+            saturated_pre.windows(2).all(|w| w[0] < w[1]),
+            "the fix: pre-Softmax margins must still be strictly ordered, got {saturated_pre:?}"
+        );
+    }
+
+    /// (d) DEFAULTS UNCHANGED. With no lever set the pre-Softmax objective is
+    /// disarmed, so the attack lane never runs the admission guard, never reads
+    /// a pre-Softmax tensor, and scores on the trusted forward's output exactly
+    /// as it does at HEAD.
+    #[test]
+    fn pre_softmax_attack_objective_is_dark_by_default() {
+        ny_test_utils::env::with_serialized_env_vars_removed(
+            &["NY_ATTACK_PRE_SOFTMAX_OBJECTIVE"],
+            || {
+                assert!(
+                    !pre_softmax_attack_objective_armed(),
+                    "the pre-Softmax attack objective must be dark with no lever set"
+                );
+            },
+        );
+    }
+
+    /// (d) The gate is armed by the EXACT byte string "1" and disarmed by the
+    /// exact "0"; every other byte string is a recorded rejection that resolves
+    /// to the declaration's `false` default, so a typo can never silently arm a
+    /// scored run.
+    #[test]
+    fn pre_softmax_attack_objective_gate_parses_exactly_one() {
+        for value in [
+            "", "0", "01", "1 ", " 1", "true", "TRUE", "yes", "on", "2", "1\n",
+        ] {
+            ny_test_utils::env::with_serialized_env_vars(
+                &[("NY_ATTACK_PRE_SOFTMAX_OBJECTIVE", value)],
+                || {
+                    assert!(
+                        !pre_softmax_attack_objective_armed(),
+                        "{value:?} must not arm the pre-Softmax attack objective"
+                    );
+                },
+            );
+        }
+        ny_test_utils::env::with_serialized_env_vars(
+            &[("NY_ATTACK_PRE_SOFTMAX_OBJECTIVE", "1")],
+            || {
+                assert!(
+                    pre_softmax_attack_objective_armed(),
+                    "exact \"1\" must arm the pre-Softmax attack objective"
+                );
+            },
+        );
     }
 
     /// #traffic-ranked-target: rank 0 must be the argmax target (byte-identical

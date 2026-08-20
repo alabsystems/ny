@@ -27,7 +27,7 @@
 use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ny_core::{
     GpuBackwardOp, GpuCrownLayer, GpuIntermediateSweepReceipt, GpuIntermediateSweepRequest,
@@ -76,20 +76,68 @@ struct ActiveSweep {
     boundaries: Vec<Option<SweepBoundary>>,
     next_boundary: usize,
     work: SweepWorkReceipt,
+    /// Submissions recorded since the last SUCCESSFUL queue-idle
+    /// synchronization (a bounded `poll(Wait)` that completed). Zero after at
+    /// least one submit is a proof that nothing this sweep enqueued can still
+    /// be in flight on the device.
+    submits_since_last_sync: usize,
+}
+
+/// How an accepted sweep exited after its first submit, recorded by the FIRST
+/// cause observed (later, less precise observers on the same unwind never
+/// overwrite it). The reservation release maps each state to
+/// restore / bounded-drain / poison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PostSubmitAbort {
+    /// No post-submit abort: the scope finished, or nothing was submitted.
+    None,
+    /// The sweep aborted, but a successful queue-idle synchronization followed
+    /// its last submit: nothing can still be in flight, the ledger's
+    /// accounting is truthful, and the reservation releases normally.
+    ProvenDrained,
+    /// The call-local deadline expired while a submission may still have been
+    /// in flight (`note_post_submit_abort`). A bounded blocking drain of the
+    /// already-submitted work restores the ledger; only a drain failure — a
+    /// genuinely wedged device — falls back to the poison path.
+    DeadlineInFlight,
+    /// Any other abort with a possibly in-flight submission (validation
+    /// fault, internal error, unwind). Fail closed: the device state is
+    /// suspect and the ledger is permanently poisoned, exactly as before.
+    UnknownInFlight,
 }
 
 thread_local! {
     static ACTIVE_SWEEP: RefCell<Option<ActiveSweep>> = const { RefCell::new(None) };
     /// Set when an accepted sweep exits after at least one submit without
-    /// proving its final bounded readback/finish boundary. The reservation drop
-    /// then leaves the exact device permanently poisoned for later sweeps
-    /// instead of claiming potentially in-flight allocations are gone.
-    static SWEEP_POST_SUBMIT_ABORTED: Cell<bool> = const { Cell::new(false) };
+    /// proving its final bounded readback/finish boundary. The reservation
+    /// release classifies the abort (see [`PostSubmitAbort`]) instead of
+    /// unconditionally claiming potentially in-flight allocations are gone.
+    static SWEEP_POST_SUBMIT_ABORTED: Cell<PostSubmitAbort> =
+        const { Cell::new(PostSubmitAbort::None) };
 }
 
+fn record_post_submit_abort(state: PostSubmitAbort) {
+    SWEEP_POST_SUBMIT_ABORTED.with(|aborted| {
+        if aborted.get() == PostSubmitAbort::None {
+            aborted.set(state);
+        }
+    });
+}
+
+/// Called by the shared readback helpers when the call-local deadline gives up
+/// on an in-flight submission. First-cause-wins: the later, generic
+/// [`SweepScope`] drop on the same unwind cannot downgrade this to
+/// [`PostSubmitAbort::UnknownInFlight`].
 pub(in crate::wgpu_device) fn note_post_submit_abort() {
-    if ACTIVE_SWEEP.with(|slot| slot.borrow().is_some()) {
-        SWEEP_POST_SUBMIT_ABORTED.with(|aborted| aborted.set(true));
+    let in_flight = ACTIVE_SWEEP.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|active| active.submits_since_last_sync > 0)
+    });
+    match in_flight {
+        None => {}
+        Some(true) => record_post_submit_abort(PostSubmitAbort::DeadlineInFlight),
+        Some(false) => record_post_submit_abort(PostSubmitAbort::ProvenDrained),
     }
 }
 
@@ -112,6 +160,7 @@ impl SweepScope {
                 // Boundary zero was encoded into the host seed.
                 next_boundary: 1,
                 work: SweepWorkReceipt::default(),
+                submits_since_last_sync: 0,
             });
             Ok(Self { armed: true })
         })
@@ -132,6 +181,7 @@ impl SweepScope {
                 boundaries: Vec::new(),
                 next_boundary: 0,
                 work: SweepWorkReceipt::default(),
+                submits_since_last_sync: 0,
             });
             Ok(Self { armed: true })
         })
@@ -159,12 +209,14 @@ impl Drop for SweepScope {
     fn drop(&mut self) {
         if self.armed {
             ACTIVE_SWEEP.with(|slot| {
-                if slot
-                    .borrow_mut()
-                    .take()
-                    .is_some_and(|active| active.work.submits > 0)
-                {
-                    SWEEP_POST_SUBMIT_ABORTED.with(|aborted| aborted.set(true));
+                if let Some(active) = slot.borrow_mut().take() {
+                    if active.work.submits > 0 {
+                        record_post_submit_abort(if active.submits_since_last_sync == 0 {
+                            PostSubmitAbort::ProvenDrained
+                        } else {
+                            PostSubmitAbort::UnknownInFlight
+                        });
+                    }
                 }
             });
         }
@@ -232,15 +284,29 @@ pub(in crate::wgpu_device) fn note_device_to_host(
     readbacks: usize,
     synchronizations: usize,
 ) {
-    note(|work| {
-        work.device_to_host_bytes = work.device_to_host_bytes.saturating_add(bytes);
-        work.readbacks = work.readbacks.saturating_add(readbacks);
-        work.synchronizations = work.synchronizations.saturating_add(synchronizations);
+    ACTIVE_SWEEP.with(|slot| {
+        if let Some(active) = slot.borrow_mut().as_mut() {
+            let work = &mut active.work;
+            work.device_to_host_bytes = work.device_to_host_bytes.saturating_add(bytes);
+            work.readbacks = work.readbacks.saturating_add(readbacks);
+            work.synchronizations = work.synchronizations.saturating_add(synchronizations);
+            if synchronizations > 0 {
+                // Every noted synchronization is a SUCCESSFUL bounded
+                // poll(Wait), which proves the queue was idle: nothing
+                // submitted earlier can still be in flight.
+                active.submits_since_last_sync = 0;
+            }
+        }
     });
 }
 
 pub(in crate::wgpu_device) fn note_submits(count: usize) {
-    note(|work| work.submits = work.submits.saturating_add(count));
+    ACTIVE_SWEEP.with(|slot| {
+        if let Some(active) = slot.borrow_mut().as_mut() {
+            active.work.submits = active.work.submits.saturating_add(count);
+            active.submits_since_last_sync = active.submits_since_last_sync.saturating_add(count);
+        }
+    });
 }
 
 struct PreparedSweep {
@@ -250,11 +316,57 @@ struct PreparedSweep {
     boundaries: Vec<SweepBoundary>,
 }
 
+/// EXACT text of the ledger-poison ERROR line. The design's §7 kill criterion
+/// (`SWEEP_POST_SUBMIT_KILL_LINE`, pinned against this source file by
+/// ny-propagate's `sweep_kill_line_matches_the_sweep_source`) greps M2/M3 run
+/// logs for its "exited after submission without a final drain" substring.
+/// Never reword it; the last-resort poison path must stay grep-able.
+pub(super) const POST_SUBMIT_POISON_LINE: &str =
+    "WGPU intermediate sweep exited after submission without a final drain; memory ledger left permanently fail-closed";
+
+/// Bounded blocking drain authority for a deadline-shaped post-submit abort.
+/// Implemented by [`WgpuDevice`]; unit tests substitute scripted outcomes.
+pub(super) trait SweepAbortDrain {
+    /// Block until every already-submitted command buffer retires, or fail.
+    fn drain_after_post_submit_abort(&self) -> Result<()>;
+}
+
+/// Upper bound on the post-abort drain. The wait covers only work this sweep
+/// already submitted — the aborting thread still holds the exclusive GPU
+/// transaction, so nothing new can be enqueued behind it — i.e. at most one
+/// transaction's chunk of GPU time (measured ~1s/wave on cifar100). Ten
+/// seconds is far above any healthy chunk while still small against an
+/// instance budget; exceeding it means the device is genuinely wedged and the
+/// poison path is correct.
+const POST_SUBMIT_ABORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl SweepAbortDrain for WgpuDevice {
+    fn drain_after_post_submit_abort(&self) -> Result<()> {
+        // Deliberately NOT `poll_readback`: that helper honours the (already
+        // expired) call-local deadline — the exact mechanism that abandoned
+        // the readback in the first place. This wait is bounded by the
+        // constant alone.
+        if let Err(error) = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(POST_SUBMIT_ABORT_DRAIN_TIMEOUT),
+        }) {
+            return Err(NyError::InternalError(format!(
+                "post-submit abort drain did not reach queue idle: {error}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Call-local reservation against the retained WGPU device. The outer checked
 /// transaction holds the GPU serialization mutex first; this RAII entry is the
 /// second lock in the invariant shared with `clear_crown_working_set`.
 pub(super) struct SweepMemoryReservation<'a> {
     ledger: &'a std::sync::Mutex<usize>,
+    /// Drain authority for a deadline-shaped post-submit abort. `None` (bare
+    /// ledgers in unit tests) cannot prove queue idle, so such an abort keeps
+    /// the fail-closed poison path.
+    drain: Option<&'a dyn SweepAbortDrain>,
     bytes: usize,
     armed: bool,
 }
@@ -269,14 +381,53 @@ impl SweepMemoryReservation<'_> {
                 "intermediate sweep reservation release lock poisoned: {err}"
             ))
         })?;
-        let post_submit_aborted = SWEEP_POST_SUBMIT_ABORTED.with(|flag| flag.replace(false));
-        if post_submit_aborted {
-            *reserved = usize::MAX;
-            self.armed = false;
-            tracing::error!(
-                "WGPU intermediate sweep exited after submission without a final drain; memory ledger left permanently fail-closed"
-            );
-            return Ok(());
+        match SWEEP_POST_SUBMIT_ABORTED.with(|flag| flag.replace(PostSubmitAbort::None)) {
+            PostSubmitAbort::None => {}
+            PostSubmitAbort::ProvenDrained => {
+                // A successful queue-idle synchronization followed the sweep's
+                // last submit, so the abort left nothing in flight; release
+                // normally below so later sweeps stay available.
+                tracing::warn!(
+                    "WGPU intermediate sweep aborted after submission with a proven \
+                     queue-idle synchronization; memory ledger restored"
+                );
+            }
+            PostSubmitAbort::DeadlineInFlight => {
+                let drained = match self.drain {
+                    Some(device) => device.drain_after_post_submit_abort(),
+                    None => Err(NyError::InternalError(
+                        "no drain authority is attached to this sweep reservation".into(),
+                    )),
+                };
+                match drained {
+                    Ok(()) => {
+                        // Blocking on the already-submitted work (bounded by
+                        // one chunk's GPU time) reached queue idle: in-flight
+                        // allocations are retired and the ledger's accounting
+                        // is truthful again; release normally below.
+                        tracing::warn!(
+                            "WGPU intermediate sweep deadline abort drained to queue idle; \
+                             memory ledger restored"
+                        );
+                    }
+                    Err(drain_error) => {
+                        *reserved = usize::MAX;
+                        self.armed = false;
+                        tracing::error!(
+                            %drain_error,
+                            "WGPU intermediate sweep post-submit drain failed; treating the device as wedged"
+                        );
+                        tracing::error!("{}", POST_SUBMIT_POISON_LINE);
+                        return Ok(());
+                    }
+                }
+            }
+            PostSubmitAbort::UnknownInFlight => {
+                *reserved = usize::MAX;
+                self.armed = false;
+                tracing::error!("{}", POST_SUBMIT_POISON_LINE);
+                return Ok(());
+            }
         }
         if *reserved != self.bytes {
             let actual = *reserved;
@@ -657,12 +808,13 @@ fn memory_cap_admits(peak: usize, request_cap: usize, backend_cap: usize) -> boo
     peak <= request_cap.min(backend_cap)
 }
 
-fn reserve_sweep_ledger(
-    ledger: &std::sync::Mutex<usize>,
+fn reserve_sweep_ledger<'a>(
+    ledger: &'a std::sync::Mutex<usize>,
+    drain: Option<&'a dyn SweepAbortDrain>,
     request_cap: usize,
     backend_cap: usize,
     peak: usize,
-) -> Result<Option<SweepMemoryReservation<'_>>> {
+) -> Result<Option<SweepMemoryReservation<'a>>> {
     if !memory_cap_admits(peak, request_cap, backend_cap) {
         return Ok(None);
     }
@@ -675,9 +827,10 @@ fn reserve_sweep_ledger(
         return Ok(None);
     }
     *reserved = peak;
-    SWEEP_POST_SUBMIT_ABORTED.with(|flag| flag.set(false));
+    SWEEP_POST_SUBMIT_ABORTED.with(|flag| flag.set(PostSubmitAbort::None));
     Ok(Some(SweepMemoryReservation {
         ledger,
+        drain,
         bytes: peak,
         armed: true,
     }))
@@ -692,6 +845,7 @@ impl WgpuDevice {
         let backend_cap = super::crown_memory_estimate::gpu_memory_budget_bytes();
         reserve_sweep_ledger(
             &self.intermediate_sweep_reserved_bytes,
+            Some(self as &dyn SweepAbortDrain),
             request_cap,
             backend_cap,
             peak,
@@ -842,6 +996,12 @@ impl WgpuDevice {
             request.input_lower,
             request.input_upper,
         )?;
+        // R2: the concretize readback above ended in a successful bounded
+        // poll(Wait), so every submission this sweep made has provably
+        // drained. Retire the scope BEFORE consulting the deadline again:
+        // expiry past this point discards a finished result and must never be
+        // recorded as an undrained in-flight abort that poisons the ledger.
+        let work = scope.finish()?;
         deadline_check(request.deadline, "after concretization")?;
         if lower.len() != request.plan.total_rows || upper.len() != request.plan.total_rows {
             return Err(NyError::InternalError(
@@ -857,7 +1017,6 @@ impl WgpuDevice {
                 "WGPU intermediate sweep returned a non-publishable interval".into(),
             ));
         }
-        let work = scope.finish()?;
 
         let mut targets = Vec::with_capacity(request.plan.injections.len());
         for (index, injection) in request.plan.injections.iter().enumerate() {
@@ -1249,22 +1408,22 @@ mod tests {
     #[test]
     fn reservation_ledger_balances_on_decline_error_and_unwind() {
         let ledger = std::sync::Mutex::new(0usize);
-        assert!(reserve_sweep_ledger(&ledger, 99, 200, 100)
+        assert!(reserve_sweep_ledger(&ledger, None, 99, 200, 100)
             .unwrap()
             .is_none());
         assert_eq!(*ledger.lock().unwrap(), 0);
 
         let aborted: Result<()> = (|| {
-            let _reservation = reserve_sweep_ledger(&ledger, 200, 200, 100)?
+            let _reservation = reserve_sweep_ledger(&ledger, None, 200, 200, 100)?
                 .ok_or_else(|| NyError::InternalError("unexpected reservation decline".into()))?;
-            assert!(reserve_sweep_ledger(&ledger, 200, 200, 1)?.is_none());
+            assert!(reserve_sweep_ledger(&ledger, None, 200, 200, 1)?.is_none());
             Err(NyError::DeadlineExceeded("scripted abort".into()))
         })();
         assert!(matches!(aborted, Err(NyError::DeadlineExceeded(_))));
         assert_eq!(*ledger.lock().unwrap(), 0);
 
         let unwound = std::panic::catch_unwind(|| {
-            let _reservation = reserve_sweep_ledger(&ledger, 200, 200, 100)
+            let _reservation = reserve_sweep_ledger(&ledger, None, 200, 200, 100)
                 .unwrap()
                 .unwrap();
             panic!("scripted unwind");
@@ -1272,14 +1431,14 @@ mod tests {
         assert!(unwound.is_err());
         assert_eq!(*ledger.lock().unwrap(), 0);
 
-        let mut completed = reserve_sweep_ledger(&ledger, 200, 200, 100)
+        let mut completed = reserve_sweep_ledger(&ledger, None, 200, 200, 100)
             .unwrap()
             .unwrap();
         completed.release().unwrap();
         assert_eq!(*ledger.lock().unwrap(), 0);
 
         let corrupt = std::sync::Mutex::new(0usize);
-        let mut corrupted = reserve_sweep_ledger(&corrupt, 200, 200, 100)
+        let mut corrupted = reserve_sweep_ledger(&corrupt, None, 200, 200, 100)
             .unwrap()
             .unwrap();
         *corrupt.lock().unwrap() = 99;
@@ -1287,7 +1446,7 @@ mod tests {
         assert_eq!(*corrupt.lock().unwrap(), usize::MAX);
 
         let post_submit_aborted = std::sync::Mutex::new(0usize);
-        let reservation = reserve_sweep_ledger(&post_submit_aborted, 200, 200, 100)
+        let reservation = reserve_sweep_ledger(&post_submit_aborted, None, 200, 200, 100)
             .unwrap()
             .unwrap();
         let scope = SweepScope::arm(vec![SweepBoundary::default()]).unwrap();
@@ -1295,9 +1454,144 @@ mod tests {
         drop(scope);
         drop(reservation);
         assert_eq!(*post_submit_aborted.lock().unwrap(), usize::MAX);
-        assert!(reserve_sweep_ledger(&post_submit_aborted, 200, 200, 1)
+        assert!(
+            reserve_sweep_ledger(&post_submit_aborted, None, 200, 200, 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Scripted [`SweepAbortDrain`] so the post-submit ledger paths are
+    /// exercised without a device, mirroring the module's flag-based tests.
+    struct ScriptedDrain {
+        calls: Cell<usize>,
+        wedged: bool,
+    }
+
+    impl ScriptedDrain {
+        fn new(wedged: bool) -> Self {
+            Self {
+                calls: Cell::new(0),
+                wedged,
+            }
+        }
+    }
+
+    impl SweepAbortDrain for ScriptedDrain {
+        fn drain_after_post_submit_abort(&self) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            if self.wedged {
+                Err(NyError::DeadlineExceeded(
+                    "scripted wedged-device drain timeout".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Simulate an accepted sweep aborting after one recorded submission.
+    /// `deadline_shaped` marks the abort as a call-local deadline expiry (the
+    /// shared readback helpers' `note_post_submit_abort`); `synced` records a
+    /// successful queue-idle synchronization after the submit first.
+    fn abort_after_submit(deadline_shaped: bool, synced: bool) {
+        let scope = SweepScope::arm(vec![SweepBoundary::default()]).unwrap();
+        note_submits(1);
+        if synced {
+            note_device_to_host(0, 0, 1);
+        }
+        if deadline_shaped {
+            note_post_submit_abort();
+        }
+        drop(scope);
+    }
+
+    #[test]
+    fn deadline_abort_with_successful_drain_restores_the_ledger() {
+        let ledger = std::sync::Mutex::new(0usize);
+        let drain = ScriptedDrain::new(false);
+        let reservation = reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        abort_after_submit(true, false);
+        drop(reservation);
+        // First-cause-wins: the scope drop on the same unwind must not have
+        // downgraded the deadline abort, so the drain was consulted once.
+        assert_eq!(drain.calls.get(), 1);
+        assert_eq!(*ledger.lock().unwrap(), 0);
+        assert!(reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn deadline_abort_with_wedged_drain_keeps_the_ledger_fail_closed() {
+        let ledger = std::sync::Mutex::new(0usize);
+        let drain = ScriptedDrain::new(true);
+        let reservation = reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        abort_after_submit(true, false);
+        drop(reservation);
+        assert_eq!(drain.calls.get(), 1);
+        assert_eq!(*ledger.lock().unwrap(), usize::MAX);
+        assert!(reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 1)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn deadline_abort_without_drain_authority_keeps_the_ledger_fail_closed() {
+        let ledger = std::sync::Mutex::new(0usize);
+        let reservation = reserve_sweep_ledger(&ledger, None, 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        abort_after_submit(true, false);
+        drop(reservation);
+        assert_eq!(*ledger.lock().unwrap(), usize::MAX);
+    }
+
+    #[test]
+    fn proven_drained_abort_restores_the_ledger_without_polling() {
+        let ledger = std::sync::Mutex::new(0usize);
+        // Wedged on purpose: a proven-drained abort must never consult it.
+        let drain = ScriptedDrain::new(true);
+        let reservation = reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        abort_after_submit(false, true);
+        drop(reservation);
+        assert_eq!(drain.calls.get(), 0);
+        assert_eq!(*ledger.lock().unwrap(), 0);
+        assert!(reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn unknown_in_flight_abort_still_poisons_even_with_drain_authority() {
+        // Pins the non-deadline post-submit fault behavior relied on by the
+        // DAG route's live validation-fault test: fail closed, no drain.
+        let ledger = std::sync::Mutex::new(0usize);
+        let drain = ScriptedDrain::new(false);
+        let reservation = reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        abort_after_submit(false, false);
+        drop(reservation);
+        assert_eq!(drain.calls.get(), 0);
+        assert_eq!(*ledger.lock().unwrap(), usize::MAX);
+    }
+
+    #[test]
+    fn post_submit_poison_line_is_pinned_for_the_kill_grep() {
+        // The design's §7 kill criterion and ny-propagate's
+        // `sweep_kill_line_matches_the_sweep_source` grep for this EXACT text;
+        // rewording it would silently blind both.
+        assert_eq!(
+            POST_SUBMIT_POISON_LINE,
+            "WGPU intermediate sweep exited after submission without a final drain; memory ledger left permanently fail-closed"
+        );
     }
 
     #[test]

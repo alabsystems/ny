@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
-import fcntl
 import io
 import json
 import os
@@ -33,6 +32,17 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import main16_gap_audit as gap  # noqa: E402
 import regular_bank_evidence as evidence  # noqa: E402
+import pathlib
+
+# Sibling import: make the script directory importable first, exactly as
+# replay_vnncomp2025_counterexample.py does. Without it the module loads when
+# run as a script but not when a test imports it by path.
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import _portable_file_lock as _file_lock  # noqa: E402
+
 
 INDEX_SCHEMA = evidence.INDEX_SCHEMA
 PLAN_SCHEMA = "ny_regular_bank_promotion_plan_v3"
@@ -769,9 +779,12 @@ def build_batch_plan(requests: list[PromotionRequest]) -> BatchPromotionPlan:
 def _directory_locks(paths: list[Path]) -> Iterator[None]:
     with ExitStack() as stack:
         for directory in sorted({path.parent.resolve() for path in paths}, key=str):
-            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-            stack.callback(os.close, descriptor)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            # Sorted so every caller takes the locks in the same order: this
+            # loop holds several at once, and an inconsistent order between
+            # processes is a deadlock. `directory_lock` keeps the POSIX
+            # descriptor lock verbatim and only differs on Windows, which
+            # cannot lock a directory handle at all.
+            stack.enter_context(_file_lock.directory_lock(directory))
         yield
 
 

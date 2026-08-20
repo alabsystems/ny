@@ -30,8 +30,9 @@ use std::time::Instant;
 ///
 /// The trade the original guard was protecting is real and is NOT resolved by
 /// arming this: those kernels still do not poll inside allocation/flatten/
-/// compose, so an armed run can overrun its deadline inside one. That is
-/// precisely why this defaults off and why the sequential twin does too. The
+/// compose, so an armed run can overrun its deadline inside one. NOTE
+/// (2026-08-19): the shared predicate now SHIPS ARMED by default (`=0` kill
+/// switch), so this comment records the residual RISK, not the default. The
 /// durable fix is to thread the deadline through those phases; this exists to
 /// price whether that work is worth doing before doing it.
 fn alpha_patches_finite_authority_refuses(deadline: Option<Instant>) -> bool {

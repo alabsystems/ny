@@ -33,6 +33,179 @@ struct AdditionalTargetBackwardSeed<'a> {
     bounds: CrownBounds,
 }
 
+/// Multi-target stacked-seed injection plan (#cgan-stacked-backward,
+/// `NY_CGAN_STACKED_BACKWARD=1`, default OFF).
+///
+/// ONE backward walk starts at the DEEPEST demanded trunk target with a
+/// `[total_rows x deepest_width]` seed whose first `deepest_width` rows are
+/// that target's identity and whose remaining rows are EXACTLY zero. When the
+/// walk's relation reaches a shallower member's node — i.e. the moment the
+/// relation is expressed in that node's output coordinates, exactly where a
+/// solo pass for that member would seed its identity — the member's identity
+/// block is written into its reserved rows IN PLACE
+/// (`inject_stacked_identity_block`). Every member's rows then traverse the
+/// shared upstream prefix ONCE instead of once per member.
+///
+/// SOUNDNESS (load-bearing): every dense backward step below is row-local
+/// (linear composition, per-coefficient-sign ReLU relaxation, bias and
+/// certified-error accumulation), the same row-independence the k-row subset
+/// seed already relies on (`subset_rows_match_full_backward_bit_identical_*`).
+/// A member's reserved rows are all-zero above its node; the injection
+/// VERIFIES exact zeros (coefficients, biases, certified error) before writing
+/// the identity block and refuses the whole pass otherwise, so from the
+/// injection point down each member row is bit-identical to its solo identity
+/// seed. Any refusal falls back to the existing per-target path — a wrong-side
+/// failure costs only tightness, never validity.
+pub(in crate::network::graph_alpha) struct StackedSeedInjectionPlan {
+    /// Shallower members in walk-encounter order (the deepest target is the
+    /// walk's own seed and is deliberately NOT a member here: its rows are
+    /// identity from the start, and injecting over them would trip the
+    /// exact-zero soundness check).
+    members: Vec<StackedSeedMember>,
+    total_rows: usize,
+}
+
+pub(in crate::network::graph_alpha) struct StackedSeedMember {
+    node_name: String,
+    row_offset: usize,
+    rows: usize,
+    /// Interior mutability: the walk core observes the plan behind `&`; the
+    /// walk itself is strictly sequential, so a `Cell` is sufficient. The
+    /// executor refuses the whole pass unless EVERY member injected — a
+    /// member whose node the walk never expressed a relation at would
+    /// otherwise ship an enclosure of the zero functional as its bound.
+    injected: std::cell::Cell<bool>,
+}
+
+impl StackedSeedInjectionPlan {
+    /// `deepest_rows` is the walk-start identity block height; `shallower`
+    /// lists the remaining (node_name, flat_rows) pairs in walk-encounter
+    /// order (deepest-first). Row offsets are assigned contiguously after the
+    /// deepest block.
+    fn new(deepest_rows: usize, shallower: &[(String, usize)]) -> Result<Self> {
+        let mut members = Vec::with_capacity(shallower.len());
+        let mut offset = deepest_rows;
+        for (node_name, rows) in shallower {
+            if *rows == 0 {
+                return Err(NyError::InvalidSpec(format!(
+                    "stacked seed member '{node_name}' has zero rows"
+                )));
+            }
+            members.push(StackedSeedMember {
+                node_name: node_name.clone(),
+                row_offset: offset,
+                rows: *rows,
+                injected: std::cell::Cell::new(false),
+            });
+            offset = offset.checked_add(*rows).ok_or_else(|| {
+                NyError::InvalidSpec("stacked seed row count overflows usize".to_string())
+            })?;
+        }
+        Ok(Self {
+            members,
+            total_rows: offset,
+        })
+    }
+
+    fn member_at(&self, node_name: &str) -> Option<&StackedSeedMember> {
+        self.members
+            .iter()
+            .find(|member| member.node_name == node_name)
+    }
+
+    fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    fn first_uninjected(&self) -> Option<&str> {
+        self.members
+            .iter()
+            .find(|member| !member.injected.get())
+            .map(|member| member.node_name.as_str())
+    }
+}
+
+/// Write `member`'s identity block into its reserved rows of the stacked
+/// relation, IN PLACE, at the moment the relation is expressed in the member
+/// node's output coordinates.
+///
+/// LOAD-BEARING soundness check: the reserved rows must be EXACTLY zero
+/// (coefficients, biases, and any certified coefficient error). The zero rows
+/// seeded at the walk start stay exactly zero through every admitted step
+/// (linear ops map zero rows to zero rows; the fixed-slope ReLU relaxation
+/// scales coefficients and adds intercept*coefficient bias terms — all zero;
+/// error terms are proportional to coefficient magnitudes — zero). If ANY
+/// admitted step ever violated that (e.g. an absolute error floor), setting
+/// the diagonal to 1.0 over a nonzero row would silently bound
+/// `(leaked functional + member row)` instead of the member row — so a nonzero
+/// find refuses the whole pass instead of writing anything.
+fn inject_stacked_identity_block(
+    node_cb: &mut CrownBounds,
+    member: &StackedSeedMember,
+    total_rows: usize,
+    label: &str,
+) -> Result<()> {
+    let CrownBounds::Dense(lb) = node_cb else {
+        return Err(NyError::SoundnessRefusal(format!(
+            "{label}: stacked seed injection at '{}' requires a Dense carrier",
+            member.node_name
+        )));
+    };
+    let end = member.row_offset.saturating_add(member.rows);
+    if lb.num_outputs() != total_rows || end > total_rows || lb.num_inputs() != member.rows {
+        return Err(NyError::SoundnessRefusal(format!(
+            "{label}: stacked seed injection at '{}' shape mismatch: carrier \
+             [{}x{}], member rows {}..{} of {}",
+            member.node_name,
+            lb.num_outputs(),
+            lb.num_inputs(),
+            member.row_offset,
+            end,
+            total_rows,
+        )));
+    }
+    for i in member.row_offset..end {
+        let coeff_zero = lb.lower_a().row(i).iter().all(|&v| v == 0.0)
+            && lb.upper_a().row(i).iter().all(|&v| v == 0.0);
+        let bias_zero = lb.lower_b()[i] == 0.0 && lb.upper_b()[i] == 0.0;
+        let err_zero = [lb.lower_a_err(), lb.upper_a_err()]
+            .into_iter()
+            .flatten()
+            .all(|err| err.row(i).iter().all(|&v| v == 0.0));
+        if !coeff_zero || !bias_zero || !err_zero {
+            // Name the leaking component: a refusal that says WHICH invariant
+            // broke (and by how much) is diagnosable; a bare boolean is not.
+            let max_c = lb
+                .lower_a()
+                .row(i)
+                .iter()
+                .chain(lb.upper_a().row(i).iter())
+                .fold(0.0f32, |m, &v| m.max(v.abs()));
+            let mut max_e = 0.0f32;
+            for e in [lb.lower_a_err(), lb.upper_a_err()].into_iter().flatten() {
+                for &v in e.row(i) {
+                    max_e = max_e.max(v.abs());
+                }
+            }
+            return Err(NyError::SoundnessRefusal(format!(
+                "{label}: stacked seed rows for '{}' are not exactly zero at \
+                 injection (row {i}): coeff_zero={coeff_zero} (max |a|={max_c:e}) \
+                 bias_zero={bias_zero} (lb={:e} ub={:e}) err_zero={err_zero} \
+                 (max err={max_e:e}); refusing the stacked pass",
+                member.node_name,
+                lb.lower_b()[i],
+                lb.upper_b()[i],
+            )));
+        }
+    }
+    for i in 0..member.rows {
+        lb.lower_a_mut()[[member.row_offset + i, i]] = 1.0;
+        lb.upper_a_mut()[[member.row_offset + i, i]] = 1.0;
+    }
+    member.injected.set(true);
+    Ok(())
+}
+
 /// Exact dense topology admitted for an output-conditioned additional seed.
 ///
 /// This is intentionally narrower than [`Layer::propagates_coeff_err`]. The
@@ -1768,6 +1941,7 @@ impl GraphNetwork {
             initial_bounds,
             cut_ctx,
             None,
+            None,
             false,
         )? {
             TargetBackwardPassResult::NoInputContribution => Ok(None),
@@ -1823,6 +1997,7 @@ impl GraphNetwork {
             initial_bounds,
             cut_ctx,
             None,
+            None,
             true,
         )? {
             TargetBackwardPassResult::NoInputContribution => Ok(None),
@@ -1855,9 +2030,21 @@ impl GraphNetwork {
         initial_bounds: CrownBounds,
         cut_ctx: Option<&CrownCutContext>,
         additional_seed: Option<AdditionalTargetBackwardSeed<'_>>,
+        stacked_seed_plan: Option<&StackedSeedInjectionPlan>,
         capture_input_linear: bool,
     ) -> Result<TargetBackwardPassResult> {
         let has_additional_seed = additional_seed.is_some();
+        let has_stacked_seed_plan = stacked_seed_plan.is_some();
+        // #cgan-stacked-backward admission: the stacked lane is dense-only
+        // (the injection's exact-zero check and in-place identity write are
+        // Dense semantics) and exclusive of the other special seed modes.
+        if has_stacked_seed_plan && (has_additional_seed || capture_input_linear || allow_patches) {
+            return Err(NyError::SoundnessRefusal(
+                "stacked-seed backward is dense-only and exclusive of additional-seed/linear \
+                 capture"
+                    .to_string(),
+            ));
+        }
         if has_additional_seed {
             if allow_patches {
                 return Err(NyError::SoundnessRefusal(
@@ -1912,6 +2099,9 @@ impl GraphNetwork {
         // `into_dense()` below.
         if !capture_input_linear
             && !has_additional_seed
+            // A stacked walk must not take the whole-suffix GPU shortcut: it
+            // would concretize before the shallower members' seeds inject.
+            && !has_stacked_seed_plan
             && super::super::resnet_decompose::resnet_gpu_enabled()
             && target_dim <= super::super::resnet_decompose::resnet_gpu_max_objectives()
         {
@@ -2011,6 +2201,15 @@ impl GraphNetwork {
                     Some(cb) => cb,
                     None => continue,
                 };
+            // #cgan-stacked-backward: inject this member's identity block the
+            // moment the walk's relation is expressed in the member node's
+            // output coordinates — BEFORE this node's own backward step, which
+            // is exactly where a solo pass for this member seeds its identity.
+            if let Some(plan) = stacked_seed_plan {
+                if let Some(member) = plan.member_at(node_name) {
+                    inject_stacked_identity_block(&mut node_cb, member, plan.total_rows(), label)?;
+                }
+            }
             if carrier_trace {
                 crate::patches_carrier_trace::enter_node(target_node, node_name);
             }
@@ -2291,7 +2490,11 @@ impl GraphNetwork {
                 }
             }
             let mut node_lb = node_cb.into_dense_with_deadline(per_node_deadline)?;
-            if !capture_input_linear && !has_additional_seed {
+            // The mid-walk GPU suffix finisher concretizes the remaining
+            // prefix in one shot; a stacked walk must decline it — members
+            // whose seeds have not injected yet would be concretized as the
+            // zero functional.
+            if !capture_input_linear && !has_additional_seed && !has_stacked_seed_plan {
                 if let Some(bounds) = try_finish_target_gpu_suffix_with_pending_input(
                     input,
                     node_name,
@@ -3095,7 +3298,21 @@ impl GraphNetwork {
                 )));
             }
         }
-        if deadline_is_hard {
+        // EXPIRY, not presence — the same question the dispatcher, the patches
+        // family and the structured-boundary stamp above all now ask.
+        //
+        // This is the LAST presence guard in the chain, and it is the one that
+        // makes the memory reroute unreachable. `auto_objective_chunk_route_plan`
+        // exists precisely so an over-budget target chunks instead of degrading
+        // to reference bounds, but every plan it produced was refused here at
+        // driver entry because a deadline was merely PRESENT. Correcting the
+        // budget predicate without this would only have exchanged one
+        // reference-bound fallback for another, which is why the cost-model fix
+        // lands with it rather than before it.
+        if deadline_is_hard
+            && (!crate::network::core::sequential::crown::patches_step::expiry_authority_armed()
+                || per_node_deadline.is_some_and(|limit| std::time::Instant::now() >= limit))
+        {
             // Hard-deadline chunking still performs whole-target setup before its
             // between-chunk polls: endpoint flatten/copy, range-vector
             // allocation, GPU-suffix planning, and dense subset-seed
@@ -3918,6 +4135,7 @@ impl GraphNetwork {
             target_seed,
             None,
             additional_seed,
+            None,
             false,
         )?;
         if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
@@ -3996,6 +4214,176 @@ impl GraphNetwork {
             upper.push(best_upper);
         }
         Ok((lower, upper))
+    }
+
+    /// ONE stacked backward pass for several demanded trunk targets
+    /// (#cgan-stacked-backward). `stack` lists `(node_name, flat_rows)` in
+    /// walk-encounter order: the DEEPEST target first (its ancestry is the
+    /// walk), then successively shallower targets, each of which must lie on
+    /// the deepest target's ancestry. Returns one flat `[flat_rows]` bound per
+    /// stack entry, in `stack` order; the caller reshapes via its forward
+    /// contract exactly as it does for a solo Complete result.
+    ///
+    /// Every row is arithmetically identical to its solo pass launched
+    /// against the SAME `crown_bounds`/`ibp_bounds` maps (row-independence +
+    /// exact-zero injection; see [`StackedSeedInjectionPlan`]), pinned by
+    /// `stacked_backward_matches_solo_passes_bit_identical`. Any refusal or
+    /// error leaves the caller on the existing per-target path.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::network::graph_alpha) fn propagate_crown_to_node_stacked(
+        &self,
+        input: &BoundedTensor,
+        stack: &[(String, usize)],
+        crown_bounds: &std::collections::HashMap<String, BoundedTensor>,
+        ibp_bounds: &std::collections::HashMap<String, BoundedTensor>,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        label: &str,
+        per_node_deadline: Option<std::time::Instant>,
+        deadline_is_hard: bool,
+    ) -> Result<Vec<(String, BoundedTensor)>> {
+        let Some(((deepest_name, deepest_rows), shallower)) = stack.split_first() else {
+            return Err(NyError::InvalidSpec(
+                "stacked backward requires a non-empty target stack".to_string(),
+            ));
+        };
+        if shallower.is_empty() {
+            return Err(NyError::InvalidSpec(
+                "stacked backward requires at least two targets (one is a solo pass)".to_string(),
+            ));
+        }
+        let relevant_nodes = self.ancestors(deepest_name)?;
+        for (node_name, _) in shallower {
+            if !relevant_nodes.iter().any(|name| name == node_name) {
+                return Err(NyError::InvalidSpec(format!(
+                    "stacked member '{node_name}' is not on the ancestry of the deepest target \
+                     '{deepest_name}'"
+                )));
+            }
+        }
+        for (node_name, rows) in stack {
+            let width = ibp_bounds
+                .get(node_name)
+                .map(|bounds| bounds.len())
+                .ok_or_else(|| {
+                    NyError::InvalidSpec(format!("stacked target '{node_name}' has no IBP bounds"))
+                })?;
+            if width != *rows {
+                return Err(NyError::InvalidSpec(format!(
+                    "stacked target '{node_name}' width {width} does not match its declared \
+                     {rows} rows"
+                )));
+            }
+        }
+        // Same finite-authority contract as the two-seed evaluator: a scored
+        // deadline needs a cooperative backend, and the walk's GPU dispatches
+        // observe the deadline through the scoped gate.
+        if !crate::sound_gpu_gate::gpu_crown_route_honors_deadline(engine, per_node_deadline) {
+            return Err(NyError::SoundnessRefusal(
+                "deadline-scored stacked backward requires a cooperative GPU backend".to_string(),
+            ));
+        }
+        let _gpu_deadline_scope =
+            crate::sound_gpu_gate::GpuCrownDeadlineScope::set(engine, per_node_deadline);
+        let plan = StackedSeedInjectionPlan::new(*deepest_rows, shallower)?;
+        let total_rows = plan.total_rows();
+
+        // Walk-start seed: the deepest target's identity block over rows
+        // 0..deepest_rows, every other row EXACTLY zero (the injection's
+        // soundness precondition).
+        let mut lower_a = Array2::<f32>::zeros((total_rows, *deepest_rows));
+        let mut upper_a = Array2::<f32>::zeros((total_rows, *deepest_rows));
+        for i in 0..*deepest_rows {
+            lower_a[[i, i]] = 1.0;
+            upper_a[[i, i]] = 1.0;
+        }
+        let seed = LinearBounds::new(
+            lower_a,
+            Array1::zeros(total_rows),
+            upper_a,
+            Array1::zeros(total_rows),
+        )?;
+        let contract =
+            GraphTargetShapeContract::from_bounds(deepest_name, &flat_bounds_view(total_rows)?);
+        let gpu_suffix_plan =
+            GpuSuffixPlan::build(&relevant_nodes, self, input, crown_bounds, ibp_bounds, None);
+        let produced = self.run_target_backward_pass_core(
+            input,
+            deepest_name,
+            crown_bounds,
+            ibp_bounds,
+            // Fixed-slope relaxations only: the stacked audit
+            // (cgan_stacked::stacked_walk_node_is_audited) has not admitted
+            // any alpha-parameterized branch.
+            None,
+            engine,
+            label,
+            per_node_deadline,
+            deadline_is_hard,
+            false,
+            relevant_nodes.as_slice(),
+            &contract,
+            total_rows,
+            input.len(),
+            // Dense-only: patches carriers cannot take the in-place injection.
+            false,
+            &gpu_suffix_plan,
+            CrownBounds::Dense(seed),
+            None,
+            None,
+            Some(&plan),
+            false,
+        )?;
+        if per_node_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(NyError::DeadlineExceeded(format!(
+                "{label}: stacked per-pass deadline exceeded after backward pass"
+            )));
+        }
+        let concrete = match produced {
+            TargetBackwardPassResult::Concrete(bounds) => bounds,
+            TargetBackwardPassResult::NoInputContribution => {
+                return Err(NyError::SoundnessRefusal(
+                    "stacked backward produced no input contribution".to_string(),
+                ));
+            }
+            TargetBackwardPassResult::InputLinear(_) => {
+                return Err(NyError::InternalError(
+                    "stacked concrete backward returned an input-linear certificate".to_string(),
+                ));
+            }
+        };
+        // SOUNDNESS TRIPWIRE: a member whose node the walk never reached
+        // still holds its zero seed — its rows bound the ZERO functional, not
+        // the member target. Refuse everything rather than serve any of it.
+        if let Some(node_name) = plan.first_uninjected() {
+            return Err(NyError::SoundnessRefusal(format!(
+                "stacked member '{node_name}' was never injected; refusing the whole stacked pass"
+            )));
+        }
+        let flat = concrete.flatten();
+        if flat.len() != total_rows {
+            return Err(NyError::InvalidSpec(format!(
+                "stacked backward returned {} rows, expected {total_rows}",
+                flat.len()
+            )));
+        }
+        let flat_lower = flat.lower();
+        let flat_upper = flat.upper();
+        let mut results = Vec::with_capacity(stack.len());
+        let mut offset = 0usize;
+        for (node_name, rows) in stack {
+            let lower: Array1<f32> = (0..*rows)
+                .map(|i| flat_lower[[offset + i]])
+                .collect::<Vec<f32>>()
+                .into();
+            let upper: Array1<f32> = (0..*rows)
+                .map(|i| flat_upper[[offset + i]])
+                .collect::<Vec<f32>>()
+                .into();
+            let bounds = BoundedTensor::new(lower.into_dyn(), upper.into_dyn())?;
+            results.push((node_name.clone(), bounds));
+            offset += rows;
+        }
+        Ok(results)
     }
 }
 
@@ -4725,6 +5113,188 @@ mod margin_subset_backward_tests {
                 false,
                 &[6],
                 None,
+            )
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod stacked_backward_tests {
+    use crate::layers::{Layer, LinearLayer, ReLULayer};
+    use crate::network::core::{GraphNetwork, GraphNode};
+    use ndarray::{arr1, arr2};
+    use ny_tensor::BoundedTensor;
+    use std::collections::HashMap;
+
+    /// in -> l1 (2->3) -> relu1 -> l2 (3->4) -> relu2. Mixed-sign weights so
+    /// relu1 has crossing rows and the walk exercises a real relaxation.
+    fn two_target_chain() -> (GraphNetwork, BoundedTensor) {
+        let l1 = LinearLayer::new(
+            arr2(&[[1.0_f32, -0.5], [0.25, 0.75], [-0.6, 0.4]]),
+            Some(arr1(&[0.05_f32, -0.1, 0.02])),
+        )
+        .expect("l1");
+        let l2 = LinearLayer::new(
+            arr2(&[
+                [0.9_f32, -0.3, 0.2],
+                [-0.7, 0.6, -0.1],
+                [0.4, 0.4, 0.4],
+                [-0.2, -0.8, 0.5],
+            ]),
+            Some(arr1(&[0.01_f32, -0.02, 0.03, 0.0])),
+        )
+        .expect("l2");
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("l1", Layer::Linear(l1)));
+        graph.add_node(GraphNode::new(
+            "relu1",
+            Layer::ReLU(ReLULayer),
+            vec!["l1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "l2",
+            Layer::Linear(l2),
+            vec!["relu1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "relu2",
+            Layer::ReLU(ReLULayer),
+            vec!["l2".to_string()],
+        ));
+        graph.set_output("relu2");
+        let input = BoundedTensor::new(
+            arr1(&[-1.0_f32, -0.5]).into_dyn(),
+            arr1(&[1.0_f32, 0.75]).into_dyn(),
+        )
+        .expect("input");
+        (graph, input)
+    }
+
+    /// #cgan-stacked-backward KILL CRITERION (pre-registered in
+    /// docs/CGAN_STACKED_BACKWARD_2026-08-19.md): every stacked row must be
+    /// BIT-IDENTICAL to its solo pass against the same bound maps. Stacking
+    /// is pure batching — the deepest target's rows never see the extra rows,
+    /// and a shallower member's rows are exact zeros until its identity
+    /// injects at its own node, after which they take exactly the solo
+    /// arithmetic. A failure here means some step is not row-local (or zero
+    /// rows pick up a residue) and the lane must not ship.
+    #[test]
+    fn stacked_backward_matches_solo_passes_bit_identical() {
+        let (graph, input) = two_target_chain();
+        let forward = graph.collect_node_bounds(&input).expect("forward bounds");
+
+        let solo_l2 = graph
+            .propagate_crown_to_node(
+                &input,
+                "l2",
+                &HashMap::new(),
+                &forward,
+                None,
+                None,
+                Some(0),
+                None,
+            )
+            .expect("solo l2")
+            .flatten();
+        let solo_l1 = graph
+            .propagate_crown_to_node(
+                &input,
+                "l1",
+                &HashMap::new(),
+                &forward,
+                None,
+                None,
+                Some(0),
+                None,
+            )
+            .expect("solo l1")
+            .flatten();
+
+        let stack = [("l2".to_string(), 4usize), ("l1".to_string(), 3usize)];
+        let results = graph
+            .propagate_crown_to_node_stacked(
+                &input,
+                &stack,
+                &HashMap::new(),
+                &forward,
+                None,
+                "stacked-test",
+                None,
+                false,
+            )
+            .expect("stacked pass");
+        assert_eq!(results.len(), 2);
+        let solo = [("l2", solo_l2), ("l1", solo_l1)];
+        for ((name, stacked), (solo_name, solo_bounds)) in results.iter().zip(solo.iter()) {
+            assert_eq!(name.as_str(), *solo_name);
+            let stacked = stacked.flatten();
+            assert_eq!(stacked.len(), solo_bounds.len());
+            for i in 0..stacked.len() {
+                assert_eq!(
+                    stacked.lower()[[i]],
+                    solo_bounds.lower()[[i]],
+                    "'{name}' lower row {i} must be bit-identical to its solo pass"
+                );
+                assert_eq!(
+                    stacked.upper()[[i]],
+                    solo_bounds.upper()[[i]],
+                    "'{name}' upper row {i} must be bit-identical to its solo pass"
+                );
+            }
+        }
+        // Meaningfulness guard: the deep target's CROWN rows must beat IBP
+        // somewhere, or this pins a vacuous walk.
+        let ibp_l2 = forward.get("l2").expect("l2 IBP").flatten();
+        let deep = results[0].1.flatten();
+        assert!(
+            (0..deep.len()).any(|i| deep.lower()[[i]] > ibp_l2.lower()[[i]]
+                || deep.upper()[[i]] < ibp_l2.upper()[[i]]),
+            "stacked CROWN must beat IBP on at least one deep-target row"
+        );
+    }
+
+    #[test]
+    fn stacked_backward_refuses_single_target_and_off_ancestry_members() {
+        let (graph, input) = two_target_chain();
+        let forward = graph.collect_node_bounds(&input).expect("forward bounds");
+        // One target is a solo pass, not a stack.
+        assert!(graph
+            .propagate_crown_to_node_stacked(
+                &input,
+                &[("l2".to_string(), 4usize)],
+                &HashMap::new(),
+                &forward,
+                None,
+                "stacked-test",
+                None,
+                false,
+            )
+            .is_err());
+        // 'l2' is not on the ancestry of 'l1' (wrong order): must refuse
+        // BEFORE any walk instead of shipping zero-functional rows.
+        assert!(graph
+            .propagate_crown_to_node_stacked(
+                &input,
+                &[("l1".to_string(), 3usize), ("l2".to_string(), 4usize)],
+                &HashMap::new(),
+                &forward,
+                None,
+                "stacked-test",
+                None,
+                false,
+            )
+            .is_err());
+        // A declared row count that disagrees with the node width must refuse.
+        assert!(graph
+            .propagate_crown_to_node_stacked(
+                &input,
+                &[("l2".to_string(), 4usize), ("l1".to_string(), 2usize)],
+                &HashMap::new(),
+                &forward,
+                None,
+                "stacked-test",
+                None,
+                false,
             )
             .is_err());
     }
@@ -6548,8 +7118,14 @@ mod cut_segment_env_tests {
             .expect("no-deadline flat ConvTranspose backward");
         assert_eq!(flat_engine.calls.load(Ordering::Relaxed), 2);
 
+        // EXPIRY, not presence. This asserted that a merely PRESENT deadline
+        // declines chunk setup, which made the objective-chunked backward — the
+        // route an over-budget target is supposed to be steered INTO — dead on
+        // every scored run. A live deadline now runs it; an expired one still
+        // declines before any engine work, which is the property this test was
+        // written to protect.
         let chunk_engine = CountingGemmEngine::default();
-        let error = graph
+        graph
             .propagate_crown_to_node(
                 &input,
                 "convt",
@@ -6560,10 +7136,33 @@ mod cut_segment_env_tests {
                 Some(0),
                 None,
             )
-            .expect_err("finite objective-chunk setup must decline before execution");
+            .expect("a live deadline must admit the objective-chunk route");
+
+        let expired_engine = CountingGemmEngine::default();
+        let error = graph
+            .propagate_crown_to_node(
+                &input,
+                "convt",
+                &HashMap::new(),
+                &forward,
+                Some(&expired_engine),
+                Some(
+                    Instant::now()
+                        .checked_sub(Duration::from_millis(1))
+                        .expect("one millisecond fits before now"),
+                ),
+                Some(0),
+                None,
+            )
+            .expect_err("an expired deadline must still decline before execution");
         assert!(
-            matches!(error, NyError::UnsupportedConfiguration(_)),
-            "expected typed unsupported finite-chunk route, got {error:?}"
+            error.is_deadline_exceeded() || matches!(error, NyError::UnsupportedConfiguration(_)),
+            "expected a typed expiry refusal, got {error:?}"
+        );
+        assert_eq!(
+            expired_engine.calls.load(Ordering::Relaxed),
+            0,
+            "an expired refusal must precede the opaque engine"
         );
         assert_eq!(
             chunk_engine.calls.load(Ordering::Relaxed),
@@ -6709,33 +7308,47 @@ mod cut_segment_env_tests {
                     PartialCrownDeadlineSalvagePolicy::EnabledByExactEnvironment,
                     super::crown_tighten::CrownIbpCollectionMode::Standard,
                 )
-                .expect("finite chunk refusal must retain the sound baseline");
-            assert!(matches!(
-                retained.provenance.get("convt"),
-                Some(BoundsProvenance::ForwardFallback(
-                    CrownIbpFallbackReason::CrownPropagationError
-                ))
-            ));
-            let event = retained
-                .fallback_events
-                .iter()
-                .find(|event| event.reason == CrownIbpFallbackReason::CrownPropagationError)
-                .expect("explicit finite-chunk refusal event");
+                .expect("a live collector authority must publish");
+            // EXPIRY, not presence. This asserted that a LIVE collector
+            // authority could not enter the chunk driver and had to retain the
+            // IBP baseline with a typed CrownPropagationError provenance. That
+            // refusal is exactly what made the memory reroute unreachable, so a
+            // live authority now runs the driver and the target is no longer a
+            // forward fallback. What is still pinned is the sound direction: the
+            // published bound never LOSES to the baseline it replaced.
             assert!(
-                event.details.contains(
-                    "finite objective-chunk target backward is not cooperatively bounded"
+                !matches!(
+                    retained.provenance.get("convt"),
+                    Some(BoundsProvenance::ForwardFallback(
+                        CrownIbpFallbackReason::CrownPropagationError
+                    ))
                 ),
-                "fallback must preserve the typed entry refusal: {}",
-                event.details
+                "a live authority must no longer degrade this target to a forward fallback"
             );
             let retained_bound = retained.bounds.get("convt").expect("retained target");
-            assert_eq!(retained_bound.lower(), baseline.lower());
-            assert_eq!(retained_bound.upper(), baseline.upper());
+            assert!(
+                retained_bound
+                    .lower()
+                    .iter()
+                    .zip(baseline.lower().iter())
+                    .all(|(published, base)| *published >= *base - 1e-4),
+                "the chunked publication must not be looser than the baseline it replaced"
+            );
+            assert!(
+                retained_bound
+                    .upper()
+                    .iter()
+                    .zip(baseline.upper().iter())
+                    .all(|(published, base)| *published <= *base + 1e-4),
+                "the chunked publication must not be looser than the baseline it replaced"
+            );
+            // Still pinned, and it is the property that mattered: whatever the
+            // driver publishes, it never publishes PARTIALLY completed rows.
             assert!(
                 retained.fallback_events.iter().all(|event| {
                     event.reason != CrownIbpFallbackReason::PartialCrownRowsDeadlineExceeded
                 }),
-                "entry refusal must not publish partially completed rows"
+                "the chunk driver must not publish partially completed rows"
             );
         });
     }

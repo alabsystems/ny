@@ -1124,6 +1124,7 @@ mod constrained_patches_relu_gate_tests {
 
     #[test]
     fn borrowed_patches_capture_is_bit_exact_with_direct_materialization() {
+        let _env = crate::tests::lock_env_shared();
         let patches = capture_bounds();
         let expected = patches
             .to_dense()
@@ -1283,6 +1284,7 @@ mod constrained_patches_relu_gate_tests {
 
     #[test]
     fn production_capture_uses_the_borrowed_helper_route_unconditionally() {
+        let _env = crate::tests::lock_env_shared();
         let node_cb = CrownBounds::Patches(Box::new(capture_bounds()));
         let borrowed_site = helper_capture_route_call_site(&node_cb);
         // `file!()` yields the host separator — `constraints\backward\relu.rs` on

@@ -593,7 +593,7 @@ impl BetaCrownVerifier {
         if local_gpu.is_none() && bounded_gpu.is_none() {
             return None;
         }
-        let probe = std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1");
+        let probe = crate::beta_gpu_probe_armed();
         let (segments, relu_names, frontier_abs, node_abs) =
             crate::network::extract_gpu_resnet_segments_with_relu_names(
                 graph,

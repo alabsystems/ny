@@ -468,6 +468,65 @@ fn strip_terminal_softmax_guard(
     Ok((producer_idx, pre_softmax, true_label))
 }
 
+/// Receipt of an ADMITTED pre-Softmax attack-scoring objective.
+///
+/// Returned only by [`admit_pre_softmax_attack_scoring`], and carrying nothing
+/// the caller could mistake for proof authority: the pre-Softmax tensor name,
+/// the authenticated true label, and the output width the guard pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreSoftmaxAttackAdmission {
+    /// Name of the tensor feeding the terminal Softmax — the logits.
+    pub pre_softmax_tensor: String,
+    /// The single right-hand label shared by every argmax-complement atom.
+    pub true_label: usize,
+    /// Output width the shape guard pinned to exactly `[1, num_outputs]`.
+    pub num_outputs: usize,
+}
+
+/// Admit scoring an ATTACK SEARCH against pre-Softmax logits, using the EXACT
+/// SAME predicate as the (dark) terminal-Softmax strip.
+///
+/// # This is deliberately not a second predicate
+///
+/// The body is one call to [`strip_terminal_softmax_guard`] — the identical
+/// model-side ([`validate_terminal_normalization_single_group`],
+/// [`validate_terminal_activation_has_no_other_consumers`], the `[1, N]` shape
+/// pin) and spec-side ([`validate_argmax_complement_disjunction`]) union that
+/// gates the strip. Nothing is relaxed for the attack, so every refusal the
+/// strip makes is a refusal here: a comparison against a CONSTANT (softmax is
+/// order-preserving, NOT value-preserving), outputs from DIFFERENT softmaxes,
+/// a non-terminal Softmax, the wrong axis, a linear combination of several
+/// outputs, a dual-network spec, or a strict atom.
+///
+/// # Why an attack may use it WITHOUT a lattice certificate
+///
+/// [`authenticate_logit_lattice`] and [`validate_certified_lattice_structure`]
+/// are deliberately NOT called. They exist to give the *bound* path UNSAT
+/// authority: stripping the Softmax changes what the solver PROVES, so it must
+/// clear the f32 tie window on exactly authenticated bytes. Scoring an attack
+/// proves nothing. The lane only chooses which points the search VISITS; the
+/// candidate it proposes is still confirmed by the UNCHANGED trusted-oracle
+/// gate running a real ONNX Runtime forward on the ORIGINAL, UNMODIFIED graph.
+/// A mis-scored search therefore finds nothing — it cannot emit a verdict at
+/// all, let alone a wrong one. Requiring a per-model byte certificate here
+/// would buy no soundness and would pin a general capability to one file's
+/// SHA-256.
+///
+/// This function reads; it never mutates. It is also cheap: no forward pass,
+/// no tensor arithmetic — a handful of shape and constraint-shape checks over
+/// already-parsed metadata.
+pub fn admit_pre_softmax_attack_scoring(
+    model: &OnnxModel,
+    vnnlib: &VnnLibSpec,
+) -> Result<PreSoftmaxAttackAdmission, String> {
+    let (_, pre_softmax_tensor, true_label) = strip_terminal_softmax_guard(model, vnnlib)?;
+    Ok(PreSoftmaxAttackAdmission {
+        pre_softmax_tensor,
+        true_label,
+        num_outputs: vnnlib.num_outputs,
+    })
+}
+
 /// Dark-gated strip of a terminal Softmax for argmax-complement properties.
 ///
 /// DEFAULT OFF. Runs only when [`STRIP_TERMINAL_SOFTMAX_ENV`] is exactly `"1"`;
@@ -1436,6 +1495,250 @@ mod tests {
             spec.input_bounds,
             spec.num_outputs,
         )
+    }
+
+    // ---------------------------------------------------------------------
+    // ATTACK-SCORING ADMISSION (`admit_pre_softmax_attack_scoring`).
+    //
+    // These pin that the attack entry point is the SAME predicate as the
+    // strip's: it is not a second, laxer guard. Every refusal below is a
+    // refusal the strip also makes, and no environment gate is involved —
+    // the attack admission is not dark-gated here, its CALLER is.
+    // ---------------------------------------------------------------------
+
+    /// A two-Softmax graph: two graph outputs, each produced by its OWN
+    /// `Softmax` over its OWN input. `p_a` and `p_b` have DIFFERENT
+    /// denominators, so comparing one against the other is not order-preserving
+    /// in either direction.
+    fn two_softmax_model() -> OnnxModel {
+        let mut first = layer("softmax_a", LT::Softmax, &["za"], &["ya"]);
+        first
+            .attributes
+            .insert("axis".to_string(), crate::AttributeValue::Int(-1));
+        let mut second = layer("softmax_b", LT::Softmax, &["zb"], &["yb"]);
+        second
+            .attributes
+            .insert("axis".to_string(), crate::AttributeValue::Int(-1));
+        let network = Network {
+            name: "two_softmax_fixture".to_string(),
+            inputs: vec![
+                TensorSpec {
+                    name: "za".to_string(),
+                    shape: vec![1, 4],
+                    dtype: DataType::Float32,
+                },
+                TensorSpec {
+                    name: "zb".to_string(),
+                    shape: vec![1, 4],
+                    dtype: DataType::Float32,
+                },
+            ],
+            outputs: vec![
+                TensorSpec {
+                    name: "ya".to_string(),
+                    shape: vec![1, 4],
+                    dtype: DataType::Float32,
+                },
+                TensorSpec {
+                    name: "yb".to_string(),
+                    shape: vec![1, 4],
+                    dtype: DataType::Float32,
+                },
+            ],
+            layers: vec![first, second],
+            param_count: 0,
+        };
+        OnnxModel::empty_with_network(network, WeightStore::new()).with_tensor_shapes(
+            HashMap::from([
+                ("za".to_string(), vec![1, 4]),
+                ("ya".to_string(), vec![1, 4]),
+                ("zb".to_string(), vec![1, 4]),
+                ("yb".to_string(), vec![1, 4]),
+            ]),
+        )
+    }
+
+    /// Baseline: the exact benchmark layout IS admitted, so every refusal below
+    /// is attributable to the thing it changes and not to a fixture that never
+    /// passed.
+    #[test]
+    fn admit_pre_softmax_attack_scoring_accepts_the_exact_argmax_complement_layout() {
+        let model = softmax_terminal_model(LT::Softmax, vec![1, 43], Some(-1));
+        let spec = argmax_complement_spec(43, 25);
+
+        let admission =
+            admit_pre_softmax_attack_scoring(&model, &spec).expect("exact layout must admit");
+
+        assert_eq!(admission.pre_softmax_tensor, "z");
+        assert_eq!(admission.true_label, 25);
+        assert_eq!(admission.num_outputs, 43);
+    }
+
+    /// (a) REFUSE a CONSTANT-THRESHOLD spec. Softmax preserves ORDER, not
+    /// VALUE: `z = [0.6, 10]` makes `Y_0 >= 0.5` TRUE on logits and FALSE on
+    /// probabilities, so a threshold atom must never be scored in logit space.
+    #[test]
+    fn admit_pre_softmax_attack_scoring_refuses_a_constant_threshold_spec() {
+        let model = softmax_terminal_model(LT::Softmax, vec![1, 2], Some(-1));
+
+        // The `smart_turn_multimodal_2026` shape: `(assert (> Y[0,0] 0.5))`.
+        let mut threshold = VnnLibSpec::new();
+        threshold.num_inputs = 1;
+        threshold.num_outputs = 2;
+        threshold.input_bounds = vec![(0.0, 1.0)];
+        threshold.output_constraint_clauses =
+            vec![vec![OutputConstraint::GreaterThanConst(0, 0.5)]];
+        threshold.output_constraints = vec![OutputConstraint::GreaterThanConst(0, 0.5)];
+        threshold.is_disjunction = true;
+
+        let refusal = admit_pre_softmax_attack_scoring(&model, &threshold)
+            .expect_err("a constant threshold must be refused");
+        assert_eq!(
+            refusal,
+            "argmax-complement atoms must be non-strict output-vs-output GreaterEq"
+        );
+
+        // The same refusal for the NON-STRICT constant form, and for the
+        // `cgan2026` two-sided band, so no `*Const` variant slips through.
+        for constant_spec in [
+            {
+                let mut spec = VnnLibSpec::new();
+                spec.num_inputs = 1;
+                spec.num_outputs = 2;
+                spec.input_bounds = vec![(0.0, 1.0)];
+                spec.output_constraint_clauses =
+                    vec![vec![OutputConstraint::GreaterEqConst(0, 0.5)]];
+                spec.output_constraints = vec![OutputConstraint::GreaterEqConst(0, 0.5)];
+                spec.is_disjunction = true;
+                spec
+            },
+            band_clause_spec(-1.0, 1.0),
+        ] {
+            let model = softmax_terminal_model(
+                LT::Softmax,
+                vec![1, i64::try_from(constant_spec.num_outputs).unwrap()],
+                Some(-1),
+            );
+            assert!(
+                admit_pre_softmax_attack_scoring(&model, &constant_spec).is_err(),
+                "no constant-threshold shape may be admitted"
+            );
+        }
+    }
+
+    /// (a) REFUSE a MULTI-SOFTMAX graph, in both of its shapes.
+    #[test]
+    fn admit_pre_softmax_attack_scoring_refuses_a_multi_softmax_graph() {
+        // Shape 1: two SEPARATE Softmax nodes with two graph outputs. The
+        // compared coordinates would come from two different denominators.
+        let two = two_softmax_model();
+        let spec = argmax_complement_spec(4, 1);
+        assert_eq!(
+            admit_pre_softmax_attack_scoring(&two, &spec)
+                .expect_err("two softmax outputs must be refused"),
+            "multiple outputs not supported"
+        );
+
+        // Shape 2: ONE Softmax node whose shape carries more than one
+        // normalization group — `[2, 43]` on axis -1 is two independent
+        // softmaxes stacked, so index k of the flat spec does not name one
+        // group's coordinate.
+        let stacked = softmax_terminal_model(LT::Softmax, vec![2, 43], Some(-1));
+        let stacked_spec = argmax_complement_spec(43, 25);
+        assert_eq!(
+            admit_pre_softmax_attack_scoring(&stacked, &stacked_spec)
+                .expect_err("more than one normalization group must be refused"),
+            "terminal Softmax has more than one normalization group"
+        );
+
+        // Shape 3: the same failure reached through the AXIS. `[1, 43]`
+        // normalized on axis 0 is 43 groups of one.
+        let wrong_axis = softmax_terminal_model(LT::Softmax, vec![1, 43], Some(0));
+        assert_eq!(
+            admit_pre_softmax_attack_scoring(&wrong_axis, &argmax_complement_spec(43, 25))
+                .expect_err("the wrong axis must be refused"),
+            "terminal Softmax has more than one normalization group"
+        );
+    }
+
+    /// (a) REFUSE a NON-TERMINAL Softmax, in both of its shapes: another layer
+    /// consuming the softmax output, and a graph that merely CONTAINS a Softmax
+    /// while ending in something else (the `vit_2023` /
+    /// `smart_turn_multimodal_2026` attention shape).
+    #[test]
+    fn admit_pre_softmax_attack_scoring_refuses_a_non_terminal_softmax() {
+        let mut consumed = softmax_terminal_model(LT::Softmax, vec![1, 43], Some(-1));
+        consumed
+            .network
+            .layers
+            .push(layer("downstream", LT::ReLU, &["y"], &["w"]));
+        assert_eq!(
+            admit_pre_softmax_attack_scoring(&consumed, &argmax_complement_spec(43, 25))
+                .expect_err("a consumed Softmax output must be refused"),
+            "terminal Softmax output is consumed by other layers"
+        );
+
+        // Attention-internal Softmax, terminal `Gemm`: the model contains a
+        // Softmax node but the graph output is not produced by it.
+        let mut attention = layer("attn_softmax", LT::Softmax, &["scores"], &["attn"]);
+        attention
+            .attributes
+            .insert("axis".to_string(), crate::AttributeValue::Int(-1));
+        let network = Network {
+            name: "attention_fixture".to_string(),
+            inputs: vec![TensorSpec {
+                name: "scores".to_string(),
+                shape: vec![1, 4],
+                dtype: DataType::Float32,
+            }],
+            outputs: vec![TensorSpec {
+                name: "y".to_string(),
+                shape: vec![1, 4],
+                dtype: DataType::Float32,
+            }],
+            layers: vec![attention, layer("head", LT::Linear, &["attn"], &["y"])],
+            param_count: 0,
+        };
+        let vit_like = OnnxModel::empty_with_network(network, WeightStore::new())
+            .with_tensor_shapes(HashMap::from([
+                ("scores".to_string(), vec![1, 4]),
+                ("attn".to_string(), vec![1, 4]),
+                ("y".to_string(), vec![1, 4]),
+            ]));
+        assert_eq!(
+            admit_pre_softmax_attack_scoring(&vit_like, &argmax_complement_spec(4, 1))
+                .expect_err("an attention-internal Softmax must be refused"),
+            "terminal layer is not exactly Softmax"
+        );
+    }
+
+    /// (a) REFUSE the remaining unsound shapes the brief names: outputs from a
+    /// DUAL network (two invocations, two denominators), and a property that is
+    /// not a pure pairwise argmax complement (a linear combination, or a
+    /// bare pairwise atom between two NON-argmax classes).
+    #[test]
+    fn admit_pre_softmax_attack_scoring_refuses_dual_network_and_non_pairwise_specs() {
+        let model = softmax_terminal_model(LT::Softmax, vec![1, 43], Some(-1));
+
+        let mut dual = argmax_complement_spec(43, 25);
+        dual.dual_network = Some(dual_network_stub());
+        assert_eq!(
+            admit_pre_softmax_attack_scoring(&model, &dual)
+                .expect_err("a dual-network spec must be refused"),
+            "dual-network spec: outputs may not share a softmax denominator"
+        );
+
+        // A single bare pairwise atom between two non-argmax classes. It passes
+        // every MODEL-side guard, and is exactly the shape that manufactures a
+        // false reading under f32 saturation, so the SPEC side must refuse it.
+        let mut single_pair = relational_spec(43);
+        single_pair.is_disjunction = true;
+        single_pair.output_constraint_clauses = vec![vec![OutputConstraint::GreaterEq(0, 42)]];
+        single_pair.output_constraints = vec![OutputConstraint::GreaterEq(0, 42)];
+        assert!(
+            admit_pre_softmax_attack_scoring(&model, &single_pair).is_err(),
+            "an incomplete argmax complement must be refused"
+        );
     }
 
     /// (a) GATE UNSET => the transform never runs and the model/spec are

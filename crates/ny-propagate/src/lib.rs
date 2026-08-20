@@ -399,6 +399,32 @@ pub const fn sequential_clip_interm_domain_supported() -> bool {
     beta_crown::engine::domain::clip::sequential_clip_interm_domain_supported()
 }
 
+/// `NY_BETA_GPU_PROBE` — the declared chokepoint for the dark beta/GPU
+/// diagnostic markers scattered through graph propagation and branching.
+///
+/// Twenty sites used to sample the process environment directly with an
+/// open-coded `env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1")`.
+/// The lever was ALREADY declared in `ny-levers` (telemetry::BETA_GPU_PROBE),
+/// and its own `ReaderSite` documentation recorded the gap: those sites "still
+/// sample the process environment directly and remain visible to the raw-read
+/// migration ratchet". This is that migration.
+///
+/// It also removes a real inconsistency rather than only debt. `ny-cli`'s
+/// `beta_gpu_probe_armed` already read through this declaration, so the two
+/// halves of the same switch disagreed: `NY_BETA_GPU_PROBE=true` armed the CLI
+/// wide-lane readout while leaving every propagation marker dark, because the
+/// open-coded form accepted the single spelling "1" and nothing else. Both
+/// halves now answer with the declared Bool parser.
+///
+/// Dark by default (`DefaultSpec::Bool(false)`): disarmed, this is one env read
+/// returning false, and no diagnostic path runs.
+#[must_use]
+pub(crate) fn beta_gpu_probe_armed() -> bool {
+    ny_levers::read(&ny_levers::decls::telemetry::BETA_GPU_PROBE)
+        .value
+        .as_bool()
+}
+
 #[cfg(test)]
 mod tests;
 

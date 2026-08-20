@@ -48,6 +48,8 @@ pub(crate) mod gt;
 pub(crate) mod inspect;
 pub(crate) mod inspect_model;
 pub(crate) mod json_error;
+pub(crate) mod lane_allocation;
+pub(crate) mod lane_schedule;
 pub(crate) mod lipschitz;
 pub(crate) mod margin_row_bab;
 pub(crate) mod relational_equiv;
@@ -107,4 +109,26 @@ pub(crate) fn cli_shape_infer_backend() -> ny_onnx::ShapeInferBackend {
             }
         }
     }
+}
+
+/// Resolve the VNN-COMP 2026 corpus root across BOTH checkout spellings.
+///
+/// Upstream's repository is named `vnncomp2026_benchmarks`, so a plain
+/// `git clone` lands there; every other corpus in this tree (vnncomp2023 /
+/// 2024 / 2025) sits under its bare year, and `.gitignore` lists both
+/// spellings. Test sites that hardcoded one of the two panicked with "fixtures
+/// missing" against a corpus that was present under the other name, which made
+/// the whole `external-vnncomp` lane unrunnable on a correct checkout.
+///
+/// Returns `None` only when NEITHER layout exists — callers keep their own
+/// hard failure, so a genuinely absent corpus is still never a silent skip.
+#[cfg(all(test, feature = "mip", feature = "external-vnncomp"))]
+pub(crate) fn vnncomp2026_benchmarks_root() -> Option<std::path::PathBuf> {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    [
+        manifest.join("../../benchmarks/vnncomp2026_benchmarks/benchmarks"),
+        manifest.join("../../benchmarks/vnncomp2026/benchmarks"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_dir())
 }

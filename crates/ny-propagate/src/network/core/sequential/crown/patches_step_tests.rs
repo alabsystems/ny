@@ -147,7 +147,7 @@ fn dense_linear_preserves_expired_deadline_without_engine_launch() -> Result<()>
 }
 
 #[test]
-fn finite_deadline_conv_uses_typed_fallback_and_preserves_expiry() -> Result<()> {
+fn finite_deadline_conv_keeps_patches_while_live_and_refuses_once_expired() -> Result<()> {
     let kernel =
         ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1]), vec![1.0f32]).expect("valid Conv2d kernel");
     let layer = Layer::Conv2d(Conv2dLayer::with_input_shape(
@@ -199,26 +199,27 @@ fn finite_deadline_conv_uses_typed_fallback_and_preserves_expiry() -> Result<()>
         "test",
         Some(Instant::now() + Duration::from_secs(30)),
     )?;
-    match result {
-        CrownStepResult::IbpFallback(fallback) => {
-            assert_eq!(
-                fallback.reason,
-                CrownIbpFallbackReason::CrownPropagationError
-            );
-            assert!(
-                fallback.details.contains("finite") && fallback.details.contains("Conv2d"),
-                "typed finite refusal must retain operator context: {}",
-                fallback.details
-            );
-        }
-        CrownStepResult::Continue => {
-            panic!("finite Conv2d must not enter the partially cooperative dense kernel")
-        }
-    }
+    // A LIVE deadline keeps the native Patches route. This arm asserted the
+    // opposite while the refusal was decided by deadline PRESENCE, and that
+    // presence test is the defect: every scored run carries a deadline, so the
+    // refusal fired on every conv, the carrier densified, and the walk paid the
+    // dense-path bill (bootstrap 37.3s vs 1.4s on cifar_bias_field_46).
+    //
+    // What is retained is the STAGING invariant, not the presence test: the
+    // carrier stays structured, nothing is materialized, and the caller's
+    // engine is not launched behind its back.
+    assert!(
+        matches!(result, CrownStepResult::Continue),
+        "a live finite deadline must take the native Patches route, not refuse it"
+    );
+    assert!(
+        matches!(bounds, CrownBounds::Patches(_)),
+        "the live-deadline route must leave the carrier structured"
+    );
     assert_eq!(
         engine.gemm_calls(),
         0,
-        "finite Conv2d refusal must not launch the caller engine"
+        "the native Patches route must not launch the caller engine"
     );
     Ok(())
 }
@@ -492,25 +493,54 @@ fn collector_soft_deadline_keeps_native_conv_patches_route() {
         assert!(matches!(result, CrownStepResult::Continue));
         assert!(matches!(soft, CrownBounds::Patches(_)));
 
-        let mut hard = identity;
+        // Hard authority with a LIVE deadline now behaves like the soft arm.
+        // The memory guard exists to stop a ruinous Patches->Dense
+        // materialization, and the native route does not materialize at all;
+        // refusing here used to FORCE the very densification the guard then had
+        // to catch.
+        let mut hard_live = identity.clone();
         let result = crown_backward_step_patches_with_deadline_authority(
             &layer,
-            &mut hard,
+            &mut hard_live,
             &pre_activation,
             None,
             0,
-            "caller-hard-deadline",
+            "caller-hard-deadline-live",
             soft_deadline,
             true,
         )
-        .expect("hard authority must retain the typed memory fallback");
-        assert!(matches!(
-            result,
-            CrownStepResult::IbpFallback(CrownStepFallback {
-                reason: CrownIbpFallbackReason::MemoryBudgetExceeded,
-                ..
-            })
-        ));
+        .expect("a live hard deadline must keep the native Patches route");
+        assert!(matches!(result, CrownStepResult::Continue));
+        assert!(matches!(hard_live, CrownBounds::Patches(_)));
+
+        // An EXPIRED deadline refuses before any of this — at the step's own
+        // entry check, ahead of the memory guard and ahead of dispatch. Worth
+        // pinning, because it is why deciding on expiry is safe here: the
+        // stop-work behaviour a hard deadline is owed comes from THIS check,
+        // never from the presence test that was removed.
+        let mut hard_expired = identity;
+        let error = match crown_backward_step_patches_with_deadline_authority(
+            &layer,
+            &mut hard_expired,
+            &pre_activation,
+            None,
+            0,
+            "caller-hard-deadline-expired",
+            Some(
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("one millisecond fits before the current instant"),
+            ),
+            true,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an expired hard deadline must refuse before dispatch"),
+        };
+        assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+        assert!(
+            matches!(hard_expired, CrownBounds::Patches(_)),
+            "refusing before dispatch must not have materialized anything"
+        );
     });
 }
 

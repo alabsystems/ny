@@ -171,6 +171,59 @@ pub(crate) fn aw_f64_with_abssum(a_block: &Mat<f32>, w: &Mat<f32>) -> (Array2<f6
     aw_f64_with_abssum_unbounded(a_block, w)
 }
 
+/// Domain-batched twin of [`aw_f64_with_abssum`] (#iso-batched-rebound): the
+/// per-domain shortcut rebound's dominant leaf is this f64 `A·W` + `|A|·|W|`
+/// pair, issued once per Linear layer PER DOMAIN as a small latency-bound GEMM.
+/// This twin stacks `n_domains` per-domain coefficient blocks — which all share
+/// the SAME layer weight `w` — into one tall `a_stacked` (`(n_domains*m) × k`,
+/// domain `d`'s block at rows `d*m .. (d+1)*m`) and issues ONE faer f64 GEMM
+/// pair over the stack, turning `n_domains` tiny GEMMs into one throughput-bound
+/// GEMM.
+///
+/// PARITY (BIT-IDENTICAL by construction): faer's blocked f64 GEMM computes each
+/// output element `(i,j)` by the SAME `k`-reduction sequence regardless of the
+/// row count `M` (the batch axis only adds rows `i`, never touches the `k`
+/// contraction or the `(i,j)` accumulation order). So block `d` of the stacked
+/// product equals `aw_f64_with_abssum(&A_d, w)`'s faer arm output bit-for-bit —
+/// the same operands, the same `current_par()` policy, the same `Accum::Replace`.
+/// Empirically verified: 0 / 1.87M element mismatches across shapes/batches,
+/// under both `Par::Seq` and `Par::rayon` (see
+/// `aw_batched_matches_per_domain_bit_for_bit`). The certified error `γ_n·S`
+/// (Higham, summation-order independent) is unchanged, so the stacked `s` is a
+/// valid basis for the identical enclosure `a64 ± γ_n·S`.
+///
+/// Returns `(a64, s)` stacked the same way as the input rows. The rebound-scratch
+/// pool is intentionally NOT used here (the whole point is one large product, not
+/// per-domain recycled buffers); the pooled per-domain arm is itself proven
+/// bit-identical to this owned faer arm (#rebound-scratch), so a caller that runs
+/// the reference with rebound-scratch ON still matches this twin.
+#[cfg_attr(not(test), allow(dead_code))] // primitive for the batched-forward SoA driver — the merged-GEMM leaf of the per-node CROWN-IBP forward that the iso shortcut rebound spends ~85% of its time in; SoA-loop wiring is the follow-on.
+pub(crate) fn aw_batched_f64_with_abssum(
+    a_stacked: &Mat<f32>,
+    w: &Mat<f32>,
+) -> (Array2<f64>, Array2<f64>) {
+    let mk = a_stacked.nrows(); // n_domains * m (per-domain rows stacked)
+    let k = a_stacked.ncols();
+    let p = w.ncols();
+    debug_assert_eq!(w.nrows(), k);
+
+    // Faer owned arm, verbatim to `aw_f64_with_abssum`'s faer branch but over the
+    // full stacked row set. `f32→f64` widening and `|·|` are EXACT, so both GEMMs
+    // sum the SAME exact-in-f64 products; per-block bit-identity is the row-count
+    // independence of faer's per-element reduction (verified). `mat_mul_f64` uses
+    // `current_par()`, matching the reference's parallelism policy at every call
+    // site (driver thread or, under a NestedFaerParGuard, a rayon worker).
+    let a_f = Mat::<f64>::from_fn(mk, k, |i, j| f64::from(a_stacked[(i, j)]));
+    let w_f = Mat::<f64>::from_fn(k, p, |i, j| f64::from(w[(i, j)]));
+    let a_abs = Mat::<f64>::from_fn(mk, k, |i, j| f64::from(a_stacked[(i, j)]).abs());
+    let w_abs = Mat::<f64>::from_fn(k, p, |i, j| f64::from(w[(i, j)]).abs());
+    let c = mat_mul_f64(&a_f, &w_f);
+    let s_mat = mat_mul_f64(&a_abs, &w_abs);
+    let a64 = Array2::from_shape_fn((mk, p), |(i, j)| c[(i, j)]);
+    let s = Array2::from_shape_fn((mk, p), |(i, j)| s_mat[(i, j)]);
+    (a64, s)
+}
+
 /// Deadline-aware twin of [`aw_f64_with_abssum`].
 ///
 /// A sufficiently large deadline-scoped call may use the process-global sound
@@ -968,7 +1021,6 @@ const INCOMING_ERROR_POLL_MACS: usize = 1 << 12;
 /// reachable width. The `1 + 4·EPSILON` factor is belt-and-braces on top.
 /// DO NOT "simplify" `contraction + 1` to `contraction` on the strength of the
 /// old text: that removes the margin the proof rests on.
-#[cfg(test)]
 const INCOMING_ERROR_SLACK_F64: f64 = 1.0 + 4.0 * f64::EPSILON;
 
 /// Test-only `(γ_{n+1}^{f64}, abs_inflate)` factors for the withdrawn
@@ -977,7 +1029,6 @@ const INCOMING_ERROR_SLACK_F64: f64 = 1.0 + 4.0 * f64::EPSILON;
 /// deficit (`acc ≥ T·(1−γ)` ⇒ `T ≤ acc·abs_inflate`); `+inf` when γ saturates
 /// (`(n+1)·u64 ≥ 1`), which makes the candidate conservatively unusable.
 #[inline]
-#[cfg(test)]
 pub(crate) fn incoming_error_dual_factors(contraction: usize) -> (f64, f64) {
     let gamma = gamma_n_f64(contraction.saturating_add(1));
     let abs_inflate = if gamma < 1.0 {
@@ -1057,6 +1108,133 @@ pub(crate) static INCOMING_ERR_NANOS: std::sync::atomic::AtomicU64 =
 pub(crate) static INCOMING_ERR_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// GEMM lane for the incoming-error composition (#err-compose-gemm).
+///
+/// Same contract, same publication, ~10 s -> ~0.05 s on the biasfield walks:
+/// the scalar stepped triple loop below does GEMM-scale work at scalar speed
+/// (measured 10.478 s of a 63.1 s collection on `cifar_bias_field_46`;
+/// REGRESSION_FC_UNSAT_LOST_2026-08-14.md "walk-cost decomposition").
+///
+/// SOUNDNESS. Inputs are sanitized per element by the SAME
+/// `nonnegative_f32_error_or_infinity` the scalar arm uses. The f64 tile
+/// matmul's round-to-nearest sum `acc` is covered by the certified
+/// dual-accumulator bound `acc·(1 + γ_{k+1}·abs_inflate·SLACK) ≥ T` — the
+/// #cgan-row7-h4 candidate, validated against an exact-rational oracle and
+/// retained above precisely for this reuse. Publication goes through the same
+/// `publish_error_up_normal`. The withdrawn-candidate analysis proves the
+/// stepped-vs-dual delta (≤ 4.5e-13 relative at k = 4096) is INERT through
+/// that publication (2^-24-scale widening), so this lane publishes the SAME
+/// f32 values as the scalar arm — pinned bit-exactly by
+/// `incoming_error_gemm_publishes_identical_values`.
+///
+/// FALLBACKS (return `Ok(None)` => caller runs the scalar arm):
+/// - any ±inf/NaN-poisoned input element: the scalar arm's `err·0 -> 0`
+///   zero-dominates-infinity semantics cannot be reproduced by a plain GEMM
+///   (0·inf = NaN there);
+/// - a saturated dual factor (`abs_inflate` non-finite at extreme k).
+///
+/// DEADLINE. Checked at entry, between row tiles (the `gemm_f64_with_deadline`
+/// cadence: tile cost ≤ INCOMING_ERROR_GEMM_TILE_MACS), and before
+/// publication, with the same typed message as the scalar arm.
+const INCOMING_ERROR_GEMM_TILE_MACS: usize = 1 << 24;
+
+fn incoming_error_product_gemm(
+    error: &Array2<f32>,
+    column_offset: usize,
+    contraction: usize,
+    w_abs: &Mat<f32>,
+    deadline: Option<Instant>,
+) -> Result<Option<Array2<f32>>> {
+    use faer::linalg::matmul::matmul;
+    let check = || {
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            Err(NyError::DeadlineExceeded(
+                "Linear CROWN backward: deadline exceeded during incoming-error composition"
+                    .to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let rows = error.nrows();
+    let out_cols = w_abs.ncols();
+    let k = contraction;
+    if rows == 0 || out_cols == 0 || k == 0 {
+        return Ok(Some(Array2::<f32>::zeros((rows, out_cols))));
+    }
+    let (gamma, abs_inflate) = incoming_error_dual_factors(k);
+    if !gamma.is_finite() || !abs_inflate.is_finite() {
+        return Ok(None);
+    }
+    // Sanitize with the scalar arm's exact element map; refuse the lane on any
+    // non-finite element (zero-dominates-infinity is the scalar arm's job).
+    let mut a = vec![0.0f64; rows * k];
+    let mut all_zero = true;
+    for i in 0..rows {
+        for kk in 0..k {
+            let v = nonnegative_f32_error_or_infinity(error[[i, column_offset + kk]]);
+            if !v.is_finite() {
+                return Ok(None);
+            }
+            if v != 0.0 {
+                all_zero = false;
+            }
+            a[i * k + kk] = v;
+        }
+    }
+    if all_zero {
+        // Exact zero product: publish the scalar arm's zero verbatim.
+        return Ok(Some(Array2::<f32>::from_elem(
+            (rows, out_cols),
+            publish_error_up_normal(0.0),
+        )));
+    }
+    check()?;
+    let mut b = vec![0.0f64; k * out_cols];
+    for kk in 0..k {
+        for j in 0..out_cols {
+            let v = nonnegative_f32_error_or_infinity(w_abs[(kk, j)]);
+            if !v.is_finite() {
+                return Ok(None);
+            }
+            b[kk * out_cols + j] = v;
+        }
+    }
+    check()?;
+    let b_mat = faer::MatRef::from_row_major_slice(&b, k, out_cols);
+    let dual_scale = 1.0 + gamma * abs_inflate * INCOMING_ERROR_SLACK_F64;
+    let mut product = Array2::<f32>::zeros((rows, out_cols));
+    let rows_per = (INCOMING_ERROR_GEMM_TILE_MACS / k.saturating_mul(out_cols).max(1)).max(1);
+    let mut i0 = 0usize;
+    while i0 < rows {
+        check()?;
+        let tile_rows = rows_per.min(rows - i0);
+        let a_blk =
+            faer::MatRef::from_row_major_slice(&a[i0 * k..(i0 + tile_rows) * k], tile_rows, k);
+        let mut dst = Mat::<f64>::zeros(tile_rows, out_cols);
+        matmul(
+            &mut dst,
+            faer::Accum::Replace,
+            a_blk,
+            b_mat,
+            1.0,
+            crate::faer_parallelism::current_par(),
+        );
+        for i in 0..tile_rows {
+            for j in 0..out_cols {
+                // Non-negative inputs: a negative RN sum is impossible; clamp
+                // defensively so the dual bound never shrinks below zero.
+                let acc = dst[(i, j)].max(0.0);
+                product[[i0 + i, j]] = publish_error_up_normal(acc * dual_scale);
+            }
+        }
+        i0 += tile_rows;
+    }
+    check()?;
+    Ok(Some(product))
+}
+
 pub(crate) fn incoming_error_product(
     error: &Array2<f32>,
     column_offset: usize,
@@ -1065,14 +1243,22 @@ pub(crate) fn incoming_error_product(
     deadline: Option<Instant>,
 ) -> Result<Array2<f32>> {
     let probe_start = Instant::now();
-    let result = incoming_error_product_with_poll_quantum(
-        error,
-        column_offset,
-        contraction,
-        w_abs,
-        deadline,
-        INCOMING_ERROR_POLL_MACS,
-    );
+    // #err-compose-gemm: production takes the GEMM lane; `Ok(None)` (a poisoned
+    // element or saturated dual factor) falls back to the scalar stepped arm,
+    // and tests that pass an explicit poll quantum pin the scalar arm directly.
+    let result =
+        match incoming_error_product_gemm(error, column_offset, contraction, w_abs, deadline) {
+            Ok(Some(product)) => Ok(product),
+            Ok(None) => incoming_error_product_with_poll_quantum(
+                error,
+                column_offset,
+                contraction,
+                w_abs,
+                deadline,
+                INCOMING_ERROR_POLL_MACS,
+            ),
+            Err(error) => Err(error),
+        };
     INCOMING_ERR_NANOS.fetch_add(
         u64::try_from(probe_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
         std::sync::atomic::Ordering::Relaxed,
@@ -2375,7 +2561,10 @@ fn propagate_linear_via_gemm(
 
 #[cfg(test)]
 mod aw_f32_sound_tests {
-    use super::{aw_f32_sound_bound, aw_f64_with_abssum, gamma_n_f32, gamma_n_f64};
+    use super::{
+        aw_batched_f64_with_abssum, aw_f32_sound_bound, aw_f64_with_abssum, gamma_n_f32,
+        gamma_n_f64,
+    };
     use faer::Mat;
 
     /// Dependency-free deterministic PRNG (SplitMix64) so the differential
@@ -2401,6 +2590,62 @@ mod aw_f32_sound_tests {
     /// This is the term that makes `aw_f32_sound_bound` sound when `f32_gemm_rn`
     /// dispatches to a subnormal-input-flushing f32 backend — a pure result-flush
     /// floor (`c·2^-126`, magnitude-independent) cannot cover it.
+    /// THE moat for #iso-batched-rebound: every per-domain block of the stacked
+    /// [`aw_batched_f64_with_abssum`] product — BOTH the coefficient matrix `a64`
+    /// AND the certified-error base `s` — must be BIT-IDENTICAL (raw f64 bits) to
+    /// the per-domain [`aw_f64_with_abssum`] reference the shortcut rebound runs
+    /// today. This is the faer row-count-independence property the whole batched
+    /// forward relies on for its byte-identical parity gate. Varied shapes cover
+    /// the iso backward regime: tiny input GEMMs (`p=5`), square intermediates,
+    /// and mixed signs (so `s ≫ |a64|`, exercising cancellation).
+    #[test]
+    fn aw_batched_matches_per_domain_bit_for_bit() {
+        use ndarray::Array2;
+        // (m, k, p): m = target/spec rows, k = layer width, p = in-features.
+        let shapes: &[(usize, usize, usize)] = &[
+            (5, 50, 5),
+            (50, 50, 50),
+            (7, 100, 6),
+            (13, 64, 5),
+            (50, 5, 5),
+            (1, 128, 5),
+        ];
+        let batches: &[usize] = &[1, 4, 33, 128];
+        for &(m, k, p) in shapes {
+            for &n_domains in batches {
+                let mut rng =
+                    SplitMix64(0xA5A5_1234 ^ ((m * 131 + k * 17 + p * 7 + n_domains) as u64));
+                // Shared weight (all domains share the layer weight).
+                let w = Mat::<f32>::from_fn(k, p, |_, _| rng.signed(4.0));
+                // Per-domain coefficient blocks, stacked row-major.
+                let a_stacked = Mat::<f32>::from_fn(n_domains * m, k, |_, _| rng.signed(4.0));
+
+                let (a64_b, s_b) = aw_batched_f64_with_abssum(&a_stacked, &w);
+                assert_eq!(a64_b.dim(), (n_domains * m, p));
+                assert_eq!(s_b.dim(), (n_domains * m, p));
+
+                for d in 0..n_domains {
+                    let a_d = Mat::<f32>::from_fn(m, k, |i, j| a_stacked[(d * m + i, j)]);
+                    let (a64_ref, s_ref): (Array2<f64>, Array2<f64>) = aw_f64_with_abssum(&a_d, &w);
+                    for i in 0..m {
+                        for j in 0..p {
+                            assert_eq!(
+                                a64_b[[d * m + i, j]].to_bits(),
+                                a64_ref[[i, j]].to_bits(),
+                                "a64 mismatch shape=({m},{k},{p}) batch={n_domains} dom={d} [{i},{j}]"
+                            );
+                            assert_eq!(
+                                s_b[[d * m + i, j]].to_bits(),
+                                s_ref[[i, j]].to_bits(),
+                                "s mismatch shape=({m},{k},{p}) batch={n_domains} dom={d} [{i},{j}]"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn daz_operand_flush_floor_over_bounds_worst_case() {
         use super::daz_operand_flush_floor;
@@ -2767,11 +3012,13 @@ mod faer_f64_aw_tests {
         aw_f64_with_abssum, aw_f64_with_abssum_and_deadline,
         aw_f64_with_abssum_cpu_deadline_scalar, aw_f64_with_abssum_deadline_via_engine_or_cpu,
         aw_via_engine_deadline, deadline_f64_accelerator_eligible, f32_to_f64_exact, gamma_n_f64,
-        incoming_error_product, incoming_error_product_deadline, next_up_nonnegative_f64,
-        DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS, SOUND_F64_GEMM_MIN_MACS,
+        incoming_error_product, incoming_error_product_deadline, incoming_error_product_gemm,
+        incoming_error_product_with_poll_quantum, next_up_nonnegative_f64,
+        DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS, INCOMING_ERROR_POLL_MACS,
+        SOUND_F64_GEMM_MIN_MACS,
     };
     use faer::Mat;
-    use ndarray::arr2;
+    use ndarray::{arr2, Array2};
     use ny_core::{GemmEngine, NyError, Result};
     use ny_tensor::next_up_f32;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3315,6 +3562,112 @@ mod faer_f64_aw_tests {
         assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
     }
 
+    /// #err-compose-gemm equivalence pin: the GEMM lane must publish EXACTLY
+    /// the f32 values the scalar stepped arm publishes, across zeros,
+    /// subnormals, and normal magnitudes (the inertness claim of the withdrawn
+    /// #cgan-row7-h4 analysis, now load-bearing). Deterministic LCG inputs.
+    #[test]
+    fn incoming_error_gemm_publishes_identical_values() {
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next_f32 = |zero_every: u64| -> f32 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = (state >> 40) as f32 / (1u64 << 24) as f32;
+            if state.is_multiple_of(zero_every) {
+                0.0
+            } else if state.is_multiple_of(7) {
+                f32::from_bits(((state >> 8) as u32) & 0x007f_ffff) // subnormal
+            } else {
+                r * 3.0
+            }
+        };
+        for &(rows, k, cols) in &[
+            (1usize, 1usize, 1usize),
+            (3, 5, 4),
+            (8, 33, 7),
+            (2, 4096, 3),
+        ] {
+            let error = Array2::from_shape_fn((rows, k + 2), |_| next_f32(5));
+            let mut w_abs = Mat::<f32>::zeros(k, cols);
+            for kk in 0..k {
+                for j in 0..cols {
+                    w_abs[(kk, j)] = next_f32(4);
+                }
+            }
+            let gemm = incoming_error_product_gemm(&error, 1, k, &w_abs, None)
+                .expect("gemm lane must not error without a deadline")
+                .expect("finite inputs must take the gemm lane");
+            let scalar = incoming_error_product_with_poll_quantum(
+                &error,
+                1,
+                k,
+                &w_abs,
+                None,
+                INCOMING_ERROR_POLL_MACS,
+            )
+            .expect("scalar arm");
+            for i in 0..rows {
+                for j in 0..cols {
+                    assert_eq!(
+                        gemm[[i, j]].to_bits(),
+                        scalar[[i, j]].to_bits(),
+                        "published divergence at ({i},{j}) rows={rows} k={k} cols={cols}:                          gemm={} scalar={}",
+                        gemm[[i, j]],
+                        scalar[[i, j]],
+                    );
+                }
+            }
+        }
+    }
+
+    /// A poisoned (infinite) element must refuse the GEMM lane so the scalar
+    /// arm's zero-dominates-infinity semantics stay authoritative.
+    #[test]
+    fn incoming_error_gemm_refuses_poisoned_inputs_to_the_scalar_arm() {
+        let mut error = Array2::from_elem((2, 4), 0.5f32);
+        error[[1, 2]] = f32::INFINITY;
+        let mut w_abs = Mat::<f32>::zeros(3, 2);
+        w_abs[(0, 0)] = 1.0;
+        let lane = incoming_error_product_gemm(&error, 1, 3, &w_abs, None).expect("no deadline");
+        assert!(
+            lane.is_none(),
+            "poisoned input must fall back to the scalar arm"
+        );
+        // And the full entry point still answers (via the scalar arm).
+        let full = incoming_error_product(&error, 1, 3, &w_abs, None).expect("entry point");
+        assert_eq!(full.nrows(), 2);
+    }
+
+    /// An expired deadline refuses the GEMM lane with the same typed message
+    /// the scalar arm uses.
+    #[test]
+    fn incoming_error_gemm_refuses_expired_deadline() {
+        let error = Array2::from_elem((4, 6), 0.25f32);
+        let w_abs = Mat::<f32>::zeros(5, 4);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("clock is past the epoch");
+        let err = incoming_error_product_gemm(&error, 1, 5, &w_abs, Some(expired))
+            .expect_err("expired deadline must refuse");
+        assert!(matches!(err, NyError::DeadlineExceeded(_)));
+    }
+
+    // WAS DORMANT — this function carried no `#[test]` and had NEVER RUN. A
+    // duplicated `#[test]` on the function above was masking it from clippy's
+    // dead-code pass; removing that duplicate surfaced it. (Found twice
+    // independently on 2026-08-18.)
+    //
+    // It is ENABLED because the open question has now been answered by running
+    // it: it PASSES. The concern against enabling it was that its outcome was
+    // unknown and a guess could turn the gate red everywhere — that concern was
+    // right, and it is settled by measurement rather than by assumption.
+    // Measured on ny-propagate --lib, faer_f64_aw_tests 15/15.
+    //
+    // Worth keeping live: it asserts an incoming-error product REJECTS a
+    // negative subnormal weight (poisoning to +inf) and PRESERVES a positive
+    // one — a sign/subnormal guard in the certified error path, which is
+    // exactly the class of check that silently rotting is worst for.
     #[test]
     fn incoming_error_product_rejects_negative_subnormal_and_preserves_positive_one() {
         let weights = Mat::<f32>::from_fn(1, 1, |_i, _j| 2.0_f32.powi(120));

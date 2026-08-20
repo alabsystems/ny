@@ -756,6 +756,71 @@ pub(crate) fn try_apply_patches_residual_passthrough_with_deadline(
     )
 }
 
+/// #deadline-preserve telemetry (BUG #18, docs/DEADLINE_PRESENCE_FIX_2026-08-19.md).
+///
+/// Saved-vs-discarded counts for one hard-finite-authority set-mate set:
+/// `saved` = the optimized/native route was KEPT under a live deadline (the
+/// historical deadline-PRESENCE guard would have discarded the optimizer's
+/// work), `discarded` = the refusal fired (deadline expired, or the expiry
+/// lever for that set is disarmed). Recording happens strictly AFTER the
+/// decision and never touches a bound value or a route, so it cannot affect
+/// soundness or the verdict — it only makes the decision observable (rule R9:
+/// a null from a lever with no engagement signal is vacuous; these counts are
+/// the set's own engagement observable).
+///
+/// Rate-limited by construction: a line is printed only when the just-bumped
+/// counter crosses a power of two, so a million-decision run emits ~20 lines.
+pub(crate) struct DeadlinePreserveCounters {
+    set: &'static str,
+    saved: std::sync::atomic::AtomicU64,
+    discarded: std::sync::atomic::AtomicU64,
+}
+
+impl DeadlinePreserveCounters {
+    pub(crate) const fn new(set: &'static str) -> Self {
+        Self {
+            set,
+            saved: std::sync::atomic::AtomicU64::new(0),
+            discarded: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn record(&self, discarded: bool) {
+        use std::sync::atomic::Ordering;
+        let bumped = if discarded {
+            &self.discarded
+        } else {
+            &self.saved
+        };
+        let after = bumped.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if after.is_power_of_two() {
+            eprintln!(
+                "[deadline-preserve] {}: saved={} discarded={}",
+                self.set,
+                self.saved.load(Ordering::Relaxed),
+                self.discarded.load(Ordering::Relaxed),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.saved.load(Ordering::Relaxed),
+            self.discarded.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// The graph-lane patches/alpha set-mate set (audit root causes A+B — the two
+/// alpha-discarding causes: the residual fan-out densification and the
+/// Patches-ReLU optimized-alpha discard). All three graph-lane sites route
+/// their refusal through `patches_finite_authority_refuses` below, so one
+/// counter pair covers the whole set and cannot under-report a drifted mate.
+static PATCHES_ALPHA_GRAPH_PRESERVE: DeadlinePreserveCounters =
+    DeadlinePreserveCounters::new("patches-alpha-graph");
+
 /// #residual-patches-expiry: does finite authority refuse the native residual
 /// Patches fan-out?
 ///
@@ -773,10 +838,17 @@ pub(crate) fn patches_finite_authority_refuses(
     if !deadline_is_hard {
         return false;
     }
-    if crate::network::core::sequential::crown::patches_step::expiry_authority_armed() {
-        return deadline.is_some_and(|limit| Instant::now() >= limit);
-    }
-    true
+    let refuses = if crate::network::core::sequential::crown::patches_step::expiry_authority_armed()
+    {
+        deadline.is_some_and(|limit| Instant::now() >= limit)
+    } else {
+        true
+    };
+    // [deadline-preserve] BUG #18: count the decision either way. Hard
+    // authority only — a soft internal timestamp never carried an optimizer
+    // state to preserve. Recording is after the decision; routing unchanged.
+    PATCHES_ALPHA_GRAPH_PRESERVE.record(refuses);
+    refuses
 }
 
 /// Conservative retained-footprint admission for the native residual fan-out.
@@ -853,14 +925,19 @@ pub(crate) fn try_apply_patches_residual_passthrough_with_deadline_authority(
     // disappears and the SAME decline reappears one node later at
     // /layers.2/Reshape, then at the next family, until all five sites sharing
     // the predicate are switched together" (REGRESSION_FC_UNSAT_LOST_2026-08-14).
-    if patches_finite_authority_refuses(deadline_is_hard, deadline) {
-        return Ok(false);
-    }
-
+    // Carrier check FIRST: a Dense carrier returns Ok(false) either way, and
+    // asking the refusal predicate only when a Patches carrier is actually at
+    // stake keeps the [deadline-preserve] saved/discarded counts meaning "a
+    // structured carrier was preserved/discarded", not "this helper was called".
+    // Order swap is behavior-identical — both checks return Ok(false).
     let pb = match node_cb {
         CrownBounds::Patches(pb) => pb,
         CrownBounds::Dense(_) => return Ok(false),
     };
+
+    if patches_finite_authority_refuses(deadline_is_hard, deadline) {
+        return Ok(false);
+    }
 
     // The invariant the original guard was protecting, restated and kept: the
     // legacy fan-out helper neither polls a deadline nor charges the

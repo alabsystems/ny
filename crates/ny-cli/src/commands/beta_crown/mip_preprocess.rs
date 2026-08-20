@@ -721,6 +721,8 @@ mod tests {
         value
     }
 
+    // Reached only via `audit_external_acas_fold`, itself `external-vnncomp`.
+    #[cfg(feature = "external-vnncomp")]
     fn eval_foldable_network_exact(network: &Network, input: &[f32]) -> Vec<BigRational> {
         let mut value = input
             .iter()
@@ -780,6 +782,8 @@ mod tests {
         value
     }
 
+    // Reached only from the `external-vnncomp` audits in this module.
+    #[cfg(feature = "external-vnncomp")]
     fn eval_folded_mip_exact(folded: &FoldedMipNetwork, input: &[f32]) -> Vec<BigRational> {
         let mut value = input
             .iter()
@@ -822,6 +826,8 @@ mod tests {
         value
     }
 
+    // Reached only from the `external-vnncomp` audits in this module.
+    #[cfg(feature = "external-vnncomp")]
     fn eval_folded_mip_f64(folded: &FoldedMipNetwork, input: &[f64]) -> Vec<f64> {
         let mut value = input.to_vec();
         let mut bias_index = 0usize;
@@ -1106,6 +1112,8 @@ mod tests {
         assert!(matches!(&folded.layers()[1], Layer::Linear(_)));
     }
 
+    // Reached only from the `external-vnncomp` audits below.
+    #[cfg(feature = "external-vnncomp")]
     fn audit_external_acas_fold(
         model_path: &std::path::Path,
         vnnlib_path: Option<&std::path::Path>,
@@ -1192,6 +1200,8 @@ mod tests {
         );
     }
 
+    // Reached only from the `external-vnncomp` ACAS v2 row audits below.
+    #[cfg(feature = "external-vnncomp")]
     fn audit_external_acas_v2_row(row_index: usize, onnx: &str) {
         let version_root = std::env::var_os("NY_TEST_ACAS_V2_ROOT")
             .expect("set NY_TEST_ACAS_V2_ROOT when running this external conformance audit");

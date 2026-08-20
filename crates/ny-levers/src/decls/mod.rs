@@ -16,12 +16,15 @@
 //! [`crate::LeverSet`] migrations; that claim begins only when the same frozen
 //! set is threaded to both the reader and the scored receipt.
 
+pub mod bab_budget;
+pub mod cgan_stacked;
 pub mod collection;
 pub mod comprehensive_rows;
 pub mod cuda;
 pub mod dark_probes;
 pub mod diagnostics;
 pub mod graph_mip;
+pub mod margin_row;
 pub mod measurement;
 pub mod onnx;
 pub mod root_alpha;
@@ -33,12 +36,15 @@ pub mod wide_lane;
 use crate::Registry;
 
 static REGISTRIES: &[&Registry] = &[
+    &bab_budget::BAB_BUDGET_LEVERS,
+    &cgan_stacked::CGAN_STACKED_LEVERS,
     &collection::COLLECTION_LEVERS,
     &comprehensive_rows::COMPREHENSIVE_ROWS_LEVERS,
     &cuda::CUDA_LEVERS,
     &dark_probes::DARK_PROBE_LEVERS,
     &diagnostics::DIAGNOSTIC_LEVERS,
     &graph_mip::GRAPH_MIP_LEVERS,
+    &margin_row::MARGIN_ROW_LEVERS,
     &measurement::MEASUREMENT_LEVERS,
     &onnx::ONNX_LEVERS,
     &root_alpha::ROOT_ALPHA_LEVERS,
@@ -62,7 +68,7 @@ mod tests {
         let all = crate::all();
         assert_eq!(
             all.len(),
-            57,
+            88,
             "Phase 0 declared two levers; batch B1 prep adds five telemetry declarations; \
              true-gradient GPU replay adds one governed legacy-armed selector; collection \
              policy prep adds three centrally parsed compatibility overrides; terminal-Softmax \
@@ -86,14 +92,28 @@ mod tests {
              the #comprehensive-rows-probe measurement program adds five High-risk dark \
              overrides, and two presence-parser gates are declared as such rather than \
              rounded to exact-\"1\" booleans; the finite-Patches authority repair adds \
-             one dark High-risk gate whose armed arm is measured verdict-neutral; and the \
+             one High-risk gate that now SHIPS ARMED on measured evidence, with exact \
+             \"0\" as its kill switch; and the \
              sign-space minimal-move lever adds one dark Low-risk A/B shape switch, whose \
              null result is explained by one more presence-gated row-generation trace, and \
              whose SIDEWAYS half is A/B'd by one more dark Low-risk enum selecting the \
              realizability LP's pixel-column bounds; and the hunt for the sites that \
              densify a conv carrier adds one dark Low-risk print-only Patches->Dense \
-             carrier trace"
+             carrier trace; and the STE-PGD \
+             falsification lane over that same admitted fragment adds one dark \
+             High-risk env-only attack gate; and the #bab-floor root-window arbitration adds \
+             three dark High-risk closed-interval fractions -- one arming reservation for \
+             branch-and-bound plus the two shares (root objective pass, root-alpha bootstrap \
+             ceiling) that have to be named for that reservation to be reachable; and the pre-Softmax attack objective adds one \
+             dark High-risk scoring gate; and the ported falsification portfolio adds one \
+             dark High-risk strategy gate; and the cross-lane marginal-value \
+             scheduler over the attack slice adds one dark High-risk env-only \
+             admission; and LAYER A of the per-instance lane budget allocator -- the \
+             multiple-choice knapsack that commits every attack-slice cap jointly and \
+             up front -- adds one more dark High-risk env-only admission beside it"
         );
+        assert!(all.get("NY_LANE_VALUE_SCHEDULER").is_some());
+        assert!(all.get("NY_LANE_BUDGET_ALLOCATOR").is_some());
         assert!(all.get("NY_BNN_SIGN_SPACE_MINIMAL_MOVE").is_some());
         assert!(all.get("NY_BNN_SIGN_SPACE_TRUST_REGION").is_some());
         assert!(all.get("NY_BNN_SIGN_SPACE_TRACE").is_some());
@@ -140,6 +160,9 @@ mod tests {
         assert!(all.get("NY_STAR_DARK_EXACT_BELOW").is_some());
         assert!(all.get("NY_CUDA_DISCRETE_MODE").is_some());
         assert!(all.get("NY_FULL_MEASUREMENTS").is_some());
+        assert!(all.get("NY_BAB_RESERVE_FRAC").is_some());
+        assert!(all.get("NY_ROOT_SPEC_FRAC").is_some());
+        assert!(all.get("NY_ROOT_ALPHA_FRAC").is_some());
     }
 
     #[test]

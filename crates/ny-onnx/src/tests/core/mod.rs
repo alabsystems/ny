@@ -180,6 +180,14 @@ mod fusion;
     feature = "external-vnncomp",
     feature = "external-wgpu"
 ))]
+// Admitted by ANY of three lanes, but its helpers split across them: the device
+// helpers serve wgpu, the corpus helpers serve vnncomp. Any SINGLE lane leaves
+// the other lane's helpers legitimately dead, so the allowance covers every
+// build short of both. Same idiom as `cnn` above, for external-vnncomp.
+#[cfg_attr(
+    not(all(feature = "external-vnncomp", feature = "external-wgpu")),
+    allow(dead_code, unused_imports)
+)]
 mod gpu_crown;
 #[cfg(all(feature = "external-vnncomp", feature = "external-wgpu"))]
 mod gpu_crown_graph;

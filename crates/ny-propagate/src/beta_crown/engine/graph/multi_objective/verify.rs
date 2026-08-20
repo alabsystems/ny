@@ -645,6 +645,36 @@ impl BetaCrownVerifier {
                 failing.len(),
                 show
             );
+            // The failing set alone cannot say whether a near-complete census is
+            // a CLIFF or a CONTINUUM, and the two want opposite work. If the
+            // verified objectives clear zero by a wide margin the survivors are
+            // structurally different and more of the same tightening will not
+            // reach them; if the distribution runs right up to zero they are the
+            // tail of one gradient and more tightening might. Measured on
+            // cifar100 idx_2176 at 97/99, seven independent root mechanisms all
+            // stalled at the same two objectives, which is the question this
+            // line exists to answer. Print-only, same gate, no bound touched.
+            let mut passing: Vec<f32> = root_domain
+                .objective_bounds
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| root_domain.verified.get(*i).copied().unwrap_or(false))
+                .map(|(_, (lo, _))| *lo)
+                .collect();
+            if !passing.is_empty() {
+                passing.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let pick = |q: f64| passing[((passing.len() - 1) as f64 * q).round() as usize];
+                eprintln!(
+                    "[NY_ACASXU_PROF] MULTI-OBJ root verified-margin distribution: \
+                     n={} min={:.6} p10={:.6} p50={:.6} p90={:.6} max={:.6}",
+                    passing.len(),
+                    passing[0],
+                    pick(0.10),
+                    pick(0.50),
+                    pick(0.90),
+                    passing[passing.len() - 1]
+                );
+            }
         }
         let mut last_tick = Instant::now();
 

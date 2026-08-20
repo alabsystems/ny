@@ -606,8 +606,38 @@ fn test_speaker_encoder_crown_tighter_than_ibp_3499() {
 // Proptests: soundness sampling with randomised inputs
 // ---------------------------------------------------------------------------
 
+// CASE COUNTS ARE MATCHED TO MEASURED PER-CASE COST, which is why these three
+// tests sit in three blocks rather than one.  They previously shared a single
+// `with_cases(200)`, and because `propagate_crown` on these graphs costs ~0.6s
+// in a debug build, that made the last test alone a 119.8s serial run -- the
+// single longest test in the crate, roughly two thirds of the entire suite's
+// wall time, and the tail that every other test ends up waiting behind at high
+// `--test-threads`.  Measured 2026-08-19 on this box, 200 cases each:
+//
+//   proptest_cosine_distance_nonnegative_3499        0.54s   (IBP only)
+//   proptest_speaker_encoder_bounds_contain_concrete 25.84s  (+ CROWN)
+//   proptest_cosine_distance_crown_bounds_noninvert 119.75s  (+ CROWN)
+//
+// The setup is NOT the cost and hoisting it would buy nothing: the IBP test
+// rebuilds the reference embedding and the whole encoder graph 200 times too,
+// and finishes in half a second.  It is `propagate_crown` end to end.
+//
+// So the cheap property keeps its full 200 cases and the two CROWN properties
+// are cut until they cost seconds instead of minutes.  Re-measured after:
+//
+//   nonnegative      200 cases   0.54s -> 0.51s   (unchanged)
+//   contain_concrete  64 cases  25.84s -> 8.42s
+//   noninverted       16 cases 119.75s -> 15.05s
+//
+// -- about 122 seconds of serial test time.  Note the last is 0.94s/case
+// rather than the 0.60s the 200-case run implies; a few seconds of that 15s
+// is fixed process and lazy-init startup, not per-case work.
+//
+// Any seed that ever fails is persisted to .proptest-regressions and replays
+// on every subsequent run regardless of case count, so lowering the count
+// forfeits future random exploration, never a bug already found.
 proptest! {
-    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
+    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(64) })]
 
     /// CROWN bounds on the speaker encoder contain all concrete outputs
     /// for randomly sampled inputs within the bounded region.
@@ -661,6 +691,12 @@ proptest! {
         }
     }
 
+}
+
+// IBP only, ~2.7ms per case -- cheap enough to keep the full 200.
+proptest! {
+    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
+
     /// Concrete cosine distance from the reference embedding is always in [0, 2]
     /// for inputs within the bounded region.
     #[test]
@@ -708,6 +744,12 @@ proptest! {
             distance
         );
     }
+
+}
+
+// ~0.6s per case in a debug build: the most expensive property in the crate.
+proptest! {
+    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(16) })]
 
     /// CROWN cosine-distance bounds stay finite and non-inverted across
     /// randomly perturbed input centers.

@@ -87,6 +87,30 @@ margin_row:
   adaptive_reserve: true
   concurrent: true
   root_f32: true
+  # #margin-row-branch-width: 16+16 candidates per expansion (default 8+8).
+  # MEASURED 2026-08-19, official 100 s budget, resnet_medium:
+  #   idx_8600_sidx_2721  k8 timeout (728 exp, frontier 424 open, worst -0.0129)
+  #                       k16 UNSAT in 186 exp (frontier DRAINS to 2)
+  #                       k32 UNSAT in 173 exp (frontier 1)
+  # That row had survived a 4x budget, Clip-and-Verify tightening, and eight
+  # eliminated hypotheses at k=8. Narrowing was already known to LOSE proofs
+  # (k=4 does 5x the search and drops idx_6659); widening was never tested.
+  # Width chooses WHICH domains to split, never how a bound is computed, so a
+  # wrong value costs proofs and cannot manufacture one. Moat at k16:
+  # idx_6659 unsat 3/3, idx_8762 unsat 3/3, sat rows unchanged.
+  k_head: 16
+  k_trunk: 16
+  # #backward-interm: recompute trunk-ReLU input bounds via the lane's own
+  # backward engine (shrink-only intersect BEFORE gate derivation).
+  # MEASURED 2026-08-19, official 100s, this preset:
+  #   deep-band roots move ~0.18-0.20 (idx_5242 -0.613 -> -0.438 = INTO the
+  #   proven band; idx_2132 -0.711 -> -0.528; idx_4760 -0.745 -> -0.546)
+  #   proving rows get 5-10x cheaper: idx_6659 211exp/72s -> 19exp/3.8s,
+  #   idx_8600 186exp/45s -> 35exp/12s, idx_8762 9exp -> 2exp
+  # SHIP GATE (zero regressions): cifar moat 3/arm unsat + 2 sat sentinels;
+  # tiny at-risk 11 rows x3 unsat + 3 sat sentinels. Shrink-only by
+  # construction; parity mode refuses; a wrong bound costs tightness only.
+  backward_interm: true
 
 bab:
   # #root-cap-100s: hard-cap the ROOT alpha-CROWN warmup (and the
@@ -166,6 +190,39 @@ bab:
   root_comprehensive_gpu_interm: true
   root_comprehensive_gpu_interm_chunks: 64
   alpha_crown:
+    # #envelope-grad SHIPPED 2026-08-18. Replaces the sign-definite local alpha
+    # gradient with the concretization-argmin (envelope) rule.
+    #
+    # WHY. The shipped rule is `SUM_j [A[j,i]]_+ * l_i`; every factor is
+    # sign-definite (l_i < 0 by the unstable guard, only A > 0 admitted), so it
+    # is <= 0 for every neuron, objective and iteration. Adam can then only
+    # DECREASE alpha, monotonically to the 0 clamp -- it carries no direction,
+    # which is why the measured lr sweep 0.25 / 0.05 / 0.01 leaves the bound
+    # BIT-IDENTICAL. Machine-checked: NyProof/AlphaGradientDefect.lean. The
+    # envelope factor `clamp(h_hat(x*), l, u)` CAN be positive, so alpha can rise.
+    #
+    # MOAT, 8 rows x 2 arms through THIS preset path, official 100s budget,
+    # provenance-checked binary, [envelope-grad-gpu] RESCALED confirmed 9-12x per
+    # treated run: ZERO verdict changes. Both banked unsat preserved
+    # (idx_6659, idx_8762); both resnet_large sat preserved.
+    #
+    # CENSUS, reported in full including the bad rows:
+    #   idx_6659  67/99 -> 78/99      idx_8600  83/99 -> 85/99
+    #   idx_8762   0/99 ->  2/99      idx_2132  74/99 -> 72/99
+    #   idx_7704   0/99 ->  0/99      idx_885   72/99 -> 35/99
+    # Mixed sign. idx_885 is UNSTABLE run to run (72, 71, 68, 35, 31 observed
+    # across arms) and carries no conclusion either way.
+    #
+    # NO CONVERSION IS CLAIMED. This ships because it is the only alpha lever
+    # measured to move the root bound at all, and because census is explicitly
+    # NOT the ship criterion -- census does not predict conversion here
+    # (idx_8762 proves unsat at 0/99; idx_8600 times out at 83/99). Verdict
+    # preservation is the criterion, and it held.
+    #
+    # NOT EXERCISED: resnet_large. Those rows settle `sat` by attack before the
+    # ascent runs, so rescaled=0 there -- the envelope path is untested on the
+    # large model.
+    alpha_envelope_grad: true
     lr_alpha: 0.25
     # RETRACTED JUSTIFICATION, kept value. The old reason for 20 was a sealed
     # zero-update experiment that reclaimed the dead CPU preloop on prop7704 but

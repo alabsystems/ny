@@ -367,9 +367,20 @@ fn public_loader_rejects_initializer_node_output_collisions() {
         "{error}"
     );
 
+    // The node here must itself be VALID. A Conv whose W input is "" is
+    // rejected by Conv's OWN arity rule ("requires non-empty X and W ...")
+    // before the loader ever reaches the initializer table, so the previous
+    // fixture asserted the empty-NAME rule while actually exercising Conv
+    // arity — and failed on a message it could never reach. An Add over two
+    // real initializers keeps the graph well-formed, so the empty-named
+    // initializer is what the loader trips on.
     let empty_initializer = encode_tiny_model(
-        vec![onnx_node("conv", "Conv", &["input", ""], &["output"])],
-        vec![float32_tensor("", &[1, 1, 1, 1], &[2.0])],
+        vec![onnx_node("add", "Add", &["lhs", "rhs"], &["output"])],
+        vec![
+            float32_tensor("lhs", &[1], &[2.0]),
+            float32_tensor("rhs", &[1], &[0.0]),
+            float32_tensor("", &[1], &[2.0]),
+        ],
     );
     let error = load_provenance_bytes("empty_initializer.onnx", &empty_initializer)
         .expect_err("an empty initializer name is the ONNX omitted-input sentinel");

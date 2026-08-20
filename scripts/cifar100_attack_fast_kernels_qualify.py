@@ -47,7 +47,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
-import fcntl
 import hashlib
 import io
 import json
@@ -64,6 +63,17 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import pathlib
+
+# Sibling import: make the script directory importable first, exactly as
+# replay_vnncomp2025_counterexample.py does. Without it the module loads when
+# run as a script but not when a test imports it by path.
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import _portable_file_lock as _file_lock  # noqa: E402
+
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_BENCHMARK = REPO / "benchmarks/vnncomp2025/benchmarks/cifar100_2024"
@@ -473,7 +483,7 @@ def campaign_lock(output: Path) -> Iterator[None]:
         raise QualificationError(f"campaign lock must not be a symlink: {lock_path}")
     with lock_path.open("a+b") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _file_lock.lock_exclusive(lock.fileno(), blocking=False)
         except BlockingIOError as error:
             raise QualificationError(f"campaign is already active: {output}") from error
         yield

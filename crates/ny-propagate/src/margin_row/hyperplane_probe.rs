@@ -202,6 +202,7 @@ fn run_inner(net: &TwinNet, root: &RootGates, t: usize, adv: &[usize]) -> Result
             Collect {
                 unst_abs: false,
                 rows: Some(&retained),
+                unst_rows: false,
             },
         )
         .map_err(|e| e.to_string())?;

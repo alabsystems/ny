@@ -536,6 +536,10 @@ fn parse_sha1(value: &str, tensor_name: &str) -> Result<[u8; 20]> {
         )));
     }
     let mut digest = [0u8; 20];
+    // Keep `chunks_exact` for this hex-pair walk; the tippy `as_chunks`
+    // rewrite reshapes the pair type for no clarity gain.
+    #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(pair).map_err(|err| {
             NyError::ModelLoad(format!(

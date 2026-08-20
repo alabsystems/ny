@@ -1625,6 +1625,9 @@ impl GpuBabBoundBackendRegistration {
     }
 }
 
+// trust-1.99 deprecates `fetch_update` (renamed `try_update`); the public
+// 1.95 pin lacks `try_update` — keep the spelling both toolchains accept.
+#[allow(deprecated)]
 fn next_registration_epoch(counter: &AtomicU64) -> Result<u64> {
     counter
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {

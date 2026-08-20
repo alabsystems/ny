@@ -46,6 +46,9 @@ const GATHER_SCORE_CACHE_CAP: usize = 8192;
 /// fails closed instead of wrapping and reusing an identity.
 static NEXT_GATHER_STAGE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+// trust-1.99 deprecates `fetch_update` (renamed `try_update`); the public
+// 1.95 pin lacks `try_update` — keep the spelling both toolchains accept.
+#[allow(deprecated)]
 fn next_gather_stage_token() -> u64 {
     NEXT_GATHER_STAGE_TOKEN
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {

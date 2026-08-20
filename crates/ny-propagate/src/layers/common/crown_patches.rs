@@ -793,14 +793,21 @@ pub(crate) fn crown_elementwise_backward_patches<F>(
 where
     F: Fn(f32, f32) -> crate::layers::activations::LinearRelaxation,
 {
-    crown_elementwise_backward_patches_impl::<false, _, _>(
+    let probe_start = Instant::now();
+    let result = crown_elementwise_backward_patches_impl::<false, _, _>(
         bounds,
         pre_activation,
         relaxation_fn,
         true,
         false,
         &|| Ok(()),
-    )
+    );
+    PATCHES_BWD_NANOS.fetch_add(
+        u64::try_from(probe_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    PATCHES_BWD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    result
 }
 
 /// Cooperative finite-deadline face used for Anchored ReLU carriers and the
@@ -835,14 +842,25 @@ where
             })?
             .checkpoint("during Anchored ReLU Patches backward")
     };
-    crown_elementwise_backward_patches_impl::<true, _, _>(
+    let probe_start = Instant::now();
+    let parallel = explicit_row_deadline_parallel_admitted(crate::imb::region_seq_inner());
+    if !parallel {
+        PATCHES_BWD_SERIAL_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let result = crown_elementwise_backward_patches_impl::<true, _, _>(
         bounds,
         pre_activation,
         relaxation_fn,
-        explicit_row_deadline_parallel_admitted(crate::imb::region_seq_inner()),
+        parallel,
         true,
         &poll,
-    )
+    );
+    PATCHES_BWD_NANOS.fetch_add(
+        u64::try_from(probe_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    PATCHES_BWD_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    result
 }
 
 #[cfg(test)]
@@ -866,6 +884,14 @@ where
         poll,
     )
 }
+
+/// Temporary share probes (read via the collection dump lever).
+pub(crate) static PATCHES_BWD_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PATCHES_BWD_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PATCHES_BWD_SERIAL_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn crown_elementwise_backward_patches_impl<const POLL: bool, F, P>(
     bounds: &PatchesLinearBounds,

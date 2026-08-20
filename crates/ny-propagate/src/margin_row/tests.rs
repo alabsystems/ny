@@ -4769,6 +4769,7 @@ fn epoch_trunk_variant_pointwise_sound_and_correlates() {
             super::engine::Collect {
                 unst_abs: true,
                 rows: Some(&ret),
+                unst_rows: false,
             },
         )
         .expect("direct pass");
@@ -6690,4 +6691,885 @@ mod enclosure_oracle_deep {
         );
     }
     // =================== END DEEP-RESIDUAL ADVERSARIAL ENCLOSURE ORACLE =========
+}
+
+// ===========================================================================
+// #alpha-opt: fractional-alpha soundness + optimizer invariants (no GPU).
+// ===========================================================================
+
+/// Fractional lower lines are valid DeepPoly relaxations for ANY `alpha` in
+/// `[0, 1]` — checked on a grid, together with the repaired upper chord.
+#[test]
+fn fractional_alpha_gates_sound_on_grid() {
+    use super::root::{gates_from_box, repair_upper_lines};
+    for &l in &[-2.0, -1.0, -0.3, -1e-3] {
+        for &u in &[1e-3, 0.4, 1.0, 2.5] {
+            let (_a, mut s, mut c) = gates_from_box(&[l], &[u]);
+            repair_upper_lines(&[l], &[u], &mut s, &mut c);
+            for alpha in [0.0, 0.125, 0.3, 0.5, 0.75, 0.99, 1.0] {
+                for gi in 0..=100 {
+                    let y = l + (u - l) * (gi as f64) / 100.0;
+                    let relu = y.max(0.0);
+                    assert!(
+                        alpha * y <= relu + 1e-15,
+                        "lower line above relu: alpha={alpha} y={y} on [{l}, {u}]"
+                    );
+                    assert!(
+                        s[0] * y + c[0] >= relu - 1e-12,
+                        "repaired chord below relu: y={y} on [{l}, {u}]"
+                    );
+                }
+                // The lower line is valid on ALL of R (box-independent), which
+                // is why a frozen tableau stays sound under a changed backward
+                // alpha.
+                for y in [-10.0, -1.0, 0.0, 1.0, 10.0] {
+                    assert!(alpha * y <= y.max(0.0) + 1e-15);
+                }
+            }
+        }
+    }
+}
+
+/// The certified Outward pass stays SOUND under handcrafted fractional trunk
+/// alpha (with `ms = max(alpha, s)` re-derived): every per-class certified
+/// lower bound must sit under the true margin at sampled box points.
+#[test]
+fn fractional_alpha_backward_pass_sound_vs_samples() {
+    let mut rng = StdRng::seed_from_u64(97);
+    let spec = tiny_spec(&mut rng, 0.65);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let eng = BackwardEngine::new(&net, &root);
+    let (t, adv) = (0usize, vec![1usize, 2, 3]);
+    let mb = MarginBatch::new(&net, t, &adv).expect("mb");
+    let (al, au) = eng.y_rows(None).expect("y_rows");
+    let ybox = YBox::from_rows(&eng, &al, &au);
+    let gates = head_gates(&ybox, RoundMode::Outward);
+    let ms = margin_seed(&mb, &gates, &ybox, RoundMode::Outward);
+    // Fractional alpha on every unstable neuron; `ms` re-derived per the root
+    // formula. Stable neurons keep their exact lines.
+    let mut dg = super::engine::DomainGates::default();
+    for (li, layer) in root.layers.iter().enumerate() {
+        if layer.unst.is_empty() {
+            continue;
+        }
+        let mut alpha = layer.alpha.clone();
+        for (k, &j) in layer.unst.iter().enumerate() {
+            alpha[j] = match k % 4 {
+                0 => 0.17,
+                1 => 0.5,
+                2 => 0.83,
+                _ => 0.99,
+            };
+        }
+        let msv: Vec<f64> = alpha.iter().zip(&layer.s).map(|(a, s)| a.max(*s)).collect();
+        dg.layers.insert(
+            li,
+            super::engine::GateVecs {
+                alpha,
+                s: layer.s.clone(),
+                c: layer.c.clone(),
+                ms: msv,
+            },
+        );
+    }
+    assert!(
+        dg.layers
+            .values()
+            .any(|gv| gv.alpha.iter().any(|a| *a != 0.0 && *a != 1.0)),
+        "fixture produced no fractional alpha (no unstable neurons?)"
+    );
+    let pass = eng
+        .run(&ms.seed, Some(&dg), LaneDir::Lower, None, false)
+        .expect("fractional-alpha pass");
+    let dj = per_class_direct(&eng, &pass, &ms, 0..mb.nf());
+    let x = sample_box(&mut rng, &root, 256);
+    let (y, _) = net
+        .forward_points(&x, &std::collections::BTreeMap::new())
+        .expect("forward");
+    let margins = margins_at(&net, &y, t, &adv);
+    for (r0, row) in margins.iter().enumerate() {
+        for &m in row {
+            assert!(
+                dj[r0] <= m + 1e-9,
+                "UNSOUND under fractional alpha: class {} certified {} > sampled margin {}",
+                adv[r0],
+                dj[r0],
+                m
+            );
+        }
+    }
+}
+
+/// The optimizer's structural contract: monotone accept (never worse than the
+/// heuristic under its certified objective), alpha in `[0, 1]` moved ONLY at
+/// unstable neurons, `s`/`c`/`l`/`u`/`unst` untouched, and the `ms =
+/// max(alpha, s)` invariant re-established everywhere.
+#[test]
+fn alpha_opt_monotone_accept_and_ms_invariant() {
+    let mut rng = StdRng::seed_from_u64(53);
+    let spec = tiny_spec(&mut rng, 0.65);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.5; 72];
+    let hi = vec![0.5; 72];
+    let mut root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    type Snap = (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<usize>,
+    );
+    let snap: Vec<Snap> = root
+        .layers
+        .iter()
+        .map(|l| {
+            (
+                l.alpha.clone(),
+                l.s.clone(),
+                l.c.clone(),
+                l.ms.clone(),
+                l.l.clone(),
+                l.u.clone(),
+                l.unst.clone(),
+            )
+        })
+        .collect();
+    let report =
+        super::alpha_opt::optimize_root_alpha(&net, &mut root, 0, &[1, 2, 3], None, 6, 60.0);
+    for (li, layer) in root.layers.iter().enumerate() {
+        let (a0, s0, c0, ms0, l0, u0, unst0) = &snap[li];
+        assert_eq!(&layer.s, s0, "s moved at layer {li}");
+        assert_eq!(&layer.c, c0, "c moved at layer {li}");
+        assert_eq!(&layer.l, l0, "l moved at layer {li}");
+        assert_eq!(&layer.u, u0, "u moved at layer {li}");
+        assert_eq!(&layer.unst, unst0, "unst moved at layer {li}");
+        let unst: std::collections::BTreeSet<usize> = layer.unst.iter().copied().collect();
+        for j in 0..layer.n {
+            assert!(
+                (0.0..=1.0).contains(&layer.alpha[j]),
+                "alpha out of [0,1] at {li}/{j}"
+            );
+            assert_eq!(
+                layer.ms[j],
+                layer.alpha[j].max(layer.s[j]),
+                "ms invariant broken at {li}/{j}"
+            );
+            if !unst.contains(&j) {
+                assert_eq!(
+                    layer.alpha[j], a0[j],
+                    "non-unstable alpha moved at {li}/{j}"
+                );
+                assert_eq!(layer.ms[j], ms0[j], "non-unstable ms moved at {li}/{j}");
+            }
+        }
+    }
+    match report {
+        Some(r) => {
+            assert!(
+                r.best >= r.baseline,
+                "monotone accept violated: best {} < baseline {}",
+                r.best,
+                r.baseline
+            );
+            if !r.accepted {
+                for (li, layer) in root.layers.iter().enumerate() {
+                    assert_eq!(
+                        &layer.alpha, &snap[li].0,
+                        "non-accepted run must leave alpha bit-identical (layer {li})"
+                    );
+                }
+            } else {
+                assert!(r.moved_neurons > 0, "accepted with zero moved neurons");
+                assert!(r.max_dalpha > 0.0);
+            }
+        }
+        None => {
+            for (li, layer) in root.layers.iter().enumerate() {
+                assert_eq!(
+                    &layer.alpha, &snap[li].0,
+                    "refused run must leave alpha bit-identical (layer {li})"
+                );
+            }
+        }
+    }
+}
+
+/// Split piece-fixes must stay EXACT binary lines even when the frozen root
+/// carries fractional (optimized) alpha; all other neurons inherit the
+/// fractional gates verbatim.
+#[test]
+fn domain_gates_split_overrides_stay_exact_under_fractional_alpha() {
+    let mut rng = StdRng::seed_from_u64(23);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.35; 72];
+    let hi = vec![0.35; 72];
+    let mut root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    for layer in &mut root.layers {
+        let unst = layer.unst.clone();
+        for j in unst {
+            layer.alpha[j] = 0.37;
+            layer.ms[j] = layer.alpha[j].max(layer.s[j]);
+        }
+    }
+    let (li, pos) = root
+        .layers
+        .iter()
+        .enumerate()
+        .find_map(|(li, l)| (!l.unst.is_empty()).then_some((li, 0usize)))
+        .expect("fixture has an unstable neuron");
+    let idx = root.layers[li].unst[pos];
+    for dir in [1i8, -1] {
+        let dg = domain_gates(&root, &[(li, pos, dir)]);
+        let gv = dg.layers.get(&li).expect("override layer present");
+        if dir > 0 {
+            assert_eq!(
+                (gv.alpha[idx], gv.s[idx], gv.c[idx], gv.ms[idx]),
+                (1.0, 1.0, 0.0, 1.0),
+                "positive piece-fix not exact"
+            );
+        } else {
+            assert_eq!(
+                (gv.alpha[idx], gv.s[idx], gv.c[idx], gv.ms[idx]),
+                (0.0, 0.0, 0.0, 0.0),
+                "negative piece-fix not exact"
+            );
+        }
+        for j in 0..root.layers[li].n {
+            if j != idx {
+                assert_eq!(gv.alpha[j], root.layers[li].alpha[j]);
+                assert_eq!(gv.ms[j], root.layers[li].ms[j]);
+            }
+        }
+    }
+}
+
+/// The #alpha-opt capture returns the SAME pre-transform coefficients as the
+/// established Tier-0 retained capture when retention keeps every unstable
+/// neuron (discriminating gate for the new capture path).
+#[test]
+fn unst_rows_capture_matches_retained_capture() {
+    let mut rng = StdRng::seed_from_u64(53);
+    let spec = tiny_spec(&mut rng, 0.65);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let cfg = super::root::RetainCfg {
+        per_layer: 1_000_000,
+        budget_bytes: 1 << 30,
+    };
+    let (root, ret) =
+        RootGates::build_retaining(&net, &lo, &hi, RoundMode::Outward, None, Some(&cfg), &[])
+            .expect("root");
+    let ret = ret.expect("retention requested");
+    let eng = BackwardEngine::new(&net, &root);
+    let (t, adv) = (0usize, vec![1usize, 2, 3]);
+    let mb = MarginBatch::new(&net, t, &adv).expect("mb");
+    let (al, au) = eng.y_rows(None).expect("y_rows");
+    let ybox = YBox::from_rows(&eng, &al, &au);
+    let gates = head_gates(&ybox, RoundMode::Outward);
+    let ms = margin_seed(&mb, &gates, &ybox, RoundMode::Outward);
+    let pass = eng
+        .run_collect(
+            &ms.seed,
+            None,
+            LaneDir::Lower,
+            None,
+            super::engine::Collect {
+                unst_abs: false,
+                rows: Some(&ret),
+                unst_rows: true,
+            },
+        )
+        .expect("pass");
+    let ur = pass.unst_rows.as_ref().expect("unst_rows captured");
+    let cr = pass.coll_rows.as_ref().expect("retained rows captured");
+    let mut checked = 0usize;
+    for (li, layer) in root.layers.iter().enumerate() {
+        if layer.unst.is_empty() {
+            continue;
+        }
+        // Full retention keeps every unstable neuron in ascending order, so
+        // the two captures index the same rows at the same positions.
+        assert_eq!(ret.layers[li].idx, layer.unst);
+        let u = ur.get(&li).expect("unst layer captured");
+        let c = cr.get(&li).expect("retained layer captured");
+        assert_eq!(u.nrows(), layer.unst.len());
+        assert_eq!(u, c, "pre-transform capture mismatch at layer {li}");
+        checked += 1;
+    }
+    assert!(checked > 0, "fixture has no unstable layers");
+}
+
+// ===========================================================================
+// #margin-row-beta (BUILD 1) + #backward-interm (BUILD 2), 2026-08-19.
+//
+// Soundness contracts under test:
+//  * beta: ANY beta >= 0 yields a valid bound on the split region (weak
+//    duality) — checked against exact forward samples restricted to the
+//    region, in Outward mode (so the E-lane invariant at the application
+//    site is exercised too);
+//  * beta: an absent/zero/sign-less term is BIT-IDENTICAL to no term at all
+//    (the -0.0 perturbation hazard);
+//  * beta: the stacked arm matches the independent passes bit-for-bit;
+//  * backward-interm: shrink-only vs the forward-only build, chunk-count
+//    invariant, zero-budget bit-identity, and sampled enclosure of the
+//    published boxes;
+//  * clip calibration: slack must be recovered against the FORWARD bounds —
+//    the tightened ones under-recover (clamp to 0), the false-`unsat` trap
+//    root.rs's `bi_cal` exists to prevent.
+// ===========================================================================
+
+/// No-conv chain fixture shared by the beta tests: depth-3 trunk, 8-wide
+/// head, certified Outward root.
+fn beta_fixture(seed: u64) -> (TwinNet, RootGates) {
+    let spec = no_conv_chain_spec(6, 3, 8, 3, seed);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.8; 6];
+    let hi = vec![0.8; 6];
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    (net, root)
+}
+
+#[test]
+fn beta_zero_terms_never_perturb_a_pass() {
+    let (net, root) = beta_fixture(0xB37A_0001);
+    let eng = BackwardEngine::new(&net, &root);
+    let (li, pos) = (1usize, 0usize);
+    assert!(!root.layers[li].unst.is_empty(), "fixture: layer 1 stable");
+    let split = (li, pos, -1i8);
+    let dom0 = domain_gates(&root, &[split]);
+    let seed = eng.identity_seed();
+    let base = eng
+        .run(&seed, Some(&dom0), LaneDir::Lower, None, false)
+        .expect("base pass");
+    // `set_terms` filters beta == 0 (must not install a term at all).
+    let mut dom1 = domain_gates(&root, &[split]);
+    super::beta::set_terms(&mut dom1, &root, &[split], &[0.0]);
+    assert!(dom1.beta.is_empty(), "beta = 0 installed a term");
+    // Even manually injected degenerate terms are skipped by the engine:
+    // beta = 0 (would flip -0.0 bits), sign = 0 (delta would be +/-0.0).
+    let neuron = root.layers[li].unst[pos];
+    dom1.beta
+        .entry(li)
+        .or_default()
+        .push(super::engine::BetaSplit {
+            neuron,
+            sign: -1,
+            beta: 0.0,
+        });
+    dom1.beta
+        .entry(li)
+        .or_default()
+        .push(super::engine::BetaSplit {
+            neuron,
+            sign: 0,
+            beta: 1.0,
+        });
+    let same = eng
+        .run(&seed, Some(&dom1), LaneDir::Lower, None, false)
+        .expect("degenerate-term pass");
+    for (x, y) in base.a.iter().zip(same.a.iter()) {
+        assert_eq!(x.to_bits(), y.to_bits(), "coefficients moved");
+    }
+    for (x, y) in base.b.iter().zip(same.b.iter()) {
+        assert_eq!(x.to_bits(), y.to_bits(), "bias moved");
+    }
+    for (x, y) in base.eb.iter().zip(same.eb.iter()) {
+        assert_eq!(x.to_bits(), y.to_bits(), "bias error moved");
+    }
+    let (Some(ea), Some(eb2)) = (base.e.as_ref(), same.e.as_ref()) else {
+        panic!("outward passes must carry error lanes");
+    };
+    for (x, y) in ea.iter().zip(eb2.iter()) {
+        assert_eq!(x.to_bits(), y.to_bits(), "error lane moved");
+    }
+}
+
+#[test]
+fn beta_bounds_stay_sound_on_the_split_region_for_any_beta() {
+    let (net, root) = beta_fixture(0xB37A_0002);
+    let eng = BackwardEngine::new(&net, &root);
+    let mut rng = StdRng::seed_from_u64(77);
+    let x = sample_box(&mut rng, &root, 600);
+    for &(li, pos) in &[(1usize, 0usize), (2usize, 0usize)] {
+        let rec = &root.layers[li];
+        assert!(!rec.unst.is_empty(), "fixture: layer {li} has no unstable");
+        let neuron = rec.unst[pos];
+        let relu_op = rec.op;
+        let mut pre_sel = std::collections::BTreeMap::new();
+        pre_sel.insert(relu_op, vec![neuron]);
+        let (y, pre) = net.forward_points(&x, &pre_sel).expect("forward");
+        let z = &pre[&relu_op];
+        for &sign in &[1i8, -1i8] {
+            let split = (li, pos, sign);
+            // beta = 25 deliberately stresses the E-lane at the application
+            // site: an under-scaled error carry would surface here as a
+            // lower bound exceeding a sampled y (the false-UNSAT direction).
+            for &beta in &[0.0f64, 0.05, 0.5, 2.0, 25.0] {
+                let mut dom = domain_gates(&root, &[split]);
+                super::beta::set_terms(&mut dom, &root, &[split], &[beta]);
+                let seed = eng.identity_seed();
+                let plo = eng
+                    .run(&seed, Some(&dom), LaneDir::Lower, None, false)
+                    .expect("lower pass");
+                let lows = eng.concretize_lower(&plo);
+                let pup = eng
+                    .run(&seed, Some(&dom), LaneDir::Upper, None, false)
+                    .expect("upper pass");
+                let ups = eng.concretize_upper(&pup);
+                let mut kept = 0usize;
+                for bcol in 0..x.ncols() {
+                    let zb = z[[0, bcol]];
+                    if (sign > 0 && zb < 0.0) || (sign < 0 && zb > 0.0) {
+                        continue; // outside this split's region
+                    }
+                    kept += 1;
+                    for i in 0..y.nrows() {
+                        let yv = y[[i, bcol]];
+                        assert!(
+                            lows[i] <= yv + 1e-7,
+                            "li={li} sign={sign} beta={beta} row {i}: certified lower \
+{} EXCEEDS sampled y {yv} (false-UNSAT direction)",
+                            lows[i]
+                        );
+                        assert!(
+                            ups[i] >= yv - 1e-7,
+                            "li={li} sign={sign} beta={beta} row {i}: certified upper \
+{} BELOW sampled y {yv}",
+                            ups[i]
+                        );
+                    }
+                }
+                assert!(kept > 20, "vacuous region filter: kept={kept}");
+            }
+        }
+    }
+}
+
+#[test]
+fn beta_domain_stacked_matches_independent_passes() {
+    let (net, root) = beta_fixture(0xB37A_0003);
+    let eng = BackwardEngine::new(&net, &root);
+    let n_y = net.n_y;
+    let split_a = (1usize, 0usize, -1i8);
+    let split_b = (2usize, 0usize, 1i8);
+    let mut dom_a = domain_gates(&root, &[split_a]);
+    super::beta::set_terms(&mut dom_a, &root, &[split_a], &[0.7]);
+    let mut dom_b = domain_gates(&root, &[split_b]);
+    super::beta::set_terms(&mut dom_b, &root, &[split_b], &[1.3]);
+    let seed1 = eng.identity_seed();
+    let pa = eng
+        .run(&seed1, Some(&dom_a), LaneDir::Lower, None, false)
+        .expect("a");
+    let pb = eng
+        .run(&seed1, Some(&dom_b), LaneDir::Lower, None, false)
+        .expect("b");
+    let mut s = Array2::<f64>::zeros((n_y, 2 * n_y));
+    for j in 0..n_y {
+        s[[j, j]] = 1.0;
+        s[[j, n_y + j]] = 1.0;
+    }
+    let ex_a = Exceptions::default();
+    let ex_b = Exceptions::default();
+    let blocks = vec![
+        RowDomainGateBlock {
+            columns: 0..n_y,
+            gates: &dom_a,
+            exceptions: &ex_a,
+        },
+        RowDomainGateBlock {
+            columns: n_y..2 * n_y,
+            gates: &dom_b,
+            exceptions: &ex_b,
+        },
+    ];
+    let stacked = eng
+        .run_domain_stacked(&DomainStackSeed { s, e: None }, &blocks, LaneDir::Lower)
+        .expect("stacked");
+    let n_in = root.mid.len();
+    for c in 0..n_y {
+        for j in 0..n_in {
+            assert_eq!(
+                stacked.a[[j, c]].to_bits(),
+                pa.a[[j, c]].to_bits(),
+                "stacked block A coefficient moved at ({j}, {c})"
+            );
+            assert_eq!(
+                stacked.a[[j, n_y + c]].to_bits(),
+                pb.a[[j, c]].to_bits(),
+                "stacked block B coefficient moved at ({j}, {c})"
+            );
+        }
+        assert_eq!(stacked.b[c].to_bits(), pa.b[c].to_bits());
+        assert_eq!(stacked.b[n_y + c].to_bits(), pb.b[c].to_bits());
+        assert_eq!(stacked.eb[c].to_bits(), pa.eb[c].to_bits());
+        assert_eq!(stacked.eb[n_y + c].to_bits(), pb.eb[c].to_bits());
+    }
+}
+
+#[test]
+fn beta_step_projection_and_term_filters() {
+    let (_net, root) = beta_fixture(0xB37A_0004);
+    let trunk = [(1usize, 0usize, -1i8), (2usize, 0usize, 1i8)];
+    let terms = super::beta::terms_for_test(&root, &trunk, &[0.0, 2.0]);
+    assert_eq!(terms.len(), 1, "only the positive beta installs a term");
+    let t = &terms[&2][0];
+    assert_eq!(t.neuron, root.layers[2].unst[0]);
+    assert_eq!(t.sign, 1);
+    assert_eq!(t.beta, 2.0);
+    // apply_step: g > 0 raises by eta*scale, g < 0 lowers with projection at
+    // zero, an all-zero gradient proposes nothing.
+    let dir = [(1.0, 0.5), (-1.0, 10.0)];
+    let stepped = super::beta::apply_step(&[0.0, 0.2], &dir, 0.5).expect("moves");
+    assert!((stepped[0] - 0.25).abs() < 1e-12);
+    assert_eq!(stepped[1], 0.0, "projection at zero failed");
+    assert!(super::beta::apply_step(&[0.3, 0.3], &[(0.0, 1.0), (0.0, 1.0)], 0.5).is_none());
+    assert!(
+        super::beta::apply_step(&[0.3], &dir, 0.5).is_none(),
+        "shape drift"
+    );
+}
+
+// #margin-row-beta-percol: the per-column engine arm is proven by REDUCTION to
+// the shared arm rather than by re-sampling: (a) per-column terms on EVERY
+// column reproduce the shared pass bit-for-bit, and (b) terms on ONE column
+// leave every other column bit-identical to the no-beta pass while making the
+// owned column bit-identical to the shared pass. Both endpoints are covered by
+// `beta_bounds_stay_sound_on_the_split_region_for_any_beta` above, so the
+// per-column path inherits its soundness sampling transitively.
+#[test]
+fn beta_percol_all_columns_matches_shared_and_isolates_columns() {
+    let (net, root) = beta_fixture(0xB37A_0005);
+    let eng = BackwardEngine::new(&net, &root);
+    let n_y = net.n_y;
+    let split = (1usize, 0usize, -1i8);
+    let seed = eng.identity_seed();
+    let beta = [0.7f64];
+    // Shared pass (the established arm).
+    let mut dom_shared = domain_gates(&root, &[split]);
+    super::beta::set_terms(&mut dom_shared, &root, &[split], &beta);
+    let shared = eng
+        .run(&seed, Some(&dom_shared), LaneDir::Lower, None, false)
+        .expect("shared pass");
+    // No-beta pass (the isolation baseline).
+    let dom_base = domain_gates(&root, &[split]);
+    let base = eng
+        .run(&seed, Some(&dom_base), LaneDir::Lower, None, false)
+        .expect("base pass");
+    // (a) Per-column terms on EVERY column == shared, bit-for-bit.
+    let mut dom_pc_all = domain_gates(&root, &[split]);
+    let cols_all: Vec<(usize, &[f64])> = (0..n_y).map(|c| (c, &beta[..])).collect();
+    super::beta::set_terms_pc(&mut dom_pc_all, &root, &[split], &cols_all);
+    assert!(
+        dom_pc_all.beta.is_empty() && !dom_pc_all.beta_pc.is_empty(),
+        "pc terms must ride beta_pc only"
+    );
+    let pc_all = eng
+        .run(&seed, Some(&dom_pc_all), LaneDir::Lower, None, false)
+        .expect("pc-all pass");
+    for (x, y) in shared.a.iter().zip(pc_all.a.iter()) {
+        assert_eq!(x.to_bits(), y.to_bits(), "pc-all coefficients moved");
+    }
+    let (Some(es), Some(ep)) = (shared.e.as_ref(), pc_all.e.as_ref()) else {
+        panic!("outward passes must carry error lanes");
+    };
+    for (x, y) in es.iter().zip(ep.iter()) {
+        assert_eq!(x.to_bits(), y.to_bits(), "pc-all error lane moved");
+    }
+    for (x, y) in shared.b.iter().zip(pc_all.b.iter()) {
+        assert_eq!(x.to_bits(), y.to_bits(), "pc-all bias moved");
+    }
+    // (b) Terms on ONE column: that column == shared, every other == base.
+    let own = 2usize.min(n_y - 1);
+    let mut dom_pc_one = domain_gates(&root, &[split]);
+    super::beta::set_terms_pc(&mut dom_pc_one, &root, &[split], &[(own, &beta[..])]);
+    let pc_one = eng
+        .run(&seed, Some(&dom_pc_one), LaneDir::Lower, None, false)
+        .expect("pc-one pass");
+    let n_in = root.mid.len();
+    let eo = pc_one.e.as_ref().expect("outward error lane");
+    let eb2 = base.e.as_ref().expect("outward error lane");
+    for j in 0..n_in {
+        for c in 0..n_y {
+            let (want_a, want_e, what) = if c == own {
+                (shared.a[[j, c]], es[[j, c]], "owned column != shared")
+            } else {
+                (base.a[[j, c]], eb2[[j, c]], "foreign column != base")
+            };
+            assert_eq!(pc_one.a[[j, c]].to_bits(), want_a.to_bits(), "{what}");
+            assert_eq!(eo[[j, c]].to_bits(), want_e.to_bits(), "{what} (e)");
+        }
+    }
+}
+
+#[test]
+fn beta_percol_seed_shift_isolates_columns() {
+    let n_y = 4usize;
+    let nf = 3usize;
+    let mut s = Array2::<f64>::zeros((n_y, nf));
+    for i in 0..n_y {
+        for c in 0..nf {
+            s[[i, c]] = (i as f64) - 0.5 * (c as f64);
+        }
+    }
+    let e = Array2::<f64>::from_elem((n_y, nf), 1e-13);
+    let base = DomainStackSeed {
+        s: s.clone(),
+        e: Some(e.clone()),
+    };
+    let heads = [(1usize, 1i8), (3usize, -1i8)];
+    let hb = [0.4f64, 1.1];
+    let shared = super::beta::seed_with_head_terms(&base, &heads, &hb, true).expect("shared shift");
+    let own = 1usize;
+    let pc = super::beta::seed_with_head_terms_pc(&base, &heads, &[(own, &hb[..])], true)
+        .expect("pc shift");
+    for i in 0..n_y {
+        for c in 0..nf {
+            let (want_s, want_e, what) = if c == own {
+                (
+                    shared.s[[i, c]],
+                    shared.e.as_ref().expect("e")[[i, c]],
+                    "owned column != shared shift",
+                )
+            } else {
+                (base.s[[i, c]], e[[i, c]], "foreign column shifted")
+            };
+            assert_eq!(pc.s[[i, c]].to_bits(), want_s.to_bits(), "{what}");
+            assert_eq!(
+                pc.e.as_ref().expect("e")[[i, c]].to_bits(),
+                want_e.to_bits(),
+                "{what} (e)"
+            );
+        }
+    }
+    // Refusals: outward without an error lane; out-of-range column.
+    let bare = DomainStackSeed {
+        s: s.clone(),
+        e: None,
+    };
+    assert!(
+        super::beta::seed_with_head_terms_pc(&bare, &heads, &[(0, &hb[..])], true).is_none(),
+        "outward + e=None must refuse"
+    );
+    assert!(
+        super::beta::seed_with_head_terms_pc(&base, &heads, &[(nf, &hb[..])], true).is_none(),
+        "out-of-range column must refuse"
+    );
+}
+
+#[test]
+fn beta_percol_term_filters_and_grouping() {
+    let (_net, root) = beta_fixture(0xB37A_0006);
+    let trunk = [(1usize, 0usize, -1i8), (2usize, 0usize, 1i8)];
+    let mut dom = super::engine::DomainGates::default();
+    // Column 0 prices only the layer-2 split (layer-1 beta is 0); column 3
+    // prices only the layer-1 split.
+    let c0 = [0.0f64, 2.0];
+    let c3 = [1.0f64, 0.0];
+    super::beta::set_terms_pc(&mut dom, &root, &trunk, &[(0, &c0[..]), (3, &c3[..])]);
+    assert_eq!(dom.beta_pc.len(), 2, "two layers touched");
+    let l1 = &dom.beta_pc[&1];
+    assert_eq!(l1.len(), 1);
+    assert_eq!(l1[0].col, 3);
+    assert_eq!(l1[0].terms.len(), 1);
+    assert_eq!(l1[0].terms[0].beta, 1.0);
+    assert_eq!(l1[0].terms[0].sign, -1);
+    let l2 = &dom.beta_pc[&2];
+    assert_eq!(l2.len(), 1);
+    assert_eq!(l2[0].col, 0);
+    assert_eq!(l2[0].terms[0].beta, 2.0);
+    assert_eq!(l2[0].terms[0].sign, 1);
+    // All-zero vectors install nothing.
+    let z = [0.0f64, 0.0];
+    super::beta::set_terms_pc(&mut dom, &root, &trunk, &[(0, &z[..])]);
+    assert!(dom.beta_pc.is_empty(), "zero betas installed pc terms");
+}
+
+#[test]
+fn backward_interm_shrink_only_sound_and_chunk_invariant() {
+    let mut rng = StdRng::seed_from_u64(0xB1_0001);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let build = |bi: Option<super::backward_interm::BiCfg>| {
+        RootGates::build_retaining_bi(&net, &lo, &hi, RoundMode::Outward, None, bi)
+            .expect("build")
+            .0
+    };
+    let off = build(None);
+    let cfg = |chunk: usize| super::backward_interm::BiCfg {
+        secs: 60.0,
+        chunk,
+        topk: 512,
+    };
+    let on1 = build(Some(cfg(1)));
+    let on8 = build(Some(cfg(8)));
+    let zero = build(Some(super::backward_interm::BiCfg {
+        secs: 0.0,
+        chunk: 4,
+        topk: 512,
+    }));
+    assert_eq!(off.layers.len(), on1.layers.len());
+    // Shrink-only against the forward-only build.
+    let mut moved = 0usize;
+    for (fwd, bi) in off.layers.iter().zip(&on1.layers) {
+        for j in 0..fwd.n {
+            assert!(bi.l[j] >= fwd.l[j], "lower LOOSENED at neuron {j}");
+            assert!(bi.u[j] <= fwd.u[j], "upper LOOSENED at neuron {j}");
+            if bi.l[j] > fwd.l[j] || bi.u[j] < fwd.u[j] {
+                moved += 1;
+            }
+        }
+    }
+    eprintln!("[test backward-interm] tightened neurons: {moved}");
+    // Chunk count must not change any value (columns are independent passes).
+    for (a, b) in on1.layers.iter().zip(&on8.layers) {
+        for j in 0..a.n {
+            assert_eq!(a.l[j].to_bits(), b.l[j].to_bits(), "chunking moved l");
+            assert_eq!(a.u[j].to_bits(), b.u[j].to_bits(), "chunking moved u");
+        }
+    }
+    // Zero budget = disarmed, bit-identical to the forward-only build.
+    for (a, b) in off.layers.iter().zip(&zero.layers) {
+        for j in 0..a.n {
+            assert_eq!(a.l[j].to_bits(), b.l[j].to_bits(), "zero-budget moved l");
+            assert_eq!(a.u[j].to_bits(), b.u[j].to_bits(), "zero-budget moved u");
+        }
+    }
+    // Sampled enclosure of the PUBLISHED (tightened) boxes.
+    let mut rng2 = StdRng::seed_from_u64(9);
+    let x = sample_box(&mut rng2, &on1, 400);
+    let mut pre_sel = std::collections::BTreeMap::new();
+    for l in &on1.layers {
+        pre_sel.insert(l.op, (0..l.n).collect::<Vec<_>>());
+    }
+    let (_y, pre) = net.forward_points(&x, &pre_sel).expect("forward");
+    for l in &on1.layers {
+        let z = &pre[&l.op];
+        for j in 0..l.n {
+            for b in 0..x.ncols() {
+                let zv = z[[j, b]];
+                assert!(
+                    l.l[j] <= zv + 1e-9 && l.u[j] >= zv - 1e-9,
+                    "published box [{}, {}] excludes sampled z {zv} (neuron {j})",
+                    l.l[j],
+                    l.u[j]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn prefix_pass_is_a_sound_enclosure_and_rejects_bad_entry() {
+    let mut rng = StdRng::seed_from_u64(0xB1_0002);
+    let spec = tiny_spec(&mut rng, 0.5);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.3; 72];
+    let hi = vec![0.3; 72];
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let eng = BackwardEngine::new(&net, &root);
+    // Rejections: head relu (not in the trunk), non-relu op, seed shape drift.
+    let n0 = root.layers[0].n;
+    let mut s0 = Array2::<f64>::zeros((n0, n0));
+    for j in 0..n0 {
+        s0[[j, j]] = 1.0;
+    }
+    let seed0 = DomainStackSeed { s: s0, e: None };
+    assert!(eng
+        .run_prefix(&seed0, net.i_gemm1 + 1, LaneDir::Lower)
+        .is_err());
+    assert!(
+        eng.run_prefix(&seed0, 0, LaneDir::Lower).is_err(),
+        "conv op accepted"
+    );
+    let bad = DomainStackSeed {
+        s: Array2::<f64>::zeros((n0 + 1, n0)),
+        e: None,
+    };
+    assert!(eng
+        .run_prefix(&bad, root.layers[0].op, LaneDir::Lower)
+        .is_err());
+    // Soundness: prefix bounds enclose sampled pre-activations at every layer.
+    let mut rng2 = StdRng::seed_from_u64(11);
+    let x = sample_box(&mut rng2, &root, 300);
+    let mut pre_sel = std::collections::BTreeMap::new();
+    for l in &root.layers {
+        pre_sel.insert(l.op, (0..l.n).collect::<Vec<_>>());
+    }
+    let (_y, pre) = net.forward_points(&x, &pre_sel).expect("forward");
+    for l in &root.layers {
+        let n = l.n;
+        let mut s = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            s[[j, j]] = 1.0;
+        }
+        let seed = DomainStackSeed { s, e: None };
+        let plo = eng.run_prefix(&seed, l.op, LaneDir::Lower).expect("lower");
+        let lows = eng.concretize_lower(&plo);
+        let pup = eng.run_prefix(&seed, l.op, LaneDir::Upper).expect("upper");
+        let ups = eng.concretize_upper(&pup);
+        let z = &pre[&l.op];
+        for j in 0..n {
+            for b in 0..x.ncols() {
+                let zv = z[[j, b]];
+                assert!(
+                    lows[j] <= zv + 1e-9 && ups[j] >= zv - 1e-9,
+                    "prefix enclosure [{}, {}] excludes sampled z {zv} (op {}, neuron {j})",
+                    lows[j],
+                    ups[j],
+                    l.op
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn clip_slack_calibration_must_use_forward_bounds() {
+    // The #backward-interm ordering trap in isolation: slack recovered
+    // against the line's own (forward) bound is exact; recovered against a
+    // TIGHTER published bound it under-recovers and clamps to zero — which
+    // would let a Clip-and-Verify halfspace cut into the true subdomain.
+    let mi = Array2::from_shape_vec((1, 3), vec![1.0, 2.0, 0.5]).expect("shape");
+    let di = Array2::from_shape_vec((1, 3), vec![0.1, 0.2, 0.05]).expect("shape");
+    let mid = [0.1f64, -0.2];
+    let rad = [0.5f64, 0.4];
+    let (bm, bd) = (0.5f64, 0.05f64);
+    let (mut lo_min, mut up_max) = (bm - bd, bm + bd);
+    for j in 0..2 {
+        let lo_c: f64 = mi[[0, j]] - di[[0, j]];
+        let up_c: f64 = mi[[0, j]] + di[[0, j]];
+        lo_min += lo_c.mul_add(mid[j], -(lo_c.abs() * rad[j]));
+        up_max += up_c.mul_add(mid[j], up_c.abs() * rad[j]);
+    }
+    let l_fwd = [lo_min - 0.01];
+    let u_fwd = [up_max + 0.02];
+    let rows = super::root::retain_clip_rows(&mi, &di, &[0], &mid, &rad, &l_fwd, &u_fwd);
+    assert!(
+        (rows.sl_lo[0] - 0.01).abs() < 1e-12,
+        "forward slack not recovered"
+    );
+    assert!(
+        (rows.sl_up[0] - 0.02).abs() < 1e-12,
+        "forward slack not recovered"
+    );
+    let l_tight = [lo_min + 0.3];
+    let u_tight = [up_max - 0.3];
+    let wrong = super::root::retain_clip_rows(&mi, &di, &[0], &mid, &rad, &l_tight, &u_tight);
+    assert_eq!(
+        wrong.sl_lo[0], 0.0,
+        "tightened calibration must clamp (the trap)"
+    );
+    assert_eq!(
+        wrong.sl_up[0], 0.0,
+        "tightened calibration must clamp (the trap)"
+    );
 }

@@ -83,6 +83,9 @@ fn run_repository_script(relative_script: &str, arguments: &[String], cwd: &Path
         .unwrap_or_else(|error| panic!("the selected Python interpreter is unavailable: {error}"))
 }
 
+// Sole caller is the `#[cfg(unix)]` byte-path contract below; gate to match so
+// this is not dead on Windows.
+#[cfg(unix)]
 fn run_repository_code(program: &str, test_root: &Path) -> Output {
     let root = workspace_root();
     Command::new(python_executable())
@@ -97,12 +100,27 @@ fn run_repository_code(program: &str, test_root: &Path) -> Output {
         .unwrap_or_else(|error| panic!("the selected Python interpreter is unavailable: {error}"))
 }
 
+// Captured text is NORMALIZED to LF. These tools print with the platform
+// newline and the repository is checked out with CRLF on Windows, while every
+// assertion here is written against LF — a split on "\n    {\n" then finds
+// nothing and an inventory of six reads as zero. The contracts are about tool
+// CONTENT, not line-ending convention, so the convention is removed at each
+// point where text enters the test.
+fn normalize_newlines(text: String) -> String {
+    text.replace("\r\n", "\n")
+}
+
 fn stdout(output: &Output) -> String {
-    String::from_utf8(output.stdout.clone()).expect("tool stdout must be UTF-8")
+    normalize_newlines(String::from_utf8(output.stdout.clone()).expect("tool stdout must be UTF-8"))
 }
 
 fn stderr(output: &Output) -> String {
-    String::from_utf8(output.stderr.clone()).expect("tool stderr must be UTF-8")
+    normalize_newlines(String::from_utf8(output.stderr.clone()).expect("tool stderr must be UTF-8"))
+}
+
+/// Read a repository file with the same LF normalization as captured stdout.
+fn read_repository_text(path: PathBuf) -> std::io::Result<String> {
+    fs::read_to_string(path).map(normalize_newlines)
 }
 
 fn assert_success(output: &Output, context: &str) {
@@ -238,7 +256,7 @@ fn workload_policy_metadata_is_derived_from_the_rust_workloads() {
     )
     .expect("GPU workload source must be readable");
     let policy =
-        fs::read_to_string(root.join("configs/benchmark_regressions/gpu_crown_backward.json"))
+        read_repository_text(root.join("configs/benchmark_regressions/gpu_crown_backward.json"))
             .expect("GPU regression policy must be readable");
 
     let metaroom = workload_metadata(&source, "METAROOM");
@@ -344,9 +362,14 @@ fn gpu_checker_selects_the_pinned_source_and_rejects_ambiguous_evidence() {
         temporary.path(),
     );
     assert_success(&selected, "source-pinned GPU regression check");
-    let selected_report = fs::read_to_string(&report).expect("checker must write its report");
+    let selected_report =
+        read_repository_text(report.clone()).expect("checker must write its report");
     assert!(selected_report.contains("\"selection_mode\": \"source_artifact_match\""));
-    assert!(selected_report.contains(candidate_b.to_string_lossy().as_ref()));
+    // Assert on the PIN, not on the raw argument echo. `candidates` repeats the
+    // CLI paths verbatim, so on Windows they appear JSON-escaped ("C:\\Users\\...")
+    // and a `contains` of the native path can never match. `source_artifact` is
+    // the value the checker actually selected, and it is POSIX on every host.
+    assert!(selected_report.contains("\"source_artifact\": \"reports/benchmarks/candidate_b.csv\""));
     assert!(selected_report.contains("\"regression\": false"));
 
     let conflicting_policy = GPU_POLICY.replace(
@@ -365,7 +388,8 @@ fn gpu_checker_selects_the_pinned_source_and_rejects_ambiguous_evidence() {
         "ambiguous evidence must fail"
     );
     assert!(stdout(&rejected).contains("source_artifact_missing"));
-    let rejected_report = fs::read_to_string(&report).expect("checker must write rejection report");
+    let rejected_report =
+        read_repository_text(report).expect("checker must write rejection report");
     assert!(rejected_report.contains("\"reasons\": [\n        \"source_artifact_missing\""));
     assert!(rejected_report.contains("\"regression\": true"));
 }
@@ -396,7 +420,7 @@ fn gpu_refresh_is_atomic_on_rejection_and_pins_successful_evidence() {
     assert_eq!(rejected.status.code(), Some(1), "status mismatch must fail");
     assert!(stdout(&rejected).contains("status_mismatch"));
     assert_eq!(
-        fs::read_to_string(&policy).expect("policy must remain readable"),
+        read_repository_text(policy.clone()).expect("policy must remain readable"),
         initial_policy,
         "failed refresh must not rewrite the policy"
     );
@@ -408,7 +432,7 @@ fn gpu_refresh_is_atomic_on_rejection_and_pins_successful_evidence() {
         temporary.path(),
     );
     assert_success(&accepted, "valid GPU baseline refresh");
-    let refreshed = fs::read_to_string(&policy).expect("refreshed policy must be readable");
+    let refreshed = read_repository_text(policy).expect("refreshed policy must be readable");
     assert!(refreshed.contains("\"baseline_seconds\": 6.5"));
     assert!(refreshed.contains("\"source_artifact\": \"reports/benchmarks/candidate.csv\""));
 }

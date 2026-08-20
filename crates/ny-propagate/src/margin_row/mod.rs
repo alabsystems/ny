@@ -26,16 +26,36 @@
 //! no environment variable can promote an unauthorised lane to an `Unsat`
 //! verdict.
 
+/// #alpha-opt: env-gated (`NY_MARGIN_ROW_ALPHA_OPT=1`, default OFF) projected
+/// supergradient optimization of the root trunk alpha before the tree starts.
+/// See the module docs for the gradient derivation and the `ms` soundness
+/// invariant.
+pub mod alpha_opt;
 pub mod bab;
+/// #backward-interm: env-gated (`NY_MARGIN_ROW_BACKWARD_INTERM=1`, default
+/// OFF) backward-computed root intermediates — each trunk ReLU's input box
+/// re-derived by the lane's own backward engine over the frozen prefix gates
+/// and intersected (shrink-only) with the forward tableau box. See the module
+/// docs for the soundness and the clip-calibration ordering trap.
+pub(crate) mod backward_interm;
+/// #margin-row-beta: env-gated (`NY_MARGIN_ROW_BETA=1`, default OFF) β-CROWN
+/// split Lagrangians for the lane's backward pass, with a one-step projected
+/// supergradient proposal re-scored by the unchanged certified concretize.
+pub(crate) mod beta;
 pub mod bounds;
+/// #clip-and-verify: split-derived halfspaces + the closed-form dual that
+/// re-concretizes over `box INTERSECT halfspaces`. See the module docs for the
+/// frontier-explosion measurement that motivates it.
+pub mod clip;
 pub mod engine;
+pub(crate) mod gpu_backward;
 pub(crate) mod gpu_seam;
 pub mod hyperplane_probe;
 pub mod net;
 pub mod prof;
 pub mod root;
 pub mod rounding;
-pub mod spec;
+pub mod spec; // #margin-row-gpu-eft: dark skeleton, docs/GPU_CERTIFIED_LANE_BACKWARD_DESIGN_2026-08-19.md
 
 #[cfg(test)]
 mod tests;
@@ -99,6 +119,60 @@ pub fn set_root_f32_preset(on: bool) {
 /// Is the typed preset route armed?
 pub(crate) fn root_f32_preset() -> bool {
     ROOT_F32_PRESET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #margin-row-branch-width: typed preset route for the candidate budget.
+///
+/// `0` = preset silent, use the built-in default. Same bridge shape as
+/// [`set_root_f32_preset`]: the lane entry takes no `BetaCrownConfig` by
+/// signature, the workspace forbids writing process environment from code, so
+/// the preset speaks through a process-global set before any lane starts.
+///
+/// SOUNDNESS: width chooses WHICH domains to split, never how a bound is
+/// computed. Every candidate is scored by the same certified batched pass, so
+/// a wrong width costs proofs (measured: k=4 does 5x the search of k=8 and
+/// LOSES one); it cannot manufacture one.
+static K_HEAD_PRESET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static K_TRUNK_PRESET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Arm the typed branch-width preset route. `None` leaves the default.
+pub fn set_branch_width_preset(k_head: Option<usize>, k_trunk: Option<usize>) {
+    K_HEAD_PRESET.store(k_head.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    K_TRUNK_PRESET.store(k_trunk.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// #margin-row-adaptive-width: typed preset route for the frontier-driven
+/// width ratchet (see `bab::adaptive_width_enabled`).
+static K_ADAPTIVE_PRESET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the adaptive-width preset route.
+pub fn set_k_adaptive_preset(on: bool) {
+    K_ADAPTIVE_PRESET.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn k_adaptive_preset() -> bool {
+    K_ADAPTIVE_PRESET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #backward-interm: typed preset route (see `backward_interm.rs`). Same
+/// bridge shape as [`set_root_f32_preset`]; env wins in both directions.
+static BACKWARD_INTERM_PRESET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Arm the typed backward-interm preset route.
+pub fn set_backward_interm_preset(on: bool) {
+    BACKWARD_INTERM_PRESET.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn backward_interm_preset() -> bool {
+    BACKWARD_INTERM_PRESET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn k_preset(cell: &std::sync::atomic::AtomicUsize) -> Option<usize> {
+    match cell.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        k => Some(k),
+    }
 }
 
 /// End-to-end lane: compile, build certified root gates, run the BaB.
@@ -206,7 +280,7 @@ fn lane_impl(
         ..root::RetainCfg::default()
     });
     let build_t0 = Instant::now();
-    let (root, retained) = {
+    let (mut root, retained) = {
         let _t = prof::Timer::start(prof::Phase::RootGate);
         match RootGates::build_retaining(
             &net,
@@ -227,10 +301,19 @@ fn lane_impl(
         }
     };
     let root_build_secs = build_t0.elapsed().as_secs_f64();
-    // READ-ONLY diagnostic (#hyperplane-probe): default-off behind
-    // `NY_HYPERPLANE_PROBE`. Computes and logs the trunk->head Jacobian
-    // spectrum, then returns. Touches no bound, gate, or verdict; when the env
-    // var is unset this closure is never entered, so behavior is byte-identical.
+    // #alpha-opt (`NY_MARGIN_ROW_ALPHA_OPT=1`, default OFF — byte-identical
+    // when unset): optimize the root trunk alpha where the root is still owned
+    // mutably, BEFORE any consumer (probe, y-pack, tree) reads the gates. The
+    // committed gates then produce the published root bound through the
+    // unchanged `root_eval`; the retained Tier-0 rows and `clip_rows` stay
+    // valid because the forward tableau and every `(l, u)` are frozen — only
+    // `alpha` (unstable neurons) and its Lipschitz coupling `ms` move.
+    alpha_opt::maybe_optimize_root_alpha(&net, &mut root, t, adv, deadline);
+    let root = root; // freeze: no mutation past this point
+                     // READ-ONLY diagnostic (#hyperplane-probe): default-off behind
+                     // `NY_HYPERPLANE_PROBE`. Computes and logs the trunk->head Jacobian
+                     // spectrum, then returns. Touches no bound, gate, or verdict; when the env
+                     // var is unset this closure is never entered, so behavior is byte-identical.
     if hyperplane_probe::enabled() {
         hyperplane_probe::run(&net, &root, t, adv);
     }
@@ -256,11 +339,45 @@ fn lane_impl(
     let domain_stack = margin_row_domain_stack_from_env(
         std::env::var("NY_MARGIN_ROW_DOMAIN_STACK").ok().as_deref(),
     );
+    // #margin-row-branch-width: EXPERIMENTAL candidate-budget override.
+    //
+    // ny scores k_head + k_trunk candidates EXACTLY in one batched pass per
+    // expansion (default 8 + 8 = 16). Measured on the lane that actually proves
+    // cifar100 rows: `score_candidates(batched)` is 40.0% of it at 554 ms/call.
+    // alpha-beta-CROWN instead ranks 7 candidates with a CHEAP kfsb score and
+    // spends exact work only on the winner, so its expansions cost milliseconds.
+    //
+    // Open question: idx_8600 runs 729 expansions and still fails, against 189
+    // for a row that PROVES. Are 729 well-chosen expansions worse than several
+    // thousand cheaper ones? These knobs exist to answer that.
+    //
+    // NOTE FOR THE NEXT READER: the ny-cli entry point builds its OWN BabConfig,
+    // and the scored concurrent lane comes through HERE. An override added only
+    // there is inert — measured exactly that way (expansions identical at k=8,
+    // 4 and 2), which is why it lives at this construction site.
+    let k_width = |name: &str, dflt: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|k| *k > 0)
+            .unwrap_or(dflt)
+    };
+    let k_defaults = BabConfig::default();
+    // Precedence: env (research override, both directions) > typed preset >
+    // built-in default — the `read_over_config` convention.
     let cfg = BabConfig {
         max_expansions,
         deadline,
         lru_cap,
         frontier,
+        k_head: k_width(
+            "NY_MARGIN_ROW_K_HEAD",
+            k_preset(&K_HEAD_PRESET).unwrap_or(k_defaults.k_head),
+        ),
+        k_trunk: k_width(
+            "NY_MARGIN_ROW_K_TRUNK",
+            k_preset(&K_TRUNK_PRESET).unwrap_or(k_defaults.k_trunk),
+        ),
         domain_stack,
         tier0_exact,
         tier0_universe,

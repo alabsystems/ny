@@ -1417,6 +1417,159 @@ impl GraphNetwork {
                 subset_rows,
             });
         }
+        // #cgan-stacked-backward (NY_CGAN_STACKED_BACKWARD=1, default OFF =>
+        // this whole block is skipped and the loop below is byte-identical).
+        // ONE dense backward walk carries every admissible demanded trunk
+        // target's identity rows, so the shared ConvTranspose generator
+        // prefix — measured at 98.4-99.7% of EVERY demanded cgan pass
+        // (docs/CGAN_COLLECTION_CACHE_DEFECTS_2026-08-03.md) — is walked once
+        // instead of once per target. Results are served to the loop below
+        // through the SAME Complete handling (shape restore + IBP
+        // intersection + provenance) a solo walk uses.
+        //
+        // SOUND: each stacked row's arithmetic is identical to its solo pass
+        // against the same (empty-so-far CROWN, IBP) maps — see
+        // target_backward::StackedSeedInjectionPlan and the bit-identity test
+        // — and the served bound then flows through the established
+        // shrink-only intersection. The one QUALITY tradeoff vs the
+        // sequential loop: solo walks late in the loop see earlier targets'
+        // tightened boxes for their ReLU relaxations, while the stacked pass
+        // sees only the pre-loop map. Sound either way (both maps are valid
+        // enclosures); measured on cgan the per-walk cost is flat to +/-6%
+        // across repeats ("nothing tightens"), so the cascade is worth ~0
+        // there. Any planner/executor refusal leaves `stacked_results` empty
+        // and every target on the historical per-target path.
+        //
+        // Excluded by construction: atomic-target collections (single-target
+        // authority boundary), the CganSparseTargetComplete mode, sparse-row
+        // planned targets, and the margin-subset OUTPUT node (their solo
+        // routes use k-row seeds the stack does not model).
+        let mut stacked_results: HashMap<String, BoundedTensor> = HashMap::new();
+        if super::cgan_stacked::stacked_backward_enabled()
+            && !atomic_target_engaged
+            && !matches!(
+                collection_mode,
+                CrownIbpCollectionMode::CganSparseTargetComplete
+            )
+        {
+            let stacked_candidates: Vec<super::cgan_stacked::StackedCandidate> = exec_order
+                .iter()
+                .enumerate()
+                .filter(|(index, node_name)| {
+                    global_budget_candidate_mask
+                        .get(*index)
+                        .copied()
+                        .unwrap_or(false)
+                        && !all_stable_skip.contains(*node_name)
+                        && !sparse_relu_row_plans.contains_key(*node_name)
+                        && margin_subset_output_node.as_deref() != Some(node_name.as_str())
+                })
+                .filter_map(|(index, node_name)| {
+                    Some(super::cgan_stacked::StackedCandidate {
+                        exec_index: index,
+                        node_name: node_name.clone(),
+                        rows: ibp_bounds.get(node_name)?.len(),
+                    })
+                })
+                .collect();
+            if let Some(plan) = super::cgan_stacked::plan_stacked_backward(
+                self,
+                exec_order,
+                &stacked_candidates,
+                &ibp_bounds,
+            ) {
+                // The stacked pass replaces its members' solo walks, so it
+                // gets the SUM of their weighted shares — a single share
+                // would starve a pass doing k targets' work
+                // (#cgan-stacked-backward, budget_policy sum-of-shares).
+                let mut below_floor = false;
+                let stacked_deadline = deadline.and_then(|d| {
+                    let now = Instant::now();
+                    if now >= d {
+                        below_floor = true;
+                        return None;
+                    }
+                    let remaining_secs = d.duration_since(now).as_secs_f64();
+                    let remaining_weight_sum = budget_policy::sum_remaining_budget_weights(
+                        &global_budget_candidate_weights,
+                        0,
+                    );
+                    let member_shares: Vec<(f64, f64)> = plan
+                        .member_exec_indices
+                        .iter()
+                        .zip(plan.stack.iter())
+                        .map(|(&exec_index, (_, rows))| {
+                            let weight = global_budget_candidate_weights
+                                .get(exec_index)
+                                .copied()
+                                .unwrap_or(0.0);
+                            let cap_dims = budget_policy::weighted_budget_cap_dims(
+                                weight,
+                                *rows as f64,
+                                chunk_aware_budget,
+                            );
+                            (weight, cap_dims)
+                        })
+                        .collect();
+                    let secs = budget_policy::compute_stacked_backward_budget_secs(
+                        remaining_secs,
+                        remaining_weight_sum,
+                        &member_shares,
+                        &per_node_time_budget,
+                    );
+                    match secs {
+                        Some(secs) => Some(now + Duration::from_secs_f64(secs)),
+                        None => {
+                            below_floor = true;
+                            None
+                        }
+                    }
+                });
+                if below_floor {
+                    super::cgan_stacked::stacked_event(format_args!(
+                        "stage=declined reason=sum-of-shares-below-floor"
+                    ));
+                } else {
+                    let stacked_start = Instant::now();
+                    match self.propagate_crown_to_node_stacked(
+                        input,
+                        &plan.stack,
+                        &crown_ibp_bounds,
+                        &ibp_bounds,
+                        engine,
+                        "CROWN-IBP stacked backward",
+                        stacked_deadline,
+                        deadline_is_hard,
+                    ) {
+                        Ok(results) => {
+                            // Members' walks are done: zero their scheduling
+                            // weights so later candidates' shares divide the
+                            // remaining window correctly.
+                            for &exec_index in &plan.member_exec_indices {
+                                if let Some(weight) =
+                                    global_budget_candidate_weights.get_mut(exec_index)
+                                {
+                                    *weight = 0.0;
+                                }
+                            }
+                            super::cgan_stacked::stacked_event(format_args!(
+                                "stage=executed members={} total_rows={} wall_secs={:.3}",
+                                results.len(),
+                                plan.total_rows,
+                                stacked_start.elapsed().as_secs_f64(),
+                            ));
+                            stacked_results = results.into_iter().collect();
+                        }
+                        Err(error) => {
+                            super::cgan_stacked::stacked_event(format_args!(
+                                "stage=fallback error='{error}' wall_secs={:.3}",
+                                stacked_start.elapsed().as_secs_f64(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let mut deadline_exceeded = false;
         // Smallest target dimension observed to burn its whole per-node share
         // and fail on time (#cifar100-collector-order). Later candidates at or
@@ -1651,7 +1804,9 @@ impl GraphNetwork {
             });
 
             // When deadline exceeded, skip CROWN backward and use IBP directly (#3109).
-            if deadline_exceeded {
+            // A stacked result is already computed — serving it is ~free and
+            // sound, so it bypasses every pre-walk skip below.
+            if deadline_exceeded && !stacked_results.contains_key(node_name) {
                 skip_count += 1;
                 crown_ibp_bounds.insert(node_name.clone(), ibp_bound.clone());
                 provenance.insert(
@@ -1734,6 +1889,7 @@ impl GraphNetwork {
 
             if !is_atomic_selected_target
                 && is_patches_target
+                && !stacked_results.contains_key(node_name)
                 && !patches_budget.can_start_node(budget_policy::MIN_PER_NODE_BUDGET_SECS)
             {
                 let node_dim = ibp_bound.len();
@@ -1764,7 +1920,7 @@ impl GraphNetwork {
             // backward cannot meaningfully tighten further.  Skipping saves the
             // ~5-7s per-node cost for the budget to reach deeper, wider nodes
             // where tightening matters most (#3499).
-            if !is_atomic_selected_target {
+            if !is_atomic_selected_target && !stacked_results.contains_key(node_name) {
                 if let Some(threshold) = min_width_to_tighten {
                     let ibp_max_width = ibp_bound.max_width();
                     if ibp_max_width < threshold {
@@ -1845,7 +2001,10 @@ impl GraphNetwork {
 
             // Skip this node when its per-node share falls below the minimum
             // floor even though the global deadline has not expired yet.
-            if deadline.is_some() && per_node_deadline.is_none() {
+            if deadline.is_some()
+                && per_node_deadline.is_none()
+                && !stacked_results.contains_key(node_name)
+            {
                 let remaining_global_candidates = budget_policy::count_remaining_budget_candidates(
                     &global_budget_candidate_mask,
                     layer_index,
@@ -1896,7 +2055,9 @@ impl GraphNetwork {
             // at least as large as one that already burned its entire share and
             // failed on time cannot finish either. Route it to IBP (SOUND — IBP
             // is a valid enclosure) so the budget reaches cheaper later targets.
-            if let Some(min_dim) = hopeless_min_dim {
+            if let Some(min_dim) =
+                hopeless_min_dim.filter(|_| !stacked_results.contains_key(node_name))
+            {
                 if effective_target_rows >= min_dim {
                     info!(
                         "CROWN-IBP DAG: node '{}' (effective rows {}, dim {}) skipped as \
@@ -1969,7 +2130,9 @@ impl GraphNetwork {
             if let (Some(model), Some(node_deadline), Some(collection_deadline)) =
                 (walk_cost_model.as_ref(), per_node_deadline, deadline)
             {
-                if !is_patches_target {
+                // A stacked-served member runs no walk: admission must not
+                // refuse (or re-price) work that is already done.
+                if !is_patches_target && !stacked_results.contains_key(node_name) {
                     let est_macs = self.collector_walk_macs_with_shapes(
                         node_name,
                         effective_target_rows,
@@ -2220,7 +2383,8 @@ impl GraphNetwork {
             // modeled. Likewise, a full-width non-patches target is dense. Any
             // other route has no authenticated proxy and runs unchanged.
             let mut prefix_work_units = None;
-            let prefix_admission = if prefix_cost_active {
+            let prefix_admission = if prefix_cost_active && !stacked_results.contains_key(node_name)
+            {
                 let prefix_objective_rows = match subset_indices.as_deref() {
                     Some(indices) => {
                         let virtual_full_grid = is_patches_target
@@ -2511,6 +2675,13 @@ impl GraphNetwork {
                 // attempt into a second dense attempt, and never publish any
                 // completed prefix. The match below retains the baseline.
                 Err(error)
+            } else if let Some(stacked_bound) = stacked_results.remove(node_name) {
+                // #cgan-stacked-backward: this member's rows were computed by
+                // the pre-loop stacked pass; serve them through the SAME
+                // Complete handling (shape restore + IBP intersection +
+                // provenance) a solo walk's result takes.
+                super::cgan_stacked::stacked_event(format_args!("stage=serve node='{node_name}'"));
+                Ok(super::target_backward::TargetCrownCollectionResult::Complete(stacked_bound))
             } else {
                 full_backward_attempted = true;
                 if expected_fixed_waves.is_some() {

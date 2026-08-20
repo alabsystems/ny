@@ -72,6 +72,11 @@ ny-cert = { path = "../ny-cert" }
 ny-api = { path = "../ny-api", features = ["cert"] }
 ny-groundtruth = { path = "../ny-groundtruth" }
 ny-levers = { path = "../ny-levers" }
+# The falsification chassis (`docs/FALSIFICATION_PORTFOLIO_ARCHITECTURE_2026-08-18.md`).
+# The edge is ONE WAY and must stay one way: `ny-falsify` has no dependency of any
+# kind, so `VnncompResult` and `gate_sat_with_trusted_oracle` are not nameable from
+# a strategy. Pinned by `crates/ny-falsify/tests/soundness_boundary.rs`.
+ny-falsify = { path = "../ny-falsify" }
 ny-mip = { path = "../ny-mip", optional = true }
 # In-process CDCL SAT backend for the sat_relu CNF-recovery route
 # (`commands/beta_crown/cnf_route.rs`). Rev-pinned to the SAME ay commit

@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import platform
-import resource
 import shutil
 import subprocess
 from pathlib import Path
@@ -52,7 +51,16 @@ def _init_git_repo(path: Path) -> None:
 
 
 def _lower_child_vmem_below_attestation() -> None:
-    """Keep safety-test children contained while making attestation false."""
+    """Keep safety-test children contained while making attestation false.
+
+    ``resource`` is imported HERE, not at module scope. Every contract in this
+    file is an ``external_*`` Linux-lane test, and that naming is supposed to
+    keep them out of ordinary ``pytest tests/``; a module-level POSIX-only
+    import defeated it at COLLECTION time, erroring the whole file on Windows
+    before the lane selection could apply. Selecting the lane on a non-Linux
+    host still fails here, which is the contract.
+    """
+    import resource
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
     attested_bytes = ATTESTED_VMEM_KIB * 1024
     if soft == resource.RLIM_INFINITY or soft >= attested_bytes:

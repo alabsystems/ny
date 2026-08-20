@@ -32,9 +32,31 @@ use ny_tensor::BoundedTensor;
 /// recovery than the local rule, not an exact or uniformly better gradient.
 /// The gate remains dark, and no verdict conversion has been measured.
 pub(crate) fn envelope_grad_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::root_alpha::ALPHA_ENVELOPE_GRAD)
-        .value
-        .as_bool()
+    envelope_grad_enabled_with(None)
+}
+
+/// [`envelope_grad_enabled`] with the typed preset answer layered in.
+///
+/// DELIVERY, and the reason this function exists: `vnncomp_scripts/run_instance.sh`
+/// exports exactly ONE `NY_*` variable, so an env-only lever cannot fire in
+/// competition however well it measures (`ny-cli/tests/measured_gate_delivery.rs`
+/// guards that). The preset key `bab.alpha_crown.alpha_envelope_grad` is the
+/// path that actually reaches a scored run.
+///
+/// Layering is `read_over_config`'s: an env value wins in BOTH directions so an
+/// A/B can still force the rule on or off over a preset that sets it; config
+/// second; the declaration default (`false`) last. A malformed env token is a
+/// REJECTION, not an arming — `"true"`, `" 1"`, `"01"` all leave the rule dark,
+/// which is deliberate and pinned by the lever's own tests.
+///
+/// Fails closed to the shipped local rule if resolution errors.
+pub(crate) fn envelope_grad_enabled_with(config: Option<bool>) -> bool {
+    ny_levers::read_over_config(
+        &ny_levers::decls::root_alpha::ALPHA_ENVELOPE_GRAD,
+        config.map(ny_levers::LeverValue::Bool),
+    )
+    .map(|resolved| resolved.value.as_bool())
+    .unwrap_or(false)
 }
 
 /// The dark `x*` envelope diagnostic, shared by this CPU path and the DAG path
@@ -104,6 +126,9 @@ impl GraphNetwork {
             intermediate,
             alpha_state,
             engine,
+            // The legacy face has no AlphaCrownConfig in scope; env-only here.
+            // The DAG lane (which is what cifar100 takes) threads the preset
+            // answer at its own call sites.
             envelope_grad_enabled(),
         )
     }

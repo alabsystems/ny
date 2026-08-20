@@ -360,6 +360,11 @@ pub(in crate::beta_crown::engine::graph) fn validate_append_suffix_v1(
     let suffix = &child[parent.len()..];
 
     let mut pattern = 0u64;
+    // `as_chunks::<N>()` (the tippy suggestion) reshapes this validation
+    // walk's types; keep `chunks_exact` until the public pin's clippy also
+    // carries the lint.
+    #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (offset, record) in suffix
         .chunks_exact(GPU_BAB_BOUND_SPLIT_HISTORY_RECORD_WORDS)
         .enumerate()

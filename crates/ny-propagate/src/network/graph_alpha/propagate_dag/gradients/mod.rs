@@ -914,7 +914,9 @@ impl GraphNetwork {
             // even the baselines disagree (CPU local 59, GPU local 63), so the
             // interior-alpha counts are not commensurable. That question needs an
             // experiment holding the bound path fixed.
-            if super::super::backward::gradients::envelope_grad_enabled() {
+            if super::super::backward::gradients::envelope_grad_enabled_with(Some(
+                ctx.config.alpha_envelope_grad,
+            )) {
                 static ARMED: std::sync::Once = std::sync::Once::new();
                 ARMED.call_once(|| {
                     tracing::info!(
@@ -927,7 +929,7 @@ impl GraphNetwork {
                     );
                 });
             }
-            let probe = std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1");
+            let probe = crate::beta_gpu_probe_armed();
             if probe {
                 eprintln!(
                     "[warmup-grad] ENTER gpu={} od={}",
@@ -1461,8 +1463,9 @@ impl GraphNetwork {
                     // clamp = the loosest envelope). When the envelope gate is
                     // armed, rescale it into the envelope rule on the host.
                     let envelope =
-                        if crate::network::graph_alpha::backward::gradients::envelope_grad_enabled()
-                        {
+                        if crate::network::graph_alpha::backward::gradients::envelope_grad_enabled_with(
+                            Some(ctx.config.alpha_envelope_grad),
+                        ) {
                             self.envelope_rescaled_warmup_gradients(
                                 ctx,
                                 node_bounds,
@@ -1484,7 +1487,7 @@ impl GraphNetwork {
                             if envelope.is_some() {
                                 "RESCALED the resident local-rule gradients"
                             } else if crate::network::graph_alpha::backward::gradients::
-                                envelope_grad_enabled()
+                                envelope_grad_enabled_with(Some(ctx.config.alpha_envelope_grad))
                             {
                                 "ARMED but unavailable -> local rule (fail-closed)"
                             } else {
@@ -2155,7 +2158,7 @@ impl GraphNetwork {
         {
             return None;
         }
-        if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+        if crate::beta_gpu_probe_armed() {
             let mn = result
                 .lower_bounds
                 .iter()
@@ -5440,8 +5443,13 @@ mod tests {
 
     /// Direct no-deadline replay oracle at the same α iterate: one complete
     /// AnalyticChain intermediates fold + `binding_row_true_alpha_grads`.
-    /// This pins the low-level math; finite production-seam tests separately
-    /// assert that incomplete deadline-bounded captures refuse replay.
+    ///
+    /// This pins the low-level math and serves as a NON-VACUITY witness for
+    /// the finite production-seam tests: it proves the replay produces
+    /// something other than the caller's supplied-local sentinel at this
+    /// iterate. It is NOT a bit-exact oracle for the finite seam — see the
+    /// `#patches-finite-expiry` block below: the seam replays a
+    /// deadline-BOUNDED capture, whose values are nearby but not identical.
     fn direct_replay_oracle(
         fix: &WarmupFixture,
         runtime: &DagAlphaRuntimeState,
@@ -5473,13 +5481,122 @@ mod tests {
             .expect("oracle binding-row replay")
     }
 
-    /// Finite-authority Conv fixture: the bounded DAG backward exits through
-    /// full-CROWN without publishing intermediate A-matrices. The replay must
-    /// refuse that partial capture and preserve supplied-local fallback. The
-    /// no-deadline direct oracle proves the replay math itself is available
-    /// and distinct, so the refusal assertion is not vacuous.
+    // =====================================================================
+    // #patches-finite-expiry — WHY THE FINITE-Conv SEAM TESTS BELOW CHANGED
+    // =====================================================================
+    //
+    // These four tests (the two `finite_conv_margin_lane_*` lane tests, the
+    // `finite_conv_proposal_refusal_*` tier-order test, and the
+    // `finite_conv_margin_loop_*` telemetry receipt) used to assert
+    // `LocalFallback { reason: ResidentUnavailable | JointUnavailable,
+    // source: SuppliedLocal }` and a FLAT `telemetry().replay_dispatches`.
+    //
+    // THAT WAS A CONSEQUENCE OF A DEFECT, NOT AN INVARIANT. A family of
+    // guards refused the native structured ("Patches") CROWN routes whenever
+    // a deadline was merely PRESENT rather than EXPIRED. Every scored
+    // VNN-COMP run carries a deadline, so those guards fired ALWAYS: the
+    // carrier densified, the bounded DAG backward exited through full-CROWN
+    // without publishing intermediate A-matrices, and the binding-row replay
+    // had no complete capture to replay. The tests then recorded the
+    // resulting fallback as if it were the contract. It never was — it was
+    // the shape of the bug, frozen into assertions.
+    //
+    // The guards now decide by EXPIRY (`patches_step::expiry_authority_armed`,
+    // default ON; `NY_PATCHES_FINITE_EXPIRY=0` is the opt-out kill switch that
+    // restores the old presence behaviour). A non-expired deadline keeps the
+    // structured route, the capture is COMPLETE, and the armed lane reaches
+    // the joint adjoint: `JointDispatched { source: CpuReplay }`, with the
+    // replay counter incrementing. Measured evidence for the flip: bootstrap
+    // on cifar_bias_field_46 37.3s -> 1.4s; a 20-row relusplitter biasfield
+    // sweep identical row-by-row in both arms (3 sat / 17 timeout); commit
+    // `8c393486c` proves that row at a 300s budget with bounds marginally
+    // TIGHTER than the last-good commit (alpha -167.82 vs -168.46, layer-4
+    // width 726.70 vs 726.89); `55ec3d0bf` quantifies the residual regression
+    // at 2.36x walk cost.
+    //
+    // THE INVARIANT THAT STILL HOLDS, and which these tests continue to
+    // protect, is narrower: A REPLAY MUST NOT BE ACCEPTED OR COUNTED OFF AN
+    // INCOMPLETE CAPTURE. `try_binding_row_replay_gradients` still typed-
+    // refuses (`intermediates_capture_failed`, `replay_typed_refusal`,
+    // `seed_row_space_unmapped`, `irreconcilable_alpha_geometry`,
+    // `nonfinite_gradient`, expiry) and still calls `note_replay_dispatch()`
+    // only on the accepted path. What changed is that this fixture now HAS a
+    // complete capture, so the refusal branch is simply not the one it takes.
+    // The refusal machinery keeps its own coverage in
+    // `replay_refuses_multi_row_objective_and_falls_through_with_reason_preserved`
+    // and `replay_requires_deadline_and_is_unreachable_when_disarmed`.
+    //
+    // WHY THIS IS SAFE TO FLIP UNDER TEST. Margin gradients are
+    // non-soundness-critical: they only steer α, and ANY α ∈ [0,1] is a valid
+    // lower slope, so every iterate is a certified-sound relaxation and the
+    // loop's own certified CPU fold re-evaluates it (element-wise best-state
+    // retention rejects regressions). The thing being replaced here is not a
+    // safe default — this module's own header records that the local rule the
+    // lane fell back to is the WRONG one (`true_root_warmup_gradients`:
+    // "NOT the wrong local rule `pre_lower_i·Σ_j max(A[j,i],0)`"; the
+    // no-authority tier comment: "the wrong-direction local rule is LAST in
+    // all cases"). That rule is sign-definite by construction
+    // (`pre_lower ≤ 0` times a non-negative column sum), so it can carry the
+    // WRONG SIGN relative to the true d(binding-row)/dα. Preferring an
+    // FD-proven replay over a possibly-wrong-signed local rule is the point
+    // of the tier, not a hazard.
+    //
+    // WHAT WE DELIBERATELY DO NOT ASSERT: bit-equality against
+    // `direct_replay_oracle`. Measured, the finite seam and the no-deadline
+    // oracle DIFFER — same sparsity, nearby values — because the seam replays
+    // a deadline-BOUNDED capture. Asserting bitwise identity would re-freeze
+    // an accident of one capture path. We assert the DISPATCH, and that the
+    // returned gradients are no longer the caller's supplied-local ones; the
+    // oracle stays only as a non-vacuity witness.
+
+    /// Assert an armed finite-Conv lane accepted the CPU binding-row replay
+    /// and actually replaced the caller's supplied-local gradients.
+    ///
+    /// Deliberately does NOT compare against `direct_replay_oracle` bitwise
+    /// (see the `#patches-finite-expiry` block above).
+    fn assert_accepted_replay_dispatch(
+        result: Option<WarmupGradientResult>,
+        supplied: &[Array1<f32>],
+    ) -> Vec<Array1<f32>> {
+        let result = result.expect("an armed request must resolve inside the bounded lane");
+        assert_eq!(
+            result.margin_dispatch,
+            MarginGradientDispatch::JointDispatched {
+                source: MarginGradientJointSource::CpuReplay
+            },
+            "a COMPLETE finite Conv capture must reach the joint adjoint via the CPU replay"
+        );
+        assert_eq!(
+            result.gradients.len(),
+            supplied.len(),
+            "the replay must emit one gradient per runtime ReLU"
+        );
+        for (index, (got, sentinel)) in result.gradients.iter().zip(supplied).enumerate() {
+            assert_eq!(
+                got.len(),
+                sentinel.len(),
+                "ReLU {index}: the replay must stay at ALPHA width"
+            );
+            assert_ne!(
+                grads_bits(std::slice::from_ref(got)),
+                grads_bits(std::slice::from_ref(sentinel)),
+                "ReLU {index}: an ACCEPTED replay must overwrite the caller's supplied-local \
+                 sentinel — if this still matches, the lane silently fell back"
+            );
+        }
+        result.gradients
+    }
+
+    /// Finite-authority Conv fixture: with the structured CROWN route decided
+    /// by deadline EXPIRY (`#patches-finite-expiry`, default ON), the bounded
+    /// DAG backward publishes a COMPLETE intermediates capture, so the armed
+    /// margin lane dispatches the CPU binding-row replay and the caller's
+    /// supplied-local sentinel is gone. The no-deadline direct oracle stays as
+    /// the non-vacuity witness (the replay math is available and distinct at
+    /// this iterate); it is NOT compared bitwise — the seam replays a
+    /// deadline-BOUNDED capture.
     #[test]
-    fn finite_conv_margin_lane_refuses_partial_replay_and_keeps_supplied_local() {
+    fn finite_conv_margin_lane_dispatches_replay_over_supplied_local() {
         with_env_edits(|env| {
             replay_tier_env(env);
 
@@ -5492,7 +5609,7 @@ mod tests {
             let mut spec = vec![0.0f32; fix.output_dim];
             spec[binding_row] = 1.0;
 
-            assert_local_margin_fallback(
+            let dispatched = assert_accepted_replay_dispatch(
                 fix.graph.try_gpu_resnet_warmup_gradients(
                     &ctx,
                     &fix.bounds,
@@ -5503,8 +5620,6 @@ mod tests {
                     MarginGradientRequest::Binding(&spec),
                 ),
                 &supplied,
-                MarginGradientFallbackReason::ResidentUnavailable,
-                MarginGradientFallbackSource::SuppliedLocal,
             );
 
             let oracle = direct_replay_oracle(&fix, &runtime, binding_row);
@@ -5516,18 +5631,27 @@ mod tests {
                 assert_ne!(
                     grads_bits(std::slice::from_ref(expected)),
                     grads_bits(std::slice::from_ref(&supplied[index])),
-                    "the complete no-deadline replay at '{name}' must differ from the finite \
-                     seam's supplied-local fallback"
+                    "the complete no-deadline replay at '{name}' must differ from the \
+                     supplied-local sentinel, or this fixture proves nothing"
+                );
+                assert_eq!(
+                    expected.len(),
+                    dispatched[index].len(),
+                    "the oracle and the finite seam must agree on ALPHA width at '{name}' \
+                     even though their values differ"
                 );
             }
         });
     }
 
-    /// The same finite-capture refusal with channel-shared alpha. The direct
-    /// oracle still proves the replay produces correctly reduced alpha-width
-    /// gradients when a complete no-deadline capture is explicitly requested.
+    /// The same accepted finite-capture dispatch with channel-shared alpha:
+    /// the replay must land at ALPHA width C (channel-summed), not at neuron
+    /// width, and must replace the supplied-local sentinel. The direct oracle
+    /// pins the reduced width independently (see the `#patches-finite-expiry`
+    /// block above for why it is a width/non-vacuity witness only, never a
+    /// bitwise oracle for this seam).
     #[test]
-    fn finite_conv_margin_lane_refuses_partial_channel_shared_replay() {
+    fn finite_conv_margin_lane_dispatches_channel_shared_replay() {
         with_env_edits(|env| {
             replay_tier_env(env);
 
@@ -5552,7 +5676,7 @@ mod tests {
             let mut spec = vec![0.0f32; fix.output_dim];
             spec[binding_row] = 1.0;
 
-            assert_local_margin_fallback(
+            let dispatched = assert_accepted_replay_dispatch(
                 fix.graph.try_gpu_resnet_warmup_gradients(
                     &ctx,
                     &fix.bounds,
@@ -5563,8 +5687,6 @@ mod tests {
                     MarginGradientRequest::Binding(&spec),
                 ),
                 &supplied,
-                MarginGradientFallbackReason::ResidentUnavailable,
-                MarginGradientFallbackSource::SuppliedLocal,
             );
 
             let oracle = direct_replay_oracle(&fix, &runtime, binding_row);
@@ -5573,7 +5695,12 @@ mod tests {
                 assert_eq!(
                     supplied[index].len(),
                     alpha_len,
-                    "supplied fallback at '{name}' must be at ALPHA width C"
+                    "supplied sentinel at '{name}' must be at ALPHA width C"
+                );
+                assert_eq!(
+                    dispatched[index].len(),
+                    alpha_len,
+                    "the dispatched replay at '{name}' must reduce to ALPHA width C"
                 );
                 let expected = oracle
                     .grads
@@ -5587,17 +5714,22 @@ mod tests {
                 assert_ne!(
                     grads_bits(std::slice::from_ref(expected)),
                     grads_bits(std::slice::from_ref(&supplied[index])),
-                    "the complete direct replay at '{name}' must differ from fallback"
+                    "the complete direct replay at '{name}' must differ from the sentinel"
                 );
             }
         });
     }
 
-    /// A typed proposal refusal still consults the replay tier, but the finite
-    /// Conv capture cannot publish complete A-matrices. Preserve the original
-    /// proposal's `joint_unavailable` reason and supplied-local gradients.
+    /// Tier order on the refusal side: a typed proposal refusal must still
+    /// consult the replay tier FIRST, and — now that the finite Conv capture
+    /// is complete (`#patches-finite-expiry`, default ON) — the replay
+    /// ACCEPTS, so the proposal's `joint_unavailable` reason is superseded
+    /// rather than preserved. Preservation is only the both-tiers-refuse
+    /// contract, and it keeps its own coverage in
+    /// `replay_refuses_multi_row_objective_and_falls_through_with_reason_preserved`.
+    /// The proposal accelerant must still be consulted exactly once.
     #[test]
-    fn finite_conv_proposal_refusal_survives_partial_replay_refusal() {
+    fn finite_conv_proposal_refusal_falls_through_to_accepted_replay() {
         with_env_edits(|env| {
             replay_tier_env(env);
 
@@ -5626,18 +5758,18 @@ mod tests {
                 1,
                 "the proposal accelerant must have been consulted first"
             );
-            assert_local_margin_fallback(
-                result,
-                &supplied,
-                MarginGradientFallbackReason::JointUnavailable,
-                MarginGradientFallbackSource::SuppliedLocal,
-            );
+            let dispatched = assert_accepted_replay_dispatch(result, &supplied);
             let oracle = direct_replay_oracle(&fix, &runtime, binding_row);
             for (index, (name, _)) in fix.relu_nodes.iter().enumerate() {
                 assert_ne!(
                     grads_bits(std::slice::from_ref(&oracle.grads[name.as_str()])),
                     grads_bits(std::slice::from_ref(&supplied[index])),
                     "the complete direct replay at '{name}' must remain non-vacuous"
+                );
+                assert_eq!(
+                    oracle.grads[name.as_str()].len(),
+                    dispatched[index].len(),
+                    "the oracle and the finite seam must agree on ALPHA width at '{name}'"
                 );
             }
         });
@@ -5821,11 +5953,21 @@ mod tests {
         });
     }
 
-    /// Loop-level hard-authority receipt: this finite Conv run cannot publish
-    /// a complete intermediates capture, so it must finish via local fallback
-    /// without incrementing the truthful accepted-replay counter.
+    /// Loop-level truthfulness receipt for the accepted-replay counter: this
+    /// finite Conv run publishes a COMPLETE intermediates capture
+    /// (`#patches-finite-expiry`, default ON), so its armed margin iterations
+    /// reach the CPU binding-row replay and `note_replay_dispatch()` fires.
+    ///
+    /// The counter is a process-wide monotonic atomic and `before` is sampled
+    /// outside the env lock held by `run_margin_loop_with_steering`, so this
+    /// asserts a strict INCREASE rather than an exact delta — concurrent
+    /// tests may add to it, but nothing can subtract. The invariant under
+    /// test is that an accepted replay is counted; the complementary
+    /// invariant (an INCOMPLETE capture must never be counted) is enforced by
+    /// the typed refusals in `try_binding_row_replay_gradients`, which return
+    /// before `note_replay_dispatch()`.
     #[test]
-    fn finite_conv_margin_loop_records_no_accepted_replay_dispatch() {
+    fn finite_conv_margin_loop_records_accepted_replay_dispatch() {
         let before = crate::alpha_gradient_steering::telemetry().replay_dispatches;
         let (_bounds, steering) = run_margin_loop_with_steering(None, 3);
         assert!(
@@ -5833,10 +5975,10 @@ mod tests {
             "this arm runs without a proposal channel"
         );
         let after = crate::alpha_gradient_steering::telemetry().replay_dispatches;
-        assert_eq!(
-            after, before,
-            "a finite Conv loop must not report a replay after its bounded capture omitted \
-             the A-matrices ({before} -> {after})"
+        assert!(
+            after > before,
+            "a finite Conv loop with a complete bounded capture must report at least one \
+             accepted replay ({before} -> {after})"
         );
     }
 

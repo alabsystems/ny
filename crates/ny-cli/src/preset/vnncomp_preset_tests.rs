@@ -368,6 +368,30 @@ fn complete_clip_experiment_is_scoped_to_cifar100_not_tinyimagenet() {
     assert!(!tiny_config.root_alpha_phase_checkpoint);
 }
 
+/// #margin-row-branch-width: pin the measured cifar100 width and its scoping.
+///
+/// k=16 converts `idx_8600_sidx_2721` (timeout -> unsat, 186 expansions,
+/// frontier drains 424 -> 2) and k=4 LOSES a banked proof, so this key is
+/// evidence-bearing in both directions: the value matters, and it must not
+/// leak to categories where it was never measured (the tinyimagenet transfer
+/// trap all over again — see the allocation-trio no-go below).
+#[test]
+fn cifar100_branch_width_is_pinned_and_scoped() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let cifar = load_preset(&repo_root.join("configs/vnncomp25/cifar100_2024.yaml")).unwrap();
+    assert_eq!(cifar.margin_row.k_head, Some(16));
+    assert_eq!(cifar.margin_row.k_trunk, Some(16));
+
+    let tiny = load_preset(&repo_root.join("configs/vnncomp25/tinyimagenet_2024.yaml")).unwrap();
+    assert_eq!(tiny.margin_row.k_head, None);
+    assert_eq!(tiny.margin_row.k_trunk, None);
+
+    // #backward-interm ships to BOTH wall categories — each on its own
+    // measured evidence and its own pre-registered ship gate (2026-08-19).
+    assert_eq!(cifar.margin_row.backward_interm, Some(true));
+    assert_eq!(tiny.margin_row.backward_interm, Some(true));
+}
+
 /// #tinyimagenet-alloc-parity-no-go: the CIFAR allocation trio regressed the
 /// official-budget TinyImageNet sample from 5/10 to 2/10, including three lost
 /// SAT rows. Pin the measured TinyImageNet baseline so a sibling-preset transfer

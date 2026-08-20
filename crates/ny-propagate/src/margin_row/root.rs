@@ -140,7 +140,16 @@ pub struct LayerGates {
     pub l: Vec<f64>,
     /// Upper box side.
     pub u: Vec<f64>,
-    /// Lower-line slope per neuron (0.0 or 1.0).
+    /// Lower-line slope per neuron, in `[0, 1]`.
+    ///
+    /// Born binary from the area heuristic (`gates_from_box`: `[u >= -l]`);
+    /// `alpha_opt` (#alpha-opt, env-gated, default OFF) may move UNSTABLE
+    /// neurons to fractional values. Any `alpha in [0, 1]` is a valid DeepPoly
+    /// lower line (`alpha*y <= relu(y)` pointwise on all of R), and the
+    /// backward engine's certified error carry contracts by
+    /// [`Self::ms`] `= max(alpha, s)` — whoever writes `alpha` MUST re-derive `ms` or the
+    /// carried error is under-scaled (false-UNSAT risk). Stable and
+    /// split-baked neurons always keep their exact fixed lines.
     pub alpha: Vec<f64>,
     /// Upper-line slope per neuron.
     pub s: Vec<f64>,
@@ -150,9 +159,80 @@ pub struct LayerGates {
     pub ms: Vec<f64>,
     /// Unstable neuron indices (l < 0 < u).
     pub unst: Vec<usize>,
+    /// #clip-rows: INPUT-RELATIVE affine rows for the UNSTABLE neurons only,
+    /// `(unst.len(), n_in)` midpoint coefficients and matching deviation.
+    ///
+    /// These are the halfspace coefficients Clip-and-Verify needs: a split
+    /// `z_k,i(x) <= 0` plus this row gives an input-space constraint that
+    /// over-approximates the subdomain (a NECESSARY condition, hence the safe
+    /// direction), which lets every OTHER unstable neuron be re-concretized over
+    /// `box INTERSECT halfspaces`. Without it a split tightens only its own
+    /// neuron, children never close, and the frontier explodes -- the measured
+    /// cause of cifar100's timeouts (idx_8600 open domains 18 -> 415 at depth 30
+    /// while idx_6659 drains 26 -> 4 and proves).
+    ///
+    /// The root forward pass ALREADY computes these (`mi`/`di` at each ReLU's
+    /// input) and previously discarded them, so this is retention, not new work.
+    /// `None` when unretained, which is byte-identical to the historical struct
+    /// for every existing consumer.
+    ///
+    /// FRAME: input-relative, `n_in` columns. NOT the tier-0 capture, which is
+    /// output-relative — substituting it is the frame error that quarantined the
+    /// sequential clip and is a false-`unsat` generator.
+    pub clip_rows: Option<ClipRows>,
+}
+
+/// #clip-rows: retained input-relative affine rows for one layer's unstable
+/// neurons. See [`LayerGates::clip_rows`].
+#[derive(Debug, Clone)]
+pub struct ClipRows {
+    /// Midpoint coefficients, `(unst.len(), n_in)`.
+    pub m: Array2<f64>,
+    /// Deviation, same shape.
+    pub d: Array2<f64>,
+    /// Certified DOWNWARD slack of the lower line, one per retained row.
+    ///
+    /// `concretize_box` does not stop at the box-minimum of the `m - d` line: it
+    /// subtracts `gam * (tabs + |bl| + |bu|)` plus, on the f32 fast path, a
+    /// per-neuron error term `gerr[j]` that GROWS WITH DEPTH (measured on
+    /// cifar100 idx_8600: 2.4e-5 at layer 0, 2.9e-3 at layer 2). So the line
+    /// bounds the neuron pointwise only up to that error, and any halfspace
+    /// derived from it must pay the same slack or it cuts into the true
+    /// subdomain — a false-`unsat` generator.
+    ///
+    /// Stored as the gap between the line's own box-minimum and the bound the
+    /// lane actually published, which needs no re-derivation of `gam`, `tabs`
+    /// or `gerr` and is therefore exact by construction.
+    pub sl_lo: Vec<f64>,
+    /// Certified UPWARD slack of the upper line, one per retained row.
+    pub sl_up: Vec<f64>,
+    /// Midpoint CONSTANT term, one per retained row.
+    ///
+    /// The forward tableau is AUGMENTED (`naug = n_in + 1`) and
+    /// `concretize_box` reads the bias out of the last column as
+    /// `bl = m[n_in] - d[n_in]`, `bu = m[n_in] + d[n_in]`. Dropping it would
+    /// make every halfspace pass through the origin, which is simply a
+    /// different (and wrong) constraint.
+    pub bm: Vec<f64>,
+    /// Deviation of the constant term.
+    pub bd: Vec<f64>,
 }
 
 /// Root state shared by every pass: input box + frozen gates.
+/// #clip-rows: retain input-relative affine rows at each trunk ReLU?
+///
+/// Default OFF, so `LayerGates::clip_rows` is `None` and the struct is
+/// byte-identical to its history for every existing consumer. Retention is pure
+/// memory — nothing reads these rows yet.
+fn clip_rows_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_ROWS)
+            .value
+            .as_bool()
+    })
+}
+
 pub struct RootGates {
     /// Rounding mode the gates (and every consumer pass) run in.
     pub mode: RoundMode,
@@ -283,7 +363,25 @@ impl RootGates {
         deadline: Option<Instant>,
         use_f32: bool,
     ) -> Result<Self> {
-        Ok(Self::build_retaining_inner(net, lo, hi, mode, deadline, None, &[], use_f32)?.0)
+        // `bi: None`: the precision differential/enclosure oracles compare the
+        // f32 and f64 tableau lanes in isolation; the (env-gated) backward
+        // intermediate phase is exercised by its own tests instead.
+        Ok(Self::build_retaining_inner(net, lo, hi, mode, deadline, None, &[], use_f32, None)?.0)
+    }
+
+    /// Test entry with an EXPLICIT backward-intermediate config
+    /// (#backward-interm), bypassing the `NY_MARGIN_ROW_BACKWARD_INTERM` env
+    /// gate so unit tests are order-independent of process environment.
+    #[cfg(test)]
+    pub(crate) fn build_retaining_bi(
+        net: &TwinNet,
+        lo: &[f64],
+        hi: &[f64],
+        mode: RoundMode,
+        deadline: Option<Instant>,
+        bi: Option<super::backward_interm::BiCfg>,
+    ) -> Result<(Self, Option<RetainedRows>)> {
+        Self::build_retaining_inner(net, lo, hi, mode, deadline, None, &[], false, bi)
     }
 
     /// Build with optional Tier-0 row retention (#epoch-bab) and optional
@@ -319,6 +417,7 @@ impl RootGates {
             retain,
             splits,
             root_f32_requested(),
+            super::backward_interm::from_env(mode),
         )
     }
 
@@ -339,6 +438,7 @@ impl RootGates {
         retain: Option<&RetainCfg>,
         splits: &[(usize, usize, i8)],
         use_f32: bool,
+        bi: Option<super::backward_interm::BiCfg>,
     ) -> Result<(Self, Option<RetainedRows>)> {
         // f32 lanes + the certified error slack are only meaningful in the
         // certified-outward verdict mode.
@@ -425,6 +525,15 @@ impl RootGates {
             vec![None; net.ops.len() + 1];
         state[0] = Some((m0, d0, g0, s0));
         let mut layers = Vec::new();
+        // #backward-interm: only on the ROOT build (`splits.is_empty()`) —
+        // Tier-2 epoch rebuilds must not re-spend the budget mid-search — and
+        // only in outward mode (enforced by `from_env`; the test entry passes
+        // an explicit config). `None` ⇒ byte-identical build.
+        let mut bi_state = if splits.is_empty() && mode.outward() {
+            bi.map(|cfg| super::backward_interm::BiState::new(cfg, deadline))
+        } else {
+            None
+        };
 
         // Baked splits per trunk layer (#epoch-bab Tier 2).
         let mut split_by_layer: std::collections::BTreeMap<usize, Vec<(usize, i8)>> =
@@ -660,7 +769,7 @@ impl RootGates {
                     } else {
                         None
                     };
-                    let (l, u) = concretize_box(
+                    let (mut l, mut u) = concretize_box(
                         &mi,
                         &di,
                         &mid,
@@ -678,6 +787,35 @@ impl RootGates {
                                 "margin_row: non-finite tableau box".into(),
                             ));
                         }
+                    }
+                    // #backward-interm calibration capture. `clip_rows` slack
+                    // MUST be recovered against the bounds THIS layer's own
+                    // `m ± d` lines produced (the forward-only ones): after the
+                    // shrink-only intersection below, `lo_min - l_published`
+                    // under-recovers the line's certified slack (it can go
+                    // negative and clamp to 0), and a halfspace paying too
+                    // little slack cuts into the true subdomain — a
+                    // false-`unsat` generator. Cloned only when both the
+                    // tightener and retention are live.
+                    let bi_cal =
+                        (bi_state.is_some() && clip_rows_enabled()).then(|| (l.clone(), u.clone()));
+                    if let Some(bi) = bi_state.as_mut() {
+                        // Shrink-only intersection with the lane's own
+                        // backward enclosure over the frozen prefix gates
+                        // (soundness: module docs of `backward_interm`).
+                        bi.tighten_layer(
+                            net,
+                            mode,
+                            &mid,
+                            &rad,
+                            &xabs,
+                            lo,
+                            hi,
+                            &mut layers,
+                            k,
+                            &mut l,
+                            &mut u,
+                        );
                     }
                     let mut gates = gates_from_box(&l, &u);
                     if mode.outward() {
@@ -744,6 +882,26 @@ impl RootGates {
                         }
                         ret.layers.push(layer_ret);
                     }
+                    // #clip-rows: retain the INPUT-RELATIVE affine rows for the
+                    // unstable neurons. `mi`/`di` are (n, n_in) and are exactly
+                    // what `concretize_box` just consumed to produce `l`/`u`, so
+                    // the frame is established by construction here rather than
+                    // asserted later. Only `unst` rows are kept: a split can only
+                    // constrain an unstable neuron, and keeping all of them would
+                    // be (n x n_in) f64 per trunk layer.
+                    // Calibration frame (#backward-interm): the FORWARD-only
+                    // bounds when the tightener ran (see `bi_cal` above),
+                    // otherwise the published ones — which then ARE the
+                    // forward bounds, so the historical behavior is
+                    // bit-identical.
+                    let clip_rows = clip_rows_enabled().then(|| {
+                        let (l_cal, u_cal) = bi_cal
+                            .as_ref()
+                            .map_or((l.as_slice(), u.as_slice()), |(lc, uc)| {
+                                (lc.as_slice(), uc.as_slice())
+                            });
+                        retain_clip_rows(&mi, &di, &unst, &mid, &rad, l_cal, u_cal)
+                    });
                     layers.push(LayerGates {
                         op: k,
                         n,
@@ -754,6 +912,7 @@ impl RootGates {
                         c: c.clone(),
                         ms,
                         unst,
+                        clip_rows,
                     });
                     debug_assert_eq!(layers.len() - 1, *layer);
                     if k == last_relu {
@@ -814,6 +973,9 @@ impl RootGates {
         if timing {
             print_root_timing(&op_times, build_t0.elapsed().as_secs_f64(), true);
         }
+        if let Some(bi) = bi_state.as_ref() {
+            bi.finish();
+        }
         Ok((
             Self {
                 mode,
@@ -826,6 +988,66 @@ impl RootGates {
             },
             retained,
         ))
+    }
+}
+
+/// #clip-rows retention body (extracted so the calibration frame is testable
+/// in isolation — see the #backward-interm ordering trap below).
+///
+/// `mi`/`di` are the layer's pre-activation tableau rows (`(n, n_in + 1)`,
+/// bias in the last column) exactly as `concretize_box` consumed them, so the
+/// frame is established by construction. Only `unst` rows are kept.
+///
+/// CALIBRATION INVARIANT (load-bearing): `l_cal`/`u_cal` MUST be the bounds
+/// these very `m ± d` lines produced through `concretize_box` — the
+/// FORWARD-only bounds. `lo_min` is the exact box-minimum of the `m - d` line
+/// and `l_cal[i]` is that minus the certified slack, so the difference IS the
+/// slack, recovered without re-deriving it. Passing a TIGHTER published bound
+/// (e.g. after the #backward-interm intersection) under-recovers the slack
+/// (negative, clamped to 0), and every Clip-and-Verify halfspace built from
+/// the line would then claim the line bounds `z` pointwise more tightly than
+/// certified — cutting into the true subdomain, a false-`unsat` generator.
+pub(crate) fn retain_clip_rows(
+    mi: &Array2<f64>,
+    di: &Array2<f64>,
+    unst: &[usize],
+    mid: &[f64],
+    rad: &[f64],
+    l_cal: &[f64],
+    u_cal: &[f64],
+) -> ClipRows {
+    let n_in = mid.len();
+    let mut m_sel = Array2::<f64>::zeros((unst.len(), n_in));
+    let mut d_sel = Array2::<f64>::zeros((unst.len(), n_in));
+    let mut bm = vec![0.0f64; unst.len()];
+    let mut bd = vec![0.0f64; unst.len()];
+    let mut sl_lo = vec![0.0f64; unst.len()];
+    let mut sl_up = vec![0.0f64; unst.len()];
+    for (r, &i) in unst.iter().enumerate() {
+        for j in 0..n_in {
+            m_sel[[r, j]] = mi[[i, j]];
+            d_sel[[r, j]] = di[[i, j]];
+        }
+        // The augmented constant column. `mi` is
+        // `(n, n_in + 1)`; column `n_in` is the bias.
+        bm[r] = mi[[i, n_in]];
+        bd[r] = di[[i, n_in]];
+        let (mut lo_min, mut up_max) = (bm[r] - bd[r], bm[r] + bd[r]);
+        for j in 0..n_in {
+            let (lo_c, up_c) = (m_sel[[r, j]] - d_sel[[r, j]], m_sel[[r, j]] + d_sel[[r, j]]);
+            lo_min += lo_c.mul_add(mid[j], -(lo_c.abs() * rad[j]));
+            up_max += up_c.mul_add(mid[j], up_c.abs() * rad[j]);
+        }
+        sl_lo[r] = (lo_min - l_cal[i]).max(0.0);
+        sl_up[r] = (u_cal[i] - up_max).max(0.0);
+    }
+    ClipRows {
+        m: m_sel,
+        d: d_sel,
+        sl_lo,
+        sl_up,
+        bm,
+        bd,
     }
 }
 
@@ -1253,4 +1475,63 @@ fn apply_gates(
             }
         });
     (mo, do_)
+}
+
+/// #clip-rows FRAME ORACLE.
+///
+/// The retained rows are the halfspace coefficients Clip-and-Verify will build
+/// its constraints from. If they are in the wrong frame the constraints are
+/// nonsense in a way that does NOT fail loudly — it produces a tighter-looking
+/// bound over the wrong region, which is a false-`unsat` generator. That is
+/// exactly how the sequential clip earned its quarantine (`domain/clip.rs`: the
+/// old adapter read output-relative rows as input-relative, "wrong in both axes
+/// at once").
+///
+/// So the frame is checked against something already trusted rather than
+/// argued: `l`/`u` in `LayerGates` were produced by `concretize_box` from these
+/// very rows, so re-concretizing a retained row over the root box MUST reproduce
+/// that neuron's stored interval. Anything else means the selection or the
+/// orientation is wrong.
+///
+/// Cheap enough to run on every retained layer, and it runs BEFORE any consumer
+/// exists — which is the only useful time to catch this.
+#[must_use]
+pub fn clip_rows_frame_holds(gates: &RootGates, tol: f64) -> bool {
+    for (li, layer) in gates.layers.iter().enumerate() {
+        let Some(rows) = layer.clip_rows.as_ref() else {
+            continue;
+        };
+        if rows.m.nrows() != layer.unst.len() || rows.m.ncols() != gates.mid.len() {
+            eprintln!(
+                "[clip-frame] layer {li}: shape {:?} against unst {} / n_in {}",
+                rows.m.shape(),
+                layer.unst.len(),
+                gates.mid.len()
+            );
+            return false;
+        }
+        // The lines are CALIBRATED against the published bound at retention, so
+        // exact reproduction is true by construction and would test nothing.
+        // What is worth testing is that the calibration is SANE: a row in the
+        // wrong frame (transposed, output-relative, bias-dropped) still yields
+        // numbers, but its box-minimum misses the published bound by a wild
+        // margin, so the recovered slack blows up. Certified slack is a small
+        // fraction of the interval; a frame error is multiples of it.
+        for (r, &i) in layer.unst.iter().enumerate() {
+            let width = (layer.u[i] - layer.l[i]).abs().max(1e-12);
+            let (sl, su) = (rows.sl_lo[r], rows.sl_up[r]);
+            if !sl.is_finite() || !su.is_finite() || sl < 0.0 || su < 0.0 {
+                eprintln!("[clip-frame] layer {li} row {r}: bad slack {sl:.3e}/{su:.3e}");
+                return false;
+            }
+            if sl > tol * width || su > tol * width {
+                eprintln!(
+                    "[clip-frame] layer {li} row {r} neuron {i}: slack {sl:.3e}/{su:.3e} \
+against width {width:.3e} — frame is wrong, not merely rounded"
+                );
+                return false;
+            }
+        }
+    }
+    true
 }

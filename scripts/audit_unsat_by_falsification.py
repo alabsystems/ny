@@ -381,19 +381,30 @@ def _literal(token: Any) -> float | None:
     return None
 
 
-def _input_variable(token: Any) -> int | None:
+def _input_variable(token: Any, layout: Any = None) -> int | None:
+    """Flat input index of ``token``, or None when it is not an X reference.
+
+    ``layout`` is the VNN-LIB 2.0 ``SpecLayout`` when the spec declared tensor
+    shapes; None keeps the historical VNN-LIB 1.x ``X_i`` behaviour.  A
+    variable-shaped atom the active dialect cannot express raises
+    ``vnnlib_ce.UnsupportedSyntaxError`` instead of returning None -- returning
+    None here is exactly what made a spec whose NAMES were unreadable look like
+    a spec whose STRUCTURE was unsearchable.
+    """
     if not isinstance(token, str):
         return None
-    match = vnnlib_ce.VARIABLE.fullmatch(token)
-    if match is not None and match.group(1) == "X":
-        return int(match.group(2))
+    resolved = vnnlib_ce.resolve_variable(token, layout)
+    if resolved is not None and resolved[0] == "X":
+        return resolved[1]
     return None
 
 
 _FLIP = {">=": "<=", "<=": ">=", ">": "<", "<": ">"}
 
 
-def simple_input_bounds(node: Any) -> list[tuple[int, str, float]] | None:
+def simple_input_bounds(
+    node: Any, layout: Any = None
+) -> list[tuple[int, str, float]] | None:
     """Flatten ``node`` into ``(index, op, constant)`` input bounds, or None.
 
     Accepts ``(and ...)`` nests of ``(<=|>=|<|>|= X_i c)`` in either operand
@@ -406,15 +417,19 @@ def simple_input_bounds(node: Any) -> list[tuple[int, str, float]] | None:
     if operator == "and":
         collected: list[tuple[int, str, float]] = []
         for child in node[1:]:
-            child_bounds = simple_input_bounds(child)
+            child_bounds = simple_input_bounds(child, layout)
             if child_bounds is None:
                 return None
             collected.extend(child_bounds)
         return collected
     if operator in {">=", "<=", ">", "<", "="} and len(node) == 3:
-        index, constant, effective = _input_variable(node[1]), _literal(node[2]), operator
+        index, constant, effective = (
+            _input_variable(node[1], layout),
+            _literal(node[2]),
+            operator,
+        )
         if index is None or constant is None:
-            index, constant = _input_variable(node[2]), _literal(node[1])
+            index, constant = _input_variable(node[2], layout), _literal(node[1])
             if index is None or constant is None:
                 return None
             effective = _FLIP.get(operator, operator)
@@ -424,7 +439,9 @@ def simple_input_bounds(node: Any) -> list[tuple[int, str, float]] | None:
     return None
 
 
-def _input_bounds_within(node: Any) -> list[tuple[int, str, float]]:
+def _input_bounds_within(
+    node: Any, layout: Any = None
+) -> list[tuple[int, str, float]]:
     """Input bounds found inside a MIXED conjunction that also mentions Y.
 
     ``simple_input_bounds`` refuses a node the moment it meets a Y term, which
@@ -435,11 +452,11 @@ def _input_bounds_within(node: Any) -> list[tuple[int, str, float]]:
     SAMPLING only -- correctness still comes from evaluating the full assertion.
     """
     if not isinstance(node, list) or not node or node[0] != "and":
-        single = simple_input_bounds(node)
+        single = simple_input_bounds(node, layout)
         return single or []
     collected: list[tuple[int, str, float]] = []
     for child in node[1:]:
-        child_bounds = simple_input_bounds(child)
+        child_bounds = simple_input_bounds(child, layout)
         if child_bounds is not None:
             collected.extend(child_bounds)
     return collected
@@ -469,6 +486,8 @@ class SpecModel:
     disjuncts: list[Any]  # top-level `or` arms of the single splittable output assert
     disjunct_parent: int  # index into output_asserts that `disjuncts` replaces
     notes: list[str]
+    # VNN-LIB 2.0 declared tensor layouts, or None for VNN-LIB 1.x names.
+    layout: Any = None
 
 
 def load_spec(path: Path, max_bytes: int) -> SpecModel:
@@ -482,6 +501,8 @@ def load_spec(path: Path, max_bytes: int) -> SpecModel:
 
     declared_inputs = 0
     declared_outputs = 0
+    layout: Any = None
+    legacy_declarations = 0
     domain_asserts: list[Any] = []
     output_asserts: list[Any] = []
     or_domain: list[list[tuple[int, str, float]]] | None = None
@@ -493,10 +514,42 @@ def load_spec(path: Path, max_bytes: int) -> SpecModel:
             if not isinstance(expression, list) or not expression:
                 continue
             head = expression[0]
+            if head == "vnnlib-version":
+                if len(expression) != 2 or str(expression[1]) not in (
+                    vnnlib_ce.SUPPORTED_VNNLIB_VERSIONS
+                ):
+                    raise vnnlib_ce.UnsupportedSyntaxError(
+                        f"VNN-LIB version {expression[1:]!r} is not supported"
+                    )
+                continue
+            if head == "declare-network":
+                # VNN-LIB 2.0: the shapes are DECLARED here, and every X[...] /
+                # Y[...] name below is flattened row-major from them.  Without
+                # this branch the tensor names were invisible and the spec was
+                # mis-reported as structurally unsearchable.
+                if layout is not None:
+                    raise vnnlib_ce.UnsupportedSyntaxError(
+                        "multi-network properties are not supported"
+                    )
+                if legacy_declarations:
+                    raise vnnlib_ce.UnsupportedSyntaxError(
+                        "mixed VNN-LIB syntax: declare-const and declare-network "
+                        "in one file"
+                    )
+                layout = vnnlib_ce._parse_declare_network(expression)
+                declared_inputs = layout.inputs.size
+                declared_outputs = layout.outputs.size
+                continue
             if head == "declare-const" and len(expression) == 3:
+                if layout is not None:
+                    raise vnnlib_ce.UnsupportedSyntaxError(
+                        "mixed VNN-LIB syntax: declare-const and declare-network "
+                        "in one file"
+                    )
                 match = vnnlib_ce.VARIABLE.fullmatch(str(expression[1]))
                 if match is None:
                     continue
+                legacy_declarations += 1
                 index = int(match.group(2))
                 if match.group(1) == "X":
                     declared_inputs = max(declared_inputs, index + 1)
@@ -506,14 +559,14 @@ def load_spec(path: Path, max_bytes: int) -> SpecModel:
             if head != "assert" or len(expression) != 2:
                 continue
             body = expression[1]
-            if vnnlib_ce._references(body, "Y"):
+            if vnnlib_ce._references(body, "Y", layout):
                 if len(output_asserts) >= MAX_OUTPUT_ASSERTS:
                     raise SpecError(
                         f"more than {MAX_OUTPUT_ASSERTS} output assertions; not searched"
                     )
                 output_asserts.append(body)
                 continue
-            bounds = simple_input_bounds(body)
+            bounds = simple_input_bounds(body, layout)
             if bounds is not None:
                 simple.extend(bounds)
                 continue
@@ -522,9 +575,11 @@ def load_spec(path: Path, max_bytes: int) -> SpecModel:
                 and body
                 and body[0] == "or"
                 and or_domain is None
-                and all(simple_input_bounds(arm) is not None for arm in body[1:])
+                and all(
+                    simple_input_bounds(arm, layout) is not None for arm in body[1:]
+                )
             ):
-                or_domain = [simple_input_bounds(arm) or [] for arm in body[1:]]
+                or_domain = [simple_input_bounds(arm, layout) or [] for arm in body[1:]]
                 domain_asserts.append(body)  # still checked exactly
                 continue
             if len(domain_asserts) >= MAX_COMPLEX_DOMAIN_ASSERTS:
@@ -591,6 +646,7 @@ def load_spec(path: Path, max_bytes: int) -> SpecModel:
         disjuncts=disjuncts,
         disjunct_parent=disjunct_parent,
         notes=notes,
+        layout=layout,
     )
 
 
@@ -606,14 +662,14 @@ def load_spec(path: Path, max_bytes: int) -> SpecModel:
 Evaluator = Callable[[Any, Any], Any]
 
 
-def compile_numeric(node: Any) -> Evaluator:
+def compile_numeric(node: Any, layout: Any = None) -> Evaluator:
     import numpy as np  # noqa: PLC0415
 
     if isinstance(node, str):
-        match = vnnlib_ce.VARIABLE.fullmatch(node)
-        if match is not None:
-            index = int(match.group(2))
-            if match.group(1) == "X":
+        resolved = vnnlib_ce.resolve_variable(node, layout)
+        if resolved is not None:
+            prefix, index = resolved
+            if prefix == "X":
                 return lambda x, y, i=index: x[:, i]
             return lambda x, y, i=index: y[:, i]
         value = _literal(node)
@@ -623,7 +679,7 @@ def compile_numeric(node: Any) -> Evaluator:
     if not isinstance(node, list) or not node or not isinstance(node[0], str):
         raise SpecError("malformed numeric expression")
     operator = node[0]
-    parts = [compile_numeric(argument) for argument in node[1:]]
+    parts = [compile_numeric(argument, layout) for argument in node[1:]]
     if operator == "+":
         return lambda x, y, p=parts: sum(f(x, y) for f in p)
     if operator == "-":
@@ -649,7 +705,9 @@ def compile_numeric(node: Any) -> Evaluator:
     raise SpecError(f"unsupported numeric operator {operator!r}")
 
 
-def compile_boolean(node: Any) -> Callable[[Any, Any], tuple[Any, Any]]:
+def compile_boolean(
+    node: Any, layout: Any = None
+) -> Callable[[Any, Any], tuple[Any, Any]]:
     """Return ``fn(x, y) -> (margin, holds)`` for a boolean VNN-LIB node."""
     import numpy as np  # noqa: PLC0415
 
@@ -666,7 +724,7 @@ def compile_boolean(node: Any) -> Callable[[Any, Any], tuple[Any, Any]]:
     operator = node[0]
 
     if operator in {">=", "<=", ">", "<"} and len(node) == 3:
-        left, right = compile_numeric(node[1]), compile_numeric(node[2])
+        left, right = compile_numeric(node[1], layout), compile_numeric(node[2], layout)
         if operator in {">=", ">"}:
             strict = operator == ">"
 
@@ -684,7 +742,7 @@ def compile_boolean(node: Any) -> Callable[[Any, Any], tuple[Any, Any]]:
         return lesser
 
     if operator == "=" and len(node) >= 3:
-        parts = [compile_numeric(argument) for argument in node[1:]]
+        parts = [compile_numeric(argument, layout) for argument in node[1:]]
 
         def equals(x, y, p=parts):
             first = p[0](x, y)
@@ -699,7 +757,7 @@ def compile_boolean(node: Any) -> Callable[[Any, Any], tuple[Any, Any]]:
         return equals
 
     if operator in {"and", "or"} and len(node) >= 2:
-        parts = [compile_boolean(argument) for argument in node[1:]]
+        parts = [compile_boolean(argument, layout) for argument in node[1:]]
         conjunctive = operator == "and"
 
         def combine(x, y, p=parts, c=conjunctive):
@@ -717,7 +775,7 @@ def compile_boolean(node: Any) -> Callable[[Any, Any], tuple[Any, Any]]:
         return combine
 
     if operator == "not" and len(node) == 2:
-        inner = compile_boolean(node[1])
+        inner = compile_boolean(node[1], layout)
 
         def negate(x, y, f=inner):
             margin, holds = f(x, y)
@@ -728,7 +786,9 @@ def compile_boolean(node: Any) -> Callable[[Any, Any], tuple[Any, Any]]:
     raise SpecError(f"unsupported boolean operator {operator!r}")
 
 
-def compile_conjunction(nodes: list[Any]) -> Callable[[Any, Any], tuple[Any, Any]]:
+def compile_conjunction(
+    nodes: list[Any], layout: Any = None
+) -> Callable[[Any, Any], tuple[Any, Any]]:
     import numpy as np  # noqa: PLC0415
 
     if not nodes:
@@ -736,7 +796,7 @@ def compile_conjunction(nodes: list[Any]) -> Callable[[Any, Any], tuple[Any, Any
             np.zeros(x.shape[0], dtype=np.float64),
             np.ones(x.shape[0], dtype=bool),
         )
-    parts = [compile_boolean(node) for node in nodes]
+    parts = [compile_boolean(node, layout) for node in nodes]
 
     def conjunction(x, y, p=parts):
         margin, holds = p[0](x, y)
@@ -1389,6 +1449,15 @@ def audit_row(
 
     try:
         model = load_spec(vnnlib_path, int(max_spec_mb * 1e6))
+    except vnnlib_ce.UnsupportedSyntaxError as error:
+        # NOT "not searchable".  That verdict claims the spec was read and found
+        # structurally unsuitable; this one says the file could not be read at
+        # all, so no structural claim is being made about it.  Conflating the
+        # two is how 640 tensor-indexed 2026 rows were silently mis-reported.
+        record["detail"] = f"spec not parseable (unsupported VNN-LIB syntax): {error}"
+        record["spec_unreadable"] = True
+        record["effort"] = effort.as_dict()
+        return record
     except (SpecError, vnnlib_ce.ValidationError, OSError, RecursionError) as error:
         record["detail"] = f"spec not searchable: {error}"
         record["effort"] = effort.as_dict()
@@ -1424,7 +1493,9 @@ def audit_row(
     # try to allocate 1.5 GB per strategy step.
     batch = max(1, min(batch, 8_000_000 // max(1, model.input_count)))
 
-    gate = compile_conjunction(model.domain_asserts + model.output_asserts)
+    gate = compile_conjunction(
+        model.domain_asserts + model.output_asserts, model.layout
+    )
 
     # Targets: the whole output condition, plus one per top-level `or` arm so
     # the search can chase a single disjunct instead of only their maximum.
@@ -1440,7 +1511,12 @@ def audit_row(
         suffix = f"box{box_index}" if len(model.boxes) > 1 else ""
         if usable(low, high):
             targets.append(
-                (f"all{suffix}", low, high, compile_conjunction(model.output_asserts))
+                (
+                    f"all{suffix}",
+                    low,
+                    high,
+                    compile_conjunction(model.output_asserts, model.layout),
+                )
             )
         else:
             unusable_boxes += 1
@@ -1455,7 +1531,9 @@ def audit_row(
             # disjuncts.  Tightening happens BEFORE the usability test so those
             # specs are searched instead of skipped as "unbounded".
             arm_low, arm_high = low.copy(), high.copy()
-            arm_bounds = simple_input_bounds(arm) or _input_bounds_within(arm)
+            arm_bounds = simple_input_bounds(arm, model.layout) or (
+                _input_bounds_within(arm, model.layout)
+            )
             if arm_bounds:
                 try:
                     _tighten((arm_low, arm_high), arm_bounds)
@@ -1468,7 +1546,7 @@ def audit_row(
                     f"{suffix}arm{arm_index}" if suffix else f"arm{arm_index}",
                     arm_low,
                     arm_high,
-                    compile_conjunction([arm, *others]),
+                    compile_conjunction([arm, *others], model.layout),
                 )
             )
     if not targets:
@@ -1575,7 +1653,7 @@ def audit_row(
     if not is_counterexample and not can_validate:
         try:
             reduced_holds, reduced_detail, reduced_output = reduced_oracle(
-                onnx_path, vnnlib_path, values
+                onnx_path, vnnlib_path, values, model.layout
             )
         except Exception as error:
             reduced_holds, reduced_detail, reduced_output = (
@@ -1664,7 +1742,7 @@ def explain(model: SpecModel, point, output, np) -> list[dict]:
     y = output[None, :]
     for position, assertion in enumerate(model.output_asserts):
         try:
-            margin, holds = compile_boolean(assertion)(x, y)
+            margin, holds = compile_boolean(assertion, model.layout)(x, y)
         except SpecError as error:
             rows.append({"assertion": position, "error": str(error)})
             continue
@@ -1683,7 +1761,7 @@ def explain(model: SpecModel, point, output, np) -> list[dict]:
             satisfied_arms = []
             for arm_index, arm in enumerate(assertion[1:]):
                 try:
-                    _m, arm_holds = compile_boolean(arm)(x, y)
+                    _m, arm_holds = compile_boolean(arm, model.layout)(x, y)
                 except SpecError:
                     continue
                 if bool(arm_holds[0]):
@@ -1714,7 +1792,10 @@ def oracle_precheck(vnnlib_path: Path) -> tuple[bool, str]:
 
 
 def reduced_oracle(
-    onnx_path: Path, vnnlib_path: Path, values: dict[int, float]
+    onnx_path: Path,
+    vnnlib_path: Path,
+    values: dict[int, float],
+    layout: Any = None,
 ) -> tuple[bool, str, list[float]]:
     """Batch-1 re-check for properties the FULL validator refuses structurally.
 
@@ -1750,7 +1831,9 @@ def reduced_oracle(
     if len(outputs) != 1:
         return False, f"expected one ONNX output tensor, found {len(outputs)}", []
     output = outputs[0].flatten().astype(np.float64)
-    environment = vnnlib_ce._VariableEnvironment(values, output, executed_inputs=False)
+    environment = vnnlib_ce._VariableEnvironment(
+        values, output, executed_inputs=False, layout=layout
+    )
     all_results, output_results = vnnlib_ce._evaluate_full(vnnlib_path, environment)
     detail = (
         f"reduced: all_hold={all_results.all_hold} "

@@ -8,6 +8,16 @@
 //!
 //! Design: designs/2026-02-28-patches-mode-wrapper-enum-design.md
 //! Part of #2613
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
+//! and single-threaded, these properties cost 10-30s in a debug build, and the
+//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
+//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
+//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
+//! 10-20x the measured isolated cost. The failure these exist to catch is an
+//! infinite loop, and no finite wall lets one of those through.
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
 use crate::layers::activations::ReLULayer;
@@ -50,7 +60,7 @@ proptest! {
     ///
     /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 1
     /// Part of #2613
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_relu_conv2d_patches_composition(
         // Conv1: (in_c1, in_h1, in_w1) → (out_c1, out_h1, out_w1)
@@ -230,7 +240,13 @@ proptest! {
     /// Part of #2613
     // This 200-case nonlinear differential sweep needs the same shared-host
     // allowance as the neighboring pooling sweeps.
-    #[ntest::timeout(20000)]
+    //
+    // HANG SENTINEL, NOT A PERFORMANCE ASSERTION. Measured 2026-08-19:
+    // 0.96s isolated, 5.93s with 14 CPU burners pinned (6.2×). The 20s wall was
+    // only 3.4× the contended cost and tripped under `--test-threads=8`; 120s
+    // is ~20×, and brings this into line with the 60s its composition siblings
+    // in this same file already use. MEASURE BEFORE RAISING IT AGAIN.
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_silu_patches_vs_dense(
         in_c in 1usize..=3,

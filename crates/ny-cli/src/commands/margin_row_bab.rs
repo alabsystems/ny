@@ -734,6 +734,36 @@ pub(crate) fn root_f32_from_preset(preset: Option<&Path>) -> Option<bool> {
         .and_then(|c| c.margin_row.root_f32)
 }
 
+/// Resolve the typed branch-width keys (#margin-row-branch-width). `None`s
+/// leave the propagate-side defaults untouched.
+// STAGED AHEAD OF ITS CONSUMER. Added by 043d7ff75 but nothing calls it yet,
+// so the crate fails -D warnings on dead_code. DELETE THIS ATTRIBUTE with the
+// commit that wires the preset key through; it is not a permanent exemption.
+#[allow(dead_code)]
+pub(crate) fn branch_width_from_preset(
+    preset: Option<&Path>,
+) -> (Option<usize>, Option<usize>, Option<bool>) {
+    let Some(c) = preset.and_then(|p| crate::preset::load_preset(p).ok()) else {
+        return (None, None, None);
+    };
+    (
+        c.margin_row.k_head,
+        c.margin_row.k_trunk,
+        c.margin_row.k_adaptive,
+    )
+}
+
+/// Resolve the typed backward-interm key (#backward-interm).
+// STAGED AHEAD OF ITS CONSUMER. Added by 043d7ff75 but nothing calls it yet,
+// so the crate fails -D warnings on dead_code. DELETE THIS ATTRIBUTE with the
+// commit that wires the preset key through; it is not a permanent exemption.
+#[allow(dead_code)]
+pub(crate) fn backward_interm_from_preset(preset: Option<&Path>) -> Option<bool> {
+    preset
+        .and_then(|p| crate::preset::load_preset(p).ok())
+        .and_then(|c| c.margin_row.backward_interm)
+}
+
 /// Start the margin-row lane on a BACKGROUND THREAD, concurrently with the
 /// internal verifier (#epoch-bab).
 ///
@@ -2159,6 +2189,11 @@ pub(crate) mod research {
         let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
         let run = |frontier: usize| {
             let deadline = Instant::now() + Duration::from_secs(secs);
+            // #margin-row-branch-width: the candidate-width knobs live in
+            // `margin_row/mod.rs`, NOT here. This diagnostic entry point builds
+            // its own config; the SCORED concurrent lane does not come through
+            // it, so an override added here is inert — measured exactly that way
+            // (expansions identical at k=8, 4 and 2).
             let cfg = BabConfig {
                 max_expansions: 20_000,
                 deadline: Some(deadline),

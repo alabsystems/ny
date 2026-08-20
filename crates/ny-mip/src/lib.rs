@@ -67,6 +67,12 @@ pub mod dump;
 pub mod encoder;
 pub mod error;
 pub mod ir;
+// Unwired budget primitive (LAYER A of the per-instance lane budget allocator:
+// a multiple-choice knapsack over source-declared cap ladders;
+// docs/LANE_BUDGET_ALLOCATION_MCKP_2026-08-19.md). Not on any verdict path and
+// not on any scored path: nothing calls it, and by construction no type on its
+// public surface can carry an instance answer.
+pub mod lane_allocation;
 pub mod shared_tree_profile;
 pub mod solver;
 pub mod star_dual;
@@ -85,14 +91,14 @@ pub use ay_lib::{prove_infeasible_with_row_farkas, RowSide};
 pub use bnn_sign_space::TrustRegion;
 pub use bnn_sign_space::{
     classify_first_layer_unwired, f32_replay_slack_floor, falsify_bnn_sign_suffix_unwired,
-    logits_at_unwired, realizability_probe_unwired, BinaryStage, ConvSpec, InputGeometry, PoolSpec,
-    ReferenceForward, SegmentMove, SignSpaceActivation, SignSpaceAffine, SignSpaceCandidate,
-    SignSpaceError, SignSpaceLimits, SignSpaceOutcome, SignSpaceRefusal, SignSpaceRequest,
-    UnitClassification, UnitPhase, SIGN_SPACE_EXACT_ACCUMULATION_LIMIT, SIGN_SPACE_HARD_MAX_FLAT,
-    SIGN_SPACE_HARD_MAX_FREE_UNITS, SIGN_SPACE_HARD_MAX_LP_COLUMNS,
-    SIGN_SPACE_HARD_MAX_LP_NONZEROS, SIGN_SPACE_HARD_MAX_LP_ROWS, SIGN_SPACE_HARD_MAX_LP_SOLVES,
-    SIGN_SPACE_HARD_MAX_POOL_AREA, SIGN_SPACE_HARD_MAX_STAGES, SIGN_SPACE_HARD_MAX_UNITS,
-    SIGN_SPACE_HARD_MAX_WALL_TIME,
+    falsify_bnn_ste_pgd_unwired, logits_at_unwired, realizability_probe_unwired, BinaryStage,
+    ConvSpec, InputGeometry, PoolSpec, ReferenceForward, SegmentMove, SignSpaceActivation,
+    SignSpaceAffine, SignSpaceCandidate, SignSpaceError, SignSpaceLimits, SignSpaceOutcome,
+    SignSpaceRefusal, SignSpaceRequest, StePgdLimits, UnitClassification, UnitPhase,
+    SIGN_SPACE_EXACT_ACCUMULATION_LIMIT, SIGN_SPACE_HARD_MAX_FLAT, SIGN_SPACE_HARD_MAX_FREE_UNITS,
+    SIGN_SPACE_HARD_MAX_LP_COLUMNS, SIGN_SPACE_HARD_MAX_LP_NONZEROS, SIGN_SPACE_HARD_MAX_LP_ROWS,
+    SIGN_SPACE_HARD_MAX_LP_SOLVES, SIGN_SPACE_HARD_MAX_POOL_AREA, SIGN_SPACE_HARD_MAX_STAGES,
+    SIGN_SPACE_HARD_MAX_UNITS, SIGN_SPACE_HARD_MAX_WALL_TIME,
 };
 pub use certified_auxiliary_bounds64::{
     CertifiedAuxiliaryBounds64, CertifiedAuxiliaryBounds64BudgetError,
@@ -274,6 +280,13 @@ pub use constrained_zonotope_tail_lp::{
 pub use encoder::{encode_feedforward, MipEncoder, MipParts};
 pub use error::MipError;
 pub use ir::MilpProblem;
+pub use lane_allocation::{
+    allocate, declared_ladder, AllocationOutcome, AllocationRequest, CapLadder, FallOpen,
+    LadderError, LadderProvenance, Lane, LaneGrant, LanePlan, LaneRequest, ObjectiveRequirement,
+    ObjectiveTier, Rung, RungOrigin, SourceCitation, StructuralZero, UnknownLadder,
+    ALLOC_SOLVE_CAP, DEFAULT_LANE_REACH_PRIOR, MAX_LANES, MAX_RUNGS_PER_LANE, OBJECTIVE_SNAP_BITS,
+    REACH_PROBABILITY_CLAMP,
+};
 pub use solver::{
     MipResult, MipSolver, OneSidedSatDecline, OneSidedSatProbe, OneSidedSatWitness, Sense,
     SplitUnsatCache,

@@ -2434,6 +2434,12 @@ fn test_alpha_optimizer_output_sound_on_random_dags() {
 /// with the fixed route is never worse, and memoizes.
 #[test]
 fn test_generic_alpha_optimizer_reaches_non_cgan_dag_and_is_never_worse() {
+    // Excluded from overlapping an env WRITER. `NY_DENSE_BUDGET_MB` is read
+    // process-globally by `crown_memory::explicit_cpu_crown_dense_budget_bytes`;
+    // a concurrent test setting it to 0 starves this one's dense path, which
+    // surfaced here as `budget_bytes: 0` / bounds no tighter than IBP rather
+    // than as the race it is. Observed at --test-threads=8.
+    let _env = crate::tests::lock_env_shared();
     let spec = margin_spec();
     let (mut graph, input) = build_residual_dag(42, 0.6);
     assert!(graph.has_conv2d_layers());
@@ -2818,6 +2824,12 @@ fn build_conv_transpose_relu_chain(
 /// affine range to near machine precision.
 #[test]
 fn test_image_conv_transpose_after_relu_keeps_input_correlation_daz_packet() {
+    // Excluded from overlapping an env WRITER. `NY_DENSE_BUDGET_MB` is read
+    // process-globally by `crown_memory::explicit_cpu_crown_dense_budget_bytes`;
+    // a concurrent test setting it to 0 starves this one's dense path, which
+    // surfaced here as `budget_bytes: 0` / bounds no tighter than IBP rather
+    // than as the race it is. Observed at --test-threads=8.
+    let _env = crate::tests::lock_env_shared();
     // ---- Part 1: the fail-open mechanism. -------------------------------
     let zero_lower = ny_tensor::next_down_f32(0.0);
     let zero_upper = ny_tensor::next_up_f32(0.0);

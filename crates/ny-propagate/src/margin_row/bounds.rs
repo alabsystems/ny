@@ -71,6 +71,42 @@ impl MarginBatch {
     pub fn nf(&self) -> usize {
         self.adv.len()
     }
+
+    /// #margin-row-col-retire: row-subset copy. `keep` must be strictly
+    /// increasing indices into this batch's rows. The kept rows (`wp`, `wn`,
+    /// `cst`, `adv`) are copied VERBATIM — bit-identical to the corresponding
+    /// rows of `self` — so every per-row quantity downstream (`margin_seed`,
+    /// `per_class_direct`, `compose_viay`, the variant rankers) reproduces the
+    /// full-width batch's value for a surviving row exactly (all of those
+    /// loops are row-local by construction).
+    pub fn subset(&self, keep: &[usize]) -> Result<Self> {
+        let n_y = self.n_y;
+        let mut wp = Vec::with_capacity(keep.len() * n_y);
+        let mut wn = Vec::with_capacity(keep.len() * n_y);
+        let mut cst = Vec::with_capacity(keep.len());
+        let mut adv = Vec::with_capacity(keep.len());
+        let mut prev: Option<usize> = None;
+        for &r in keep {
+            if r >= self.nf() || prev.is_some_and(|p| p >= r) {
+                return Err(NyError::InvalidSpec(
+                    "margin_row: invalid column-retirement survivor set".into(),
+                ));
+            }
+            prev = Some(r);
+            wp.extend_from_slice(&self.wp[r * n_y..(r + 1) * n_y]);
+            wn.extend_from_slice(&self.wn[r * n_y..(r + 1) * n_y]);
+            cst.push(self.cst[r]);
+            adv.push(self.adv[r]);
+        }
+        Ok(Self {
+            t: self.t,
+            adv,
+            wp,
+            wn,
+            cst,
+            n_y,
+        })
+    }
 }
 
 /// A y-box (per head neuron pre-activation bounds).

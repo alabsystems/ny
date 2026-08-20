@@ -11,6 +11,22 @@
 //! 3. CROWN backward produces correct coefficient matrices for random kernels
 //!
 //! Part of #40.
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion, and the walls are deliberately
+//! far above these tests' isolated cost (well under a second each).
+//!
+//! They have to be. These tests participate in the `ny-test-utils` env lock --
+//! either holding the shared half so a concurrent writer cannot leak
+//! `NY_DENSE_BUDGET_MB` into them mid-run, or holding the exclusive half
+//! themselves. Waiting on that lock is CORRECT behaviour, not a hang, and the
+//! wait can be long: `margin_row`'s `root_build_bit_identical_across_conv_grain`
+//! holds the exclusive half across a loop that runs over 60 seconds. A 10s wall
+//! turns that legitimate wait into a spurious failure -- measured, 17 of 20
+//! full-suite failures at --test-threads=8 were exactly this, with zero
+//! remaining `crown=-inf` leaks.
+//!
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::convolution::conv1d::{Conv1dLayer, ConvTranspose1dLayer};
@@ -41,7 +57,7 @@ pub(super) fn eval_conv1d(layer: &Conv1dLayer, input_flat: &[f32], shape: &[usiz
 /// Regression for #2183: Conv1d batched CROWN bias path must use f64
 /// accumulation with directed rounding on the final f32 cast.
 /// Converted from proptest with `_case in 0u8..1` (zero randomization).
-#[ntest::timeout(60000)]
+#[ntest::timeout(300000)]
 #[test]
 fn directed_rounding_conv1d_batched_bias_2183() {
     let input_len = 100usize;
@@ -113,7 +129,7 @@ fn directed_rounding_conv1d_batched_bias_2183() {
 /// Regression for #2183: Conv2d batched CROWN bias path must use f64
 /// accumulation with directed rounding on the final f32 cast.
 /// Converted from proptest with `_case in 0u8..1` (zero randomization).
-#[ntest::timeout(60000)]
+#[ntest::timeout(300000)]
 #[test]
 fn directed_rounding_conv2d_batched_bias_2183() {
     let _env_lock = ny_test_utils::env::lock_env();
@@ -270,7 +286,7 @@ proptest! {
     /// Verifies:
     /// 1. IBP bounds contain all sampled concrete outputs
     /// 2. CROWN concretized bounds match IBP (linear layer equivalence)
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_1c_k3(
         k0 in -3.0f32..3.0,
@@ -279,6 +295,13 @@ proptest! {
         bias in -2.0f32..2.0,
         bounds in prop::collection::vec(-5.0f32..5.0, 10), // 5 pairs -> 5 elements
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         // Reconstruct bounds as pairs from flat vector
         let input_len = 5;
         let in_shape = [1_usize, input_len]; // (in_channels=1, length=5)
@@ -356,7 +379,7 @@ proptest! {
     /// Tests that the transposed convolution correctly composes with arbitrary
     /// incoming coefficient matrices, including negative coefficients that exercise
     /// the sign-switching paths.
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_non_identity(
         k0 in -3.0f32..3.0,
@@ -441,7 +464,7 @@ proptest! {
     /// Verifies:
     /// 1. IBP bounds contain all sampled concrete outputs
     /// 2. CROWN concretized bounds match IBP (linear layer equivalence)
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv2d_crown_1c_k3(
         weights in prop::collection::vec(-2.0f32..2.0, 18), // 2 * 1 * 3 * 3 = 18
@@ -540,7 +563,7 @@ proptest! {
     /// Tests CROWN backward composition with arbitrary coefficients through a
     /// 2-output-channel Conv2d. Verifies that transposed convolution correctly
     /// handles mixed-sign coefficients across spatial and channel dimensions.
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv2d_crown_non_identity(
         weights in prop::collection::vec(-2.0f32..2.0, 18),
@@ -631,7 +654,7 @@ proptest! {
     /// Padding introduces implicit zero-valued neighbors, which the transposed
     /// convolution must correctly handle. This test catches bugs where the
     /// padding offset is wrong in the CROWN backward.
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_with_padding(
         k0 in -3.0f32..3.0,
@@ -640,6 +663,13 @@ proptest! {
         bias in -2.0f32..2.0,
         bounds in prop::collection::vec(-5.0f32..5.0, 8), // 4 lower + 4 delta
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let input_len = 4;
         let in_shape = [1_usize, input_len];
         let lower: Vec<f32> = bounds[..4].to_vec();
@@ -712,7 +742,7 @@ proptest! {
     ///
     /// Stride changes the spatial mapping between output and input positions.
     /// The transposed convolution must correctly space out the contributions.
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv2d_crown_stride2(
         weights in prop::collection::vec(-2.0f32..2.0, 9), // 1 * 1 * 3 * 3 = 9
@@ -803,7 +833,7 @@ proptest! {
     /// This verifies the dedicated ConvTranspose1d CROWN backward path
     /// (`propagate_linear` uses regular convolution of incoming A with the
     /// transpose kernel and adds broadcast bias contribution).
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv_transpose1d_crown_1c_k3(
         k0 in -3.0f32..3.0,
@@ -812,6 +842,13 @@ proptest! {
         bias in -2.0f32..2.0,
         bounds in prop::collection::vec(-4.0f32..4.0, 8), // 4 lower + 4 delta
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let input_len = 4_usize;
         let in_shape = [1_usize, input_len];
 
@@ -889,13 +926,20 @@ proptest! {
     ///
     /// This verifies non-identity coefficient mapping in ConvTranspose2d CROWN
     /// backward instead of treating ConvTranspose as a structural identity op.
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv_transpose2d_crown_1c_k3(
         weights in prop::collection::vec(-2.0f32..2.0, 9), // 1 * 1 * 3 * 3
         bias in -1.0f32..1.0,
         bounds in prop::collection::vec(-3.0f32..3.0, 8), // 4 lower + 4 delta -> 2x2 input
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let in_h = 2_usize;
         let in_w = 2_usize;
         let in_shape = [1_usize, in_h, in_w];

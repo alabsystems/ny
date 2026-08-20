@@ -90,6 +90,13 @@ const TOOLING_TESTS: &[&str] = &[
     "test_vnncomp_prepare_instance_script.py",
     "test_vnncomp_publication.py",
     "test_vnncomp_trust_linux_build.py",
+    // Landed by 380cd179e with the VNN-LIB 2.0 tensor-name validator fix and no
+    // disposition, which is what this manifest exists to refuse. Tooling, by
+    // its subject: it exercises `scripts/extended_bank/vnnlib_ce.py`, a Python
+    // script, not a Rust contract with a Python mirror. The GENUINE/SPURIOUS
+    // decision it covers is real, but it is the SCRIPT's decision — migrating
+    // it would mean porting the script, not the test.
+    "test_vnnlib_ce_tensor_specs.py",
 ];
 
 const PYTHON_BINDING_TESTS: &[&str] = &["test_ny.py", "test_types.py"];
@@ -147,6 +154,18 @@ const EXTERNAL_TOOLING_TESTS: &[&str] = &[
     "test_replay_vnncomp2025_counterexample.py::external_consumer_safe_bound_replay_executes_retained_worker",
     "test_replay_vnncomp2025_counterexample.py::external_official_checker_sources_match_commit_and_retained_copy",
     "test_replay_vnncomp2025_counterexample.py::external_retained_runtime_matches_all_exact_pins",
+    // 8776f96f2 moved these seven off `pytest.mark.skipif` and onto the
+    // external lane, which is the right fix -- but the lane's own manifest is
+    // what makes the move explicit rather than another disappearance. They
+    // need the traffic_signs_recognition_2023/2.0 corpus and fail, not skip,
+    // when it is absent.
+    "test_vnnlib_ce_tensor_specs.py::external_a_short_witness_is_refused_as_incomplete",
+    "test_vnnlib_ce_tensor_specs.py::external_a_witness_permuted_into_the_wrong_tensor_order_is_refused",
+    "test_vnnlib_ce_tensor_specs.py::external_banked_traffic_signs_witnesses_are_genuine",
+    "test_vnnlib_ce_tensor_specs.py::external_box_centre_is_not_a_counterexample",
+    "test_vnnlib_ce_tensor_specs.py::external_declared_shape_is_read_from_the_spec_header",
+    "test_vnnlib_ce_tensor_specs.py::external_flat_mapping_agrees_with_the_independent_replay_oracle",
+    "test_vnnlib_ce_tensor_specs.py::external_one_ulp_outside_the_box_is_refused_after_the_float32_cast",
 ];
 
 const MIGRATION_SUITES: &[MigrationSuite] = &[

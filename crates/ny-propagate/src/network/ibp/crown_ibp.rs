@@ -414,6 +414,35 @@ pub(super) fn collect_core(
             "[err-share] incoming_error_product: {probe_calls} calls, {:.3}s total",
             probe_nanos as f64 / 1e9
         );
+        eprintln!(
+            "[conv-share] bias={:.3}s err={:.3}s group={:.3}s group-engine={:.3}s",
+            crate::layers::convolution::crown_helpers::CONV_BIAS_NANOS
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
+            crate::layers::convolution::crown_helpers::CONV_ERR_NANOS
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
+            crate::layers::convolution::conv2d::ops_transpose_gemm::CONV_GROUP_NANOS
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
+            // group-engine is a SUBSET of group: the share of the conv-group
+            // arm spent waiting on the sound_f64_gemm engine attempt. Printed
+            // next to its parent so the reader can see the fraction directly,
+            // which is the whole question 61c628a76 posed.
+            crate::layers::convolution::conv2d::ops_transpose_gemm::CONV_GROUP_ENGINE_NANOS
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
+        );
+        eprintln!(
+            "[patches-share] crown_elementwise_backward_patches: {} calls, {:.3}s total, {} serial-row calls",
+            crate::layers::common::crown_patches::PATCHES_BWD_CALLS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            crate::layers::common::crown_patches::PATCHES_BWD_NANOS
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1e9,
+            crate::layers::common::crown_patches::PATCHES_BWD_SERIAL_ROWS
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         for (idx, bt) in crown_ibp_bounds.iter().enumerate() {
             let flat = bt.flatten();
             let (mut lo, mut hi, mut w) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);

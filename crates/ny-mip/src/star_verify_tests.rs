@@ -914,7 +914,7 @@ fn capability_probe() {
             let mut best = f64::NEG_INFINITY;
             let rounds = if full { 9 } else { 2 };
             for _ in 0..rounds {
-                let t = 0.5 * (easy + hard);
+                let t = easy.midpoint(hard);
                 let spec = StarSpec {
                     rows: vec![(vec![1.0], t)],
                 };

@@ -10,6 +10,28 @@ use ny_core::{
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 use tracing::{debug, warn};
 
+/// Temporary share probes for the certified conv arms (read via the
+/// collection dump lever).
+pub(crate) static CONV_BIAS_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CONV_ERR_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) struct ShareTimer(&'static std::sync::atomic::AtomicU64, std::time::Instant);
+impl ShareTimer {
+    pub(crate) fn new(sink: &'static std::sync::atomic::AtomicU64) -> Self {
+        Self(sink, std::time::Instant::now())
+    }
+}
+impl Drop for ShareTimer {
+    fn drop(&mut self) {
+        self.0.fetch_add(
+            u64::try_from(self.1.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 use crate::LinearBounds;
 
 const F64_FRACTION_BITS: u32 = 52;
@@ -743,6 +765,7 @@ pub(crate) fn compute_conv_bias_f64_with_poll<F>(
 where
     F: FnMut() -> Result<()>,
 {
+    let _share_timer = ShareTimer::new(&CONV_BIAS_NANOS);
     match bias {
         Some(bias) => compute_conv_bias_rows_f64_with_poll(
             bounds.lower_a().view(),
@@ -946,6 +969,7 @@ pub(crate) fn conv_coeff_err_matrix_with_poll<F>(
 where
     F: FnMut() -> Result<()>,
 {
+    let _share_timer = ShareTimer::new(&CONV_ERR_NANOS);
     conv_coeff_err_matrix_downgraded_with_poll(
         in_a,
         in_err,

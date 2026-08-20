@@ -838,3 +838,60 @@ fn no_shipped_preset_arms_root_alpha_margin_without_a_current_positive_ab() {
          {armed:?}"
     );
 }
+
+/// #envelope-grad DELIVERY. The rule is measured to move the root census where
+/// every other alpha lever left it bit-identical, so it has to reach a SCORED
+/// run — and `vnncomp_scripts/run_instance.sh` exports exactly one `NY_*`, so an
+/// env-only lever never can. This pins the preset path that does.
+#[test]
+fn apply_preset_maps_alpha_envelope_grad_into_alpha_config() {
+    // Absent => byte-identical to the shipped local rule.
+    let mut config = BetaCrownConfig::default();
+    assert!(
+        !config.alpha_config.alpha_envelope_grad,
+        "the envelope rule must default OFF; the shipped local rule is the baseline"
+    );
+    apply_preset(&mut config, &PresetConfig::default()).expect("empty preset should apply");
+    assert!(
+        !config.alpha_config.alpha_envelope_grad,
+        "an absent alpha_envelope_grad key must leave the local rule in place"
+    );
+
+    // Armed via solver.alpha_crown.
+    let preset = PresetConfig {
+        solver: SolverPreset {
+            alpha_crown: AlphaCrownPreset {
+                alpha_envelope_grad: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).expect("envelope grad should apply");
+    assert!(
+        config.alpha_config.alpha_envelope_grad,
+        "solver.alpha_crown.alpha_envelope_grad must reach AlphaCrownConfig"
+    );
+
+    // Explicit false must be honoured, not treated as absent — a preset that
+    // deliberately disables the rule has to win over any future default flip.
+    let preset_off = PresetConfig {
+        solver: SolverPreset {
+            alpha_crown: AlphaCrownPreset {
+                alpha_envelope_grad: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    config.alpha_config.alpha_envelope_grad = true;
+    apply_preset(&mut config, &preset_off).expect("explicit false should apply");
+    assert!(
+        !config.alpha_config.alpha_envelope_grad,
+        "an explicit `false` must disarm, not be indistinguishable from absent"
+    );
+}

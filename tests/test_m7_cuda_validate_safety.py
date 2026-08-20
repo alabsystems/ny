@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import os
-import resource
 import subprocess
 from pathlib import Path
 
@@ -19,6 +18,9 @@ ATTESTED_VMEM_KIB = 167_772_160
 
 def _lower_child_vmem_below_attestation() -> None:
     """Keep the child contained while making the exact M7 attestation false."""
+    # POSIX-only, imported here so this module stays COLLECTABLE off Linux: a
+    # module-level import errored the whole file, hiding its other contracts.
+    import resource
     soft, hard = resource.getrlimit(resource.RLIMIT_AS)
     attested_bytes = ATTESTED_VMEM_KIB * 1024
     if soft == resource.RLIM_INFINITY or soft >= attested_bytes:

@@ -36,6 +36,9 @@ impl CrownDegradationLogScope {
         Self::receipt(&self.info_occurrences)
     }
 
+    // trust-1.99 deprecates `fetch_update` (renamed `try_update`); the public
+    // 1.95 pin lacks `try_update` — keep the spelling both toolchains accept.
+    #[allow(deprecated)]
     fn receipt(counter: &AtomicU64) -> Option<CrownDegradationLogReceipt> {
         // Saturation avoids a theoretical wrap back to occurrence one. Relaxed
         // is sufficient: the counter allocates unique report ordinals but

@@ -9,6 +9,22 @@
 //! 2. Overflow-inducing dimensions saturate to `usize::MAX` (never wrap to small)
 //! 3. With zero budget, batched CROWN fallback bounds are sound (contain all outputs)
 //! 4. With zero budget, batched CROWN bounds are at least as wide as IBP
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: the `#[ntest::timeout(..)]` guards below are
+//! HANG SENTINELS, not performance assertions. These two properties cost 0.09s
+//! and 0.06s ISOLATED -- they are not slow, they WAIT.
+//!
+//! They are the WRITER side of the `ny-test-utils` env lock: they set
+//! `NY_DENSE_BUDGET_MB` to 0 process-wide, so they take the exclusive half and
+//! must first drain every reader holding the shared half. That is the whole
+//! point -- this file's zero-budget mutation is exactly the leak that was
+//! surfacing elsewhere in the suite as `crown=-inf` and `budget_bytes: 0`, in
+//! tests that had nothing to do with budgets. Excluding readers is correct; the
+//! wait it creates is correct; a 10s wall turned that correct wait into the last
+//! 2 failures of a 10,489-test run at --test-threads=8.
+//!
+//! 300s is ~3000x the isolated cost, and still catches an infinite loop.
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::network::crown_memory::{
     batched_dense_pair_bytes, batched_identity_pair_bytes, check_batched_identity_budget,
@@ -109,7 +125,7 @@ proptest! {
     /// Network: Linear(2x2) -> ReLU -> Linear(1x2).
     /// This is the critical invariant: budget exhaustion must never produce
     /// unsound bounds.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn batched_crown_zero_budget_fallback_is_sound(
         w1_vec in prop::collection::vec(-2.0f32..2.0, 4),
@@ -169,7 +185,7 @@ proptest! {
     /// Since the budget guard forces fallback to sequential CROWN (which itself
     /// falls back to IBP under zero budget), the final bounds must be no tighter
     /// than IBP. This tests the fallback chain doesn't silently narrow bounds.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn batched_crown_zero_budget_at_least_as_wide_as_ibp(
         w1_vec in prop::collection::vec(-2.0f32..2.0, 4),

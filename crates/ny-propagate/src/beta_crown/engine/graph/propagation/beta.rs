@@ -891,7 +891,7 @@ impl BetaCrownVerifier {
         if authority_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return None;
         }
-        let probe = std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1");
+        let probe = crate::beta_gpu_probe_armed();
         let gpu = engine
             .and_then(|e| e.as_gpu_crown_backward())
             .filter(|g| g.provides_sound_gpu_crown())

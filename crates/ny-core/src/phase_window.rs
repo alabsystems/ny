@@ -132,6 +132,110 @@ pub fn admit(predicted: Duration, remaining: Duration, policy: WindowPolicy) -> 
     Admission::Admitted(padded)
 }
 
+/// One root window, split into named claims. Every field is a share of the
+/// SAME window, so they can be added up and checked — which is exactly the
+/// property the ten independent `k x remaining` claimants in the
+/// multi-objective root evaluator do not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootWindowSplit {
+    /// Ceiling for the root-alpha bootstrap ascent.
+    pub alpha: Duration,
+    /// What is left to the intermediate-tightening sweeps that follow it.
+    pub sweep: Duration,
+    /// Reserved for the root objective (spec) pass.
+    pub spec: Duration,
+    /// Reserved for branch-and-bound. This field is the whole point of the
+    /// type: it is subtracted FIRST, so it cannot become the residue.
+    pub bab: Duration,
+}
+
+impl RootWindowSplit {
+    /// Everything the tightening ladder may consume: alpha plus sweeps.
+    #[must_use]
+    pub fn tighten(&self) -> Duration {
+        self.alpha.saturating_add(self.sweep)
+    }
+
+    /// The four claims, which never exceed the window they were cut from.
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.tighten()
+            .saturating_add(self.spec)
+            .saturating_add(self.bab)
+    }
+}
+
+/// #bab-floor — invariant I3: **the root pipeline is not the only claimant.**
+///
+/// ## The defect this exists to make impossible
+///
+/// [`admit`] fixes a phase that is handed too little. This fixes the dual: a
+/// pipeline in which the phase after the pipeline is handed nothing at all. In
+/// the multi-objective graph root evaluator every phase sizes itself as
+/// `min(fixed_cap, k x whatever remains)` against the *instance* deadline, and
+/// branch-and-bound is whatever survives the ladder. Measured on cifar100_2024
+/// idx_2176 at the official 100 s budget: the ladder spent ~63.5 s of a
+/// 72.892 s window and BaB was never entered — it emitted no telemetry because
+/// it never ran.
+///
+/// A per-phase `max_frac < 1` does not prevent this. Ten claimants each taking
+/// half of what is left still converge on the whole window; the residue is a
+/// product of fractions, not a reservation.
+///
+/// ## The rule
+///
+/// Name every claim as a share of ONE window and subtract the DOWNSTREAM claims
+/// first. `bab` and `spec` come off the top, so the ladder's `k x remaining`
+/// arithmetic — preserved untouched — now divides a smaller remainder and can
+/// no longer reach past the reservation.
+///
+/// Fractions are clamped to `[0, 1]`; non-finite reads as `0.0`. If the three
+/// named shares oversubscribe the window they are scaled down proportionally,
+/// so `sweep` is never negative and [`RootWindowSplit::total`] never exceeds
+/// `window`. A `bab_frac` of `0.0` reproduces the un-reserved ladder exactly,
+/// which is what makes this safe to leave dark.
+#[must_use]
+pub fn split_root_window(
+    window: Duration,
+    bab_frac: f64,
+    spec_frac: f64,
+    alpha_frac: f64,
+) -> RootWindowSplit {
+    let sanitize = |value: f64| {
+        if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    let (mut bab_share, mut spec_share, mut alpha_share) = (
+        sanitize(bab_frac),
+        sanitize(spec_frac),
+        sanitize(alpha_frac),
+    );
+    let claimed = bab_share + spec_share + alpha_share;
+    if claimed > 1.0 {
+        // Oversubscribed: preserve the operator's RATIO rather than silently
+        // zeroing whichever claim happens to be evaluated last.
+        bab_share /= claimed;
+        spec_share /= claimed;
+        alpha_share /= claimed;
+    }
+    let bab = window.mul_f64(bab_share);
+    let spec = window.mul_f64(spec_share);
+    let alpha = window.mul_f64(alpha_share);
+    let sweep = window
+        .saturating_sub(bab)
+        .saturating_sub(spec)
+        .saturating_sub(alpha);
+    RootWindowSplit {
+        alpha,
+        sweep,
+        spec,
+        bab,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +308,73 @@ mod tests {
         if let Admission::Admitted(w) = admit(S(1), S(1000), over) {
             assert!(w <= S(1000));
         }
+    }
+
+    #[test]
+    fn a_zero_bab_fraction_reproduces_the_unreserved_ladder() {
+        // The dark arm. Nothing is held back, so the ladder still owns the
+        // whole window and the shipped path is unchanged.
+        let split = split_root_window(S(100), 0.0, 0.0, 0.0);
+        assert_eq!(split.bab, Duration::ZERO);
+        assert_eq!(split.spec, Duration::ZERO);
+        assert_eq!(split.alpha, Duration::ZERO);
+        assert_eq!(split.sweep, S(100));
+        assert_eq!(split.tighten(), S(100));
+    }
+
+    #[test]
+    fn bab_is_reserved_off_the_top_and_never_the_residue() {
+        // The measured row: a 72.892 s window in which the ladder took ~63.5 s
+        // and BaB got zero. With the reservation the ladder can only ever see
+        // what is left AFTER bab and spec are removed.
+        let window = Duration::from_secs_f64(72.892);
+        let split = split_root_window(window, 0.25, 0.15, 0.30);
+        assert_eq!(split.bab, window.mul_f64(0.25));
+        assert_eq!(split.spec, window.mul_f64(0.15));
+        assert_eq!(split.alpha, window.mul_f64(0.30));
+        // The ladder's whole entitlement is alpha + sweep, which is strictly
+        // less than the window minus the reservation no matter what the sweeps
+        // do with their share.
+        assert!(split.tighten() < window.checked_sub(split.bab).unwrap());
+        assert!(split.total() <= window);
+        assert!(window.checked_sub(split.total()).unwrap() < Duration::from_millis(1));
+    }
+
+    #[test]
+    fn oversubscribed_shares_scale_down_instead_of_starving_the_sweeps() {
+        let split = split_root_window(S(100), 0.6, 0.6, 0.6);
+        // Nanoseconds, not zero: three equal thirds of a window do not divide
+        // exactly in `mul_f64`. The invariant that matters is that the sweeps'
+        // share cannot go NEGATIVE and cannot borrow from the reservations.
+        assert!(
+            split.sweep < Duration::from_micros(1),
+            "nothing left for the sweeps, got {:?}",
+            split.sweep
+        );
+        assert!(split.total() <= S(100), "claims never exceed the window");
+        assert_eq!(split.bab, split.spec, "equal asks stay equal");
+        assert!(
+            split.bab >= S(33) && split.bab <= S(34),
+            "0.6/1.8 of 100s, got {:?}",
+            split.bab
+        );
+    }
+
+    #[test]
+    fn nonfinite_and_negative_fractions_reserve_nothing_rather_than_panicking() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            let split = split_root_window(S(100), bad, bad, bad);
+            assert_eq!(split.bab, Duration::ZERO, "{bad} must not reserve");
+            assert_eq!(split.sweep, S(100));
+        }
+    }
+
+    #[test]
+    fn a_full_bab_reservation_leaves_the_ladder_nothing_and_still_sums() {
+        let split = split_root_window(S(100), 1.0, 0.0, 0.0);
+        assert_eq!(split.bab, S(100));
+        assert_eq!(split.tighten(), Duration::ZERO);
+        assert_eq!(split.total(), S(100));
     }
 
     #[test]

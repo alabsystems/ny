@@ -2,6 +2,7 @@
 name = "ny-gpu-passthrough"
 version = "0.2.0"
 edition = "2021"
+license.workspace = true
 publish = false
 
 # The ONE crate in the workspace allowed to touch wgpu's unsafe passthrough

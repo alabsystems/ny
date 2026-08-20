@@ -113,6 +113,9 @@ pub fn record_alloc(label: &str, bytes: u64) {
 ///
 /// Saturating: a double-free or an unpaired release must not wrap the counter
 /// to `u64::MAX` and make every subsequent reading nonsense.
+// trust-1.99 deprecates `fetch_update` (renamed `try_update`); the public
+// 1.95 pin lacks `try_update` — keep the spelling both toolchains accept.
+#[allow(deprecated)]
 pub fn record_free(bytes: u64) {
     let _ = LIVE_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
         Some(live.saturating_sub(bytes))

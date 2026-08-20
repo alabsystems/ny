@@ -1120,9 +1120,13 @@ mod extraction_tests {
 
 #[cfg(all(test, feature = "mip"))]
 mod tests {
+    // Only the `external-vnncomp` items below reach into the parent module.
+    #[cfg(feature = "external-vnncomp")]
     use super::*;
 
     /// The last-holdout isomorphic pairs (network + perturbation).
+    // Used only by `coupled_row_lower_is_sound`, the `external-vnncomp` test below.
+    #[cfg(feature = "external-vnncomp")]
     const PAIRS: &[(&str, &str, &str)] = &[
         (
             "instance_5",
@@ -1153,6 +1157,8 @@ mod tests {
 
     /// Sampled minimum of `obj·(f-g)` over the box (the sound bound must sit at
     /// or below this for every objective).
+    // Used only by `coupled_row_lower_is_sound`, the `external-vnncomp` test below.
+    #[cfg(feature = "external-vnncomp")]
     fn sampled_min_obj(
         f: &[Affine],
         g: &[Affine],
@@ -1202,10 +1208,14 @@ mod tests {
     #[test]
     #[cfg(feature = "external-vnncomp")]
     fn coupled_row_lower_is_sound() {
-        let base = std::path::PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
-        ));
+        let base = crate::commands::vnncomp2026_benchmarks_root()
+            .map(|root| root.join("isomorphic_acasxu_2026/2.0"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "external VNN-COMP 2026 relational fixtures missing under either \
+                     benchmarks/vnncomp2026_benchmarks/ or benchmarks/vnncomp2026/"
+                )
+            });
         assert!(
             base.is_dir(),
             "external VNN-COMP 2026 relational fixtures missing at {}; run \

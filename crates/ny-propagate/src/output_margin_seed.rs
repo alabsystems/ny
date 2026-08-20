@@ -152,6 +152,28 @@ pub(crate) fn margin_subset_indices(output_dim: usize) -> Option<Arc<[usize]>> {
     })
 }
 
+/// Whether ANY margin publication exists on this thread, regardless of node
+/// width (#cgan-truncated-scope-output-dim).
+///
+/// The truncated-reuse scope guard normally consults
+/// [`margin_subset_indices`] with the OUTPUT node's true width. When a
+/// collection map does not contain the output node's bounds, that width is
+/// unavailable — and the documented-unsound shortcut of skipping the guard
+/// ("no output node ⇒ no objective-specific selection") must not be taken
+/// (`docs/CGAN_COLLECTION_CACHE_DEFECTS_2026-08-03.md`, "the obvious fix for
+/// (E) is UNSOUND"). This predicate lets that caller refuse on the STRICTLY
+/// more conservative condition "a publication exists at all": every map the
+/// dim-consulted guard would refuse is also refused here (if the subset
+/// engaged for the true dim, a publication necessarily existed), so the
+/// objective-leak the guard prevents cannot slip through, at the price of
+/// also refusing publications that would not have engaged.
+///
+/// `publish(vec![])` stores `None` (subset seeding disengaged), so an empty
+/// publication correctly reads as "nothing published".
+pub(crate) fn margin_subset_published() -> bool {
+    PUBLISHED.with(|slot| slot.borrow().is_some())
+}
+
 /// #margin-subset-seed: scatter k tight CROWN rows over the node's sound
 /// IBP/forward bounds.
 ///
@@ -290,6 +312,33 @@ mod tests {
     fn empty_objective_publishes_nothing() {
         let _guard = MarginOutputSeedGuard::publish_from_objective(&[0.0, 0.0]);
         assert!(margin_subset_indices(1000).is_none());
+    }
+
+    /// #cgan-truncated-scope-output-dim: the width-independent predicate must
+    /// track the thread-local publication exactly — false when nothing (or an
+    /// empty set) is published, true while any nonempty publication is live,
+    /// false again after the guard drops.
+    #[test]
+    fn margin_subset_published_tracks_thread_local_publication() {
+        assert!(!margin_subset_published());
+        {
+            let _empty = MarginOutputSeedGuard::publish(vec![]);
+            assert!(
+                !margin_subset_published(),
+                "an empty publication disengages subset seeding and must read as unpublished"
+            );
+        }
+        {
+            let _guard = MarginOutputSeedGuard::publish(vec![0]);
+            assert!(
+                margin_subset_published(),
+                "a live publication must be visible regardless of node width"
+            );
+        }
+        assert!(
+            !margin_subset_published(),
+            "drop must restore the unpublished state"
+        );
     }
 
     #[test]

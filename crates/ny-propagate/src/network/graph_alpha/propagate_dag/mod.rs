@@ -2464,10 +2464,49 @@ impl GraphNetwork {
                 // believable against a non-empty line here, and `tightened=0` is a
                 // materially different claim from silence.
                 if joint_every > 0 {
+                    // #joint-interm-grad WIDTH PROBE. `tightened=0` has two very
+                    // different causes and the count alone cannot separate them:
+                    //   (a) the candidate is WEAKER than the incumbent, so the
+                    //       shrink-only merge rejects all of it -- which would be
+                    //       the case if the reference is built by forward-linear
+                    //       substitution (tighter than a CROWN backward on these
+                    //       layers), and would mean the alternating scheme cannot
+                    //       pay by construction, at any rebuild cost;
+                    //   (b) the candidate is tighter but only below the merge's
+                    //       comparison threshold.
+                    // Report the mean widths so the next reader does not have to
+                    // re-derive which one it is.
+                    let (mut cand_w, mut ref_w, mut n) = (0.0f64, 0.0f64, 0usize);
+                    for target in reference_bounds.targets() {
+                        let Some(c) = candidate.get(target) else {
+                            continue;
+                        };
+                        let Some(r) = reference_bounds.current().get(target) else {
+                            continue;
+                        };
+                        let cw: f64 = c
+                            .upper()
+                            .iter()
+                            .zip(c.lower())
+                            .map(|(u, l)| f64::from(*u) - f64::from(*l))
+                            .sum();
+                        let rw: f64 = r
+                            .upper()
+                            .iter()
+                            .zip(r.lower())
+                            .map(|(u, l)| f64::from(*u) - f64::from(*l))
+                            .sum();
+                        cand_w += cw;
+                        ref_w += rw;
+                        n += 1;
+                    }
                     eprintln!(
                         "[joint-interm-alpha] iter={iter} cadence={joint_every} \
-                         targets={} tightened={tightened_targets} targets_only=true",
+                         targets={} tightened={tightened_targets} targets_only=true \
+                         cmp_targets={n} candidate_width={cand_w:.4} reference_width={ref_w:.4} \
+                         candidate_is_tighter={}",
                         reference_bounds.targets().len(),
+                        cand_w < ref_w,
                     );
                 }
             }

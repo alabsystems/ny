@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "ny-accelerate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "faer",
  "libc",
@@ -2583,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "ny-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blas-src",
  "half",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "ny-build"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blas-src",
  "ndarray",
@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "ny-cert"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ntest",
  "num-bigint",
@@ -2630,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "ny-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ay-sat",
@@ -2648,6 +2648,7 @@ dependencies = [
  "ny-cert",
  "ny-core",
  "ny-cuda",
+ "ny-falsify",
  "ny-gpu",
  "ny-groundtruth",
  "ny-levers",
@@ -2674,11 +2675,11 @@ dependencies = [
 
 [[package]]
 name = "ny-contracts"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "ny-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "ntest",
@@ -2697,7 +2698,7 @@ dependencies = [
 
 [[package]]
 name = "ny-cuda"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "cudarc",
  "libc",
@@ -2708,8 +2709,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ny-falsify"
+version = "0.3.0"
+
+[[package]]
 name = "ny-gpu"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "approx",
  "blas-src",
@@ -2747,7 +2752,7 @@ dependencies = [
 
 [[package]]
 name = "ny-groundtruth"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ndarray",
  "num-bigint",
@@ -2765,18 +2770,18 @@ dependencies = [
 
 [[package]]
 name = "ny-levers"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "ny-lint-guard"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "ny-load"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blas-src",
  "flate2",
@@ -2792,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "ny-mip"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ay-milp",
  "blas-src",
@@ -2817,7 +2822,7 @@ dependencies = [
 
 [[package]]
 name = "ny-onnx"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "approx",
  "blas-src",
@@ -2861,7 +2866,7 @@ dependencies = [
 
 [[package]]
 name = "ny-propagate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "approx",
@@ -2896,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "ny-python"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "blas-src",
  "ndarray",
@@ -2913,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "ny-relaxation"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libm",
  "ndarray",
@@ -2924,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "ny-tensor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "approx",
  "blas-src",
@@ -2943,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "ny-test-utils"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ny-core",
  "ny-tensor",
@@ -2951,7 +2956,7 @@ dependencies = [
 
 [[package]]
 name = "ny-trace-bridge"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "half",
  "ndarray",

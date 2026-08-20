@@ -131,6 +131,18 @@ impl std::fmt::Display for Inert {
 /// reader can see they were considered and rejected on purpose.
 const UNSAFE_AXES: &[Axis] = &[
     Axis {
+        name: "NY_CUDA_GEMM_TRANSPORT",
+        domain: Domain::Bool,
+        class: Class::Unsafe,
+        deliver: Deliver::EnvOnly,
+        why: "names which CUDA GEMM transport the engine uses. The right answer \
+              is a property of the MACHINE — driver, cuBLAS presence, arch — and \
+              compute_backend already derives it. A search that moved this would \
+              be measuring the host it happens to run on and reporting it as a \
+              tuning result, and on a host missing the chosen transport every \
+              arm degrades identically, which reads as `no effect`",
+    },
+    Axis {
         name: "NY_EFT_ERR",
         domain: Domain::Bool,
         class: Class::Unsafe,
@@ -176,6 +188,8 @@ const INSTRUMENT_ONLY: &[&str] = &[
     "NY_GPU_MEM_TRACE",
     "NY_MIP_TRACE",
     "NY_CONV_PATCHES_DEBUG",
+    "NY_BNN_SIGN_SPACE_TRACE",
+    "NY_DUMP_NODE_BOUNDS",
 ];
 
 /// Test-only axes, excluded: they exist to drive fixtures, not the scored path.
@@ -280,9 +294,12 @@ const AXES: &[Axis] = &[
         name: "NY_ALPHA_ENVELOPE_GRAD",
         domain: Domain::Bool,
         class: Class::VerdictAffecting,
-        deliver: Deliver::EnvOnly,
+        // Shipped as a typed preset key 2026-08-18. Was EnvOnly, which meant a
+        // search could never propose it for a scored run however well it scored.
+        deliver: Deliver::PresetKey("bab.alpha_crown.alpha_envelope_grad"),
         why: "envelope gradient for the alpha ascent; changes which alpha is \
-              reached, hence the bound",
+              reached, hence the bound. MEASURED to move the root census where \
+              every other alpha lever left it bit-identical",
     },
     Axis {
         name: "NY_ALPHA_ZERO_YIELD_FRAC",
@@ -328,14 +345,445 @@ const AXES: &[Axis] = &[
         deliver: Deliver::EnvOnly,
         why: "admission bookkeeping; LATCHED in a OnceLock",
     },
+    // --- root/BaB window arbitration (#bab-floor; see decls/bab_budget.rs) ---
+    //
+    // These are the knobs a hand-run found non-monotonic: on cifar100_2024
+    // idx_8600 the reserve gives a 97/99 root census at 0.10 and 0/99 at 0.20.
+    // A share that only shortens phases should not collapse a census between
+    // two neighbouring points, so the region between them is exactly what a
+    // grid search has to resolve rather than a human bisecting it by hand.
+    Axis {
+        name: "NY_BAB_RESERVE_FRAC",
+        // 0.0 is the disarmed control and belongs IN the grid: it is the
+        // baseline arm the other four are scored against, and it is the only
+        // setting that also disarms the two children below.
+        domain: Domain::Enum(&["0.0", "0.10", "0.15", "0.20", "0.30"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.root_bab_reserve_frac"),
+        why: "subtracts BaB's share before any root phase sizes itself; every \
+              phase stays shrink-only and fails closed, but which verdicts are \
+              REACHED inside the window changes, and the decl carries MoatRisk::High",
+    },
+    Axis {
+        name: "NY_ROOT_SPEC_FRAC",
+        domain: Domain::Enum(&["0.10", "0.15", "0.25"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.root_spec_frac"),
+        why: "the root objective pass's share; starves the pass that PRODUCES \
+              the bounds BaB consumes, so it cannot be scored independently of \
+              the reserve above it",
+    },
+    Axis {
+        name: "NY_ROOT_ALPHA_FRAC",
+        domain: Domain::Enum(&["0.20", "0.30", "0.45"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("bab.root_alpha_frac"),
+        why: "converts the bootstrap's fixed 40 s wall into a share; that wall \
+              is 51% of the BaB slice at 100 s and 4% at 1200 s, so it is the \
+              one claimant whose cost does NOT scale with the window",
+    },
+    // --- accounted for by every_declared_lever_is_accounted_for ---
+    Axis {
+        name: "NY_MARGIN_ROW_ALPHA_OPT",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "alpha ascent on the margin-row lane; changes the published row bound",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_ALPHA_ITERS",
+        domain: Domain::Grid(&[4, 8, 16, 32]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "ascent steps for that lane; more steps tighten but spend the row's window",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_ALPHA_SECS",
+        domain: Domain::Grid(&[10, 20, 40]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "wall cap on the margin-row ascent; the cap and the iteration count bind at different instance sizes, so neither prices the other",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_K_ADAPT",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "adapts K per row instead of holding the preset value",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_CLIP",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "clips the margin row against the certified envelope",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_CLIP_INTERM",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "extends that clip to intermediate bounds; refinement of the clip above",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_CLIP_ROWS",
+        domain: Domain::Bool,
+        class: Class::SafeToSearch,
+        deliver: Deliver::EnvOnly,
+        why: "row-wise vs whole-tensor clip application; MoatRisk::None in the decl",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_CLIP_TOPK",
+        domain: Domain::Grid(&[5, 20, 50]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "how many rows the clip considers; a budget, not a bound change",
+    },
+    Axis {
+        name: "NY_ROOT_OBJECTIVE_DIRECTED_ROWS",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "directs the root objective pass at the rows that actually gate the verdict rather than sweeping all of them",
+    },
+    Axis {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_MAX_DIM",
+        domain: Domain::Grid(&[64, 256, 1024]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "dimension ceiling above which the joint intermediate alpha pass declines; the ceiling decides whether the pass runs at all on a wide graph",
+    },
+    Axis {
+        name: "NY_SWEEP_CLASS_ROWS",
+        domain: Domain::Grid(&[64, 256, 1024]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "row count that classifies a sweep as large; picks the execution class",
+    },
+    Axis {
+        name: "NY_SWEEP_CLASS_MIB",
+        domain: Domain::Grid(&[64, 256, 1024]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "the memory half of the same classification; rows and MiB can disagree, and which one binds is the thing to measure",
+    },
+    Axis {
+        name: "NY_MO_GPU_CHUNK_DEADLINE",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "gives each multi-objective GPU chunk its own deadline instead of one deadline for the batch",
+    },
+    Axis {
+        name: "NY_KFSB_SIM_SHARE",
+        domain: Domain::Enum(&["0.15", "0.35", "0.60"]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "share of the kFSB branching budget spent on simulation; branching order decides which subproblems are ever opened",
+    },
+    Axis {
+        name: "NY_STAR_DARK_SECONDS",
+        domain: Domain::Grid(&[0, 10, 30, 60]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "wall budget for the star-dark lane; 0 is the disarmed control and the arming gate for the five knobs below",
+    },
+    Axis {
+        name: "NY_STAR_DARK_MAX_STARS",
+        domain: Domain::Grid(&[1000, 100000, 50000000]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "star ceiling; the default 50M is effectively unbounded, so the low arms are the ones that test whether the ceiling ever binds",
+    },
+    Axis {
+        name: "NY_STAR_DARK_MAX_DEPTH",
+        domain: Domain::Grid(&[64, 512, 4096]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "depth ceiling for the same lane",
+    },
+    Axis {
+        name: "NY_STAR_DARK_DUAL_ITERS",
+        domain: Domain::Grid(&[8, 32, 128]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "dual ascent steps per star",
+    },
+    Axis {
+        name: "NY_STAR_DARK_INPUT_SPLIT",
+        domain: Domain::Grid(&[1, 2, 4]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "input-space splits before the star lane runs",
+    },
+    Axis {
+        name: "NY_STAR_DARK_EXACT_BELOW",
+        domain: Domain::Grid(&[0, 8, 32]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "size below which the lane solves exactly instead of relaxing; 0 disables the exact fallback",
+    },
+    Axis {
+        name: "NY_FALSIFY_PORTFOLIO",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "runs the falsification portfolio; produces SAT verdicts, which is the half of the score BaB cannot reach",
+    },
+    Axis {
+        name: "NY_FALSIFY_PORTFOLIO_SECONDS",
+        domain: Domain::Grid(&[0, 5, 15, 30]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "wall budget for that portfolio, taken from the same instance window the sound lanes spend",
+    },
+    Axis {
+        name: "NY_ATTACK_PRE_SOFTMAX_OBJECTIVE",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "attacks the pre-softmax objective instead of the post-softmax one; changes which counterexamples are findable",
+    },
+    Axis {
+        name: "NY_BNN_SIGN_SPACE",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "sign-space encoding for binarised networks; the arming gate for the two refinements below",
+    },
+    Axis {
+        name: "NY_BNN_SIGN_SPACE_MINIMAL_MOVE",
+        domain: Domain::Bool,
+        class: Class::SafeToSearch,
+        deliver: Deliver::EnvOnly,
+        why: "minimal-move variant of that encoding; MoatRisk::Low in the decl",
+    },
+    Axis {
+        name: "NY_BNN_SIGN_SPACE_TRUST_REGION",
+        domain: Domain::Enum(&["box", "tight", "linf"]),
+        class: Class::SafeToSearch,
+        deliver: Deliver::EnvOnly,
+        why: "trust-region shape for the sign-space search",
+    },
+    Axis {
+        name: "NY_LANE_BUDGET_ALLOCATOR",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "commits every attack-slice lane's cap jointly and up front by solving a multiple-choice \
+              knapsack, and can take a structurally blind lane to zero seconds; it changes which lane \
+              runs under what cap, so it changes which counterexamples are reachable within the budget",
+    },
+    Axis {
+        name: "NY_LANE_VALUE_SCHEDULER",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "reallocates a stalled lane's remaining seconds to a later lane; changes which lane runs under what cap, so it changes which counterexamples are reachable within the budget",
+    },
+    Axis {
+        name: "NY_BNN_STE_PGD",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "straight-through-estimator PGD for binarised nets; a falsification path",
+    },
+    Axis {
+        name: "NY_CLIP_HOST_MEAN_LA",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "host-side mean look-ahead clip",
+    },
+    Axis {
+        name: "NY_CLIP_INTERM_CERTIFIED",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "clips intermediate bounds against the certified envelope",
+    },
+    Axis {
+        name: "NY_GRAPH_MIP_LEAF_SAT",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "hands BaB leaves to the MIP backend for a SAT decision instead of leaving them unknown",
+    },
+    // --- margin-row backward / beta / cgan (4227a10bc, declared after the fact) ---
+    Axis {
+        name: "NY_MARGIN_ROW_BACKWARD_INTERM",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::PresetKey("margin_row.backward_interm"),
+        why: "backward intermediate refinement; the one axis here already SHIPPED on the scored cifar100 and \
+              tinyimagenet presets, on a measured row conversion, so its arms are baseline-vs-shipped rather \
+              than dark-vs-dark",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BI_SECS",
+        domain: Domain::Grid(&[5, 20, 60]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "wall budget for that refinement; it fails closed on expiry, so a short budget publishes looser bounds rather than wrong ones",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BI_CHUNK",
+        domain: Domain::Grid(&[64, 256, 1024]),
+        class: Class::SafeToSearch,
+        deliver: Deliver::EnvOnly,
+        why: "row-window size; disjoint windows over the same rows, so cost only — MoatRisk::None in the decl",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BI_TOPK",
+        domain: Domain::Grid(&[256, 1024, 4096]),
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "how many neurons get refined; unlike the chunk size this changes WHICH bounds move",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BETA",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "beta ascent over split constraints; the arming gate for the two below, and the margin-row lane's analogue of what makes beta-CROWN beat alpha-CROWN",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BETA_ETA",
+        domain: Domain::Enum(&["0.25", "0.5", "1.0"]),
+        class: Class::SafeToSearch,
+        deliver: Deliver::EnvOnly,
+        why: "dual ascent step; any iterate is a valid dual point, so this costs tightness, not soundness",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BETA_ITERS",
+        domain: Domain::Grid(&[1, 2, 4]),
+        class: Class::SafeToSearch,
+        deliver: Deliver::EnvOnly,
+        why: "ascent trials per domain; each is a full certified pass, so this is a direct per-domain cost multiplier",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_GPU_EFT",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "certified error-free-transformation GPU backward; refuses rather than degrading on device failure, so an arm that finds the lane dead measures the CPU path",
+    },
+    Axis {
+        name: "NY_CGAN_STACKED_BACKWARD",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "one stacked backward walk in place of per-target walks in the cgan collector",
+    },
+    Axis {
+        name: "NY_CGAN_STACKED_BUDGET_MB",
+        domain: Domain::Grid(&[512, 4096, 32768]),
+        class: Class::SafeToSearch,
+        deliver: Deliver::EnvOnly,
+        why: "memory admission for that walk; decides only whether it is ATTEMPTED, since the fallback computes the same bounds",
+    },
+    Axis {
+        name: "NY_CROWN_PARTIAL_FINITE_EXPIRY",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "switches two per-node partial CROWN sites from deadline PRESENCE to \
+              deadline EXPIRY. Worth searching precisely because the audit predicts \
+              a null unless the WHOLE root-cause-D set switches together — a zero \
+              here is evidence about the split, not about the fix",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BETA_LAMBDA",
+        domain: Domain::Enum(&["0.5", "1.0", "2.0"]),
+        class: Class::SafeToSearch,
+        deliver: Deliver::EnvOnly,
+        why: "Polyak relaxation factor; also the recovery ceiling the per-node \
+              lambda memory grows back toward, so it sets both the step size and \
+              how fast an accepted step is rewarded",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BETA_POLYAK",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "gap-targeted step rule vs the legacy sign step. Armed by default \
+              inside the beta lane, so here the 0 arm is the TREATMENT and the \
+              default is the incumbent -- the reverse of the rest of this family",
+    },
+    Axis {
+        name: "NY_MARGIN_ROW_BETA_HEADS",
+        domain: Domain::Bool,
+        class: Class::VerdictAffecting,
+        deliver: Deliver::EnvOnly,
+        why: "head-split beta terms, armed by default inside the lane; the 0 arm \
+              is trunk-only and exists to PRICE the head terms, not to revert them",
+    },
 ];
 
 /// Prerequisite and exclusion edges.
 ///
-/// Every one of these corresponds to a literal `&&`, `?` or early return in the
-/// engine. A sample that violates one is not a cheap experiment — it is a 100 s
-/// measurement of the baseline, mislabelled as a treatment.
+/// Every one of these corresponds to a literal `&&`, `?` or early return in
+/// the engine. A sample that violates one is not a cheap experiment — it is a
+/// 100 s measurement of the baseline, mislabelled as a treatment.
 const EDGES: &[Edge] = &[
+    Edge {
+        child: "NY_MARGIN_ROW_BETA_LAMBDA",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BETA"),
+        site: "margin_row/beta.rs:lambda — the ascent knobs are dead unless beta is armed",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BETA_POLYAK",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BETA"),
+        site: "margin_row/beta.rs:polyak — same arming gate",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BETA_HEADS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BETA"),
+        site: "margin_row/beta.rs:heads_on — same arming gate",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BI_SECS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BACKWARD_INTERM"),
+        site: "margin_row/backward_interm.rs:from_env — the three BI_* knobs are read \
+               only after the arming match falls through",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BI_CHUNK",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BACKWARD_INTERM"),
+        site: "margin_row/backward_interm.rs:from_env — same arming match",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BI_TOPK",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BACKWARD_INTERM"),
+        site: "margin_row/backward_interm.rs:from_env — same arming match",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BETA_ETA",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BETA"),
+        site: "margin_row/beta.rs:eta — the ascent knobs are dead unless beta is armed",
+    },
+    Edge {
+        child: "NY_MARGIN_ROW_BETA_ITERS",
+        requires: Requirement::Armed("NY_MARGIN_ROW_BETA"),
+        site: "margin_row/beta.rs:iters — same arming gate",
+    },
+    Edge {
+        child: "NY_CGAN_STACKED_BUDGET_MB",
+        requires: Requirement::Armed("NY_CGAN_STACKED_BACKWARD"),
+        site: "graph_alpha/bounds/cgan_stacked.rs:stacked_budget_bytes — the budget is \
+               consulted only when the stacked walk is armed",
+    },
+    Edge {
+        child: "NY_ROOT_SPEC_FRAC",
+        requires: Requirement::NonZero("NY_BAB_RESERVE_FRAC"),
+        site: "multi_objective/root.rs — the spec share is read only under an \
+               armed reserve; unarmed it is dead and the arm measures baseline",
+    },
+    Edge {
+        child: "NY_ROOT_ALPHA_FRAC",
+        requires: Requirement::NonZero("NY_BAB_RESERVE_FRAC"),
+        site: "multi_objective/root.rs — same arming gate as the spec share",
+    },
     Edge {
         child: "NY_MARGIN_ROW_GPU_BATCH",
         requires: Requirement::Armed("NY_MARGIN_ROW_GPU"),
@@ -494,6 +942,71 @@ pub fn expand(sample: &BTreeMap<&str, String>) -> Result<Vec<(String, String)>, 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    /// Every declared lever must be ACCOUNTED FOR by this module.
+    ///
+    /// This is the guard for a failure that already happened. `NY_BAB_RESERVE_FRAC`
+    /// and its two children were declared, wired, documented and then tuned BY
+    /// HAND across four values, because nothing connected declaring a lever to
+    /// making it searchable. The search platform could not have found the
+    /// operating point it exists to find: the axis simply was not there.
+    ///
+    /// Absence is the bug this catches. A lever may be searchable (`AXES`), or
+    /// deliberately withheld (`UNSAFE_AXES`), or excluded as instrumentation or
+    /// test scaffolding — but it may not be MISSING, because a missing lever
+    /// looks exactly like a covered one from the outside. Adding a name to an
+    /// exclusion list is a fine way to satisfy this test; that is a recorded
+    /// decision, which is the whole point. Saying nothing is not.
+    #[test]
+    fn every_declared_lever_is_accounted_for() {
+        let mut covered: BTreeSet<&str> = BTreeSet::new();
+        covered.extend(AXES.iter().map(|a| a.name));
+        covered.extend(UNSAFE_AXES.iter().map(|a| a.name));
+        covered.extend(INSTRUMENT_ONLY.iter().copied());
+        covered.extend(TEST_ONLY.iter().copied());
+
+        let missing: Vec<&str> = crate::all()
+            .all()
+            .iter()
+            .map(|d| d.name)
+            .filter(|n| !covered.contains(n))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "{} declared lever(s) are in no search-space category — not searchable, \
+             not excluded, just absent. Each must join AXES, UNSAFE_AXES, \
+             INSTRUMENT_ONLY or TEST_ONLY:\n  {}",
+            missing.len(),
+            missing.join("\n  "),
+        );
+    }
+
+    /// Nothing may be listed here that is not actually declared.
+    ///
+    /// The companion to the test above: a stale name in an exclusion list is a
+    /// silent hole, because it makes the accounting look complete while
+    /// covering a lever that no longer exists.
+    #[test]
+    fn the_space_names_only_declared_levers() {
+        let declared: BTreeSet<&str> = crate::all().all().iter().map(|d| d.name).collect();
+        let mut listed: Vec<&str> = Vec::new();
+        listed.extend(AXES.iter().map(|a| a.name));
+        listed.extend(UNSAFE_AXES.iter().map(|a| a.name));
+        listed.extend(INSTRUMENT_ONLY.iter().copied());
+        listed.extend(TEST_ONLY.iter().copied());
+
+        let phantom: Vec<&str> = listed
+            .into_iter()
+            .filter(|n| !declared.contains(n))
+            .collect();
+
+        assert!(
+            phantom.is_empty(),
+            "search space names undeclared levers: {phantom:?}"
+        );
+    }
     use super::*;
 
     fn sample(pairs: &[(&'static str, &str)]) -> BTreeMap<&'static str, String> {

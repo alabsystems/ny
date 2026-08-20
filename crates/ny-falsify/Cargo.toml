@@ -1,0 +1,33 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ny-falsify"
+description = "Falsification strategy chassis: typed admission, budget schedule, and candidate-input-only proposals. Cannot name a verdict."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# DELIBERATELY DEPENDENCY-FREE, and this is the load-bearing part of the
+# soundness argument (design doc §8, M2). `ny-cli` owns `VnncompResult` and the
+# trusted-oracle gate. This crate has NO path dependency on any workspace crate,
+# so no verdict type is *nameable* from a strategy — not by import, not by
+# re-export, not by a trait method's associated type. A reviewer checks this by
+# reading eleven lines of TOML, not thirty comments across four crates. The
+# invariant is pinned by `tests/soundness_boundary.rs`.
+#
+# It also has no third-party dependencies: the RNG is in-crate (`src/rng.rs`)
+# precisely so that "which points did the search emit" is reproducible from this
+# repo alone, which is what makes the port-fidelity test in
+# `tests/calibration_special.rs` meaningful.
+[dependencies]
+
+[dev-dependencies]

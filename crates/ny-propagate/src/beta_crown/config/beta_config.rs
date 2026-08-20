@@ -752,6 +752,30 @@ pub struct BetaCrownConfig {
     /// Default false keeps unmeasured presets byte-identical.
     #[serde(default)]
     pub root_comprehensive_gpu_interm: bool,
+    /// `#bab-floor`: BaB's guaranteed share of the multi-objective root window,
+    /// subtracted BEFORE any root phase sizes itself.
+    ///
+    /// DELIVERY: the scored entry point exports exactly one `NY_*`, so the env
+    /// lever these three were measured through is dead in competition. These
+    /// typed keys are how a search result reaches a scored run.
+    ///
+    /// `None` (the default) means no arbitration exists and every root phase
+    /// keeps the deadline it has today, so an unmeasured preset stays
+    /// byte-identical. `NY_BAB_RESERVE_FRAC` overrides in BOTH directions.
+    #[serde(default)]
+    pub root_bab_reserve_frac: Option<f64>,
+    /// `#bab-floor`: the root objective pass's share, subtracted after
+    /// `root_bab_reserve_frac`. Read only when that reservation is armed —
+    /// without a share of its own the pass starves and the BaB reserve behind
+    /// it is unreachable. `NY_ROOT_SPEC_FRAC` overrides.
+    #[serde(default)]
+    pub root_spec_frac: Option<f64>,
+    /// `#bab-floor`: the bootstrap ascent's share, min-composed onto
+    /// `root_alpha_cap_secs`. That cap is a FIXED 40 s — 51% of the BaB slice
+    /// at 100 s and 4% at 1200 s — so it is the one claimant whose cost does
+    /// not scale with the window. `NY_ROOT_ALPHA_FRAC` overrides.
+    #[serde(default)]
+    pub root_alpha_frac: Option<f64>,
     /// How many DISJOINT row windows the comprehensive sweep may accumulate.
     ///
     /// The sweep is hard-capped in rows-per-target by device memory (the backend
@@ -1298,6 +1322,13 @@ impl Default for BetaCrownConfig {
             root_sparse_interm_crown_max_rows: default_root_sparse_interm_crown_max_rows(),
             root_sparse_interm_crown_max_targets: default_root_sparse_interm_crown_max_targets(),
             root_comprehensive_gpu_interm: false,
+            // #bab-floor: None, not 0.0 — absent means the arbitration does
+            // not exist, which is the byte-identical shipped ladder. 0.0 is a
+            // different statement: an explicit kill switch that still leaves
+            // the two shares parseable.
+            root_bab_reserve_frac: None,
+            root_spec_frac: None,
+            root_alpha_frac: None,
             root_comprehensive_gpu_interm_chunks: default_root_comprehensive_gpu_interm_chunks(),
             root_post_c_survivor: false,
             mo_beta_graft: false, // #mo-beta-graft (env NY_MO_BETA_GRAFT overrides)

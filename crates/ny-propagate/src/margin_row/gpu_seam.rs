@@ -36,8 +36,11 @@
 //!
 //! 1. **Every relaxation the device is handed is a valid over-approximation of
 //!    the corresponding real op.** ReLU lower lines are `alpha*x` with
-//!    `alpha in [0, 1]` — sound for any such alpha, and `alpha` is 0/1 here so
-//!    the f32 downcast is EXACT. ReLU upper lines are repaired after the
+//!    `alpha in [0, 1]` — sound for any such alpha. Root gates and piece-fixes
+//!    are 0/1, so their f32 downcast is EXACT; #alpha-opt may leave FRACTIONAL
+//!    alpha in the root gates, and any alpha that is not exactly
+//!    f32-representable makes [`outward_gate_f32`] REFUSE (fail-closed CPU
+//!    fallback) rather than guess. ReLU upper lines are repaired after the
 //!    downcast by [`outward_gate_f32`]: relu is convex and the line is affine,
 //!    so `line >= relu` on `[l, u]` iff it holds at `l` and at `u`; the repair
 //!    bumps the intercept UP until both endpoint residuals are non-negative.
@@ -913,9 +916,10 @@ fn retarget_plan(
 /// Downcast a ReLU gate into f32 so the DEVICE's relaxation still encloses the
 /// real ReLU on `[l, u]`.
 ///
-/// * lower line `alpha*x`: sound for any `alpha in [0, 1]`. The lane's alphas
-///   are 0/1 (root gates and piece-fixes alike), so the downcast is EXACT; a
-///   non-representable alpha refuses rather than guesses.
+/// * lower line `alpha*x`: sound for any `alpha in [0, 1]`. Binary alphas
+///   (heuristic root gates and piece-fixes) downcast EXACTLY; a
+///   non-representable alpha — e.g. a fractional #alpha-opt value — refuses
+///   rather than guesses (fail-closed to the CPU pass).
 /// * upper line `s*x + c`: relu is convex and the line affine, so
 ///   `line >= relu` on `[l, u]` IFF it holds at both endpoints. When the
 ///   downcast is inexact the intercept is bumped up by the worst endpoint
@@ -1343,6 +1347,7 @@ pub(crate) fn convert_and_check(
         eb,
         coll: None,
         coll_rows: None,
+        unst_rows: None,
     };
     // Same fail-closed firewall the CPU pass applies before any verdict math.
     if out.a.iter().any(|v| !v.is_finite())

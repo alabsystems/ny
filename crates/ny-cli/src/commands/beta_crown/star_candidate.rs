@@ -153,7 +153,7 @@ fn star_from_outward_box(lower: &[f64], upper: &[f64]) -> Result<Star> {
         if !lo32.is_finite() || !hi32.is_finite() || lo32 > hi32 {
             bail!("star candidate: input interval {index} cannot be enclosed in f32");
         }
-        let center = ((f64::from(lo32) + f64::from(hi32)) * 0.5) as f32;
+        let center = (f64::from(lo32).midpoint(f64::from(hi32))) as f32;
         if !center.is_finite() {
             bail!("star candidate: input center {index} is not finite");
         }

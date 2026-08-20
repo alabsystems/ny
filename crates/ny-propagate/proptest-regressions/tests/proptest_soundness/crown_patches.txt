@@ -15,3 +15,4 @@ cc 31dda76ffe67a3c7075c7563fe14d6a6e69fcacdef261e0ed29fb36575644bad # shrinks to
 cc a1913f272756802b54008c05661c5359b4b531c29c6113a0108a3c7432eaceac # shrinks to in_c1 = 2, out_c1 = 1, kh1 = 3, kw1 = 3, in_h1 = 5, in_w1 = 7, out_c2 = 1, kh2 = 2, kw2 = 2, seed = 14083273974073471688
 cc ea756c4694c1d2af344da25ad75205c569549fa5a7f1fc7c5accd637800c2110 # shrinks to in_c = 3, out_c = 1, kh = 2, kw = 3, in_h = 7, in_w = 6, stride_h = 2, stride_w = 2, pad_h = 0, pad_w = 0, seed = 6315236309029114507
 cc 27e74d063e55804c0a95c52641f61e91a2dce3ba6c340c3a14e397ddfbf5fc15 # shrinks to in_c = 1, out_c = 1, kh = 1, kw = 1, in_h = 4, in_w = 5, stride_h = 2, stride_w = 1, pad_h = 1, pad_w = 0, seed = 9492549203921369894
+cc 398dfab178ebb039727bd6c9bff3dc7559f0b1bd6c552343030d96748f727e75 # shrinks to in_c1 = 3, out_c1 = 2, kh1 = 3, kw1 = 1, in_h1 = 7, in_w1 = 6, out_c2 = 3, kh2 = 1, kw2 = 2, seed = 10706703534889054881

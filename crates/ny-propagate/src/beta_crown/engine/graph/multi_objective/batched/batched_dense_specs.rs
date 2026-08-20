@@ -819,7 +819,7 @@ impl BetaCrownVerifier {
                     // #unsat-keystone CONVERGENCE PROBE (NY_BETA_GPU_PROBE=1): does the best
                     // (max) active objective lower bound climb toward the verify threshold as
                     // BaB deepens? Climbing → converging (GPU speed wins); stuck → tightness gap.
-                    if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1")
+                    if crate::beta_gpu_probe_armed()
                         && !active_bounds_i.is_empty()
                     {
                         let mn = active_bounds_i

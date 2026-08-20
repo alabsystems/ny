@@ -1177,6 +1177,7 @@ fn write_tarball(repo_root: &Path, output: &Path, included_paths: &[String]) -> 
     // other packaging path) that omits a checksummed file breaks Cargo's
     // directory-source build. Verify the ACTUAL archived bytes here.
     verify_vendor_checksums(staged_output.path())?;
+    verify_shell_scripts_are_lf(staged_output.path())?;
 
     let archived_source = Command::new("tar")
         .args(["-xOzf"])
@@ -1224,6 +1225,66 @@ fn write_tarball(repo_root: &Path, output: &Path, included_paths: &[String]) -> 
 /// the evaluator, a single dropped vendored file turns the whole run into a
 /// zero-scoring non-build. We verify the archived bytes (not the working tree) so
 /// any packaging path that drops a checksummed vendored file fails the pack here.
+/// Refuse an archive whose shell scripts carry CRLF.
+///
+/// The packer tars the WORKING TREE, not `git archive`, so it ships whatever
+/// bytes are on disk. A `.sh` checked out with CRLF on Windows gets a shebang
+/// of `#!/bin/bash\r`, which names an interpreter that does not exist: the
+/// competition host fails the run with a bare "No such file or directory" and
+/// the tarball itself looks perfectly well-formed. `.gitattributes` already
+/// pins `*.sh text eol=lf`, but that only applies at CHECKOUT — a tree written
+/// before the rule landed, or a file produced by a tool, still reaches the
+/// archive uncorrected.
+///
+/// Measured on this repository: 26 tracked `.sh` files, `prepare_instance.sh`
+/// among them, held CRLF in a working tree git reported as clean.
+fn verify_shell_scripts_are_lf(archive: &Path) -> Result<()> {
+    let listing = Command::new("tar").arg("-tzf").arg(archive).output()?;
+    if !listing.status.success() {
+        bail!(
+            "could not list submission archive for line-ending verification: {}",
+            String::from_utf8_lossy(&listing.stderr).trim()
+        );
+    }
+    let scripts: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .map(|raw| raw.strip_prefix("./").unwrap_or(raw).to_string())
+        // Case-insensitive: a `.SH` member is just as unrunnable with CRLF.
+        .filter(|entry| {
+            Path::new(entry)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
+        })
+        .collect();
+
+    let mut offenders = Vec::new();
+    for script in &scripts {
+        let member = Command::new("tar")
+            .args(["-xOzf"])
+            .arg(archive)
+            .arg(script)
+            .output()?;
+        if !member.status.success() {
+            bail!(
+                "could not read archived shell script {script:?}: {}",
+                String::from_utf8_lossy(&member.stderr).trim()
+            );
+        }
+        if member.stdout.windows(2).any(|pair| pair == b"\r\n") {
+            offenders.push(script.clone());
+        }
+    }
+    if !offenders.is_empty() {
+        bail!(
+            "refusing a submission whose shell scripts carry CRLF; they will not \
+             execute on the evaluation host (shebang becomes `#!/bin/bash\r`). \
+             Re-check out these files with `*.sh text eol=lf` in effect: {}",
+            offenders.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn verify_vendor_checksums(archive: &Path) -> Result<()> {
     let listing = Command::new("tar").arg("-tzf").arg(archive).output()?;
     if !listing.status.success() {

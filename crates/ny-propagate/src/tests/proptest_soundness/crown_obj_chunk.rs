@@ -17,6 +17,16 @@
 //!    `to_dense()` bound (NOT the loose IBP fallback).
 //!
 //! Helpers (`make_kernel`, `make_bias`) are cloned from `crown_patches.rs`.
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
+//! and single-threaded, these properties cost 10-30s in a debug build, and the
+//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
+//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
+//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
+//! 10-20x the measured isolated cost. The failure these exist to catch is an
+//! infinite loop, and no finite wall lets one of those through.
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::layers::{Conv2dLayer, ReLULayer};
 use crate::network::{GraphNetwork, GraphNode};
@@ -147,7 +157,12 @@ proptest! {
     ///   streamed_lower <= single_lower + tol AND streamed_upper >= single_upper - tol.
     /// Containment: both streams contain the true conv->relu output on 20
     /// sampled in-box points.
-    #[ntest::timeout(30000)]
+    // HANG SENTINEL, NOT A PERFORMANCE ASSERTION. Measured 2026-08-19: 29.57s
+    // ISOLATED, single-threaded, against the 30s wall this used to carry -- a
+    // margin of 1.01x. It was not a sentinel, it was a coin flip that any
+    // concurrent load loses, and it duly failed at both 4 and 8 test threads.
+    // 300s is ~10x the isolated cost. MEASURE BEFORE LOWERING IT.
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_obj_chunk_equivalence_and_containment(
         in_c in 1usize..=3,

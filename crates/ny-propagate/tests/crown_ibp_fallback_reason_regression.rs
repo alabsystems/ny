@@ -7,7 +7,7 @@ use ny_propagate::layers::ReLULayer;
 use ny_propagate::types::{BoundsProvenance, CrownIbpFallbackReason};
 use ny_propagate::{GraphNetwork, GraphNode, Layer};
 use ny_tensor::BoundedTensor;
-use std::sync::MutexGuard;
+use std::sync::RwLockWriteGuard;
 use std::time::{Duration, Instant};
 
 const CROWN_DENSE_BUDGET_ENV: &str = "NY_DENSE_BUDGET_MB";
@@ -52,7 +52,7 @@ fn assert_bounds_match(actual: &BoundedTensor, expected: &BoundedTensor, label: 
 /// Field order matters: `_var` restores before `_lock` releases.
 struct DenseBudgetEnvGuard {
     _var: ny_test_utils::env::ScopedEnvVar,
-    _lock: MutexGuard<'static, ()>,
+    _lock: RwLockWriteGuard<'static, ()>,
 }
 
 impl DenseBudgetEnvGuard {

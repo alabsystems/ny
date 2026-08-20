@@ -501,9 +501,7 @@ fn is_quantized_integer_dtype_at_opset(dtype: i32, opset: i64) -> bool {
 }
 
 fn is_quantized_integer_dtype_i64(dtype: i64) -> bool {
-    i32::try_from(dtype)
-        .ok()
-        .is_some_and(is_quantized_integer_dtype)
+    i32::try_from(dtype).is_ok_and(is_quantized_integer_dtype)
 }
 
 fn is_dequantize_input_dtype_at_opset(dtype: i32, opset: i64) -> bool {

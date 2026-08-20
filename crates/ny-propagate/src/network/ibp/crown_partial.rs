@@ -68,6 +68,73 @@ fn check_partial_deadline(deadline: Option<Instant>) -> Result<()> {
     }
 }
 
+/// #crown-partial-finite-expiry — BUG #18 root cause D, the last two
+/// deadline-PRESENCE declines of the whole-network-IBP set
+/// (docs/DEADLINE_PRESENCE_FIX_2026-08-19.md).
+///
+/// Their set-mates in `sequential/crown/backward_step.rs`
+/// (`finite_authority_refuses_per_layer_ibp`, the per-layer IBP salvage arms)
+/// already decide by EXPIRY unconditionally, so with this lever armed the
+/// COMPLETE root-cause-D set is on expiry — which is the only configuration
+/// the audit predicts can measure as nonzero ("set-mates switch together;
+/// partial fixes measure exactly zero").
+///
+/// Exact `"1"` arms; any other token (or absence) leaves the historical
+/// presence guard byte-identical. Default OFF: unlike `NY_PATCHES_FINITE_EXPIRY`
+/// these two sites have no measurement yet, and an unmeasured default flip is
+/// how this campaign has manufactured fake results before.
+///
+/// The token contract is now owned by the typed declaration
+/// `ny_levers::decls::diagnostics::CROWN_PARTIAL_FINITE_EXPIRY`, whose
+/// `LeverKind::Bool` parser is the same exact-`"1"` rule this site always had:
+/// `"0"` is an explicit disarm, every other spelling is a recorded rejection
+/// that leaves the dark default, and a non-UTF-8 value cannot arm it — exactly
+/// what the old `OsStr == "1"` comparison did, with the rejection now visible in
+/// the flight receipt instead of being silently swallowed.
+///
+/// Latched once per process — this predicate sits on the per-node partial
+/// walk, where a live environment read is a lock plus a scan of the environment
+/// block (same idiom as `patches_step::expiry_authority_armed`).
+fn crown_partial_expiry_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| {
+        let armed = ny_levers::read(&ny_levers::decls::diagnostics::CROWN_PARTIAL_FINITE_EXPIRY)
+            .value
+            .as_bool();
+        if armed {
+            // R9: the lever's own engagement announcement. A null measured
+            // without this line is indistinguishable from an inert lever.
+            eprintln!(
+                "[deadline-preserve] NY_CROWN_PARTIAL_FINITE_EXPIRY ARMED: CROWN-IBP \
+                 partial GPU route and sparse seed discovery now decline on EXPIRY, \
+                 not on deadline presence"
+            );
+        }
+        armed
+    })
+}
+
+/// Pure decision core, testable without touching the process environment or
+/// the wall clock. `true` = decline (take the historical degraded arm).
+///
+/// * no deadline: never declines — byte-identical to the no-deadline tree;
+/// * unarmed: declines on PRESENCE, exactly the historical guard;
+/// * armed: declines only at or past expiry — commit-what-you-have semantics,
+///   never extending past the deadline (the walk's existing entry/exit expiry
+///   checks still refuse any late publication).
+fn finite_authority_declines_partial(armed: bool, deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|limit| !armed || now >= limit)
+}
+
+/// [deadline-preserve] saved-vs-discarded counts for the root-cause-D pair.
+/// Two decisions are recorded per deadlined partial walk (GPU route, sparse
+/// seed); recording happens after each decision and changes nothing.
+static CROWN_PARTIAL_PRESERVE:
+    crate::network::core::graph::backward_helpers::DeadlinePreserveCounters =
+    crate::network::core::graph::backward_helpers::DeadlinePreserveCounters::new(
+        "crown-partial-salvage",
+    );
+
 /// Propagate CROWN bounds through a partial network (subset of layers).
 ///
 /// Uses Patches-aware backward dispatch via [`crown_backward_step_patches`]
@@ -119,12 +186,13 @@ pub(super) fn propagate_crown_partial_with_engine(
     // GPU fast path (#3599 Phase 1): dispatch the entire per-node backward to GPU
     // when all layers in the sub-network are GPU-extractable. This avoids the
     // CPU-bound Patches/Dense backward loop and host-side concretization.
-    // A finite request deliberately skips this optional GPU route. Although a
-    // backend can advertise cooperative device cancellation, the legacy host
-    // preparation still extracts/copies every layer and input endpoint and
-    // builds the full (or sparse) specification matrix without cooperative
-    // polls. The CPU Patches/Dense path below observes the same absolute
-    // deadline through its admitted materialization boundaries.
+    // Historical stance, now lever-decided below: a finite request
+    // deliberately skipped this optional GPU route. Although a backend can
+    // advertise cooperative device cancellation, the legacy host preparation
+    // still extracts/copies every layer and input endpoint and builds the
+    // full (or sparse) specification matrix without cooperative polls. The
+    // CPU Patches/Dense path below observes the same absolute deadline
+    // through its admitted materialization boundaries.
     // Soundness gate (#vnncomp-gpu-crown-soundness): under the gate, route to the
     // SOUND GPU-resident backward (`use_sound = true`) when the engine advertises
     // it — that path carries the certified `γ_n·S` coefficient-rounding error
@@ -133,8 +201,27 @@ pub(super) fn propagate_crown_partial_with_engine(
     // loop. Without the gate (`use_sound = false`) the existing fast unsound path
     // runs. Either way an `Err`/NaN inside falls back to the proven CPU loop below.
     // See `sound_gpu_gate`.
-    let gpu_route = deadline
-        .is_none()
+    // #crown-partial-finite-expiry set-mate 1/2 (BUG #18 root cause D). The
+    // historical guard above ("deliberately skips") tested deadline PRESENCE,
+    // so this route ran only in tests — every scored run carries a deadline.
+    // The route is already deadline-plumbed for a live limit: the entry/exit
+    // expiry checks below return `DeadlineExceeded` instead of publishing a
+    // late result, dispatch is bracketed by `GpuCrownBackendDeadlineScope`,
+    // and `gpu_crown_backend_honors_deadline` refuses any backend that cannot
+    // observe the limit. Armed, a live unexpired deadline keeps the route;
+    // expired or unarmed restores the historical decline byte-identically.
+    // Wall-clock safety unchanged: nothing here extends the deadline. Sound-
+    // ness: route selection only — both arms produce sound enclosures and no
+    // bound value is created at this site. Bounded residue, stated: the host
+    // layer extraction inside `try_gpu_crown_partial_backward` is not
+    // internally polled, so an armed run can overrun by that one preparation
+    // phase — the same accepted tradeoff class as NY_PATCHES_FINITE_EXPIRY.
+    let gpu_partial_declined =
+        finite_authority_declines_partial(crown_partial_expiry_armed(), deadline, Instant::now());
+    if deadline.is_some() {
+        CROWN_PARTIAL_PRESERVE.record(gpu_partial_declined);
+    }
+    let gpu_route = (!gpu_partial_declined)
         .then(|| crate::sound_gpu_gate::gpu_crown_backward_route_with_deadline(engine, deadline));
     if let Some(Some((gpu, use_sound))) = gpu_route {
         if crate::sound_gpu_gate::gpu_crown_backend_honors_deadline(gpu, deadline) {
@@ -194,11 +281,31 @@ pub(super) fn propagate_crown_partial_with_engine(
     let mut patches_tracked_flat: Option<Vec<usize>> = None;
     let mut crown_bounds = if has_conv2d && output_shape.len() == 3 {
         let spatial = (output_shape[0], output_shape[1], output_shape[2]);
-        // Try sparse patches from IBP output bounds
-        // Sparse discovery and seed construction retain legacy infallible
-        // `Vec` growth and full endpoint scans. Keep finite authority on the
-        // admitted full virtual-identity route; no-deadline behavior is exact.
-        let sparse_patches = if deadline.is_none() {
+        // Try sparse patches from IBP output bounds.
+        // Historical stance: sparse discovery and seed construction retain
+        // legacy infallible `Vec` growth and full endpoint scans, so finite
+        // authority was kept on the admitted full virtual-identity route.
+        // That stance is now lever-decided below.
+        // #crown-partial-finite-expiry set-mate 2/2 (BUG #18 root cause D).
+        // Sparse discovery is one O(output) endpoint scan plus index-Vec
+        // growth — bounded, front-loaded work. Declining it on deadline
+        // PRESENCE forced every scored run onto the FULL identity seed, the
+        // strictly larger allocation, which is exactly the degradation this
+        // set removes. The sparse seed tracks a subset of the full seed's
+        // rows, so its footprint is bounded by the full seed the historical
+        // arm admits; untracked rows merge from the SAME sound IBP bounds
+        // (`merge_sparse_crown_with_ibp`), so seed choice never manufactures
+        // a value — numerics match the no-deadline arm bit for bit. Expired
+        // or unarmed: exact historical behavior.
+        let sparse_declined = finite_authority_declines_partial(
+            crown_partial_expiry_armed(),
+            deadline,
+            Instant::now(),
+        );
+        if deadline.is_some() {
+            CROWN_PARTIAL_PRESERVE.record(sparse_declined);
+        }
+        let sparse_patches = if !sparse_declined {
             crate::bounds::patches::UnstableIdx::from_ibp_bounds(
                 output_bounds.lower().as_slice().unwrap_or(&[]),
                 output_bounds.upper().as_slice().unwrap_or(&[]),
@@ -500,5 +607,83 @@ mod deadline_tests {
                 if message.contains("after concretization")),
             "late CROWN result should fail open as DeadlineExceeded, got {error:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod deadline_presence_fix_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // BUG #18 root cause D (docs/DEADLINE_PRESENCE_FIX_2026-08-19.md): the
+    // decision core is pure, so the entire lever truth table is pinned here
+    // GPU-free, independent of the process environment and the wall clock.
+
+    #[test]
+    fn no_deadline_never_declines() {
+        let now = Instant::now();
+        assert!(!finite_authority_declines_partial(false, None, now));
+        assert!(!finite_authority_declines_partial(true, None, now));
+    }
+
+    #[test]
+    fn unarmed_declines_on_presence_exactly_like_the_historical_guard() {
+        let now = Instant::now();
+        let live = now + Duration::from_mins(1);
+        assert!(finite_authority_declines_partial(false, Some(live), now));
+    }
+
+    #[test]
+    fn armed_keeps_a_live_deadline() {
+        let now = Instant::now();
+        let live = now + Duration::from_mins(1);
+        assert!(!finite_authority_declines_partial(true, Some(live), now));
+    }
+
+    #[test]
+    fn armed_still_declines_at_and_past_expiry() {
+        // Wall-clock safety unchanged: arming never admits work at or past
+        // the limit — commit-what-you-have applies only to budget still live.
+        let limit = Instant::now();
+        assert!(finite_authority_declines_partial(true, Some(limit), limit));
+        assert!(finite_authority_declines_partial(
+            true,
+            Some(limit),
+            limit + Duration::from_nanos(1)
+        ));
+    }
+
+    /// The same truth table the now-deleted local `expiry_token_arms` predicate
+    /// pinned, exercised against the TYPED DECLARATION that
+    /// `crown_partial_expiry_armed` reads. `read_with` supplies the token
+    /// directly, so this stays GPU-free and independent of the process
+    /// environment, exactly as before.
+    #[test]
+    fn lever_token_is_exact_one() {
+        let arms = |raw: Option<&str>| {
+            ny_levers::read_with(
+                &ny_levers::decls::diagnostics::CROWN_PARTIAL_FINITE_EXPIRY,
+                |_| raw.map(str::to_owned),
+            )
+            .value
+            .as_bool()
+        };
+        assert!(arms(Some("1")));
+        assert!(!arms(Some("0")));
+        assert!(!arms(Some("true")));
+        assert!(!arms(Some("")));
+        assert!(!arms(Some(" 1")));
+        assert!(!arms(None));
+    }
+
+    #[test]
+    fn preserve_counters_report_saved_vs_discarded() {
+        let counters = crate::network::core::graph::backward_helpers::DeadlinePreserveCounters::new(
+            "test-set",
+        );
+        counters.record(false);
+        counters.record(false);
+        counters.record(true);
+        assert_eq!(counters.snapshot(), (2, 1));
     }
 }

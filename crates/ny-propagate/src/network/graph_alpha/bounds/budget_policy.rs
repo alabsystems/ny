@@ -726,6 +726,43 @@ pub(crate) fn compute_weighted_per_node_budget_secs(
     (capped >= resolved.floor_secs).then_some(capped)
 }
 
+/// Sum-of-shares budget for ONE stacked multi-target backward
+/// (#cgan-stacked-backward). The stacked pass replaces each member's solo
+/// walk, so it must receive the SUM of the members' weighted per-node shares —
+/// handing it a single share would starve a pass doing k targets' work (the
+/// stack would abort where every solo walk would have completed).
+///
+/// Each member's share is computed EXACTLY as its solo walk would have
+/// received it (`compute_weighted_per_node_budget_secs`, including the
+/// dim-scaled cap and the floor), so the stacked pass can never be granted
+/// more wall than the per-target path it replaces. Members whose solo share
+/// would have been refused below-floor contribute nothing — they ride along
+/// for free, which is the point of stacking. The total is clamped to the
+/// remaining collection window. `None` (no member clears its floor) declines
+/// the lane and the historical per-target path runs unchanged.
+pub(crate) fn compute_stacked_backward_budget_secs(
+    remaining_secs: f64,
+    remaining_work_weight_sum: f64,
+    member_weights_and_cap_dims: &[(f64, f64)],
+    budget: &CrownIbpPerNodeTimeBudget,
+) -> Option<f64> {
+    let mut total = 0.0f64;
+    let mut granted = 0usize;
+    for &(weight, cap_dims) in member_weights_and_cap_dims {
+        if let Some(share) = compute_weighted_per_node_budget_secs(
+            remaining_secs,
+            remaining_work_weight_sum,
+            weight,
+            cap_dims,
+            budget,
+        ) {
+            total += share;
+            granted += 1;
+        }
+    }
+    (granted > 0 && total > 0.0).then(|| total.min(remaining_secs))
+}
+
 /// Allocation result for a node against an explicitly admitted denominator.
 ///
 /// `NotAdmitted` and `BelowFloor` are both reference-bound fallbacks for the
@@ -1480,6 +1517,49 @@ impl GraphNetwork {
     /// The graph-native collector may keep spatial Conv2d targets on the
     /// patches-start path landed by #3813, so its per-target budget guard is
     /// intentionally looser than the sequential fast-path gate. #3839
+    ///
+    /// #patches-dense-peak — WHY THIS PREDICATE CANNOT SEE THE cifar_bias_field_46
+    /// MISS, and why widening it is NOT the repair.
+    ///
+    /// Measured on `cifar_bias_field_46`, target `/layers.4/Relu`:
+    ///
+    /// ```text
+    /// CPU memory exceeded at patches full dense materialization:
+    /// requires 6,445,080,584 bytes but budget is 6,442,450,944
+    /// ```
+    ///
+    /// Both terms of this predicate are FALSE there, and only one of them is the
+    /// one a previous attempt tried to withdraw:
+    ///
+    /// * `dense_identity_exceeds_budget` charges the `[dim x dim]` f32 PAIR:
+    ///   `16_384 * 16_384 * 4 * 2 = 2,147,483,648` = 2 GiB against a 6 GiB
+    ///   budget. It is false by a factor of three, INDEPENDENTLY of the patches
+    ///   exemption. Withdrawing `!crown_ibp_target_can_start_in_patches(..)`
+    ///   therefore could not — and measurably did not — remove the refusal.
+    /// * The site that actually aborts is not the identity pair at all. It is
+    ///   `bounds/patches/to_dense.rs`'s full dense materialization, whose exact
+    ///   peak (`dense_materialization_peak_bytes`) is
+    ///   `resident + map + 6*M + bias_pair` with `M = rows * in_dim * 4`.
+    ///   Here `rows = in_dim = 16_384`, so `M` is exactly 1 GiB, SIX live copies
+    ///   are 6,442,450,944 = the budget exactly, and the 2,629,640-byte overflow
+    ///   (map 270,344 + bias 131,072 + resident 2,228,224) is pure bookkeeping.
+    ///   A 6D/6D carrier charges 6 matrices; a 7D explicit-rows carrier charges 8.
+    ///
+    /// So the honest cost model for a PATCHES-capable target is `6*rows*cols*f32`
+    /// against the widest conv-ancestor column count the carrier can still be
+    /// holding when it densifies — not `2*dim*dim*f32`. (The mid-walk pre-check
+    /// `patches_densify_over_budget` in target_backward.rs has the same 3x
+    /// under-charge: it consults `dense_pair_bytes`, i.e. two matrices, so it
+    /// also waves the 2 GiB estimate through before the 6-matrix site fails.)
+    ///
+    /// Correcting the predicate here is necessary but NOT sufficient, and was
+    /// deliberately not landed on its own — see the blocker recorded on
+    /// `alpha_explicit::alpha_target_chunk_override`: the objective-chunked
+    /// backward this predicate is supposed to steer over-budget targets into is
+    /// itself refused at driver entry whenever a deadline is merely PRESENT, so
+    /// a corrected predicate would only exchange one reference-bound fallback
+    /// for another. Landing the cost model before that guard is expiry-decided
+    /// would add chunk plans that never execute.
     pub(super) fn graph_native_target_exceeds_budget(
         &self,
         node_name: &str,
@@ -1531,14 +1611,15 @@ mod tests {
     use super::super::target_backward::{objective_chunk_route_plan, ObjectiveChunkFixedWavePlan};
     use super::{
         admitted_weighted_budget_secs, compute_global_per_node_budget_secs,
-        compute_weighted_per_node_budget_secs, count_remaining_budget_candidates,
-        crown_chunk_aware_budget_from_raw, demanded_target_work_weight, dim_cap_scale_from_raw,
-        effective_per_node_time_budget, objective_fixed_wave_work_weight,
-        prefix_cost_admission_enabled_from_raw, resolve_patches_tightening_budget_from_raw,
-        resolve_per_node_time_budget_from_raw, sum_remaining_budget_weights,
-        weighted_budget_cap_dims, CrownIbpPerNodeTimeBudget, ObjectiveChunkSchedulingPlan,
-        PrefixCostAdmission, PrefixCostAdmissionModel, WeightedBudgetAdmission,
-        ADAPTIVE_PER_NODE_CAP_FLOOR_SECS, MIN_PER_NODE_BUDGET_SECS, PRESET_CAP_REFERENCE_DIMS,
+        compute_stacked_backward_budget_secs, compute_weighted_per_node_budget_secs,
+        count_remaining_budget_candidates, crown_chunk_aware_budget_from_raw,
+        demanded_target_work_weight, dim_cap_scale_from_raw, effective_per_node_time_budget,
+        objective_fixed_wave_work_weight, prefix_cost_admission_enabled_from_raw,
+        resolve_patches_tightening_budget_from_raw, resolve_per_node_time_budget_from_raw,
+        sum_remaining_budget_weights, weighted_budget_cap_dims, CrownIbpPerNodeTimeBudget,
+        ObjectiveChunkSchedulingPlan, PrefixCostAdmission, PrefixCostAdmissionModel,
+        WeightedBudgetAdmission, ADAPTIVE_PER_NODE_CAP_FLOOR_SECS, MIN_PER_NODE_BUDGET_SECS,
+        PRESET_CAP_REFERENCE_DIMS,
     };
     use std::time::Duration;
 
@@ -1546,6 +1627,71 @@ mod tests {
         floor_secs: None,
         cap_secs: None,
     };
+
+    /// #cgan-stacked-backward: the stacked pass receives the SUM of its
+    /// members' solo shares — never a single share, never more than the
+    /// remaining window, and exactly zero grant when no member clears the
+    /// floor.
+    #[test]
+    fn stacked_budget_is_the_sum_of_member_solo_shares() {
+        let remaining = 300.0;
+        let total_weight = 100.0;
+        let members = [(30.0, 4_096.0), (20.0, 2_048.0), (10.0, 1_024.0)];
+        let expected: f64 = members
+            .iter()
+            .filter_map(|&(weight, dims)| {
+                compute_weighted_per_node_budget_secs(
+                    remaining,
+                    total_weight,
+                    weight,
+                    dims,
+                    &DEFAULT_BUDGET,
+                )
+            })
+            .sum();
+        assert!(expected > 0.0, "fixture members must clear the floor");
+        let granted = compute_stacked_backward_budget_secs(
+            remaining,
+            total_weight,
+            &members,
+            &DEFAULT_BUDGET,
+        )
+        .expect("members above floor must be granted");
+        assert_eq!(granted, expected.min(remaining));
+        // A single member's share must be strictly smaller than the stack's.
+        let solo = compute_weighted_per_node_budget_secs(
+            remaining,
+            total_weight,
+            members[0].0,
+            members[0].1,
+            &DEFAULT_BUDGET,
+        )
+        .expect("solo share");
+        assert!(granted > solo, "the stack must get MORE than one share");
+    }
+
+    #[test]
+    fn stacked_budget_clamps_to_the_remaining_window_and_floors_out() {
+        // One member owning ~the whole weight: its solo share is ~remaining;
+        // the sum must clamp at the window, never exceed it.
+        let remaining = 50.0;
+        let members = [(99.0, 4_096.0), (1.0, 512.0)];
+        let granted =
+            compute_stacked_backward_budget_secs(remaining, 100.0, &members, &DEFAULT_BUDGET)
+                .expect("granted");
+        assert!(granted <= remaining);
+        // Every member below the 2 s floor: the lane must decline.
+        let starved = [(0.001, 512.0), (0.001, 512.0)];
+        assert_eq!(
+            compute_stacked_backward_budget_secs(remaining, 100.0, &starved, &DEFAULT_BUDGET),
+            None
+        );
+        // No members at all: decline.
+        assert_eq!(
+            compute_stacked_backward_budget_secs(remaining, 100.0, &[], &DEFAULT_BUDGET),
+            None
+        );
+    }
 
     #[test]
     fn prefix_cost_admission_enable_parser_is_exact_and_default_dark() {
@@ -1661,7 +1807,7 @@ mod tests {
 
     struct DefaultBudgetEnv {
         _guards: [ny_test_utils::env::ScopedEnvVar; 3],
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: std::sync::RwLockWriteGuard<'static, ()>,
     }
 
     /// Production budget helpers intentionally read operator env overrides.

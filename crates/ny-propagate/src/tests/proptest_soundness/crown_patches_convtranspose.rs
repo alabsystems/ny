@@ -31,6 +31,16 @@
 //! Design: no-deadline stride 1 retains the stage-2a reduction to the proven
 //! Conv2d patches path (flip+swap kernel, adjusted padding, same bias). Finite
 //! stride 1 uses the same cooperative, budgeted Anchored planners as stride>1.
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
+//! and single-threaded, these properties cost 10-30s in a debug build, and the
+//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
+//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
+//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
+//! 10-20x the measured isolated cost. The failure these exist to catch is an
+//! infinite loop, and no finite wall lets one of those through.
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::bounds::patches::{
     CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds, UnstableIdx,
@@ -169,7 +179,7 @@ proptest! {
 
     /// STAGE 2a gate — identity incoming. `propagate_patches` -> `to_dense` must
     /// reproduce the dense `propagate_linear_with_engine` A/b within 1e-5.
-    #[ntest::timeout(30000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_convtranspose2d_patches_vs_dense_identity(
         in_c in 1usize..=4,
@@ -648,7 +658,7 @@ proptest! {
     /// bit-identical. The incoming-err composition is inherited verbatim from the
     /// (proptested) Conv2d patches path and is exercised end-to-end against
     /// sampled truth by `proptest_convtranspose2d_relu_chain_soundness`.
-    #[ntest::timeout(30000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_convtranspose2d_patches_vs_dense_nonidentity(
         in_c in 1usize..=3,
@@ -733,7 +743,7 @@ proptest! {
     /// End-to-end soundness: sampled true ConvTranspose outputs stay inside BOTH
     /// the dense and the patches `concretize_sound` boxes (built from the
     /// certified `coeff_err`). Mirrors the Conv2d patches soundness proptest.
-    #[ntest::timeout(20000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_convtranspose2d_patches_soundness(
         in_c in 1usize..=3,
@@ -823,7 +833,7 @@ proptest! {
     /// enclose every sampled true output `ReLU(ConvTranspose(x))`. This exercises
     /// the incoming-`coeff_err` composition (which the bit-equivalence tests hold
     /// exact-only) against sampled truth via `concretize_sound`.
-    #[ntest::timeout(20000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_convtranspose2d_relu_chain_soundness(
         in_c in 1usize..=2,
@@ -2503,7 +2513,7 @@ proptest! {
     /// Stage-4 native composition gate over both carrier families. A one-position
     /// incoming carrier keeps the independent dense oracle small while varying
     /// every ConvTranspose geometry parameter and anchors on/beyond both edges.
-    #[ntest::timeout(30000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_convtranspose2d_general_6d_7d_dense_parity(
         explicit_rows in proptest::bool::ANY,
@@ -3524,7 +3534,7 @@ proptest! {
     /// lower/upper incoming biases, asymmetric stride/padding/dilation, and every
     /// legal output-padding residue must agree with both the algebraic inverse-map
     /// oracle and the existing dense CROWN implementation.
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_convtranspose2d_anchored_identity_exact_dense_parity(
         in_c in 1usize..=2,
@@ -3807,7 +3817,7 @@ proptest! {
     ///     coefficient (within 1e-5 relative).
     // Hang sentinel with scheduler headroom for the 300-case property on a
     // shared builder; equivalence assertions, not elapsed time, are the gate.
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_convtranspose2d_phase_partition_identity(
         s in 2usize..=3,
@@ -3865,7 +3875,7 @@ proptest! {
     /// above. Assert the two agree within 1e-4 relative on the coefficients —
     /// i.e. the phase reduction commutes with an arbitrary non-identity
     /// composition, exactly the dense path's result.
-    #[ntest::timeout(20000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_convtranspose2d_phase_partition_nonidentity(
         s in 2usize..=3,

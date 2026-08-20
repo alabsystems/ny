@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import errno
-import fcntl
 import hashlib
 import json
 import math
@@ -22,6 +21,18 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+import pathlib
+import sys
+
+# Sibling import: make the script directory importable first, exactly as
+# replay_vnncomp2025_counterexample.py does. Without it the module loads when
+# run as a script but not when a test imports it by path.
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import _portable_file_lock as _file_lock  # noqa: E402
+
 
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 MAX_FLIGHT_RECORD_BYTES = 16 * 1024 * 1024
@@ -639,7 +650,7 @@ def _capture_input_evidence(
     lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _file_lock.lock_exclusive(lock.fileno())
         cache, dirty = _load_hash_cache(
             cache_path,
             run_id=run_id,

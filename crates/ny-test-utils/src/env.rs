@@ -24,12 +24,12 @@
 //!   guard): [`lock_env`] + [`ScopedEnvVar::set`] / [`ScopedEnvVar::unset`]
 
 use std::ffi::{OsStr, OsString};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// One process-wide lock for all environment mutation in a test binary.
-fn env_mutex() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn env_mutex() -> &'static RwLock<()> {
+    static LOCK: OnceLock<RwLock<()>> = OnceLock::new();
+    LOCK.get_or_init(|| RwLock::new(()))
 }
 
 /// Acquire the process-wide environment lock explicitly.
@@ -39,8 +39,29 @@ fn env_mutex() -> &'static Mutex<()> {
 /// must stay in place. A poisoned lock (a previous test panicked while
 /// holding it) is recovered: the guards below restore state on unwind, so the
 /// environment is consistent even after a panic.
-pub fn lock_env() -> MutexGuard<'static, ()> {
-    env_mutex().lock().unwrap_or_else(|e| e.into_inner())
+pub fn lock_env() -> RwLockWriteGuard<'static, ()> {
+    env_mutex().write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Acquire the environment lock for READING.
+///
+/// WHY THIS EXISTS, and why a plain mutex was not enough. [`lock_env`] only ever
+/// serialized WRITERS against each other. A test that merely READS
+/// environment-derived global state — a memory budget, a lever latch — took no
+/// lock at all, so it could run concurrently with a writer and observe that
+/// writer's temporary mutation. Measured: `NY_DENSE_BUDGET_MB` is set to `0` or
+/// `1` by several `to_dense`/`patches` fixtures, and under `--test-threads=4`
+/// that leaked into at least three unrelated tests in this repo — a
+/// merge-accumulator rounding test, a dense-promotion test, and a conv-chain
+/// SOUNDNESS oracle — each of which passes in isolation. A flake on a soundness
+/// oracle is worse than an ordinary flake: it trains everyone to re-run and
+/// shrug, which is exactly how a real failure gets waved through.
+///
+/// Readers take the SHARED half, so they still run concurrently with each other
+/// and pay nothing; they are merely excluded from overlapping a writer. Use this
+/// in any test that consults environment-derived state without setting it.
+pub fn lock_env_shared() -> RwLockReadGuard<'static, ()> {
+    env_mutex().read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// RAII guard: sets or removes one env var, restoring the previous state on

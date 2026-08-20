@@ -7837,6 +7837,9 @@ mod tests {
     #[cfg(feature = "external-vnncomp")]
     use ndarray::Array1;
     use ny_onnx::vnnlib::load_vnnlib_with_certified_scalar_moat;
+    // Gated to match its usage: every call site below sits behind
+    // `external-vnncomp`, like the sibling imports in this block.
+    #[cfg(feature = "external-vnncomp")]
     use ny_onnx::{load_onnx_with_config, BatchNormFoldingPolicy, OnnxLoadConfig};
     #[cfg(feature = "external-vnncomp")]
     use ny_propagate::{types::BoundsProvenance, GraphNode};

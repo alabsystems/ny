@@ -121,6 +121,27 @@ impl GraphNetwork {
             config.fix_interm_bounds,
             completed_iterations,
         );
+        // Bug #19 (budget-monotonicity): snapshot the optimizer's MONOTONE
+        // artifact map before publication can discard it. The artifact is the
+        // initial certified reference INTERSECTED with every mid-loop refresh
+        // candidate (`reference_bounds.rs::merge_tighter_bounds`), so it is an
+        // incumbent every later publication must not loosen. Default OFF: no
+        // clone, byte-identical path. Engagement telemetry per rule R9 — a
+        // null measured without this line in the log is vacuous.
+        let census_monotone = census_commit::census_monotone_enabled();
+        let census_incumbent =
+            census_commit::census_commit_observed().then(|| artifact_reference_bounds.clone());
+        if census_incumbent.is_some() {
+            static ARMED_LINES: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if ARMED_LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                eprintln!(
+                    "[census-commit] ARMED apply={census_monotone} nodes={}: dag-dispatch \
+                     publication audited against the optimizer's monotone artifact map",
+                    artifact_reference_bounds.len()
+                );
+            }
+        }
 
         // The typed cGAN collectors are intentionally absent from the generic
         // collection cache because both start from a caller-supplied baseline.
@@ -133,16 +154,43 @@ impl GraphNetwork {
         // Keep every ordinary route on its historical recollection contract.
         let typed_reference = cgan_sparse_target_complete || cgan_complete_crown_ibp;
         let phase_deadline_expired = checkpoint_candidate && config.past_deadline();
-        let (reference_bounds, phase_cap_checkpoint) = match resolve_reference_bounds_publication(
-            artifact_reference_bounds,
-            typed_reference,
-            checkpoint_candidate,
-            phase_deadline_expired,
-            || self.collect_alpha_reference_bounds_with_engine(input, config, engine, exec_order),
-        )? {
-            ReferenceBoundsPublication::Complete(bounds) => (bounds, false),
-            ReferenceBoundsPublication::PhaseCapCheckpoint(bounds) => (bounds, true),
-        };
+        let (mut reference_bounds, phase_cap_checkpoint) =
+            match resolve_reference_bounds_publication(
+                artifact_reference_bounds,
+                typed_reference,
+                checkpoint_candidate,
+                phase_deadline_expired,
+                || {
+                    self.collect_alpha_reference_bounds_with_engine(
+                        input, config, engine, exec_order,
+                    )
+                },
+            )? {
+                ReferenceBoundsPublication::Complete(bounds) => (bounds, false),
+                ReferenceBoundsPublication::PhaseCapCheckpoint(bounds) => (bounds, true),
+            };
+        // Bug #19 Site A: the ordinary route above REPLACED the artifact map
+        // with a fresh recollection, silently dropping every refresh
+        // tightening the optimizer certified mid-loop. SOUND to intersect:
+        // artifact and recollection are independently certified enclosures of
+        // the same nodes over the SAME input box, so the elementwise
+        // [max(l), min(u)] encloses every reachable point and is at least as
+        // tight as either (a rebuild under a different relaxation may be
+        // validly looser per-neuron in one direction and tighter in the other
+        // — intersection keeps the tighter side of each). Typed/checkpoint
+        // routes returned the artifact itself and count zero movement here.
+        if let Some(incumbent) = census_incumbent.as_ref() {
+            let stats = census_commit::shrink_only_commit(
+                &mut reference_bounds,
+                incumbent,
+                census_monotone,
+            );
+            census_commit::emit_census_commit(
+                "dag-dispatch-reference-recollect",
+                census_monotone,
+                &stats,
+            );
+        }
         if cgan_sparse_target_complete {
             // This route's authority is deliberately one atomic target over a
             // complete forward-linear baseline. Running the ordinary
@@ -211,6 +259,27 @@ impl GraphNetwork {
                     merged.insert(output_node.to_string(), tightened);
                 }
             }
+        }
+        // Bug #19 Site B: `collect_crown_bounds_with_alpha` runs under the
+        // FINAL alpha state, which degrades as iterations accumulate (the
+        // shipped gradient is sign-definite <= 0, so alpha clamps toward 0),
+        // and only the OUTPUT node above was intersected against the
+        // optimizer's monotone box — every intermediate node took the fresh
+        // collection verbatim. That is the anti-monotone publication: more
+        // budget -> more iterations -> a looser final-alpha collection
+        // replacing the same discarded artifact (MEASURED as census 83->73 /
+        // 72->31 going 100 s -> 400 s). Same soundness argument as Site A:
+        // both maps are independently certified enclosures over the same
+        // input box, so the elementwise intersection is sound and at least as
+        // tight as either. `would_have_loosened > 0` in an observe-only run
+        // is the smoking gun; armed, those elements keep the incumbent.
+        if let Some(incumbent) = census_incumbent.as_ref() {
+            let stats = census_commit::shrink_only_commit(&mut merged, incumbent, census_monotone);
+            census_commit::emit_census_commit(
+                "dag-dispatch-with-alpha-collection",
+                census_monotone,
+                &stats,
+            );
         }
 
         Ok(Some(GraphAlphaCollectionOutcome::Complete((

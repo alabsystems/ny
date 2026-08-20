@@ -13,6 +13,22 @@
 //! MulBinaryLayer uses McCormick envelope or Middle relaxation — bounds are sound but not tight.
 //!
 //! Part of proof_coverage audit: binary ops had zero proptest soundness coverage.
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion, and the walls are deliberately
+//! far above these tests' isolated cost (well under a second each).
+//!
+//! They have to be. These tests participate in the `ny-test-utils` env lock --
+//! either holding the shared half so a concurrent writer cannot leak
+//! `NY_DENSE_BUDGET_MB` into them mid-run, or holding the exclusive half
+//! themselves. Waiting on that lock is CORRECT behaviour, not a hang, and the
+//! wait can be long: `margin_row`'s `root_build_bit_identical_across_conv_grain`
+//! holds the exclusive half across a loop that runs over 60 seconds. A 10s wall
+//! turns that legitimate wait into a spurious failure -- measured, 17 of 20
+//! full-suite failures at --test-threads=8 were exactly this, with zero
+//! remaining `crown=-inf` leaks.
+//!
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::layers::binary_ops::{
     AddLayer, MaxBinaryLayer, MinBinaryLayer, MulBinaryLayer, SubLayer,
@@ -54,7 +70,7 @@ proptest! {
     /// For C = A + B (linear), CROWN backward with identity incoming should
     /// produce bounds that match IBP exactly. Verifies both CROWN-IBP equivalence
     /// and sampling soundness.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_add_binary_crown_identity(
         la0 in -5.0f32..5.0, da0 in 0.01f32..3.0,
@@ -62,6 +78,13 @@ proptest! {
         lb0 in -5.0f32..5.0, db0 in 0.01f32..3.0,
         lb1 in -5.0f32..5.0, db1 in 0.01f32..3.0,
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let ua0 = (la0 + da0).min(5.0);
         let ua1 = (la1 + da1).min(5.0);
         let ub0 = (lb0 + db0).min(5.0);
@@ -147,7 +170,7 @@ proptest! {
     ///
     /// For C = A - B (linear), CROWN backward negates B-branch coefficients
     /// and swaps lower/upper. Verifies CROWN-IBP equivalence and sampling soundness.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_sub_binary_crown_identity(
         la0 in -5.0f32..5.0, da0 in 0.01f32..3.0,
@@ -155,6 +178,13 @@ proptest! {
         lb0 in -5.0f32..5.0, db0 in 0.01f32..3.0,
         lb1 in -5.0f32..5.0, db1 in 0.01f32..3.0,
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let ua0 = (la0 + da0).min(5.0);
         let ua1 = (la1 + da1).min(5.0);
         let ub0 = (lb0 + db0).min(5.0);
@@ -245,7 +275,7 @@ proptest! {
     ///
     /// Reference: McCormick (1976), "Computability of global solutions to factorable
     /// nonconvex programs". Implementation in mul/mod.rs:select_mccormick_plane.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_mul_binary_mccormick_crown_identity(
         la0 in -3.0f32..3.0, da0 in 0.01f32..2.0,
@@ -333,7 +363,7 @@ proptest! {
     /// auto_LiRPA's `mul.middle`. Must also be sound (bounds contain true product).
     ///
     /// Reference: auto_LiRPA/operators/bivariate.py:MulHelper.interpolated_relaxation
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_mul_binary_middle_crown_identity(
         la0 in -3.0f32..3.0, da0 in 0.01f32..2.0,
@@ -413,7 +443,7 @@ proptest! {
     /// (x, y) in the input box. This exercises the weight-sign-dependent
     /// McCormick plane selection (positive k prefers tight lower planes,
     /// negative k prefers tight upper planes).
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_mul_binary_mccormick_crown_nonidentity(
         la0 in -2.0f32..2.0, da0 in 0.01f32..1.5,
@@ -492,7 +522,7 @@ proptest! {
     /// envelope selection becomes more complex because different facets dominate
     /// in different quadrants. This test specifically targets zero-crossing to
     /// catch plane selection bugs.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_mul_binary_mccormick_zero_crossing(
         la0 in -3.0f32..-0.01, ra0 in 0.01f32..3.0,
@@ -574,7 +604,7 @@ proptest! {
     /// The interpolated McCormick with r_l=r_u=0.5 must produce identical
     /// coefficients to `compute_middle_coefficients`. Verifies that Phase 2
     /// correctly generalizes the existing Middle relaxation.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_mul_binary_alpha_half_matches_middle(
         la0 in -3.0f32..3.0, da0 in 0.01f32..2.0,
@@ -652,7 +682,7 @@ proptest! {
     /// For any r_l, r_u in [0, 1], the interpolated McCormick envelope is a valid
     /// (sound) relaxation of z = x * y. Verifies by sampling (x, y) in the input
     /// box and checking that the true product lies within concretized bounds.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_mul_binary_alpha_random_sound(
         la0 in -3.0f32..3.0, da0 in 0.01f32..2.0,
@@ -764,7 +794,7 @@ proptest! {
     /// z_j = a_j * b_{j//3} lies within the CROWN bounds for all sampled inputs.
     ///
     /// Gap identified by proof_coverage audit: P1 iteration 592.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_mul_binary_mccormick_broadcast_se_block(
         la0 in -2.0f32..2.0, da0 in 0.01f32..1.5,
@@ -856,7 +886,7 @@ proptest! {
     /// Extends the alpha-parameterized McCormick proptest to the broadcast pattern.
     /// For any r_l, r_u in [0, 1], the interpolated McCormick with broadcast `+=`
     /// accumulation must produce sound bounds.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_mul_binary_alpha_broadcast_se_block(
         la0 in -2.0f32..2.0, da0 in 0.01f32..1.5,
@@ -962,7 +992,7 @@ proptest! {
     /// The negated spec (-I) drives the w < 0 plane-selection branch, which is
     /// the soundness-critical path (uses the opposite envelope). For each output
     /// we verify the concretized affine bound encloses `sign * max(x, y)`.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_max_binary_crown(
         la0 in -3.0f32..3.0, da0 in 0.0f32..3.0,
@@ -1013,7 +1043,7 @@ proptest! {
     }
 
     /// MinBinary CROWN backward soundness for identity and negated specs.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_min_binary_crown(
         la0 in -3.0f32..3.0, da0 in 0.0f32..3.0,

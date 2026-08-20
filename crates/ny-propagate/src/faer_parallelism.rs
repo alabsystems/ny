@@ -323,14 +323,29 @@ impl ny_core::GemmEngine for FaerCpuGemmEngine {
                  splitting k would invalidate the caller's gamma_k*S certificate"
             )));
         }
-        // Widest column tile whose single-row cost fits the cap, then as many
-        // rows as still fit. Both are >= 1 because k <= max_dispatch_macs.
-        let cols_per = match k.checked_mul(n) {
-            Some(row_macs) if row_macs <= max_dispatch_macs => n,
-            _ => (max_dispatch_macs / k).max(1),
-        };
-        let tile_row_macs = k.saturating_mul(cols_per).max(1);
-        let rows_per = (max_dispatch_macs / tile_row_macs).max(1);
+        // ROWS-FIRST tile shape. The widest-column-first choice collapsed to
+        // rows_per = 1 whenever one full-width row already filled the cap
+        // (k = n = 3072 under the 1<<24 cap => 1x3072 strips): one matmul per
+        // output row, a GEMV faer can neither block nor thread. Rows-first
+        // keeps the SAME cap, the SAME between-tile poll cadence, and k stays
+        // indivisible, so the caller's gamma_k*S certificate is untouched
+        // (summation-order independent). Receipts in
+        // REGRESSION_FC_UNSAT_LOST_2026-08-14.md ("conv-arm probes"): the
+        // certified conv group arm spent 21.4 s of a 53.3 s collection inside
+        // this dispatch on `cifar_bias_field_46`. Two prior rejections of this
+        // reshape were both measured under saturated budgets and are
+        // documented as invalid.
+        // BALANCED tiles: rows_per x cols_per as close to square as the cap
+        // allows. Column-first collapsed to 1 x n strips at k = n = 3072
+        // (unthreadable GEMV, measured 21.3 s on the acceptance row's group
+        // arm); a naive rows-first inversion collapsed to m x 1 strips and
+        // measured 100.7 s. A square-ish tile is blockable and threadable in
+        // both dimensions; tile MACs stay <= the cap, the between-tile poll
+        // cadence is unchanged, and k stays indivisible so the caller's
+        // gamma_k*S certificate (summation-order independent) is untouched.
+        let max_cells = (max_dispatch_macs / k).max(1);
+        let cols_per = n.min(((max_cells as f64).sqrt().ceil()) as usize).max(1);
+        let rows_per = (max_cells / cols_per).max(1);
 
         let b_mat = MatRef::from_row_major_slice(b, k, n);
         let mut i0 = 0usize;

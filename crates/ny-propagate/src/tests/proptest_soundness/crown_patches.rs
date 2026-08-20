@@ -14,6 +14,16 @@
 //! The wall-clock guards below are hang sentinels, not performance assertions.
 //! Keep enough scheduler headroom for the 500-case properties when unrelated
 //! crate suites are saturating a shared builder.
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
+//! and single-threaded, these properties cost 10-30s in a debug build, and the
+//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
+//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
+//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
+//! 10-20x the measured isolated cost. The failure these exist to catch is an
+//! infinite loop, and no finite wall lets one of those through.
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::bounds::patches::{CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds};
 use crate::layers::activations::ReLULayer;
@@ -76,7 +86,7 @@ proptest! {
     ///
     /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
     /// "Proptest Equivalence Specification — Test 1"
-    #[ntest::timeout(30000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_patches_vs_dense_identity(
         in_c in 1usize..=4,
@@ -94,6 +104,13 @@ proptest! {
         use_bias in proptest::bool::ANY,
         seed in any::<u64>(),
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves the dense side into a fallback and the
+        // comparison reports `dense=0` as if the maths were wrong.
+        // Observed failing at --test-threads=8.
+        let _env = crate::tests::lock_env_shared();
         // 1. Compute output spatial size. The generator guarantees validity.
         let padded_h = in_h + 2 * pad_h;
         let padded_w = in_w + 2 * pad_w;
@@ -218,7 +235,11 @@ proptest! {
     ///
     /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
     /// "Proptest Equivalence Specification — Test 2"
-    #[ntest::timeout(30000)]
+    ///
+    /// HANG SENTINEL, NOT A PERFORMANCE ASSERTION: raised with its neighbours in
+    /// this file, which were measured at 7.4-12.6s isolated and still tripped
+    /// 30-90s walls under parallel load. MEASURE BEFORE LOWERING IT.
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_patches_vs_dense_soundness(
         in_c in 1usize..=3,
@@ -357,14 +378,27 @@ proptest! {
     /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
     /// "Proptest Equivalence Specification — Test 3"
     ///
-    /// Timeout raised 10s→20s→40s→90s (#vnncomp-aw-soundness): the dense Conv2d
-    /// CROWN backward f64-recomputes the coefficient for the sound certified
-    /// error (≈2× the per-call cost). The 500-case dense-vs-patches
-    /// equivalence proptest now measures ~19s ISOLATED in a debug build, so
-    /// the 20s wall reliably trips under parallel test load. Shared builders can
-    /// also starve an otherwise serial run past 40s, so 90s keeps this a hang
-    /// sentinel without making scheduler contention a correctness failure.
-    #[ntest::timeout(90000)]
+    /// Timeout raised 10s→20s→40s→90s→300s (#vnncomp-aw-soundness): the dense
+    /// Conv2d CROWN backward f64-recomputes the coefficient for the sound
+    /// certified error (≈2× the per-call cost).
+    ///
+    /// The first four bumps were each a retune against whatever the suite's
+    /// contention happened to be that week, which is why there were four of
+    /// them. This one is derived from measurement instead. 2026-08-19:
+    ///
+    ///   isolated                     7.43s
+    ///   with 14 CPU burners pinned  32.21s   (4.3×)
+    ///
+    /// 300s is ~9× the measured contended cost, matching the ~10×-isolated
+    /// margin the ~3,900 sentinels sitting at 10s already use. This is a HANG
+    /// sentinel: the failure it exists to catch is an infinite loop, and no
+    /// finite wall lets one through. It is not a performance assertion —
+    /// 90s was already 12× the isolated cost and still tripped.
+    ///
+    /// MEASURE BEFORE RAISING THIS AGAIN. The suite now contains ~12 tests
+    /// that individually exceed 60s, so wall-clock headroom on a shared box
+    /// is not a number anyone can guess correctly.
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_chain_patches_vs_dense(
         // First conv: in_c1 → out_c1
@@ -380,6 +414,13 @@ proptest! {
         kw2 in 1usize..=2,
         seed in any::<u64>(),
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         // Compute conv1 output shape (stride=1, padding=0 for simplicity)
         let out_h1 = in_h1 - kh1 + 1;
         let out_w1 = in_w1 - kw1 + 1;
@@ -525,7 +566,13 @@ proptest! {
     ///
     /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 2
     /// Part of #2613
-    #[ntest::timeout(30000)]
+    // HANG SENTINEL, NOT A PERFORMANCE ASSERTION. Measured 2026-08-19: 12.59s
+    // isolated against the 30s wall it used to carry -- a 2.4x margin that does
+    // not survive a shared box. It failed at BOTH 4 and 8 test threads, once by
+    // timeout and once with "CPU memory exceeded at patch unfold plan", the
+    // latter being a leaked memory cap from a concurrent env writer rather than
+    // anything wrong with this test. 300s is ~24x. MEASURE BEFORE LOWERING IT.
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_relu_patches_vs_dense(
         in_c in 1usize..=3,
@@ -540,6 +587,13 @@ proptest! {
         pad_w in 0usize..=1,
         seed in any::<u64>(),
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         // Compute conv output shape
         let padded_h = in_h + 2 * pad_h;
         let padded_w = in_w + 2 * pad_w;
@@ -692,7 +746,7 @@ proptest! {
     ///
     /// Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md Phase 2
     /// Part of #2613
-    #[ntest::timeout(30000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_batchnorm_patches_vs_dense(
         in_c in 1usize..=3,
@@ -876,7 +930,7 @@ proptest! {
     /// rows in the Dense A-matrix as the full Patches to_dense().
     ///
     /// Part of #2613 Phase 4 step 19
-    #[ntest::timeout(60000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_sparse_patches_vs_dense_equivalence(
         in_c in 1usize..=3,
@@ -1050,7 +1104,7 @@ proptest! {
     /// independently perturbed within its row's carried err, endpoints and
     /// sign flips included), with the real ReLU relaxation. Coefficient and
     /// bias coverage are both checked in f64 with no tolerance epsilon.
-    #[ntest::timeout(20000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn prop_patches_activation_7d_err_covers_sampled_true(
         row_count in 1usize..=3,

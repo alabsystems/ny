@@ -25,6 +25,7 @@ L2 = [
     "ny-accelerate",
     "ny-cert",
     "ny-cuda",
+    "ny-falsify",
     "ny-gpu",
     "ny-gpu-passthrough",
     "ny-mip",

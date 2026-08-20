@@ -7,6 +7,22 @@
 //!
 //! Split from `crown_convolution.rs` to keep files under 1000 lines.
 //! Part of #3647.
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion, and the walls are deliberately
+//! far above these tests' isolated cost (well under a second each).
+//!
+//! They have to be. These tests participate in the `ny-test-utils` env lock --
+//! either holding the shared half so a concurrent writer cannot leak
+//! `NY_DENSE_BUDGET_MB` into them mid-run, or holding the exclusive half
+//! themselves. Waiting on that lock is CORRECT behaviour, not a hang, and the
+//! wait can be long: `margin_row`'s `root_build_bit_identical_across_conv_grain`
+//! holds the exclusive half across a loop that runs over 60 seconds. A 10s wall
+//! turns that legitimate wait into a spurious failure -- measured, 17 of 20
+//! full-suite failures at --test-threads=8 were exactly this, with zero
+//! remaining `crown=-inf` leaks.
+//!
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::layers::common::BoundPropagation;
 use crate::layers::convolution::conv1d::Conv1dLayer;
@@ -34,7 +50,7 @@ proptest! {
     /// in ops_gemm.rs:154 and ops.rs conv1d_transpose.
     ///
     /// Part of #3647.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_dilation_3647(
         k0 in -3.0f32..3.0,
@@ -44,6 +60,13 @@ proptest! {
         dilation in 1usize..=3,
         bounds in prop::collection::vec(-5.0f32..5.0, 14), // 7 lower + 7 delta
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let input_len = 7;
         let in_shape = [1_usize, input_len]; // (in_channels=1, length=7)
 
@@ -123,7 +146,7 @@ proptest! {
     /// kernels and inputs.
     ///
     /// Part of #3647.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_groups_3647(
         // 4 output channels, kernel_size=1 for simplicity with groups
@@ -132,6 +155,13 @@ proptest! {
         groups_idx in 0usize..3, // index into [1, 2, 4]
         bounds in prop::collection::vec(-5.0f32..5.0, 8),  // 4 lower + 4 delta
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let groups = [1, 2, 4][groups_idx];
         let out_c = 4_usize;
         let in_c_per_group = 1_usize;
@@ -222,7 +252,7 @@ proptest! {
     /// manifest as subtle numerical differences in production.
     ///
     /// Part of #3647.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_conv1d_crown_groups1_fast_path_equiv_3647(
         k0 in -3.0f32..3.0,

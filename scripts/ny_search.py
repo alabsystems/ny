@@ -559,9 +559,11 @@ def parse_lever_kinds(decls_dir=DECLS_DIR):
             if not kind_match:
                 continue
             record = {"kind": kind_match.group(1), "default": None, "file": path.name}
-            if record["kind"] == "F64Open":
+            if record["kind"] in ("F64Open", "F64ClosedTrimmed"):
                 bounds = re.search(
-                    r"F64Open\s*\{\s*min:\s*([-\d._eE]+)\s*,\s*max:\s*([-\d._eE]+)", block
+                    r"F64(?:Open|ClosedTrimmed)\s*\{\s*min:\s*([-\d._eE]+)"
+                    r"\s*,\s*max:\s*([-\d._eE]+)",
+                    block,
                 )
                 if bounds:
                     record["min"] = float(bounds.group(1))
@@ -613,6 +615,23 @@ def value_admissible(kind, token):
         low = kind.get("min", float("-inf"))
         high = kind.get("max", float("inf"))
         return value == value and abs(value) != float("inf") and low < value < high
+    if name == "F64ClosedTrimmed":
+        # CLOSED at both ends, which is the whole reason the kind exists: for a
+        # fraction, 0.0 ("this phase is worth nothing here") and 1.0 are
+        # meaningful settings rather than degenerate ones. Rejecting the
+        # endpoints would drop the disarmed control arm — the baseline every
+        # other arm is scored against.
+        #
+        # Without this branch the function fell through to `return False`, so
+        # EVERY token of this kind was rejected as "would resolve to the
+        # default" and the axis silently vanished from the search.
+        try:
+            value = float(token.strip())
+        except ValueError:
+            return False
+        low = kind.get("min", float("-inf"))
+        high = kind.get("max", float("inf"))
+        return value == value and abs(value) != float("inf") and low <= value <= high
     if name == "Secs":
         try:
             value = float(token)
@@ -1514,6 +1533,12 @@ def self_test():
     check("Bool rejects 'true' (the parser arms on exact '1')",
           not value_admissible({"kind": "Bool"}, "true")
           and value_admissible({"kind": "Bool"}, "1"))
+    check("F64ClosedTrimmed admits BOTH endpoints (0.0 is the disarmed control)",
+          value_admissible({"kind": "F64ClosedTrimmed", "min": 0.0, "max": 1.0}, "0.0")
+          and value_admissible({"kind": "F64ClosedTrimmed", "min": 0.0, "max": 1.0}, "1.0")
+          and value_admissible({"kind": "F64ClosedTrimmed", "min": 0.0, "max": 1.0}, "0.35")
+          and not value_admissible({"kind": "F64ClosedTrimmed", "min": 0.0, "max": 1.0}, "1.5")
+          and not value_admissible({"kind": "F64ClosedTrimmed", "min": 0.0, "max": 1.0}, "nope"))
     check("F64Open is OPEN at both ends",
           not value_admissible({"kind": "F64Open", "min": 0.0, "max": 0.9}, "0")
           and not value_admissible({"kind": "F64Open", "min": 0.0, "max": 0.9}, "25")
@@ -1546,11 +1571,23 @@ def self_test():
     # A value equal to the compiled default is a no-op; it may appear ONLY as a
     # lattice prerequisite (`space::expand` refuses a child whose parent is
     # merely defaulted), never as the only thing an arm moves.
+    # ... and "its default" means DefaultSpec only for an ENV-ONLY axis. For a
+    # preset-delivered one the preset key is the baseline, so `NAME=0` against a
+    # preset that sets it true is a real treatment and DefaultSpec says nothing
+    # about it. This exemption is the same rule `admissible_values` applies at
+    # T0; without it the two disagree, and the invariant fires on arms T0
+    # deliberately kept.
+    preset_delivered = {
+        axis.name for axis in space.axes
+        if str(getattr(axis, "deliver", "") or "").startswith("preset")
+    }
     no_treatment = [
         arm for arm in arms
         if arm and not [
             (name, value) for name, value in arm
-            if kinds.get(name, {}).get("default") is None or value != kinds[name]["default"]
+            if name in preset_delivered
+            or kinds.get(name, {}).get("default") is None
+            or value != kinds[name]["default"]
         ]
     ]
     check("every non-baseline arm moves at least one value off its default",

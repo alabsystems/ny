@@ -1,7 +1,28 @@
-# Pin the toolchain so the VNN-COMP submission builds reproducibly on the
-# competition AWS image (otherwise the build relies on whatever rustc the
-# image happens to provide). Bump deliberately, in lockstep with the
-# submission `install` script.
+# The PUBLIC snapshot's toolchain pin. Copied over the export's
+# rust-toolchain.toml by transforms.sh (T7); the private repo keeps
+# channel = "trust".
+#
+# WHY THIS FILE EXISTS. The private repo pins the Trust toolchain, whose
+# in-compilation verifier is FAIL-CLOSED, and pairs it with the
+# `-Ztrust-verify=off` opt-out in .cargo/config.toml. A public clone has no
+# rustup toolchain named `trust` to resolve — it is a locally linked
+# toolchain, not a distributable channel — and even if it did, the export's
+# CHECK_CMD (`cargo check/test/clippy --locked …`, publish/config.sh) would
+# die fail-closed inside third-party build scripts (nn's gate measured 584
+# errors inside memchr-2.8.3 before reaching a first-party crate on
+# 2026-08-16). Unlike nn, ny also EXPORTS `.cargo/` (manifest.txt), so the
+# paired transform installs publish/public-cargo-config.toml as well: stock
+# stable rustc rejects every `-Z` flag at parse time, so the opt-out must not
+# ship publicly either.
+#
+# The pin is EXACTLY what the repo pinned before the trust flip — the last
+# toolchain the full gate (`make gate`), the shipped-binary profile, and the
+# public-clone CHECK_CMD are all known to pass on. Do not bump it casually:
+# CHECK_CMD runs `cargo clippy … -D warnings`, and a newer clippy base means
+# new lints and a red staging gate with no code change. Same mechanism nn and
+# aterm use (publish/public-rust-toolchain.toml there). Stock upstream,
+# pinned rather than floating so the snapshot is reproducible on the
+# competition AWS image and everywhere else.
 [toolchain]
 channel = "1.95.0"
 components = ["rustfmt", "clippy"]

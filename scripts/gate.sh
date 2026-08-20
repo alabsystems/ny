@@ -86,7 +86,8 @@
 #   -h | --help   usage
 # Environment:
 #   NY_GATE_PYTHON  Python interpreter provisioned from requirements.txt
-#                   (default: ./.venv/bin/python when present, else python3)
+#                   (default: ./.venv/bin/python or ./.venv/Scripts/python.exe
+#                   when present, else python3)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -98,10 +99,19 @@ cd "$REPO_ROOT"
 # every caller to export NY_GATE_PYTHON put a working gate behind a step nothing
 # enforces. An explicit NY_GATE_PYTHON still wins, so CI and multi-venv setups
 # are unaffected.
-if [ -z "${NY_GATE_PYTHON:-}" ] && [ -x "$REPO_ROOT/.venv/bin/python" ]; then
-  NY_GATE_PYTHON="$REPO_ROOT/.venv/bin/python"
+# A venv's interpreter is `bin/python` on Unix and `Scripts/python.exe` on
+# Windows. Probing only the first meant this auto-detection — added precisely so
+# the gate works without every caller exporting NY_GATE_PYTHON — could never fire
+# under Git Bash/MSYS, and [e]/[g] stayed red on Windows with a correctly
+# provisioned .venv sitting in the repo root.
+if [ -z "${NY_GATE_PYTHON:-}" ]; then
+  for candidate in "$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/.venv/Scripts/python.exe"; do
+    if [ -x "$candidate" ]; then
+      NY_GATE_PYTHON="$candidate"
+      break
+    fi
+  done
 fi
-NY_GATE_PYTHON="${NY_GATE_PYTHON:-python3}"
 
 # Crates excluded from the Clippy portion of the Rust hygiene gate (check a),
 # with reasons.
@@ -120,7 +130,23 @@ CLIPPY_SKIPPED_CRATES=()
 # h is a pure config-vs-code coherence check that finishes in seconds, so it
 # belongs in --fast: the two gates that silently zeroed a banked category were
 # both landed by someone who would have run the fast gate, not the full one.
-FAST_CHECKS="a b c h"
+#
+# d, e, f and g joined it on 2026-08-19 for the same reason, with four fresh
+# instances. A full-gate run that day found: fmt drift in two crates; a new
+# Python test carrying a prohibited `pytest.mark.skipif` that silently deleted
+# seven counterexample contracts; that same file missing from the migration
+# manifest; `ny-falsify` a workspace member absent from docs/PACKAGES.md; and
+# two claims-of-record docs still pinning an `ay-milp` revision Cargo.lock had
+# moved off. Every one was caught by a check that ALREADY EXISTED, and every
+# one reached main anyway — because the checks that catch them were not in the
+# lane anybody can afford to run before a push.
+#
+# The cost of closing that hole is 126s: d(44) + e(82) + f(0) + g(0), taking
+# --fast from ~95s to ~221s. What stays out is i(297s) and j(2669s) — j alone
+# is 84% of the full gate's wall clock, and THAT is what makes the full gate
+# unrunnable in an edit loop. Adding a cheap check here is not weakening the
+# full gate; it is putting the cheap half where it will actually be run.
+FAST_CHECKS="a b c d e f g h"
 
 usage() {
   # Print the header block: every line from line 2 up to the first non-comment
@@ -318,7 +344,7 @@ check_e() {
 # ---------------------------------------------------------------------------
 check_f() {
   local target_dir bin
-  target_dir="$(cargo metadata --locked --format-version 1 --no-deps | python3 -c \
+  target_dir="$(cargo metadata --locked --format-version 1 --no-deps | "$NY_GATE_PYTHON" -c \
     'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
   bin="$target_dir/debug/ny"
   if [ ! -x "$bin" ]; then
@@ -382,7 +408,7 @@ check_f() {
   fi
 
   # f3: vendor-manifest scan on the archived bytes.
-  if python3 - "$tarball" <<'PY'
+  if "$NY_GATE_PYTHON" - "$tarball" <<'PY'
 import json
 import sys
 import tarfile

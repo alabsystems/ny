@@ -224,6 +224,8 @@ fn assert_grouped_envelope_dominates_and_is_sound(
         }
         let sample = Array1::from_vec(sample);
         for (row, objective) in OBJECTIVE_ENVELOPE_ROWS.iter().enumerate() {
+            #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+            #[allow(clippy::chunks_exact_to_as_chunks)]
             let true_value: f32 = softmax_groups
                 .chunks_exact(5)
                 .map(|group| {

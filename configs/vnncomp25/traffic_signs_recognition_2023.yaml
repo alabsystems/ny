@@ -54,6 +54,38 @@ attack:
   # where present: `1` arms, `0` disarms this key.
   bnn_sign_space: true
 
+  # STE-PGD falsification lane (#bnn-ste-pgd). The SIBLING of the key above,
+  # over the SAME structurally admitted binarized fragment, and armed here for
+  # the same reason: a competition harness exports no `NY_*`, so the typed
+  # preset key is the only route by which this lane reaches a SCORED run.
+  #
+  # WHY BOTH LANES. They are complementary and measurably so. The LP search
+  # above is the only method that has taken the three `model_30` eps=1 rows,
+  # and it accepts 78-99 realizable flips there; on the nine open 48x48/64x64
+  # rows it accepts ZERO flips, every time. This lane moves in PIXEL space and
+  # reaches witnesses 494-1584 first-layer flips from the box centre — a
+  # distance the flip-at-a-time LP walk cannot cover — and it takes seven of
+  # those nine rows.
+  #
+  # BUDGET, which is what arming really decides. This lane runs SECOND, so it
+  # sizes itself by subtraction (`#ste-pgd-budget`): everything left after the
+  # 45 s publication margin and the 100 s downstream reserve, capped at 4 min.
+  # That is a full 240 s cap on a 480 s instance PROVIDED the LP lane ahead of
+  # it yields quickly, which is exactly what `#bnn-lp-stall` makes it do on the
+  # nets where it accepts nothing. The two lanes together are charged against
+  # the same `attack_start` subtraction, so arming cannot push BaB past the
+  # scored deadline.
+  #
+  # SOUNDNESS. Identical to the LP lane's, by sharing its machinery:
+  # `ny_mip::SignSpaceOutcome` has no verified/unsat variant BY CONSTRUCTION,
+  # so this cannot cause a false `unsat`; a candidate becomes a `sat` only by
+  # passing the unchanged `gate_sat_with_trusted_oracle` (real ONNX Runtime
+  # forward on the ORIGINAL model plus the true-f64 recheck), and a candidate
+  # that fails that gate is DROPPED. `NY_BNN_STE_PGD` still wins where present:
+  # `1` arms, `0` disarms this key, anything else is a recorded rejection that
+  # falls back to the declaration default.
+  bnn_ste_pgd: true
+
 bab:
   batch_size: 64
   branching:

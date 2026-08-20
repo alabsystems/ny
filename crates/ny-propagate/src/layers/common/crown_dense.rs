@@ -235,8 +235,22 @@ where
     let lower_affected = lower_nonfinite_rows.iter().filter(|&&r| r).count();
     let upper_affected = upper_nonfinite_rows.iter().filter(|&&r| r).count();
     compose::log_nonfinite_fallback("Activation", lower_affected, upper_affected, num_outputs);
-    let mut new_lower_b = new_lower_b_f64.mapv(|x| next_down_f32(x as f32));
-    let mut new_upper_b = new_upper_b_f64.mapv(|x| next_up_f32(x as f32));
+    // Outward-round the f64 bias into f32 — preserving EXACT ZERO. An
+    // unconditional `next_down_f32(0.0)` manufactures a -1e-45 bias on rows
+    // whose true bias is exactly 0.0: a needless 1-ulp loosening, and a
+    // violation of the stacked-seed invariant that zero rows stay exactly
+    // zero through every admitted step (#cgan-stacked-backward injection
+    // guard refuses the whole pass on a nonzero find). `x == 0.0` casts
+    // exactly, so no widening is required there.
+    let mut new_lower_b = new_lower_b_f64.mapv(|x| {
+        if x == 0.0 {
+            0.0
+        } else {
+            next_down_f32(x as f32)
+        }
+    });
+    let mut new_upper_b =
+        new_upper_b_f64.mapv(|x| if x == 0.0 { 0.0 } else { next_up_f32(x as f32) });
     for j in 0..num_outputs {
         if lower_nonfinite_rows[j] {
             for i in 0..num_neurons {

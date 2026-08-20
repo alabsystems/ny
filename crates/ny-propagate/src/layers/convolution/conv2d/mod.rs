@@ -16,7 +16,7 @@ mod ops_gemm;
 mod ops_ibp_fwd;
 mod ops_ibp_gemm;
 mod ops_transpose_fwd;
-mod ops_transpose_gemm;
+pub(crate) mod ops_transpose_gemm;
 mod types;
 
 #[cfg(test)]

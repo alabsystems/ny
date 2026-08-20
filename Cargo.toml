@@ -23,6 +23,7 @@ members = [
     "crates/ny-groundtruth",
     "crates/ny-lint-guard",
     "crates/ny-levers",
+    "crates/ny-falsify",
 ]
 # Kani proofs excluded: verified separately with `cargo kani`
 exclude = ["proofs/kani", "fuzz"]
@@ -47,13 +48,16 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/ny"
-# MSRV tracks the pinned toolchain (rust-toolchain.toml), the only version the
-# workspace is built and tested against. The source floor is set by the source
+# MSRV floor, exercised by the PUBLIC snapshot's stock 1.95.0 pin
+# (publish/public-rust-toolchain.toml, gated by the export CHECK_CMD). The dev
+# pin (rust-toolchain.toml) is the Trust toolchain — rust-1.99-based, above
+# this floor — per the owner directive that the ALab stack carries no
+# upstream-Rust dependency. The source floor is set by the source
 # itself, not by the lockfile: bound propagation calls `f64::next_up`/`next_down`
 # for directed rounding (`float_next_up_down`, stable 1.86), well above anything
 # Cargo.lock requires (prost 0.14.4 → 1.85, half 2.7.1 → 1.81). Lowering this

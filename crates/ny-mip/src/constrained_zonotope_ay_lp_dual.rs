@@ -549,6 +549,9 @@ impl Drop for ActiveWorkerPermit {
     }
 }
 
+// trust-1.99 deprecates `fetch_update` (renamed `try_update`); the public
+// 1.95 pin lacks `try_update` — keep the spelling both toolchains accept.
+#[allow(deprecated)]
 fn try_acquire_worker(
     counter: &'static AtomicUsize,
     hard_max_active: usize,

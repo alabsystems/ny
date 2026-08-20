@@ -345,6 +345,7 @@ fn install_deltas(state: &mut crate::bounds::GraphAlphaState, slots: &[(usize, f
 /// fold, not just the accessor.
 #[test]
 fn spec_axis_zero_delta_active_slots_keep_the_whole_walk_bit_identical() {
+    let _env = crate::tests::lock_env_shared();
     let shared = run_walk_with(|_| {});
     let with_slots = run_walk_with(|state| install_deltas(state, &[(2, 0.0), (7, 0.0)]));
     for (index, (a, b)) in shared

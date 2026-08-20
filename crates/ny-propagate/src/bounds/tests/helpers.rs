@@ -284,6 +284,8 @@ fn test_alpha_crown_config_custom() {
         // #joint-interm-grad: 0 = legacy frozen-intermediate ascent, which is
         // what these fixtures were written against.
         joint_interm_alpha_every: 0,
+        // #envelope-grad: false = the shipped local rule these fixtures assume.
+        alpha_envelope_grad: false,
         iterations: 10,
         alpha_spec_slots: 0,
         learning_rate: 0.1,

@@ -52,7 +52,7 @@ pub use ndarray::{arr1, arr2};
 // is permitted under the clippy env wall (root `clippy.toml`).
 #[allow(unused_imports)]
 pub(crate) use ny_test_utils::env::{
-    with_env_edits, with_serialized_env_vars, with_serialized_env_vars_removed,
+    lock_env_shared, with_env_edits, with_serialized_env_vars, with_serialized_env_vars_removed,
 };
 
 /// Serialize tests that mutate the shared CROWN dense budget env var.

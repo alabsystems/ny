@@ -12,15 +12,14 @@ from __future__ import annotations
 
 import argparse
 import csv
-import fcntl
 import hashlib
 import io
 import json
 import math
 import os
+import pathlib
 import platform
 import re
-import resource
 import shutil
 import stat
 import subprocess
@@ -31,6 +30,15 @@ from datetime import datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+
+# Sibling import: make the script directory importable first, exactly as
+# replay_vnncomp2025_counterexample.py does. Without it the module loads
+# when run as a script but not when a test imports it by path.
+_SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+import _portable_file_lock as _file_lock  # noqa: E402
 
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 _GIT_EXECUTABLE_OVERRIDE: str | None = None
@@ -2711,6 +2719,10 @@ def _gpu_identity() -> dict[str, object]:
 
 
 def _resource_limits() -> dict[str, list[int]]:
+    # POSIX-only rlimit attestation. Imported HERE, not at module scope:
+    # a bare module-level `import resource` made this whole file unloadable
+    # off Linux and took every dependent tool and test down at import time.
+    import resource
     names = [
         "RLIMIT_AS",
         "RLIMIT_CORE",
@@ -2737,6 +2749,10 @@ def _capture_measurement_containment(
     cgroup_root: Path | None = None,
 ) -> dict[str, object]:
     """Capture and validate the scorecard process's effective containment."""
+    # POSIX-only rlimit attestation. Imported HERE, not at module scope:
+    # a bare module-level `import resource` made this whole file unloadable
+    # off Linux and took every dependent tool and test down at import time.
+    import resource
     expected_cpu_count = _expected_measurement_cpu_count()
     expected_cpu_period_us = 100_000
     expected_cpu_quota_us = expected_cpu_count * expected_cpu_period_us
@@ -6377,7 +6393,7 @@ def create_completion(*, start_manifest: Path, exit_status: int) -> Path:
     cache_path = start_manifest.with_name("input_hash_cache.json")
     cache_lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
     with cache_lock_path.open("a+b") as cache_lock:
-        fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
+        _file_lock.lock_exclusive(cache_lock.fileno())
         cache_evidence, checks["input_hash_cache"] = _validate_input_hash_cache(
             cache_path=cache_path,
             run_id=run_id,

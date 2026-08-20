@@ -226,6 +226,43 @@ pub(crate) struct MarginRowPreset {
     /// loosening (see `margin_row::root::root_f32_requested`). It can lose a
     /// proof, never invent one, and the lane stays fail-closed.
     pub(crate) root_f32: Option<bool>,
+
+    /// #margin-row-branch-width: candidate budget per expansion (head rows).
+    ///
+    /// Default 8 + 8. MEASURED 2026-08-19 on cifar100 resnet_medium at the
+    /// official 100 s budget: `idx_8600_sidx_2721` — the row that timed out at
+    /// k=8 through a 4x budget (~3000 expansions), Clip-and-Verify tightening,
+    /// and eight eliminated hypotheses — PROVES `unsat` at k=16 in 186
+    /// expansions and at k=32 in 173, with the frontier DRAINING (424 open ->
+    /// 2) instead of exploding. Narrowing was already known to lose proofs
+    /// (k=4 does 5x the search and drops a banked row); widening was never
+    /// tested until now. Width only chooses WHICH domains to split — every
+    /// candidate is scored by the same certified pass — so a wrong value costs
+    /// proofs, never manufactures one.
+    pub(crate) k_head: Option<usize>,
+
+    /// #margin-row-branch-width: candidate budget per expansion (trunk rows).
+    /// See `k_head`.
+    pub(crate) k_trunk: Option<usize>,
+
+    /// #margin-row-adaptive-width: escalate the candidate budget in-flight when
+    /// the frontier shows the measured explosion signature (open >= 32 -> k 16,
+    /// open >= 256 -> k 32; one-way ratchet, never narrows the configured
+    /// base). Rows the base width serves run bit-identically — the trigger
+    /// sits above every measured proving-row frontier peak (~26). This is the
+    /// non-overfit alternative to pinning `k_head`/`k_trunk` per category.
+    pub(crate) k_adaptive: Option<bool>,
+
+    /// #backward-interm: recompute each trunk ReLU's input bounds via the
+    /// lane's OWN backward engine through the already-frozen prefix gates,
+    /// shrink-only intersected with the forward tableau BEFORE gate
+    /// derivation. MEASURED 2026-08-19 (cycles 1-3): cifar deep-band roots
+    /// move ~0.18-0.20 (idx_5242 -0.613 -> -0.438, INTO the proven band);
+    /// tiny idx_4330 timeout -> UNSAT 3/3; and proving rows get 5-10x
+    /// CHEAPER (idx_6659 211 exp/72s -> 19 exp/3.8s; idx_8600 186/45s ->
+    /// 35/12s). Shrink-only by construction — a wrong bound costs tightness,
+    /// never soundness; parity mode refuses.
+    pub(crate) backward_interm: Option<bool>,
 }
 
 /// Model-loading configuration (alpha-beta-CROWN compatibility).
@@ -428,6 +465,28 @@ pub(crate) struct AttackPreset {
     /// CONSUMER: `commands::vnncomp::run_and_translate`, which passes it to
     /// `try_sign_space_falsify` as the lever's config layer.
     pub(crate) bnn_sign_space: Option<bool>,
+
+    /// Arm the STE-PGD falsification lane (`#bnn-ste-pgd`) for this category.
+    ///
+    /// The sibling of [`Self::bnn_sign_space`], over the SAME structurally
+    /// admitted binarized fragment and with the same soundness story:
+    /// `ny_mip::SignSpaceOutcome` has no verified/unsat variant BY
+    /// CONSTRUCTION, so the lane cannot cause a false `unsat` on any setting,
+    /// and a candidate becomes a `sat` only by passing the unchanged
+    /// `gate_sat_with_trusted_oracle`. What the key really decides is BUDGET:
+    /// armed, the lane may take everything left to it after the publication
+    /// margin and the downstream reserve, capped at 4 minutes.
+    ///
+    /// WHY IT IS A SEPARATE KEY. The two lanes are COMPLEMENTARY, not
+    /// redundant, and measurably so: the LP search takes the three `model_30`
+    /// eps=1 rows this one cannot (measured `exhausted`, best margin -222,
+    /// 97 flips), and this one takes seven 48x48/64x64 rows the LP search
+    /// cannot, whose witnesses sit 483-1483 first-layer flips from the box
+    /// centre.
+    ///
+    /// CONSUMER: `commands::vnncomp::run_and_translate`, which passes it to
+    /// `try_ste_pgd_falsify` as the lever's config layer.
+    pub(crate) bnn_ste_pgd: Option<bool>,
 }
 
 /// Explicit NY compatibility choices for unimplemented reference PGD orders.
@@ -598,6 +657,20 @@ pub(crate) struct BabPreset {
     /// key is how the result reaches a scored run
     /// (`crates/ny-cli/tests/measured_gate_delivery.rs`).
     pub(crate) root_comprehensive_gpu_interm: Option<bool>,
+
+    /// `#bab-floor`: BaB's share of the root window, subtracted before any root
+    /// phase sizes itself.
+    ///
+    /// DELIVERY: the scored entry point exports exactly one `NY_*` variable, so
+    /// the env levers these were measured through are dead in competition.
+    /// These three typed keys are how a search result reaches a scored run.
+    pub(crate) root_bab_reserve_frac: Option<f64>,
+
+    /// `#bab-floor`: the root objective pass's share of that window.
+    pub(crate) root_spec_frac: Option<f64>,
+
+    /// `#bab-floor`: the bootstrap ascent's share of that window.
+    pub(crate) root_alpha_frac: Option<f64>,
 
     /// Disjoint row windows the comprehensive sweep may accumulate. `1` is
     /// byte-identical to the historical single sweep; higher values trade wall
@@ -1101,6 +1174,13 @@ pub(crate) struct AlphaCrownPreset {
     /// fire in competition however well it measures
     /// (`crates/ny-cli/tests/measured_gate_delivery.rs`).
     pub(crate) joint_interm_alpha_every: Option<usize>,
+
+    /// #envelope-grad: replace the sign-definite local alpha-gradient rule with
+    /// the concretization-argmin (envelope) rule, so the ascent can raise alpha
+    /// instead of only walking it to the 0 clamp. Unset keeps the shipped local
+    /// rule. `NY_ALPHA_ENVELOPE_GRAD` still overrides in both directions for
+    /// A/B, but env cannot fire in competition — this key is the delivery.
+    pub(crate) alpha_envelope_grad: Option<bool>,
 
     /// Optional absolute ceiling, in seconds, on that same aggregate refresh
     /// pool. `0` explicitly disables refresh work. Unset preserves the

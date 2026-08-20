@@ -746,6 +746,10 @@ fn read_float_initializer(init: &onnx_proto::TensorProto) -> Option<ArrayD<f32>>
         .map(|&dim| usize::try_from(dim).ok())
         .collect::<Option<Vec<usize>>>()?;
     let expected: usize = shape.iter().product();
+    // `as_chunks` (the tippy suggestion) reshapes the byte-decode below; keep
+    // `chunks_exact` until the public pin's clippy also carries the lint.
+    #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     let values: Vec<f32> = if init.raw_data.is_empty() {
         init.float_data.clone()
     } else {
@@ -777,6 +781,10 @@ fn read_integer_initializer(init: &onnx_proto::TensorProto) -> Option<Vec<i64>> 
         .collect::<Option<Vec<usize>>>()?
         .iter()
         .product();
+    // Same rationale as the f32 reader above: keep `chunks_exact` for the
+    // byte decodes until the public pin's clippy also carries the lint.
+    #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     let values: Vec<i64> = match init.data_type {
         ONNX_TENSOR_INT64 => {
             if init.raw_data.is_empty() {

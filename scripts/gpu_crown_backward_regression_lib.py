@@ -353,12 +353,21 @@ def evaluate_check(
 
 
 def normalize_candidate_path(path: Path, root: Path | None = None) -> str:
+    """Repository-relative POSIX form, on every platform.
+
+    This value is PERSISTED into configs/benchmark_regressions/*.json as
+    `source_artifact` and committed. `str(Path)` renders the native separator,
+    so refreshing a baseline on Windows wrote a backslash-separated path
+    into an artifact every other host reads as "reports/benchmarks/x.csv" —
+    host-shaped evidence, and a pin that no longer matches the path it names.
+    `as_posix()` makes the serialized form independent of who refreshed it.
+    """
     if root is None:
         root = Path.cwd()
     try:
-        return str(path.resolve().relative_to(root.resolve()))
+        return path.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
-        return str(path)
+        return path.as_posix()
 
 
 def refresh_policy_payload(

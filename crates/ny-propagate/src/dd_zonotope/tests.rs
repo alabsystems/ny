@@ -82,7 +82,7 @@ fn exact_box_from_f32(lo: &[f32], up: &[f32]) -> super::certified_box::ExactBox 
         center_hi: lo
             .iter()
             .zip(up)
-            .map(|(&a, &b)| (f64::from(a) + f64::from(b)) * 0.5)
+            .map(|(&a, &b)| f64::from(a).midpoint(f64::from(b)))
             .collect(),
         center_lo: vec![0.0; lo.len()],
         center_err: vec![0.0; lo.len()],
@@ -122,7 +122,7 @@ fn relu_encloses_true_values_on_a_dense_sample() {
         }
         let (zlo, zup) = z.concretize();
         for _ in 0..80 {
-            let t: Vec<f64> = (0..n).map(|_| (rng.next_f64() + 1.0) * 0.5).collect();
+            let t: Vec<f64> = (0..n).map(|_| rng.next_f64().midpoint(1.0)).collect();
             let x = point_from_box(&lo, &up, &t);
             for i in 0..n {
                 let y = x[i].max(0.0);
@@ -311,7 +311,7 @@ fn conv_encloses_the_true_output_on_a_dense_sample() {
     let (olo, oup) = out.concretize();
 
     for _ in 0..400 {
-        let t: Vec<f64> = (0..n).map(|_| (rng.next_f64() + 1.0) * 0.5).collect();
+        let t: Vec<f64> = (0..n).map(|_| rng.next_f64().midpoint(1.0)).collect();
         let x = point_from_box(&lo, &up, &t);
         let y = super::affine::conv_f64(&plan, &w, Some(&bias), &x).expect("conv");
         for (i, &yi) in y.iter().enumerate() {
@@ -393,7 +393,7 @@ fn linear_encloses_the_true_output_on_a_dense_sample() {
     let out = apply_affine(&z, &op, || Ok(())).expect("affine");
     let (olo, oup) = out.concretize();
     for _ in 0..500 {
-        let t: Vec<f64> = (0..in_f).map(|_| (rng.next_f64() + 1.0) * 0.5).collect();
+        let t: Vec<f64> = (0..in_f).map(|_| rng.next_f64().midpoint(1.0)).collect();
         let x = point_from_box(&lo, &up, &t);
         let y = super::affine::linear_f64(out_f, in_f, &w, Some(&bias), &x).expect("linear");
         for (i, &yi) in y.iter().enumerate() {
@@ -665,7 +665,7 @@ fn end_to_end_margin_encloses_the_sampled_truth() {
                     0.0
                 }
             } else {
-                (rng.next_f32() + 1.0) * 0.5
+                rng.next_f32().midpoint(1.0)
             };
             x[i] = lower[i] + (upper[i] - lower[i]) * t;
         }

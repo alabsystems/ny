@@ -56,11 +56,82 @@ pub struct GateVecs {
     pub ms: Vec<f64>,
 }
 
+/// #margin-row-beta: one trunk split's Lagrangian term for a backward pass.
+///
+/// For a domain whose region is `box ∩ {s_j * z_j(x) >= 0}` (per split), weak
+/// duality gives, for ANY `beta_j >= 0`,
+///
+/// ```text
+///   min_{region} f  >=  min_{region} [f - Σ_j beta_j * s_j * z_j]
+///                  >=  min_{box}    relax(f - Σ_j beta_j * s_j * z_j)
+/// ```
+///
+/// because `beta_j * s_j * z_j >= 0` on the region (so subtracting it never
+/// raises the objective there), and the lane's relaxed backward pass +
+/// concretize is a valid lower bound of any seeded functional over any set
+/// containing the region. Symmetrically for the Upper lane with `+ Σ beta s z`.
+/// A WRONG `beta` therefore costs tightness, never validity — the only
+/// obligations are `beta >= 0` and the coefficient/error algebra at the
+/// application site (see `apply_beta_terms`).
+#[derive(Debug, Clone, Copy)]
+pub struct BetaSplit {
+    /// Absolute neuron index within the layer.
+    pub neuron: usize,
+    /// Split sign: `+1` = active branch (`z >= 0`), `-1` = inactive (`z <= 0`).
+    pub sign: i8,
+    /// Multiplier, must be finite and `> 0`. Callers filter zero terms: the
+    /// engine also skips them so that a `beta = 0` entry cannot perturb a
+    /// `-0.0` coefficient bit-wise.
+    pub beta: f64,
+}
+
+/// #margin-row-beta-percol: one COLUMN's split-Lagrangian terms at a layer.
+///
+/// The per-column extension of [`BetaSplit`]: a domain carries one margin
+/// objective per seed column, and each column's Lagrangian is independent —
+/// weak duality holds PER COLUMN for any `beta >= 0` vector attached to that
+/// column alone. The engine realizes a per-column term with the SAME certified
+/// `apply_beta_terms` arithmetic, restricted to `col..col + 1` (exactly the
+/// column-range shape the domain-stacked arm already exercises per block).
+#[derive(Debug, Clone)]
+pub struct PcBetaCol {
+    /// Seed column (margin objective) these terms price.
+    pub col: usize,
+    /// The column's Lagrangian terms at this layer.
+    pub terms: Vec<BetaSplit>,
+}
+
 /// Domain gate overrides keyed by trunk layer index.
 #[derive(Default, Clone)]
 pub struct DomainGates {
     /// Overridden layers.
     pub layers: BTreeMap<usize, GateVecs>,
+    /// #margin-row-beta (`NY_MARGIN_ROW_BETA=1`): split-Lagrangian terms per
+    /// trunk layer. Empty by default, in which case every pass is BIT-IDENTICAL
+    /// to the pre-beta engine (the application site is skipped entirely).
+    pub beta: BTreeMap<usize, Vec<BetaSplit>>,
+    /// #margin-row-beta-percol (`NY_MARGIN_ROW_BETA_PERCOL=1`): PER-COLUMN
+    /// split-Lagrangian terms per trunk layer. Applied AFTER `beta` (the two
+    /// compose additively: a column's effective multiplier is the shared term
+    /// plus its own — a sum of `beta >= 0` is a valid multiplier). Column
+    /// indices are the SEED columns of the pass this gate set is built for;
+    /// callers must never reuse a `beta_pc`-carrying dom on a pass with a
+    /// different column layout (the candidate-score passes strip it). Empty by
+    /// default ⇒ bit-identical passes.
+    pub beta_pc: BTreeMap<usize, Vec<PcBetaCol>>,
+    /// #clip-and-verify, the VERIFY half: this domain's region is EMPTY.
+    ///
+    /// Set when constrained re-concretization produces CROSSED bounds on any
+    /// neuron: `l_new` under-estimates the constrained minimum and `u_new`
+    /// over-estimates the constrained maximum (both pay their certified slack
+    /// in the safe direction), so `l_new > u_new` forces `min > max` over
+    /// `box ∩ halfspaces` — a Farkas certificate that the set is empty. The
+    /// domain's true region is a SUBSET of that set (each halfspace is a
+    /// necessary condition of its split), so an empty intersection discharges
+    /// the domain with no counterexample possible inside it. The certificate
+    /// is conservative: slack makes it strictly harder to trigger, never
+    /// falsely.
+    pub infeasible: bool,
 }
 
 /// One domain's exclusive ownership of a contiguous column range in a
@@ -118,6 +189,14 @@ pub struct Collect<'c> {
     /// Capture per-row coefficient vectors at each layer's RETAINED neurons
     /// (Tier-0 trunk-variant ranker input; nearest-mode values, ranker-only).
     pub rows: Option<&'c super::root::RetainedRows>,
+    /// #alpha-opt: capture the PRE-transform incoming coefficients on the relu
+    /// OUTPUT at every layer's UNSTABLE neurons (`(unst.len(), R)` per layer).
+    ///
+    /// GRADIENT-ONLY: these values never feed a verdict. They are the `v` of
+    /// the gate transform `lv = vp*alpha + vn*s` below, captured so the alpha
+    /// optimizer can read `vp = max(v, 0)` — the exact coefficient that
+    /// multiplies `alpha_j` in this pass — without re-deriving the walk.
+    pub unst_rows: bool,
 }
 
 /// Result of one backward pass: rows at the network input.
@@ -135,6 +214,10 @@ pub struct PassOut {
     /// Tier-0 capture: layer -> `(n_retained, R)` incoming coefficients on
     /// the relu OUTPUT at the layer's retained neurons (#epoch-bab).
     pub coll_rows: Option<BTreeMap<usize, Array2<f64>>>,
+    /// #alpha-opt capture: layer -> `(unst.len(), R)` PRE-transform incoming
+    /// coefficients at the layer's unstable neurons (gradient-only; see
+    /// [`Collect::unst_rows`]). Row order follows `LayerGates::unst`.
+    pub unst_rows: Option<BTreeMap<usize, Array2<f64>>>,
 }
 
 /// The engine: borrows the compiled net + frozen root gates.
@@ -189,6 +272,7 @@ impl<'a> BackwardEngine<'a> {
             Collect {
                 unst_abs: collect_unst,
                 rows: None,
+                unst_rows: false,
             },
         )
     }
@@ -202,7 +286,31 @@ impl<'a> BackwardEngine<'a> {
         exc: Option<&Exceptions>,
         collect: Collect<'_>,
     ) -> Result<PassOut> {
-        self.run_collect_impl(seed, dom, dir, exc, collect, None)
+        self.run_collect_impl(seed, dom, dir, exc, collect, None, None)
+    }
+
+    /// #backward-interm: one certified backward pass seeded at the INPUT of
+    /// trunk relu op `relu_op` (identity-style rows on its pre-activation),
+    /// walked through the already-frozen PREFIX gates and concretizable over
+    /// the root box with the lane's unchanged `concretize_*`.
+    ///
+    /// SOUNDNESS: the prefix relus' gates are the same frozen `LayerGates`
+    /// every verdict pass uses (valid DeepPoly relaxations on their certified
+    /// boxes), the certified error lane starts at zero (identity seed is
+    /// exact) and contracts/grows by the unchanged per-op algebra, so the
+    /// concretized rows are valid outward bounds on this relu's pre-activation
+    /// over the root box — an independent enclosure the caller may intersect
+    /// (shrink-only) with the forward tableau's.
+    pub(crate) fn run_prefix(&self, seed: &Seed, relu_op: usize, dir: LaneDir) -> Result<PassOut> {
+        self.run_collect_impl(
+            seed,
+            None,
+            dir,
+            None,
+            Collect::default(),
+            None,
+            Some(relu_op),
+        )
     }
 
     /// Cross-domain row stack used only by the default-off margin-row
@@ -252,8 +360,10 @@ impl<'a> BackwardEngine<'a> {
             Collect {
                 unst_abs: false,
                 rows: None,
+                unst_rows: false,
             },
             Some(blocks),
+            None,
         )
     }
 
@@ -265,88 +375,129 @@ impl<'a> BackwardEngine<'a> {
         exc: Option<&Exceptions>,
         collect: Collect<'_>,
         domain_stack: Option<&[RowDomainGateBlock<'_>]>,
+        prefix_relu: Option<usize>,
     ) -> Result<PassOut> {
         let net = self.net;
         let outward = self.outward();
         let r = seed.s.ncols();
-        if seed.s.nrows() != net.n_y {
-            return Err(NyError::shape_mismatch(vec![net.n_y], vec![seed.s.nrows()]));
-        }
-        let (w1, b1, (n_y, n_h)) = net.gemm1();
-
-        // --- Seed through gemm1: L0[k] = sum_j W1[j,k] * S[j]; b = S @ b1.
-        let mut l0 = Array2::<f64>::zeros((n_h, r));
-        {
-            let ss = seed.s.as_slice().expect("standard layout");
-            let dst = l0.as_slice_mut().expect("standard layout");
-            dst.par_chunks_mut(r).enumerate().for_each(|(k, acc)| {
-                for j in 0..n_y {
-                    let w = w1[j * n_h + k];
-                    if w != 0.0 {
-                        axpy(acc, w, &ss[j * r..(j + 1) * r]);
-                    }
-                }
-            });
-        }
+        let mut state: Vec<Option<LaneMat>> = (0..=net.ops.len()).map(|_| None).collect();
         let mut b = vec![0.0; r];
-        for j in 0..n_y {
-            let bj = b1[j];
-            if bj != 0.0 {
-                axpy(&mut b, bj, row(&seed.s, j));
-            }
-        }
         let mut eb = vec![0.0; r];
-        let e0 = if outward {
-            // E0 = |W1|^T (Es + g(|S| + Es)), certified; eb likewise via |b1|.
-            let g = gamma_n(n_y + 2);
-            let comb = combined_err(&seed.s, seed.e.as_ref(), g);
-            let mut e0 = Array2::<f64>::zeros((n_h, r));
+        let limit = if let Some(pk) = prefix_relu {
+            // #backward-interm PREFIX entry: seed rows directly at the INPUT
+            // tensor of trunk relu op `pk` (its pre-activation `z`), walk only
+            // the ops strictly before it. Every relu encountered has a smaller
+            // layer index, so its gates are already frozen in `self.root` —
+            // the same certified per-gate algebra as a head-seeded pass, on a
+            // shorter walk. The seed here is exact (identity rows), so its
+            // error lane starts at zero when the caller supplies none.
+            if pk >= net.i_gemm1 {
+                return Err(NyError::InvalidSpec(
+                    "margin_row: prefix seed op is not in the trunk".into(),
+                ));
+            }
+            let TwinOp::Relu { input, .. } = &net.ops[pk] else {
+                return Err(NyError::InvalidSpec(
+                    "margin_row: prefix seed op is not a relu".into(),
+                ));
+            };
+            let n_pre = net.tsize[*input];
+            if seed.s.nrows() != n_pre {
+                return Err(NyError::shape_mismatch(vec![n_pre], vec![seed.s.nrows()]));
+            }
+            let e0 = if outward {
+                Some(
+                    seed.e
+                        .clone()
+                        .unwrap_or_else(|| Array2::<f64>::zeros(seed.s.raw_dim())),
+                )
+            } else {
+                None
+            };
+            state[*input] = Some(LaneMat {
+                l: seed.s.clone(),
+                e: e0,
+            });
+            pk
+        } else {
+            if seed.s.nrows() != net.n_y {
+                return Err(NyError::shape_mismatch(vec![net.n_y], vec![seed.s.nrows()]));
+            }
+            let (w1, b1, (n_y, n_h)) = net.gemm1();
+
+            // --- Seed through gemm1: L0[k] = sum_j W1[j,k] * S[j]; b = S @ b1.
+            let mut l0 = Array2::<f64>::zeros((n_h, r));
             {
-                let cs = comb.as_slice().expect("standard layout");
-                let dst = e0.as_slice_mut().expect("standard layout");
-                let g2 = gamma_n(n_y + 8);
+                let ss = seed.s.as_slice().expect("standard layout");
+                let dst = l0.as_slice_mut().expect("standard layout");
                 dst.par_chunks_mut(r).enumerate().for_each(|(k, acc)| {
                     for j in 0..n_y {
-                        let w = w1[j * n_h + k].abs();
+                        let w = w1[j * n_h + k];
                         if w != 0.0 {
-                            axpy(acc, w, &cs[j * r..(j + 1) * r]);
+                            axpy(acc, w, &ss[j * r..(j + 1) * r]);
                         }
-                    }
-                    for v in acc.iter_mut() {
-                        *v = certify_up(*v, g2);
                     }
                 });
             }
-            {
-                let cs = comb.as_slice().expect("standard layout");
-                for j in 0..n_y {
-                    let bj = b1[j].abs();
-                    if bj != 0.0 {
-                        axpy(&mut eb, bj, &cs[j * r..(j + 1) * r]);
-                    }
-                }
-                let g2 = gamma_n(n_y + 8);
-                for v in &mut eb {
-                    *v = certify_up(*v, g2);
+            for j in 0..n_y {
+                let bj = b1[j];
+                if bj != 0.0 {
+                    axpy(&mut b, bj, row(&seed.s, j));
                 }
             }
-            Some(e0)
-        } else {
-            None
+            let e0 = if outward {
+                // E0 = |W1|^T (Es + g(|S| + Es)), certified; eb likewise via |b1|.
+                let g = gamma_n(n_y + 2);
+                let comb = combined_err(&seed.s, seed.e.as_ref(), g);
+                let mut e0 = Array2::<f64>::zeros((n_h, r));
+                {
+                    let cs = comb.as_slice().expect("standard layout");
+                    let dst = e0.as_slice_mut().expect("standard layout");
+                    let g2 = gamma_n(n_y + 8);
+                    dst.par_chunks_mut(r).enumerate().for_each(|(k, acc)| {
+                        for j in 0..n_y {
+                            let w = w1[j * n_h + k].abs();
+                            if w != 0.0 {
+                                axpy(acc, w, &cs[j * r..(j + 1) * r]);
+                            }
+                        }
+                        for v in acc.iter_mut() {
+                            *v = certify_up(*v, g2);
+                        }
+                    });
+                }
+                {
+                    let cs = comb.as_slice().expect("standard layout");
+                    for j in 0..n_y {
+                        let bj = b1[j].abs();
+                        if bj != 0.0 {
+                            axpy(&mut eb, bj, &cs[j * r..(j + 1) * r]);
+                        }
+                    }
+                    let g2 = gamma_n(n_y + 8);
+                    for v in &mut eb {
+                        *v = certify_up(*v, g2);
+                    }
+                }
+                Some(e0)
+            } else {
+                None
+            };
+            let g1_in = match &net.ops[net.i_gemm1] {
+                TwinOp::Gemm { input, .. } => *input,
+                _ => unreachable!("validated"),
+            };
+            state[g1_in] = Some(LaneMat { l: l0, e: e0 });
+            net.i_gemm1
         };
-
-        let mut state: Vec<Option<LaneMat>> = (0..=net.ops.len()).map(|_| None).collect();
-        let g1_in = match &net.ops[net.i_gemm1] {
-            TwinOp::Gemm { input, .. } => *input,
-            _ => unreachable!("validated"),
-        };
-        state[g1_in] = Some(LaneMat { l: l0, e: e0 });
         let mut coll: Option<BTreeMap<usize, Vec<f64>>> = collect.unst_abs.then(BTreeMap::new);
         let mut coll_rows: Option<BTreeMap<usize, Array2<f64>>> =
             collect.rows.map(|_| BTreeMap::new());
+        let mut unst_rows: Option<BTreeMap<usize, Array2<f64>>> =
+            collect.unst_rows.then(BTreeMap::new);
         let lower = matches!(dir, LaneDir::Lower);
 
-        for k in (0..net.i_gemm1).rev() {
+        for k in (0..limit).rev() {
             if state[k + 1].is_none() {
                 continue;
             }
@@ -474,6 +625,23 @@ impl<'a> BackwardEngine<'a> {
                                 }
                                 rmap.insert(li, vmat);
                             }
+                        }
+                    }
+                    // #alpha-opt capture: PRE-transform coefficients at this
+                    // layer's unstable neurons. Same values, same placement as
+                    // the Tier-0 capture above, but indexed by `rec.unst`
+                    // (every unstable neuron, not the retained subset).
+                    // Gradient-only: nothing verdict-bearing reads this.
+                    if let Some(umap) = unst_rows.as_mut() {
+                        if !rec.unst.is_empty() {
+                            let ls = cur.l.as_slice().expect("standard layout");
+                            let mut vmat = Array2::<f64>::zeros((rec.unst.len(), r));
+                            let vs = vmat.as_slice_mut().expect("standard layout");
+                            for (row_i, &j) in rec.unst.iter().enumerate() {
+                                vs[row_i * r..(row_i + 1) * r]
+                                    .copy_from_slice(&ls[j * r..(j + 1) * r]);
+                            }
+                            umap.insert(li, vmat);
                         }
                     }
                     // The established uniform-domain arm below is kept
@@ -617,6 +785,28 @@ impl<'a> BackwardEngine<'a> {
                             }
                         }
                     }
+                    // #margin-row-beta: split-Lagrangian coefficient shift,
+                    // applied LAST (after the gate transform and exceptions,
+                    // which never target a neuron this domain already split —
+                    // candidate selection excludes used splits). No-op on an
+                    // empty term list, hence bit-identical when disarmed.
+                    if let Some(terms) = dom.and_then(|d| d.beta.get(&li)) {
+                        apply_beta_terms(&mut cur, terms, lower, 0..r);
+                    }
+                    // #margin-row-beta-percol: per-COLUMN Lagrangian terms —
+                    // the same certified apply, restricted to the owning
+                    // column (the domain-stacked arm's column-range anatomy on
+                    // the uniform path). Applied after the shared terms; the
+                    // two compose additively per entry, each charging its own
+                    // rounding. An out-of-range column is skipped: dropping a
+                    // valid `beta >= 0` term only loosens, never unsounds.
+                    if let Some(pcs) = dom.and_then(|d| d.beta_pc.get(&li)) {
+                        for pc in pcs {
+                            if pc.col < r {
+                                apply_beta_terms(&mut cur, &pc.terms, lower, pc.col..pc.col + 1);
+                            }
+                        }
+                    }
                     merge_into(&mut state, *input, cur, outward);
                 }
                 TwinOp::Conv(cv) => {
@@ -700,6 +890,7 @@ impl<'a> BackwardEngine<'a> {
             eb,
             coll,
             coll_rows,
+            unst_rows,
         };
         // Fail-closed NaN/Inf firewall: verdict math must never see non-finite.
         if out.a.iter().any(|v| !v.is_finite())
@@ -740,6 +931,14 @@ impl<'a> BackwardEngine<'a> {
         dir: LaneDir,
         ctx: &super::gpu_seam::SeamCtx<'_>,
     ) -> Result<PassOut> {
+        // #margin-row-beta: the seam predates the beta terms and would compute
+        // WITHOUT them (a looser but still sound bound). No current caller
+        // passes a beta-carrying dom here; refuse defensively so that can
+        // never change silently. Per-column terms (`beta_pc`) are refused for
+        // the same reason.
+        if dom.is_some_and(|d| !d.beta.is_empty() || !d.beta_pc.is_empty()) {
+            return self.run(seed, dom, dir, None, false);
+        }
         match super::gpu_seam::run_pass(self, seed, dom, dir, ctx) {
             Ok(pass) => Ok(pass),
             Err(_refused) => self.run(seed, dom, dir, None, false),
@@ -757,6 +956,13 @@ impl<'a> BackwardEngine<'a> {
         ctx: &super::gpu_seam::SeamCtx<'_>,
     ) -> Result<(PassOut, PassOut)> {
         let seed = self.identity_seed();
+        // #margin-row-beta: see `run_seamed` — a beta-carrying dom never
+        // enters the seam (defensive; the y-pack never carries beta today).
+        if dom.is_some_and(|d| !d.beta.is_empty() || !d.beta_pc.is_empty()) {
+            let al = self.run(&seed, dom, LaneDir::Lower, None, false)?;
+            let au = self.run(&seed, dom, LaneDir::Upper, None, false)?;
+            return Ok((al, au));
+        }
         match super::gpu_seam::run_pass_pair(self, &seed, dom, ctx) {
             Ok(pair) => Ok(pair),
             Err(_refused) => {
@@ -877,6 +1083,40 @@ fn validate_domain_stack(
                 return Err(NyError::NumericalInstability(format!(
                     "margin_row: non-finite domain-stack gate in block {bi}, layer {li}"
                 )));
+            }
+        }
+        // #margin-row-beta: a stacked block's Lagrangian terms fail closed on
+        // any shape or sign problem BEFORE entering verdict arithmetic (the
+        // apply site would skip them silently; a malformed stack should not
+        // degrade quietly).
+        // #margin-row-beta-percol: a stacked block's column space is
+        // BLOCK-LOCAL (candidate rows), while `beta_pc` columns index the
+        // margin objectives of the domain's own eval pass. No caller builds
+        // such a block (the eval clears `beta_pc` before the dom reaches any
+        // scoring path); refuse rather than silently misapply a column.
+        if !block.gates.beta_pc.is_empty() {
+            return Err(NyError::InvalidSpec(format!(
+                "margin_row: domain-stack block {bi} carries per-column beta \
+(column spaces differ; unsupported)"
+            )));
+        }
+        for (&li, terms) in &block.gates.beta {
+            let Some(rec) = root.layers.get(li) else {
+                return Err(NyError::InvalidSpec(format!(
+                    "margin_row: domain-stack block {bi} beta references missing layer {li}"
+                )));
+            };
+            for t in terms {
+                if t.neuron >= rec.n || t.sign == 0 {
+                    return Err(NyError::InvalidSpec(format!(
+                        "margin_row: malformed domain-stack beta in block {bi}, layer {li}"
+                    )));
+                }
+                if !(t.beta.is_finite() && t.beta >= 0.0) {
+                    return Err(NyError::NumericalInstability(format!(
+                        "margin_row: non-finite/negative domain-stack beta in block {bi}, layer {li}"
+                    )));
+                }
             }
         }
         for (&li, list) in &block.exceptions.by_layer {
@@ -1078,12 +1318,185 @@ fn apply_domain_stacked_relu(
             }
         }
     }
+    // #margin-row-beta, stacked arm: each block's Lagrangian terms apply to
+    // exactly its own columns — same math and same (post-exception) placement
+    // as the uniform arm, so a stacked pass stays bit-identical to the
+    // per-domain passes it replaces.
+    for block in blocks {
+        if let Some(terms) = block.gates.beta.get(&li) {
+            apply_beta_terms(cur, terms, lower, block.columns.clone());
+        }
+    }
     Ok(())
+}
+
+/// #margin-row-beta: add each split's Lagrangian term to the coefficient the
+/// backward pass now holds on that split neuron's PRE-activation `z`.
+///
+/// Placement: called at trunk relu `li` AFTER the gate transform, i.e. when
+/// `cur.l[[neuron, .]]` is the coefficient multiplying `z_{li,neuron}` in the
+/// relaxed functional. Adding `delta` there is exactly seeding the extra term
+/// `delta * z_j(x)` through the remaining prefix walk:
+///
+/// * Lower lane bounds `f - Σ beta_j s_j z_j` from below ⇒ `delta = -s_j*beta_j`;
+/// * Upper lane bounds `f + Σ beta_j s_j z_j` from above ⇒ `delta = +s_j*beta_j`.
+///
+/// See [`BetaSplit`] for the weak-duality argument that makes ANY `beta >= 0`
+/// valid on the split region.
+///
+/// # Error-lane invariant (the load-bearing line)
+///
+/// The certified contraction `ms = max(alpha, s)` at this relu bounds the
+/// Lipschitz constant of the GATE map `v -> vp*alpha + vn*s`, and that update
+/// has already run. The beta shift is an ADDITIVE CONSTANT in the output
+/// coefficient — `T_beta(v) = T(v) + delta` has the SAME Lipschitz constant as
+/// `T` — so the carried upstream error needs NO rescaling (no `alpha_eff`
+/// outside `[0,1]` ever enters the contraction). The only fresh error is the
+/// one f64 addition below (`delta` itself is exact: `beta * (±1.0)`), bounded
+/// by `u * |fl(l + delta)|` and charged at double weight. Loosening-only.
+fn apply_beta_terms(cur: &mut LaneMat, terms: &[BetaSplit], lower: bool, cols: Range<usize>) {
+    let r = cur.l.ncols();
+    let n = cur.l.nrows();
+    let ls = cur.l.as_slice_mut().expect("standard layout");
+    let mut es = cur.e.as_mut().map(|e| e.as_slice_mut().expect("layout"));
+    for t in terms {
+        // Fail-safe skips: a non-positive or non-finite beta is refused here
+        // (beta = 0 must not even perturb a `-0.0` coefficient bit-wise, and
+        // a negative beta would flip the duality direction — unsound), as is
+        // a signless term (delta would be ±0.0) or an out-of-range neuron.
+        if !(t.beta.is_finite() && t.beta > 0.0) || t.sign == 0 || t.neuron >= n {
+            continue;
+        }
+        let s = f64::from(t.sign.signum());
+        let delta = if lower { -s * t.beta } else { s * t.beta };
+        let row0 = t.neuron * r;
+        for ri in cols.clone() {
+            let lv = ls[row0 + ri] + delta;
+            ls[row0 + ri] = lv;
+            if let Some(es) = es.as_deref_mut() {
+                es[row0 + ri] = slack16(es[row0 + ri] + 2.0 * UNIT * lv.abs());
+            }
+        }
+    }
 }
 
 /// Build the per-layer dense gate override for a set of trunk piece-fixes
 /// (`(layer, unst_pos, dir)`), mirroring `engine.py::domain_gates`.
 pub fn domain_gates(root: &RootGates, trunk_splits: &[(usize, usize, i8)]) -> DomainGates {
+    let mut dg = domain_gates_split_only(root, trunk_splits);
+    clip_tighten_gates(root, trunk_splits, &mut dg);
+    dg
+}
+
+/// #clip-and-verify: narrow OTHER unstable neurons using the halfspaces this
+/// domain's splits imply, and rebuild their relaxation gates from the tightened
+/// box.
+///
+/// This is what makes one split tighten the WHOLE domain. Tightening the output
+/// y-box instead was measured inert (96 of 100 rows moved, trajectory
+/// bit-identical) because nothing downstream consumes it; a narrowed
+/// INTERMEDIATE `[l, u]` shrinks that neuron's ReLU triangle and so tightens
+/// every backward pass through it.
+///
+/// # Soundness
+///
+/// `tighten_intermediate` only ever shrinks an interval, and the gates are
+/// rebuilt by the SAME certified functions the root uses — `gates_from_box`
+/// then `repair_upper_lines` in outward mode. A neuron that becomes stable
+/// under the tightened box gets the exact fixed line, which is what the root
+/// would have produced had it known the bound.
+fn clip_tighten_gates(root: &RootGates, trunk_splits: &[(usize, usize, i8)], dg: &mut DomainGates) {
+    if trunk_splits.is_empty() || !clip_interm_enabled() {
+        return;
+    }
+    let hs = super::clip::halfspaces_for_splits(root, trunk_splits);
+    if hs.is_empty() {
+        return;
+    }
+    let (x0, eps) = (root.mid.as_slice(), root.rad.as_slice());
+    let topk = clip_interm_topk();
+    for (li, layer) in root.layers.iter().enumerate() {
+        if layer.clip_rows.is_none() {
+            continue;
+        }
+        let (tight, crossed) = super::clip::tighten_intermediate(layer, &hs, x0, eps, topk);
+        if crossed > 0 {
+            // VERIFY: crossed bounds certify the region empty. Stop tightening
+            // — the caller discharges the whole domain.
+            super::clip::report_infeasible(li, crossed);
+            dg.infeasible = true;
+            return;
+        }
+        if tight.is_empty() {
+            continue;
+        }
+        let gv = dg.layers.entry(li).or_insert_with(|| GateVecs {
+            alpha: layer.alpha.clone(),
+            s: layer.s.clone(),
+            c: layer.c.clone(),
+            ms: layer.ms.clone(),
+        });
+        // Rebuild only the touched neurons, through the certified path.
+        let (mut lv, mut uv) = (layer.l.clone(), layer.u.clone());
+        let mut touched = Vec::with_capacity(tight.len());
+        for t in &tight {
+            // A neuron this domain SPLIT already carries an exact fixed line;
+            // do not overwrite it with a relaxation.
+            if trunk_splits
+                .iter()
+                .any(|&(l2, p2, _)| l2 == li && p2 == t.pos)
+            {
+                continue;
+            }
+            lv[t.idx] = t.l;
+            uv[t.idx] = t.u;
+            touched.push(t.idx);
+        }
+        if touched.is_empty() {
+            continue;
+        }
+        let (alpha2, mut s2, mut c2) = super::root::gates_from_box(&lv, &uv);
+        if root.mode.outward() {
+            super::root::repair_upper_lines(&lv, &uv, &mut s2, &mut c2);
+        }
+        for &i in &touched {
+            gv.alpha[i] = alpha2[i];
+            gv.s[i] = s2[i];
+            gv.c[i] = c2[i];
+            // Root derives `ms = max(alpha, s)` (root.rs), and `s = u/(u-l)`
+            // MOVES when the bounds tighten — so it must be re-derived, not
+            // carried over. This also covers a neuron that became stable:
+            // active gives (1,1) -> 1, inactive (0,0) -> 0.
+            gv.ms[i] = alpha2[i].max(s2[i]);
+        }
+        super::clip::report_interm(li, touched.len(), tight.len());
+    }
+}
+
+/// #clip-and-verify intermediate tightening: default OFF.
+fn clip_interm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_INTERM)
+            .value
+            .as_bool()
+    })
+}
+
+/// How many unstable neurons per layer to re-concretize. Matches
+/// alpha-beta-CROWN's `bab.clip.interm_topk` default of 20.
+fn clip_interm_topk() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_TOPK)
+            .value
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(20)
+    })
+}
+
+fn domain_gates_split_only(root: &RootGates, trunk_splits: &[(usize, usize, i8)]) -> DomainGates {
     let mut dg = DomainGates::default();
     for &(li, pos, d) in trunk_splits {
         let rec = &root.layers[li];

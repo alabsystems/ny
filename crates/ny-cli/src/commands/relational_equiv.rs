@@ -1254,7 +1254,11 @@ mod tests {
 /// selected without their benchmark checkout. This is the formula half of the gate flip measured
 /// on all 100 scored instances; only the α-CROWN emptiness proof remains for the
 /// coordinator's live runs.
-#[cfg(all(test, feature = "mip"))]
+// Every item in this module — both tests and their helpers — is
+// `external-vnncomp` content. Gating the MODULE rather than each import keeps
+// the two in step; with `mip` alone the imports and helpers were all dead, and
+// the crate failed `-D warnings` in that combination.
+#[cfg(all(test, feature = "mip", feature = "external-vnncomp"))]
 mod real_benchmark_e2e {
     use std::path::{Path, PathBuf};
 
@@ -1267,9 +1271,7 @@ mod real_benchmark_e2e {
     use super::*;
 
     fn benchmark_root() -> Option<PathBuf> {
-        let candidates = [PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../benchmarks/vnncomp2026_benchmarks/benchmarks")];
-        candidates.into_iter().find(|c| c.is_dir())
+        crate::commands::vnncomp2026_benchmarks_root()
     }
 
     fn vnnlib_files(root: &Path, category: &str) -> Vec<PathBuf> {
@@ -1430,17 +1432,16 @@ mod real_benchmark_e2e {
 /// DIAGNOSTIC (temporary): why does the relational BaB gap stall? Measures the
 /// deep-subdomain band bounds under IBP vs per-node CROWN-IBP intermediates on
 /// the REAL instance_0 difference network.
-#[cfg(all(test, feature = "mip"))]
+// Sole test is `external-vnncomp`; gate the module so its imports cannot go
+// dead under `mip` alone.
+#[cfg(all(test, feature = "mip", feature = "external-vnncomp"))]
 mod bab_gap_probe {
-    use std::path::PathBuf;
 
     #[test]
     #[cfg(feature = "external-vnncomp")]
     fn probe_diffnet_intermediates_on_deep_box() {
-        let root = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../benchmarks/vnncomp2026_benchmarks/benchmarks",
-        ));
+        let root = crate::commands::vnncomp2026_benchmarks_root()
+            .expect("VNN-COMP 2026 corpus missing under either checkout name");
         let base = root.join("isomorphic_acasxu_2026/2.0");
         assert!(
             base.is_dir(),
@@ -1621,10 +1622,11 @@ mod bab_gap_probe {
 /// (adaptive lower slope `α = u > -l`, chord upper, per-node CROWN-IBP
 /// intermediates, identical fold order); the f32 variant merely rounds every
 /// stored per-node bound through f32.
-#[cfg(all(test, feature = "mip"))]
+// Sole test is `external-vnncomp`; gate the module so its imports cannot go
+// dead under `mip` alone.
+#[cfg(all(test, feature = "mip", feature = "external-vnncomp"))]
 mod f32_tax_probe {
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     use ny_propagate::{GraphNetwork, Layer};
 
@@ -1821,10 +1823,9 @@ mod f32_tax_probe {
     #[test]
     #[cfg(feature = "external-vnncomp")]
     fn measure_f32_storage_tax_on_stuck_geometry() {
-        let base = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
-        ));
+        let base = crate::commands::vnncomp2026_benchmarks_root()
+            .expect("VNN-COMP 2026 corpus missing under either checkout name")
+            .join("isomorphic_acasxu_2026/2.0");
         assert!(
             base.is_dir(),
             "external VNN-COMP 2026 relational fixtures missing at {}; run \
@@ -1912,9 +1913,10 @@ mod f32_tax_probe {
 ///   A = default per-node CROWN-IBP intermediates → row backward;
 ///   B = A-intermediates ∩ α-collection intermediates → row backward;
 ///   C = B + row-retargeted α slopes (the full stack).
-#[cfg(all(test, feature = "mip"))]
+// Sole test is `external-vnncomp`; gate the module so its imports cannot go
+// dead under `mip` alone.
+#[cfg(all(test, feature = "mip", feature = "external-vnncomp"))]
 mod interm_alpha_probe {
-    use std::path::PathBuf;
 
     use ny_tensor::BoundedTensor;
 
@@ -1928,10 +1930,9 @@ mod interm_alpha_probe {
     #[test]
     #[cfg(feature = "external-vnncomp")]
     fn measure_interm_alpha_gain_on_stuck_geometry() {
-        let base = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../benchmarks/vnncomp2026_benchmarks/benchmarks/isomorphic_acasxu_2026/2.0",
-        ));
+        let base = crate::commands::vnncomp2026_benchmarks_root()
+            .expect("VNN-COMP 2026 corpus missing under either checkout name")
+            .join("isomorphic_acasxu_2026/2.0");
         assert!(
             base.is_dir(),
             "external VNN-COMP 2026 relational fixtures missing at {}; run \

@@ -1609,7 +1609,7 @@ mod tests {
                 .iter()
                 .zip(upper.iter())
                 .map(|(&lo, &hi)| {
-                    let t = (lcg(&mut sample_state) + 1.0) * 0.5;
+                    let t = lcg(&mut sample_state).midpoint(1.0);
                     lo + t * (hi - lo)
                 })
                 .collect();
@@ -1670,6 +1670,7 @@ mod tests {
     ///    scatter-rounding certificates must remain nonzero.
     #[test]
     fn eager_fold_7d_add28_miniature_cascade() {
+        let _env = crate::tests::lock_env_shared();
         use crate::bounds::patches::CrownBounds;
         use crate::layers::common::crown_elementwise_backward_patches;
         use crate::layers::Conv2dLayer;
@@ -1838,7 +1839,7 @@ mod tests {
             let x: Vec<f64> = x_lo
                 .iter()
                 .zip(x_hi.iter())
-                .map(|(&l, &h)| xf(l, h, (lcg(&mut s2) + 1.0) * 0.5))
+                .map(|(&l, &h)| xf(l, h, lcg(&mut s2).midpoint(1.0)))
                 .collect();
             let conv_fwd = |kern: &ArrayD<f32>,
                             inp: &[f64],

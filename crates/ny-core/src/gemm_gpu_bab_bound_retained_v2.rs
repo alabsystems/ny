@@ -1036,6 +1036,11 @@ fn validate_literal_prefix(
         budget,
         deadline,
     )?;
+    // `as_chunks::<N>()` (the tippy suggestion) reshapes this validation
+    // walk's element type; keep `chunks_exact` until the public pin's clippy
+    // also carries the lint and the rewrite can land for both toolchains.
+    #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (record_index, words) in prefix
         .chunks_exact(GPU_BAB_BOUND_SPLIT_HISTORY_RECORD_WORDS)
         .enumerate()
@@ -1087,6 +1092,10 @@ fn validate_literal_suffix(
         )));
     }
     let mut branch_pattern = 0u64;
+    // Same rationale as the prefix walk above: keep `chunks_exact` until the
+    // public pin's clippy also carries the lint.
+    #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (offset, words) in suffix
         .chunks_exact(GPU_BAB_BOUND_SPLIT_HISTORY_RECORD_WORDS)
         .enumerate()

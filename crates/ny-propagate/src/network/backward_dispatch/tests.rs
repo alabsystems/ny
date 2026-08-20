@@ -121,8 +121,18 @@ fn dispatch_linear_returns_single() {
     );
 }
 
+// EXPIRY, NOT PRESENCE. These three pinned the strict finite boundary closing
+// whenever a deadline was merely PRESENT. That is the defect that was shipped
+// for a week: every scored run carries a deadline, so the boundary closed on
+// every row, the carrier densified, and the walk paid the dense-path bill. The
+// boundary is now decided by EXPIRY, so a LIVE deadline proceeds and an EXPIRED
+// one still closes.
+//
+// Each test now asserts BOTH arms. The invariant they were written to protect —
+// that the refusal is atomic and touches nothing before declining — is retained
+// and still checked on the arm where the refusal actually happens.
 #[test]
-fn strict_finite_boundary_linear_typed_closes_before_partial_cooperative_route() {
+fn strict_finite_boundary_linear_closes_only_once_the_deadline_expires() {
     let weight = Array2::eye(3);
     let bias = Array1::zeros(3);
     let layer = Layer::Linear(LinearLayer::new(weight, Some(bias)).unwrap());
@@ -130,11 +140,27 @@ fn strict_finite_boundary_linear_typed_closes_before_partial_cooperative_route()
     let node_bounds = HashMap::new();
     let inputs = vec!["_input".to_string()];
     let mut ctx = make_ctx(&layer, &bounds, &bounds, &node_bounds, &inputs);
-    ctx.deadline = Some(Instant::now() + Duration::from_secs(30));
     let lb = identity_lb(3);
 
-    let result = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
-    assert!(matches!(result, BackwardDispatchResult::Unsupported(_)));
+    // Live: the cooperative route runs.
+    ctx.deadline = Some(Instant::now() + Duration::from_secs(30));
+    let live = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
+    assert!(
+        matches!(live, BackwardDispatchResult::Single(_)),
+        "a live deadline must not close the boundary, got {live:?}"
+    );
+
+    // Expired: it still closes, typed.
+    ctx.deadline = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond fits before now"),
+    );
+    let expired = dispatch_backward_layer_finite_boundary(&ctx, &lb);
+    assert!(
+        expired.is_err() || matches!(expired, Ok(BackwardDispatchResult::Unsupported(_))),
+        "an expired deadline must still close the boundary"
+    );
 }
 
 // ===================================================================
@@ -229,7 +255,7 @@ fn ordinary_finite_dense_add_preserves_historical_split() {
 }
 
 #[test]
-fn live_strict_finite_boundary_typed_closes_unpollable_split_atomically() {
+fn strict_finite_boundary_closes_the_unpollable_split_only_once_expired() {
     let layer = Layer::Add(AddLayer);
     let bounds = simple_bounds(2);
     let node_bounds = HashMap::new();
@@ -246,8 +272,24 @@ fn live_strict_finite_boundary_typed_closes_unpollable_split_atomically() {
     };
     let before = lb.clone();
 
-    let result = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
-    assert!(matches!(result, BackwardDispatchResult::Unsupported(_)));
+    // Live: the split proceeds.
+    let live = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
+    assert!(
+        matches!(live, BackwardDispatchResult::Binary { .. }),
+        "a live deadline must not close the unpollable split, got {live:?}"
+    );
+
+    // Expired: closed, and ATOMIC — the carrier is untouched by the refusal.
+    ctx.deadline = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond fits before now"),
+    );
+    let expired = dispatch_backward_layer_finite_boundary(&ctx, &lb);
+    assert!(
+        expired.is_err() || matches!(expired, Ok(BackwardDispatchResult::Unsupported(_))),
+        "an expired deadline must still close the unpollable split"
+    );
     assert_eq!(lb.lower_a(), before.lower_a());
     assert_eq!(lb.upper_a(), before.upper_a());
     assert_eq!(lb.lower_b(), before.lower_b());
@@ -255,7 +297,7 @@ fn live_strict_finite_boundary_typed_closes_unpollable_split_atomically() {
 }
 
 #[test]
-fn live_strict_finite_boundary_declines_coeff_err_duplication_before_work() {
+fn strict_finite_boundary_declines_coeff_err_duplication_only_once_expired() {
     let layer = Layer::Add(AddLayer);
     let bounds = simple_bounds(2);
     let node_bounds = HashMap::new();
@@ -267,12 +309,25 @@ fn live_strict_finite_boundary_declines_coeff_err_duplication_before_work() {
     lb.upper_a_err = Some(Array2::from_elem((2, 2), 0.5));
     let before = lb.clone();
 
-    let result = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
-    match result {
-        BackwardDispatchResult::Unsupported(message) => {
+    // Live: the carrier's certified error is composed rather than declined.
+    let live = dispatch_backward_layer_finite_boundary(&ctx, &lb).unwrap();
+    assert!(
+        !matches!(live, BackwardDispatchResult::Unsupported(_)),
+        "a live deadline must not decline the certified-error discharge"
+    );
+
+    // Expired: the typed refusal returns, and names the discharge it declined.
+    ctx.deadline = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond fits before now"),
+    );
+    match dispatch_backward_layer_finite_boundary(&ctx, &lb) {
+        Err(error) => assert!(error.is_deadline_exceeded(), "unexpected error: {error}"),
+        Ok(BackwardDispatchResult::Unsupported(message)) => {
             assert!(message.contains("certified-error discharge"));
         }
-        other => panic!("expected typed finite refusal, got {other:?}"),
+        Ok(other) => panic!("expected typed finite refusal once expired, got {other:?}"),
     }
     assert_eq!(lb.lower_a_err, before.lower_a_err);
     assert_eq!(lb.upper_a_err, before.upper_a_err);

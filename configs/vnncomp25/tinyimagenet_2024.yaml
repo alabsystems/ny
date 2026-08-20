@@ -70,6 +70,14 @@ attack:
 # the verifier twice (it loses the slice AND contends), the combination
 # 31949bcc refused for want of evidence.
 margin_row:
+  # #backward-interm — shipped on TINY'S OWN evidence (alloc-trio rule: never
+  # a blind cifar transfer). MEASURED 2026-08-19, official 100s, this preset:
+  #   idx_4330 timeout -> UNSAT 3/3 (~37s, ledger); in-band roots tighten
+  #   (idx_2146 -0.337 -> -0.323 etc.); SHIP GATE zero regressions on the
+  #   pre-registered at-risk list (11 slow/flaky banked unsats x3: 7689/4674/
+  #   4500/1496/1759/3115/4528/9535/6679/7403/5478) + sat sentinels
+  #   6827/9558/6252. Shrink-only by construction; parity refuses.
+  backward_interm: true
   reserve_secs: 0
   concurrent: true
   root_f32: true

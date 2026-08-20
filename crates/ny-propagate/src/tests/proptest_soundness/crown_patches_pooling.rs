@@ -10,6 +10,16 @@
 //!
 //! Design: designs/2026-03-01-patches-phase3-pooling-termination.md
 //! Part of #2613
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion. Measured 2026-08-19, isolated
+//! and single-threaded, these properties cost 10-30s in a debug build, and the
+//! walls they used to carry (20-60s) were margins of 1.2-2.9x. That is not a
+//! sentinel, it is a coin flip that any concurrent load loses -- and they duly
+//! failed at both 4 and 8 test threads. They are now a uniform 300s, roughly
+//! 10-20x the measured isolated cost. The failure these exist to catch is an
+//! infinite loop, and no finite wall lets one of those through.
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::bounds::patches::{CrownBounds, PatchesLinearBounds};
 use crate::layers::common::{BoundPropagation, PatchesPropagation};
@@ -179,7 +189,7 @@ proptest! {
     /// (Conv2d dense backward → AvgPool dense backward).
     ///
     /// Reference: designs/2026-03-01-patches-phase3-pooling-termination.md
-    #[ntest::timeout(20000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_avgpool_patches_vs_dense(
         in_c in 1usize..=3,
@@ -273,7 +283,7 @@ proptest! {
     /// Reference: designs/2026-03-01-patches-phase3-pooling-termination.md
     // Match the AvgPool differential budget above. This 200-case nonlinear
     // relaxation sweep legitimately exceeds 10 seconds on loaded shared hosts.
-    #[ntest::timeout(20000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn proptest_conv2d_maxpool_patches_vs_dense(
         in_c in 1usize..=3,

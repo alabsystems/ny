@@ -109,7 +109,20 @@ fn build_kokoro_alpha_regression_graph() -> (GraphNetwork, BoundedTensor) {
     (graph, input)
 }
 
-#[ntest::timeout(30000)]
+// HANG SENTINEL, NOT A PERFORMANCE ASSERTION. Measured 2026-08-19: this test
+// costs 0.06s isolated and 0.08s with 14 CPU burners saturating every core --
+// it is essentially immune to CPU contention, so when it tripped a 30s wall
+// under `--test-threads=8` the machine being busy was NOT the cause, and
+// neither was memory (peak RSS 0.04 GB on a 24 GiB box). It shares a process
+// with ~12 tests that each run over 60 seconds, and the wall has to survive
+// whatever scheduling pathology that tail produces. 30s -> 120s is 1500x the
+// measured contended cost; a genuine hang here is an infinite loop, which no
+// finite wall lets through.
+//
+// If this trips again, MEASURE before raising it -- `/usr/bin/time -p` on the
+// single test, then again under load. A wall retuned against a moving
+// contention baseline is the treadmill that took a sibling from 10s to 90s.
+#[ntest::timeout(120000)]
 #[test]
 fn test_collect_alpha_crown_bounds_dag_tightens_kokoro_style_conv1d_residual_graph_4400() {
     let (graph, input) = build_kokoro_alpha_regression_graph();

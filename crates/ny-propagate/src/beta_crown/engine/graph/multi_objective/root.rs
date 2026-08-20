@@ -1946,7 +1946,68 @@ fn evaluate_root_borrowed(
     // see `None` as "unbounded" and may grant themselves fresh grace slices
     // after the configured budget has already expired. A caller-provided
     // ledger deadline remains exact because `bab_deadline` is derived from it.
-    let deadline = Some(deadline.map_or(bab_deadline, |caller| caller.min(bab_deadline)));
+    let root_authority = deadline.map_or(bab_deadline, |caller| caller.min(bab_deadline));
+    let deadline = Some(root_authority);
+    // #bab-floor (DARK, `NY_BAB_RESERVE_FRAC`; absent or 0 => byte-identical).
+    //
+    // THE DEFECT. `bab_timeout` above is not a BaB allocation; it is the whole
+    // window handed to THIS evaluator. Every root phase below then claims
+    // `min(fixed_cap, k x whatever remains)` of that same window -- the
+    // bootstrap a fixed `root_alpha_cap_secs`, the comprehensive sweep
+    // `min(20s, 0.5 x remaining)`, sparse <=8s, the dense head 2s, the root
+    // objective a 3s grace -- and NOTHING subtracts a slice for
+    // branch-and-bound. BaB is therefore the residue of ten independent
+    // claimants, and a residue can be zero. Measured on cifar100_2024
+    // idx_2176 at the official 100s budget: `effective-bab=72.892s`, ladder
+    // ~63.5s, and under NY_PHASE_TELEMETRY=1 `root-objective start` is the
+    // LAST line -- no `root-objective end`, no `multiobj-bab-ready`, no
+    // BaB-side marker. The loop was never entered.
+    //
+    // THE FIX, when armed: name the downstream claims as shares of one window
+    // and subtract them FIRST (`ny_core::phase_window::split_root_window`,
+    // invariant I3). The ladder's own `k x remaining` arithmetic is preserved
+    // exactly; it simply divides a smaller remainder, and can no longer reach
+    // past the reservation. Three deadlines come out of it:
+    //   * `root_authority_deadline` -- unchanged instance authority, used for
+    //     "is the run still live" questions (phase-checkpoint authority,
+    //     `classify_expiry`) which must NOT see the reservation;
+    //   * `root_tighten_deadline`  -- what the tightening ladder may consume;
+    //   * `root_spec_deadline`     -- ladder end plus the root objective pass's
+    //     own reserved share; everything after the spec pass is bounded by it.
+    // `bab_deadline`/`bab_timeout` are untouched, so the ledger's post-BaB PGD
+    // reservation and every Timeout classification keep their exact meaning.
+    //
+    // SOUND: a deadline only schedules work. Every root tightening pass is a
+    // shrink-only intersect that fails closed on expiry, and the reserve is
+    // carved OUT of this evaluator's own window rather than minted on top of
+    // it, so no phase is ever authorized past the instance deadline.
+    let root_authority_deadline = deadline;
+    // The window the shares are cut from is the authority the ROOT actually
+    // has, which is `bab_timeout` unless a caller supplied something tighter.
+    let root_window = root_authority.saturating_duration_since(lifecycle.start_time);
+    let root_window_split = root_bab_window_split(root_window, &verifier.config);
+    let (root_spec_deadline, root_tighten_deadline) =
+        root_split_boundaries(deadline, root_window_split);
+    if let Some(split) = root_window_split {
+        // #phase-telemetry (print-only): the arbitration is the thing under
+        // test, so it has to be legible in the same log as the phase markers
+        // it bounds. Emitted only when armed, so a dark log is unchanged.
+        crate::phase_telemetry::phase_marker(&format!(
+            "multiobj-bab-split window={:.3}s alpha-cap={:.3}s sweeps={:.3}s \
+             spec-reserved={:.3}s bab-reserved={:.3}s",
+            root_window.as_secs_f64(),
+            split.alpha.as_secs_f64(),
+            split.sweep.as_secs_f64(),
+            split.spec.as_secs_f64(),
+            split.bab.as_secs_f64(),
+        ));
+    }
+    // The tightening ladder -- every phase from the bootstrap through the dense
+    // head and the MIP stash -- sizes itself against THIS boundary from here
+    // on. Re-shadowed to `root_spec_deadline` immediately before the root
+    // objective pass, which owns the next reserved share. Both are exactly
+    // `deadline` when the split is dark.
+    let deadline = root_tighten_deadline;
     let initial_deadline = Some(bab_deadline);
     // #w4-root-alpha-opt WARMUP CAP: the alpha warmup otherwise runs to the
     // full BaB budget (the initial_bounds_fraction knob never capped this
@@ -2108,6 +2169,43 @@ fn evaluate_root_borrowed(
             std::borrow::Cow::Owned(config)
         }
     };
+    // #bab-floor: the root-alpha ascent is the ladder's largest claimant and
+    // the ONE that does not scale with the remaining budget -- `40` is 51% /
+    // 17% / 4% of the BaB slice at 100s / 330s / 1200s. Reserving time
+    // downstream without converting that wall into a share would make the
+    // SWEEPS pay for the whole reservation while the bootstrap kept its 40s.
+    //
+    // The ceiling is min-composed onto `root_alpha_cap_secs`, i.e. applied
+    // through the SAME local-phase-cap seam `shared/init.rs` already uses, so
+    // an expired ascent still publishes its phase-cap CHECKPOINT. Tightening
+    // the bootstrap's DEADLINE instead (`initial_deadline`, left alone below)
+    // would clear `local_phase_cap_applied`, and the identical expiry would
+    // become a hard DeadlineExceeded for the whole instance -- the
+    // presence-guard defect class this repo already pays for elsewhere.
+    //
+    // `NY_ROOT_ALPHA_CAP_SECS` REPLACES the config cap inside init.rs (its
+    // documented contract), so it also replaces this ceiling; do not set both.
+    //
+    // KNOWN LIMIT, stated rather than hidden: `root_alpha_cap_secs` bounds the
+    // alpha-CROWN collection branch only. A preset whose bootstrap takes the
+    // forward-linear / IBP / CROWN-IBP branch is still bounded by
+    // `initial_deadline` alone and can therefore spend past the ladder share.
+    // Those branches propagate DeadlineExceeded rather than checkpointing, so
+    // tightening them here would trade an overrun for a hard instance timeout;
+    // giving them a cooperative checkpoint is separate work. cifar100_2024 (and
+    // every preset with `use_alpha_crown`) takes the capped branch.
+    let bootstrap_config = match root_window_split {
+        None => bootstrap_config,
+        Some(split) => {
+            let share_secs = split.alpha.as_secs_f64();
+            let capped_secs = bootstrap_config
+                .root_alpha_cap_secs
+                .map_or(share_secs, |configured| configured.min(share_secs));
+            let mut config = bootstrap_config.into_owned();
+            config.root_alpha_cap_secs = Some(capped_secs);
+            std::borrow::Cow::Owned(config)
+        }
+    };
     // #margin-subset-seed on the MULTI-OBJECTIVE path.
     //
     // The single-objective relu-split loop publishes the spec-referenced OUTPUT
@@ -2157,7 +2255,13 @@ fn evaluate_root_borrowed(
             &bootstrap_config,
             engine,
             initial_deadline,
-            deadline,
+            // #bab-floor: the checkpoint authority answers "is the RUN still
+            // live", not "does this phase still have budget". It must see the
+            // unreserved instance boundary: handing it the ladder deadline
+            // would refuse the checkpoint exactly when the ladder share is
+            // spent, converting a recoverable phase cap into a hard
+            // DeadlineExceeded. Identical to `deadline` when the split is dark.
+            root_authority_deadline,
         )
     } else {
         compute_graph_bab_bootstrap(graph, input, &bootstrap_config, engine, initial_deadline)
@@ -2290,6 +2394,40 @@ fn evaluate_root_borrowed(
         }
         Err(e) => return Err(e),
     };
+    // #root-window-attribution (dark, NY_PHASE_TELEMETRY=1, print-only).
+    //
+    // The window between `graph-bab-bootstrap end` and `root-objective start`
+    // carried NO `[phase]` marker at all: on cifar100_2024 idx_2176 that is
+    // 20.5 s of a 100 s scored budget (bootstrap ends t=40.0s, root-objective
+    // starts t=60.5s) attributed to nothing. TEN consumers sit in it, so
+    // "which one" was unanswerable from a phase log: the
+    // `[root-comprehensive-gpu-interm-sweep]` lines cover part of the span but
+    // carry no marker and no bracket, and a dark lever is equally silent
+    // whether it declined in 0 ms or ran for 6 s. Which consumers actually
+    // execute under a given preset is now something the log SHOWS rather than
+    // something a reader infers from the lever defaults.
+    //
+    // Every consumer below is bracketed `start`/`end` on the SHARED epoch
+    // clock, and the whole window is bracketed by `root-tighten-window`, so
+    // adjacent-line differences partition it with no residue: an interval is
+    // either a named phase (its own start->end) or explicit inter-phase glue
+    // (one phase's `end` to the next phase's `start`). A dark lever prints
+    // start and end at the same `t=` -- which is the proof it was inert,
+    // not the absence of evidence it is today.
+    //
+    // VERDICT-NEUTRAL BY CONSTRUCTION. Each marker is a whole STATEMENT
+    // inserted between existing statements; no existing expression, argument
+    // list, or block is restructured, and no marker introduces a binding or a
+    // temporary that outlives its own statement (`phase_marker` takes a
+    // `&'static str`). Drop order and drop timing of every existing value are
+    // therefore bit-identical -- the hazard that a previous "print-only" edit
+    // here hit by moving a deallocation past the clock feeding a
+    // certificate-admission test. No marker reads a deadline, and the only
+    // clock read is the shared `epoch()` inside the emitter, which is already
+    // initialized by `graph-bab-bootstrap start` long before this point, so
+    // the `t=` values of every PRE-EXISTING marker are unchanged too. Gate-off
+    // (the shipped default) is one latched-string compare per call site.
+    crate::phase_telemetry::phase_marker("root-tighten-window start");
     if let Some(optimizer_updates_completed) = bootstrap.phase_cap_optimizer_updates {
         info!(
             optimizer_updates_completed,
@@ -2340,6 +2478,7 @@ fn evaluate_root_borrowed(
     // hoisted walk changes the program -- measured, bounds identical but
     // verdict timeout -> unknown. In-place dispatch preserves order exactly.
     let mut phase_out = super::root_phases::PhaseOutput::default();
+    crate::phase_telemetry::phase_marker("root-stabilize-and-fix start");
     phase_out.merge(
         super::root_phases::RootTightenPhase::StabilizeAndFix.run_in_place(
             graph,
@@ -2353,6 +2492,8 @@ fn evaluate_root_borrowed(
             dd_zono.as_ref(),
         ),
     );
+    crate::phase_telemetry::phase_marker("root-stabilize-and-fix end");
+    crate::phase_telemetry::phase_marker("root-ddzono-interm-intersect start");
     phase_out.merge(
         super::root_phases::RootTightenPhase::DdZonoIntermIntersect.run_in_place(
             graph,
@@ -2366,6 +2507,7 @@ fn evaluate_root_borrowed(
             dd_zono.as_ref(),
         ),
     );
+    crate::phase_telemetry::phase_marker("root-ddzono-interm-intersect end");
 
     // FC-head pre-activation tightening (#cifar100-fchead): the α-CROWN warmup
     // returns the forward-linear / IBP reference intermediate bounds unchanged
@@ -2389,6 +2531,7 @@ fn evaluate_root_borrowed(
     // where it buys nothing — so it is OFF by default and enabled only where it
     // pays (the cifar100/tinyimagenet path / an explicit opt-in). It does not flip
     // cifar100 alone (the residual gap needs conv-stack tightening too).
+    crate::phase_telemetry::phase_marker("root-fchead-tighten start");
     phase_out.merge(
         super::root_phases::RootTightenPhase::FcHeadTighten.run_in_place(
             graph,
@@ -2402,6 +2545,7 @@ fn evaluate_root_borrowed(
             dd_zono.as_ref(),
         ),
     );
+    crate::phase_telemetry::phase_marker("root-fchead-tighten end");
 
     // Root intermediate-bound α tightening (#root-interm-alpha, dark
     // `NY_ROOT_INTERM_ALPHA=1`): the BROAD counterpart to NY_FCHEAD_TIGHTEN.
@@ -2420,6 +2564,7 @@ fn evaluate_root_borrowed(
     // intersect-only (shrink a bound, never widen; α only tunes the ReLU lower
     // slope within the sound triangle); on deadline each target keeps its sound
     // reference bound. Default-OFF ⇒ byte-identical (no bound is ever touched).
+    crate::phase_telemetry::phase_marker("root-interm-alpha start");
     phase_out.merge(
         super::root_phases::RootTightenPhase::RootIntermAlpha.run_in_place(
             graph,
@@ -2433,6 +2578,7 @@ fn evaluate_root_borrowed(
             dd_zono.as_ref(),
         ),
     );
+    crate::phase_telemetry::phase_marker("root-interm-alpha end");
 
     // NY_ROOT_INTERM_ALPHA block's closing brace (before the next lever's comment).
 
@@ -2461,6 +2607,7 @@ fn evaluate_root_borrowed(
     // comes from the sound fold; shrink-only intersect with per-element union
     // fallback; fail-closed on any refusal. Default-OFF ⇒ no bound is ever
     // touched.
+    crate::phase_telemetry::phase_marker("root-joint-interm-alpha start");
     let root_joint_interm_tightened_targets = super::root_phases::root_joint_interm_alpha(
         graph,
         input,
@@ -2470,12 +2617,14 @@ fn evaluate_root_borrowed(
         objectives,
         &mut bootstrap,
     );
+    crate::phase_telemetry::phase_marker("root-joint-interm-alpha end");
 
     // Resolve comprehensive-slot ownership once. The default-dark resident
     // owner claims this and the following wide slot without running here, then
     // carries its typed policy past sparse prerequisites to the dense-head
     // site. With that owner absent, the established comprehensive call and its
     // exact clean-decline ownership semantics execute unchanged.
+    crate::phase_telemetry::phase_marker("root-comprehensive-interm start");
     let (root_phase_resident_crown_policy, root_comprehensive_gpu_interm_tightened_targets) =
         phase_resident_or_comprehensive(root_phase_resident_crown_policy(), || {
             super::root_phases::comprehensive_gpu_interm_crown(
@@ -2488,6 +2637,7 @@ fn evaluate_root_borrowed(
                 objectives,
             )
         });
+    crate::phase_telemetry::phase_marker("root-comprehensive-interm end");
 
     // One-target wide DEMANDED intermediate CROWN
     // (#root-wide-demanded-interm-crown, typed default-OFF). This is the dark
@@ -2496,6 +2646,7 @@ fn evaluate_root_borrowed(
     // a secondary key, then asks the exact retained sound GPU capability for a
     // typed sweep. Local capability only: no backend-name check and no factory
     // retry; every unsupported or unauthorized path leaves the map untouched.
+    crate::phase_telemetry::phase_marker("root-wide-demanded-interm start");
     let root_wide_demanded_interm_tightened_targets =
         comprehensive_gpu_or_legacy_wide(root_comprehensive_gpu_interm_tightened_targets, || {
             super::root_phases::wide_demanded_interm_crown(
@@ -2506,6 +2657,7 @@ fn evaluate_root_borrowed(
                 &mut bootstrap,
             )
         });
+    crate::phase_telemetry::phase_marker("root-wide-demanded-interm end");
 
     // Typed sparse crossing-row intermediate CROWN (#root-sparse-interm-crown).
     // Unlike the research joint-α seam above, this production-shaped pass runs
@@ -2516,6 +2668,7 @@ fn evaluate_root_borrowed(
     // inherited by the root objective and every BaB child. Default-OFF unless a
     // measured typed preset or the sealed force-on A/B gate enables it.
     let root_interm_factory_requested = root_interm_cuda_factory_requested(&verifier.config);
+    crate::phase_telemetry::phase_marker("root-sparse-interm start");
     let root_sparse_interm_tightened_targets = super::root_phases::sparse_interm_crown(
         graph,
         input,
@@ -2525,6 +2678,7 @@ fn evaluate_root_borrowed(
         verifier,
         &mut bootstrap,
     );
+    crate::phase_telemetry::phase_marker("root-sparse-interm end");
 
     // Root CROWN-backward intermediate-bound INTERSECT (#root-crown-interm). At
     // the ROOT (before BaB), compute a SOUND heuristic-α CROWN BACKWARD box to
@@ -2567,6 +2721,7 @@ fn evaluate_root_borrowed(
                 .map(|d| d.saturating_duration_since(now).as_secs_f64()),
         );
     }
+    crate::phase_telemetry::phase_marker("root-dense-head start");
     let dense_head_out = if let Some(policy) = root_phase_resident_crown_policy {
         let resident = super::root_phases::RootTightenPhase::PhaseResidentCrown
             .run_phase_resident_in_place(graph, input, engine, deadline, &mut bootstrap, policy);
@@ -2598,6 +2753,7 @@ fn evaluate_root_borrowed(
             dd_zono.as_ref(),
         )
     };
+    crate::phase_telemetry::phase_marker("root-dense-head end");
     // #root-phases producer channel. Both legacy dense element counts and the
     // resident transaction's target count flow through one PhaseOutput, which
     // is the sole input to every later stale-box decision.
@@ -2617,12 +2773,14 @@ fn evaluate_root_borrowed(
     // the unstable-ReLU eligibility count. Disabled when whole-net Graph-MIP
     // is explicitly off or the category requests no MIP reservation; the leaf
     // oracle consumes child bounds directly and remains independent.
+    crate::phase_telemetry::phase_marker("root-mip-stash start");
     crate::beta_crown::graph_mip_leaf::stash_root_bounds_for_mip(
         graph,
         input,
         &verifier.config.phase_budget,
         &bootstrap.initial_node_bounds,
     );
+    crate::phase_telemetry::phase_marker("root-mip-stash end");
     // DIAGNOSTIC (NY_LPOPT_DUMP=<path>): dump the EXACT root state feeding every BaB
     // subdomain — the input eps-box + the full per-node pre-activation `[l,u]`
     // (`bootstrap.initial_node_bounds`, AFTER the optional CROWN-interm tighten) +
@@ -2633,9 +2791,17 @@ fn evaluate_root_borrowed(
     if let Ok(path) = std::env::var("NY_LPOPT_DUMP") {
         run_lpopt_dump(graph, input, &bootstrap, &path);
     }
+    // #bab-floor: the tightening ladder is finished. From here the root budget
+    // authority is the SPEC end -- the instance boundary minus the BaB reserve
+    // -- so the objective pass and every post-objective root consumer (the f64
+    // tail, the critical-GPU alpha lane, the output-conditioned refutation) are
+    // all bounded away from the reservation. Identical to the ladder deadline
+    // when the split is dark.
+    let deadline = root_spec_deadline;
     // #phase-telemetry (dark, NY_PHASE_TELEMETRY=1, print-only): bracket the
     // root objective evaluation. A start without an end in a log means the
     // phase timed out (the DeadlineExceeded arm) or errored.
+    crate::phase_telemetry::phase_marker("root-tighten-window end");
     crate::phase_telemetry::phase_marker("root-objective start");
     let RootObjectiveEvaluation {
         initial_output,
@@ -2653,6 +2819,7 @@ fn evaluate_root_borrowed(
         engine,
         &bootstrap,
         deadline,
+        root_window_split.map(|split| split.spec),
         root_intermediate_bounds_changed,
         root_dense_head_stage_selected,
     ) {
@@ -8322,6 +8489,13 @@ pub(super) fn compute_root_objective_bounds(
     engine: Option<&dyn GemmEngine>,
     bootstrap: &GraphBabBootstrap,
     global_deadline: Option<std::time::Instant>,
+    // `#bab-floor`: the share of the root window this pass was RESERVED by the
+    // caller's arbitration, or `None` when no arbitration is armed. Passed
+    // rather than re-read from the lever on purpose: the grace may only be
+    // rebased by a caller that actually carved a BaB reservation out of
+    // `global_deadline` first, and a parameter is the only way to state that
+    // precondition where a future second caller has to answer it.
+    root_spec_reserve: Option<std::time::Duration>,
     root_intermediate_bounds_changed: bool,
     root_dense_head_stage_selected: bool,
 ) -> Result<RootObjectiveEvaluation> {
@@ -8416,6 +8590,18 @@ pub(super) fn compute_root_objective_bounds(
             .mul_f32(0.9)
             .min(ROOT_SPEC_ALPHA_GRACE_CAP)
             .max(ROOT_SPEC_GRACE)
+    } else if let Some(reserve) = root_spec_reserve {
+        // #bab-floor: this pass owns a declared share of the root window, and
+        // `global_deadline` already excludes the BaB reservation behind it, so
+        // spend the share instead of `ROOT_SPEC_GRACE`. That 3 s is not a
+        // budget at all -- it is a constant grace granted on top of an ALREADY
+        // EXPIRED bootstrap alpha cap. On cifar100_2024 idx_2176 the pass blew
+        // it and its handler returns terminally, which is why reserving time
+        // for BaB is unreachable unless the pass that produces BaB's root
+        // bounds is given a share of its own. `resolve_root_objective_deadline`
+        // still caps this to `global_deadline`, so an over-large share cannot
+        // reach into the reservation; a small one hands the remainder to BaB.
+        reserve.max(ROOT_SPEC_GRACE)
     } else {
         ROOT_SPEC_GRACE
     };
@@ -10487,6 +10673,138 @@ const ROOT_COMPREHENSIVE_GPU_INTERM_MAX_TARGETS: usize = 16;
 const ROOT_COMPREHENSIVE_GPU_INTERM_MAX_DEVICE_BYTES: usize = 12 * 1024 * 1024 * 1024;
 const ROOT_COMPREHENSIVE_GPU_INTERM_MAX_SECS: u64 = 20;
 
+/// `#bab-floor` (DARK): resolve the root-window arbitration.
+///
+/// `None` -- absent, malformed, or an explicit `0.0` -- means no reservation
+/// exists and every caller keeps the deadline it has today, so the shipped
+/// ladder is byte-identical. The other two shares are read ONLY once this gate
+/// resolves above zero, which is what keeps their defaults inert.
+///
+/// The arithmetic itself lives in `ny_core::phase_window::split_root_window`
+/// (invariant I3) so it is unit-testable without a graph, a GPU, or a clock.
+fn root_bab_window_split(
+    window: std::time::Duration,
+    config: &BetaCrownConfig,
+) -> Option<ny_core::phase_window::RootWindowSplit> {
+    // `read_over_config`, not `read`: the scored entry point exports exactly
+    // one NY_*, so an env-only arbitration is unreachable in competition no
+    // matter what a search finds. The layering is the declared one — an
+    // admissible env value wins in BOTH directions, a PRESENT but malformed one
+    // suppresses the preset and falls to the declaration default (a typo is a
+    // kill switch, never a silent promotion), and absence defers to the preset.
+    //
+    // A config value the declaration rejects is a configuration mistake, and
+    // this reports it by declining the arbitration entirely rather than
+    // half-applying a split. Declining is the byte-identical shipped ladder.
+    let frac = |decl, value: Option<f64>| -> Option<f64> {
+        ny_levers::read_over_config(decl, value.map(ny_levers::LeverValue::F64))
+            .ok()?
+            .value
+            .as_f64()
+    };
+    let bab_frac = frac(
+        &ny_levers::decls::bab_budget::BAB_RESERVE_FRAC,
+        config.root_bab_reserve_frac,
+    )?;
+    if bab_frac <= 0.0 {
+        return None;
+    }
+    let spec_frac = frac(
+        &ny_levers::decls::bab_budget::ROOT_SPEC_FRAC,
+        config.root_spec_frac,
+    )
+    .unwrap_or(0.0);
+    let alpha_frac = frac(
+        &ny_levers::decls::bab_budget::ROOT_ALPHA_FRAC,
+        config.root_alpha_frac,
+    )
+    .unwrap_or(0.0);
+    Some(ny_core::phase_window::split_root_window(
+        window, bab_frac, spec_frac, alpha_frac,
+    ))
+}
+
+/// `#bab-floor`: turn a resolved split into the two boundaries the root
+/// pipeline runs on -- `(spec_end, tighten_end)`.
+///
+/// `spec_end` is the authority minus BaB's reservation; `tighten_end` is that
+/// minus the root objective pass's own share, and is what the tightening ladder
+/// divides. A `None` split returns the authority unchanged in both slots, which
+/// is what makes the dark arm byte-identical: every consumer keeps the exact
+/// deadline it has today.
+///
+/// Subtraction is `checked_sub` and falls back to the un-reserved boundary,
+/// because an `Instant` that cannot represent the subtraction is a clock
+/// pathology, not permission to invent a deadline in the past.
+fn root_split_boundaries(
+    authority: Option<std::time::Instant>,
+    split: Option<ny_core::phase_window::RootWindowSplit>,
+) -> (Option<std::time::Instant>, Option<std::time::Instant>) {
+    let Some(split) = split else {
+        return (authority, authority);
+    };
+    let spec_end = authority.map(|end| end.checked_sub(split.bab).unwrap_or(end));
+    let tighten_end = spec_end.map(|end| end.checked_sub(split.spec).unwrap_or(end));
+    (spec_end, tighten_end)
+}
+
+#[cfg(test)]
+mod bab_floor_split_tests {
+    use super::{root_bab_window_split, root_split_boundaries, BetaCrownConfig};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_unsplit_root_hands_every_consumer_the_same_deadline_it_has_today() {
+        let authority = Instant::now() + Duration::from_secs(72);
+        let (spec_end, tighten_end) = root_split_boundaries(Some(authority), None);
+        assert_eq!(
+            spec_end,
+            Some(authority),
+            "dark arm must not move the spec end"
+        );
+        assert_eq!(
+            tighten_end,
+            Some(authority),
+            "dark arm must not move the ladder end"
+        );
+        assert_eq!(root_split_boundaries(None, None), (None, None));
+    }
+
+    #[test]
+    fn the_reservation_comes_off_the_end_in_declared_order() {
+        // 72.892 s, the measured idx_2176 window: BaB first, then the spec pass,
+        // and the ladder gets what is left in front of both.
+        let window = Duration::from_secs_f64(72.892);
+        let authority = Instant::now() + window;
+        let split = ny_core::phase_window::split_root_window(window, 0.25, 0.15, 0.30);
+        let (spec_end, tighten_end) = root_split_boundaries(Some(authority), Some(split));
+        assert_eq!(spec_end, authority.checked_sub(split.bab));
+        assert_eq!(
+            tighten_end,
+            authority
+                .checked_sub(split.bab)
+                .and_then(|end| end.checked_sub(split.spec))
+        );
+        // The property the defect violated: BaB's slice is a fixed subtraction
+        // from the instance boundary, not the residue of the phases in front.
+        assert_eq!(
+            authority.saturating_duration_since(spec_end.unwrap()),
+            split.bab
+        );
+        assert!(tighten_end.unwrap() < spec_end.unwrap());
+    }
+
+    #[test]
+    fn the_split_is_dark_unless_its_own_gate_is_armed() {
+        // No environment is touched here on purpose: this asserts the SHIPPED
+        // resolution, which is what keeps the scored path byte-identical.
+        assert!(
+            root_bab_window_split(Duration::from_secs(72), &BetaCrownConfig::default(),).is_none(),
+            "NY_BAB_RESERVE_FRAC is unset by default and must reserve nothing"
+        );
+    }
+}
+
 /// #comprehensive-rows-probe (measurement-only, `NY_ROOT_COMP_GPU_INTERM_ROWS`).
 ///
 /// The comprehensive sweep is the ONLY mechanism measured to reach every eligible
@@ -11283,6 +11601,81 @@ mod root_crown_interm_tests {
         ));
     }
 
+    /// #root-window-attribution: the span between `graph-bab-bootstrap end`
+    /// and `root-objective start` must stay FULLY bracketed, so a phase log
+    /// partitions it with no residue. Every consumer in the window carries a
+    /// `start`/`end` pair, the pairs appear in execution order, all of them
+    /// nest inside the `root-tighten-window` bracket, and that bracket closes
+    /// immediately before the pre-existing `root-objective start` marker.
+    ///
+    /// Source-text assertion on purpose: the property being defended is that
+    /// a future edit cannot add a tenth-of-a-second-scale consumer into this
+    /// window without also naming it. Needles are assembled at run time from
+    /// `format!`/`concat!`, so the escaped literals in THIS test never match
+    /// the production call sites they assert on.
+    #[test]
+    fn root_tighten_window_is_fully_bracketed_by_phase_markers() {
+        let source = include_str!("root.rs").replace("\r\n", "\n");
+        let at = |name: &str, edge: &str| -> usize {
+            let needle = format!("phase_marker(\"{name} {edge}\")");
+            assert_eq!(
+                source.matches(&needle).count(),
+                1,
+                "exactly one `{name} {edge}` marker must exist"
+            );
+            source.find(&needle).expect("marker present")
+        };
+
+        // Execution order of every consumer between the two known markers.
+        // Most are dark under the shipped cifar100_2024 preset, which is
+        // exactly why BOTH edges are required: a lever that declined in 0 ms
+        // and a lever that ran for 6 s are otherwise indistinguishable in a
+        // phase log, and only the pair proves which one happened.
+        const WINDOW_PHASES: [&str; 10] = [
+            "root-stabilize-and-fix",
+            "root-ddzono-interm-intersect",
+            "root-fchead-tighten",
+            "root-interm-alpha",
+            "root-joint-interm-alpha",
+            "root-comprehensive-interm",
+            "root-wide-demanded-interm",
+            "root-sparse-interm",
+            "root-dense-head",
+            "root-mip-stash",
+        ];
+
+        let window_start = at("root-tighten-window", "start");
+        let window_end = at("root-tighten-window", "end");
+        let objective_start = at("root-objective", "start");
+        assert!(
+            window_start < window_end && window_end < objective_start,
+            "the window bracket must open and close before the root objective pass"
+        );
+
+        let mut cursor = window_start;
+        for phase in WINDOW_PHASES {
+            let start = at(phase, "start");
+            let end = at(phase, "end");
+            assert!(
+                cursor < start && start < end && end < window_end,
+                "`{phase}` must be bracketed in order inside the window"
+            );
+            cursor = end;
+        }
+
+        // No residue at the tail: the window closes on the statement directly
+        // above the pre-existing `root-objective start` marker.
+        let adjacency = concat!(
+            "phase_marker(\"root-tighten-window end\");\n    ",
+            "crate::phase_telemetry::phase_marker(\"root-objective start\")"
+        );
+        assert_eq!(
+            source.matches(adjacency).count(),
+            1,
+            "the window bracket must close immediately before `root-objective start`"
+        );
+    }
+
     #[test]
     fn root_intermediate_change_summary_is_wired_to_every_consumer() {
         // Normalize line endings before matching: several needles below span
@@ -11295,8 +11688,14 @@ mod root_crown_interm_tests {
             "root_intermediate_tightening_changed(",
         ]
         .concat();
+        // #bab-floor threaded the reserved root-objective share in between
+        // `deadline` and the two summaries. The gate's claim is unchanged --
+        // the root-objective request consumes the SHARED summary rather than
+        // reconstructing it -- so the needle keeps both summaries adjacent and
+        // additionally pins that the spec reserve is passed, not re-read.
         let objective_argument = [
-            "deadline,\n        root_intermediate_bounds_changed,\n",
+            "deadline,\n        root_window_split.map(|split| split.spec),\n",
+            "        root_intermediate_bounds_changed,\n",
             "        root_dense_head_stage_selected,",
         ]
         .concat();

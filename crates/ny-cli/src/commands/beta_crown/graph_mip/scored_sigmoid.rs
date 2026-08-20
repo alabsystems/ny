@@ -263,7 +263,7 @@ impl CertifiedScoredF32Sigmoid {
         // bounded by the exact midpoint of these adjacent f32 values. Widen
         // one f64 ULP in the never-stricter direction; no host transcendental
         // or platform float-to-int conversion is involved.
-        let midpoint = (f64::from(boundary_input) + f64::from(outside_neighbor)) * 0.5;
+        let midpoint = f64::from(boundary_input).midpoint(f64::from(outside_neighbor));
         let rhs = match sense {
             ScoredF32SigmoidPreimageSense::AtLeast => midpoint.next_down(),
             ScoredF32SigmoidPreimageSense::AtMost => midpoint.next_up(),

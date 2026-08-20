@@ -114,7 +114,7 @@ impl GraphNetwork {
         let direct_requested = spec_alpha_direct_enabled();
         let mut direct_active = direct_requested;
         let mut best_direct_alpha: Option<GraphAlphaState> = None;
-        if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+        if crate::beta_gpu_probe_armed() {
             if direct_requested {
                 eprintln!(
                     "[spec-obj-opt] iterations={} relus={} od={} direct=true",
@@ -163,7 +163,7 @@ impl GraphNetwork {
                     best_objective = objective;
                     best_direct_alpha = Some(alpha_state.clone());
                 }
-                if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+                if crate::beta_gpu_probe_armed() {
                     eprintln!(
                         "[spec-obj-opt] iter={iter} source=direct objective={objective:.9} best={best_objective:.9}"
                     );
@@ -180,7 +180,7 @@ impl GraphNetwork {
                     direct_active = false;
                     best_direct_alpha = None;
                     best_objective = f32::NEG_INFINITY;
-                    if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+                    if crate::beta_gpu_probe_armed() {
                         eprintln!(
                             "[spec-obj-opt] iter={iter} source=direct unavailable; legacy fallback"
                         );
@@ -533,7 +533,7 @@ impl GraphNetwork {
                 match crate::beta_crown::engine::graph::propagation::batched::wide_alpha_true::true_alpha_grads_for_row_gpu_until(
                 gpu_replay_ops.as_ref(),
                 &segments, spec_row, &[], &in_lo, &in_hi, relu_names.len(), gpu_lb,
-                std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1"),
+                crate::beta_gpu_probe_armed(),
                 deadline,
             ) {
                 Some(mut g) => {
@@ -564,7 +564,7 @@ impl GraphNetwork {
             relus = relu_names.len(),
             "Per-disjunct α-CROWN: GPU analytic spec-objective gradients (step 3b-ii)"
         );
-        if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+        if crate::beta_gpu_probe_armed() {
             eprintln!("[spec-obj-grad] GPU SUCCESS relus={}", relu_names.len());
         }
         Some(GpuSpecObjectiveEvaluation {

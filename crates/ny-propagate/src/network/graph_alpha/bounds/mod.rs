@@ -51,6 +51,10 @@ impl GraphAlphaCollectionOutcome {
 
 mod alpha;
 mod alpha_dag_dispatch;
+// Bug #19 budget-monotonicity: shrink-only publication of the DAG-alpha root
+// intermediate map (NY_CENSUS_MONOTONE=1 / NY_CENSUS_COMMIT_TELEMETRY=1,
+// default OFF => byte-identical). See census_commit.rs module docs.
+mod census_commit;
 
 pub(in crate::network::graph_alpha) use alpha::crown_ibp_collector_cap;
 pub(crate) use alpha::AlphaReferenceBoundsSource;
@@ -69,6 +73,10 @@ pub(in crate::network::graph_alpha) use alpha_explicit::{
     run_with_m1_alpha_trace, M1AlphaBudgetOutcome, M1AlphaTraceEvent,
 };
 pub(crate) mod budget_policy;
+// #cgan-stacked-backward (NY_CGAN_STACKED_BACKWARD=1, default OFF =>
+// byte-identical): shared-prefix stacked backward planner for cgan trunk
+// graphs. See docs/CGAN_STACKED_BACKWARD_2026-08-19.md.
+mod cgan_stacked;
 mod crown;
 mod crown_repropagate;
 #[cfg(test)]

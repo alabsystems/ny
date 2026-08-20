@@ -688,6 +688,7 @@ fn test_batched_relu_full_pipeline_bit_identical_multi_layer_lsnc_step2() {
 /// every premise-satisfying sample of each child subdomain.
 #[test]
 fn graft_composed_bound_encloses_true_forward_on_split_conv_chain_mo_graft() {
+    let _env = crate::tests::lock_env_shared();
     use crate::beta_crown::branching::GraphNeuronConstraint;
     use crate::layers::Conv2dLayer;
     use ndarray::{Array, IxDyn};
@@ -1321,6 +1322,7 @@ fn chain_wide_replacement_oracle_body() {
 /// fixture/domain/row. Extraction and sampling coverage must be non-vacuous.
 #[test]
 fn chain_wide_replacement_oracle_pure_conv_chains_is_sound() {
+    let _env = crate::tests::lock_env_shared();
     chain_wide_replacement_oracle_body();
 }
 

@@ -251,9 +251,11 @@ pub(crate) fn crown_backward_step_patches(
 /// and then times out where `97fb4bd6a` proved it in 35.7 s.
 ///
 /// `NY_PATCHES_FINITE_EXPIRY=1` decides the same refusal by EXPIRY instead, so a
-/// live deadline keeps the native route. It is dark because it was MEASURED not
-/// to convert: 3 sat / 17 timeout on the 20-row biasfield subset in both arms,
-/// identical row by row. Armed, the declines do disappear from the logs and
+/// live deadline keeps the native route. STALENESS NOTE (2026-08-19): the
+/// lever now SHIPS ARMED (default true, `=0` kill switch; Provenance::Measured
+/// 8c393486c) — the "dark because measured not to convert" record below is the
+/// original biasfield null kept for history, not the current state: 3 sat / 17
+/// timeout on the 20-row biasfield subset in both arms, identical row by row. Armed, the declines do disappear from the logs and
 /// tight work runs — the row then exhausts its budget inside
 /// `FaerCpuGemmEngine::gemm_f64_with_deadline` instead, which says the remaining
 /// gap is GPU routing for that backward, not this gate.
@@ -273,10 +275,21 @@ fn hard_finite_authority_refuses_patches(
     if !deadline_is_hard {
         return false;
     }
-    if expiry_authority_armed() {
-        return deadline.is_some_and(|limit| Instant::now() >= limit);
-    }
-    true
+    let refuses = if expiry_authority_armed() {
+        deadline.is_some_and(|limit| Instant::now() >= limit)
+    } else {
+        true
+    };
+    // [deadline-preserve] BUG #18 (docs/DEADLINE_PRESENCE_FIX_2026-08-19.md):
+    // saved-vs-discarded engagement counts for the sequential-lane mate of the
+    // patches/alpha set. Recorded after the decision; routing unchanged, no
+    // bound value touched — observation only. Rate-limited (power-of-two).
+    static SEQ_PRESERVE: crate::network::core::graph::backward_helpers::DeadlinePreserveCounters =
+        crate::network::core::graph::backward_helpers::DeadlinePreserveCounters::new(
+            "patches-alpha-seq",
+        );
+    SEQ_PRESERVE.record(refuses);
+    refuses
 }
 
 /// Latched once per process.

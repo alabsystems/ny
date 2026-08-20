@@ -246,4 +246,187 @@ Exact-\"1\" arming; anything else leaves the lane byte-for-byte as it is today."
             site: "crates/ny-propagate/src/margin_row/gpu_seam/batch.rs",
         }],
     };
+
+    /// `NY_MARGIN_ROW_CLIP_ROWS` — retain the clip halfspace rows on the
+    /// margin-row root gates.
+    pub MARGIN_ROW_CLIP_ROWS = LeverDecl {
+        name: "NY_MARGIN_ROW_CLIP_ROWS",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::None,
+        doc: "Retains the clip halfspace rows on `LayerGates::clip_rows` instead of dropping them. Exact `1` arms it; absence and every other value leave `clip_rows` at `None`, which is byte-identical to the struct's history for every existing consumer. Retention is PURE MEMORY as declared: nothing reads these rows yet, so the armed arm cannot change a bound or a verdict either — MoatRisk::None rather than Low, and the moment a consumer appears that classification must be revisited along with this doc.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-off, and the armed arm only retains rows no code                      path consumes; there is nothing yet to measure and nothing                      it can move",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "retain clip halfspace rows for a future consumer; latched once per process",
+            site: "crates/ny-propagate/src/margin_row/root.rs:clip_rows_enabled",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_ALPHA_OPT` — the margin-row lane's own alpha optimization.
+    pub MARGIN_ROW_ALPHA_OPT = LeverDecl {
+        name: "NY_MARGIN_ROW_ALPHA_OPT",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Arms the margin-row lane's own alpha ascent. Exact `1` arms it; absence and every \
+other value leave it dark. It changes which relaxation the lane publishes a bound \
+from, so it is verdict-affecting on the authoritative margin-row route.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "dark exact-one Debug opt-in landed with 043d7ff75; no armed-vs-unarmed \
+                     scored-row A/B is retained yet",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "arm the lane-local alpha ascent",
+            site: "crates/ny-propagate/src/margin_row/alpha_opt.rs",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_ALPHA_ITERS` — iteration count for that ascent.
+    pub MARGIN_ROW_ALPHA_ITERS = LeverDecl {
+        name: "NY_MARGIN_ROW_ALPHA_ITERS",
+        kind: LeverKind::UsizeTrimmed,
+        default: DefaultSpec::U64(8),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Iterations for the margin-row alpha ascent. Whitespace is trimmed; absent or \
+malformed leaves 8, and the reader CLAMPS the resolved value to 1..=64, so values \
+outside that range are pulled to the nearest bound rather than rejected. Inert \
+unless NY_MARGIN_ROW_ALPHA_OPT is armed.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert while its parent lever is dark, which is the shipped state",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "iteration count for the lane-local alpha ascent",
+            site: "crates/ny-propagate/src/margin_row/alpha_opt.rs:env_iters",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_ALPHA_SECS` — wall-clock slice for that ascent.
+    pub MARGIN_ROW_ALPHA_SECS = LeverDecl {
+        name: "NY_MARGIN_ROW_ALPHA_SECS",
+        kind: LeverKind::Secs,
+        default: DefaultSpec::Secs(20.0),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Seconds the margin-row alpha ascent may spend. Absent, malformed, non-finite and \
+non-positive values all leave 20.0. Inert unless NY_MARGIN_ROW_ALPHA_OPT is armed; \
+when armed it trades budget away from the rest of the lane.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert while its parent lever is dark, which is the shipped state",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "wall-clock slice for the lane-local alpha ascent",
+            site: "crates/ny-propagate/src/margin_row/alpha_opt.rs:env_secs",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_K_ADAPT` — override the preset's adaptive-k choice.
+    pub MARGIN_ROW_K_ADAPT = LeverDecl {
+        name: "NY_MARGIN_ROW_K_ADAPT",
+        kind: LeverKind::Bool,
+        // Unset, NOT Bool(false): absence must fall through to the PRESET's
+        // choice (`k_adaptive_preset()`), which is neither on nor off a priori.
+        // A Bool default here would silently override the preset with `false`.
+        default: DefaultSpec::Unset,
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Forces the margin-row adaptive-k width policy on (`1`) or off (`0`), overriding \
+the preset. Absent, malformed and every other value defer to the preset, so this \
+is a three-state override rather than a two-state gate — which is why the default \
+is Unset and the reader matches on the resolved VALUE rather than calling \
+`as_bool()`.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "an explicit A/B override for a preset-chosen policy; the unset path is \
+                     the shipped behaviour and is byte-identical",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "three-state override of the preset adaptive-k choice",
+            site: "crates/ny-propagate/src/margin_row/bab.rs",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLIP` — the margin-row Clip-Verify half.
+    pub MARGIN_ROW_CLIP = LeverDecl {
+        name: "NY_MARGIN_ROW_CLIP",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Arms the margin-row lane's Clip-Verify half. Exact `1` arms it; absence and every \
+other value leave it dark. Verdict-affecting on the authoritative margin-row route: \
+it changes which bound the lane publishes. Latched once per process.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "dark exact-one Debug opt-in landed with 043d7ff75; no scored-row A/B retained",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "arm the Clip-Verify half of the margin-row lane",
+            site: "crates/ny-propagate/src/margin_row/bab.rs",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLIP_INTERM` — intermediate re-concretization in that half.
+    pub MARGIN_ROW_CLIP_INTERM = LeverDecl {
+        name: "NY_MARGIN_ROW_CLIP_INTERM",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Re-concretizes intermediate bounds inside the margin-row Clip-Verify half. Exact \
+`1` arms it; absence and every other value leave it dark. Latched once per process.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "dark exact-one Debug opt-in; inert unless the Clip-Verify half is armed",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "arm intermediate re-concretization in the Clip-Verify half",
+            site: "crates/ny-propagate/src/margin_row/engine.rs",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLIP_TOPK` — unstable neurons per layer to re-concretize.
+    pub MARGIN_ROW_CLIP_TOPK = LeverDecl {
+        name: "NY_MARGIN_ROW_CLIP_TOPK",
+        kind: LeverKind::U64,
+        default: DefaultSpec::U64(20),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+How many unstable neurons per layer the Clip-Verify half re-concretizes. Absent or \
+malformed leaves 20, which the reader's own comment records as matching \
+alpha-beta-CROWN's `bab.clip.interm_topk` default. The parser does NOT trim, so a \
+padded value is rejected to the default — preserved verbatim from the reader. \
+Latched once per process; inert unless NY_MARGIN_ROW_CLIP_INTERM is armed.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert while its parent lever is dark, which is the shipped state",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "per-layer re-concretization width for the Clip-Verify half",
+            site: "crates/ny-propagate/src/margin_row/engine.rs:clip_interm_topk",
+        }],
+    };
 }

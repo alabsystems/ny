@@ -380,34 +380,47 @@ fn decide_cuda(
 ) -> CudaDecision {
     let visible_device = matches!(device_probe, CudaDeviceProbe::Count(count) if count > 0);
     let engine_candidate = !disabled && visible_device && engine_libraries_present;
-    // TWO INDEPENDENT REASONS TO SKIP THE WGPU PROBE, and they are not the same
-    // reason. Conflating them cost this repository the whole sound-f32 lane.
+    // THE ONLY REASON TO SKIP THE PROBE IS SAFETY. A driver-init/symbol error
+    // means the NVIDIA userspace stack is unhealthy and Vulkan would provoke the
+    // same stack, so fail safe. That is `Indeterminate` specifically.
+    // `DriverAbsent` and a valid `Count(0)` are NOT errors — they say no NVIDIA
+    // device is available to this process, so an AMD/Intel/Metal adapter may
+    // legitimately be found. The original comment said exactly this and the
+    // predicate then ignored it.
     //
-    // 1. REDUNDANCY. A second graphics context beside a CUDA engine we are
-    //    actually going to use is waste. That is `engine_candidate` — the engine
-    //    is compiled in, enabled, has a visible device AND its libraries. If any
-    //    of those is false the CUDA engine will not run, so there is nothing to
-    //    be redundant WITH and every reason to look at the other adapter.
+    // WHY REDUNDANCY IS NOT A REASON, which is the substantive change here.
+    // CUDA and wgpu are not two implementations of one capability; they populate
+    // DIFFERENT capability slots, and ny already registers them separately
+    // (`sound_f64_gemm`, `fast_f32_gemm`, `sound_gpu_gate` in ny-cli/src/main.rs).
+    // CUDA owns the f64 GEMM seams and the fast f32 GEMM (cuBLAS Sgemm is
+    // measured 2-3.4x faster than the WGSL shader). But
+    // `provides_sound_intermediate_sweep` has exactly ONE implementation in the
+    // tree — `ny-gpu/src/wgpu_device/ops/crown_backward.rs` — and
+    // `CudaGemmEngine`'s `GpuCrownBackward` impl does not override the `false`
+    // default in `ny-core/src/gemm.rs`. So the comprehensive row-chunked root
+    // sweep, which `configs/vnncomp25/cifar100_2024.yaml` ARMS by default and
+    // which is the mechanism behind the 0/99 -> 95/99 root census, gates on a
+    // capability only wgpu provides:
     //
-    // 2. SAFETY. A driver-init/symbol error means the NVIDIA userspace stack is
-    //    unhealthy, and Vulkan would provoke the same stack. That is
-    //    `Indeterminate` specifically. `DriverAbsent` and a valid `Count(0)` are
-    //    NOT errors: they say no NVIDIA device is available to this process, so
-    //    an AMD/Intel/Metal adapter may legitimately be found.
+    //     if !gpu.provides_sound_gpu_crown() || !gpu.provides_sound_intermediate_sweep()
+    //         { return RootIntermediateSweepAttempt::CleanDecline; }
     //
-    // This used to read `nvidia_kernel_driver_present || ...`, which made mere
-    // driver PRESENCE skip the probe unconditionally. On a healthy NVIDIA host
-    // that meant the wgpu adapter was never probed even when CUDA was disabled
-    // by NY_NO_CUDA, or absent from the build, or missing its libraries — so the
-    // lane fell through to `cpu-only` / CPU f64 while a usable GPU sat idle, and
-    // `NY_NO_CUDA=1 NY_WGPU_CROWN=1` could not reach the WGPU proof route at all.
-    // docs/VNNCOMP_CRITICAL_PATH_2026-08-12.md recorded that as evidence there was
-    // "no GPU f32 CROWN lane for the bound path at all"; it was this predicate.
+    // Skipping the probe because a CUDA engine exists therefore did not avoid a
+    // redundant context — it silently deleted the sweep from every NVIDIA host,
+    // while the preset went on claiming it was armed. One extra graphics context
+    // is a cheap price for the repository's single largest root-bound result.
+    //
+    // The former predicate also read `nvidia_kernel_driver_present || ...`, so
+    // mere driver PRESENCE skipped the probe even with CUDA disabled by
+    // NY_NO_CUDA or absent from the build. That is why
+    // docs/VNNCOMP_CRITICAL_PATH_2026-08-12.md's `NY_NO_CUDA=1 NY_WGPU_CROWN=1`
+    // experiment landed on CPU f64 and concluded "there is no GPU f32 CROWN lane
+    // for the bound path at all". The lane existed; the adapter was never probed.
     let unhealthy_nvidia_userspace = matches!(device_probe, CudaDeviceProbe::Indeterminate);
     let _ = nvidia_kernel_driver_present;
     CudaDecision {
         engine_candidate,
-        avoid_wgpu_probe: unhealthy_nvidia_userspace || engine_candidate,
+        avoid_wgpu_probe: unhealthy_nvidia_userspace,
     }
 }
 
@@ -649,6 +662,11 @@ mod tests {
                     avoid_wgpu_probe: false,
                 },
             ),
+            // CUDA is a real candidate here — and wgpu is STILL probed. They
+            // populate different capability slots; only wgpu implements
+            // `provides_sound_intermediate_sweep`, which the shipped cifar100
+            // preset arms. Skipping the probe here deleted that sweep from every
+            // NVIDIA host.
             (
                 false,
                 CudaDeviceProbe::Count(1),
@@ -656,7 +674,7 @@ mod tests {
                 false,
                 CudaDecision {
                     engine_candidate: true,
-                    avoid_wgpu_probe: true,
+                    avoid_wgpu_probe: false,
                 },
             ),
             // Device visible but CUDA libraries incomplete: the engine cannot

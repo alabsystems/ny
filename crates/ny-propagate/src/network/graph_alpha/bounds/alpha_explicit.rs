@@ -722,6 +722,48 @@ impl GraphNetwork {
     /// budget) keeps the single-pass path byte-for-byte. Peak memory is bounded by
     /// the chunk; a chunked node that is still too slow degrades to IBP via the
     /// per-node deadline — sound either way (both enclose the reachable set).
+    ///
+    /// #patches-dense-peak — THE REROUTE IS CURRENTLY UNREACHABLE FROM THIS LANE
+    /// WHENEVER A DEADLINE IS PRESENT. Recorded here so the next attempt does not
+    /// re-land the predicate widening that was already tried and reverted.
+    ///
+    /// `cifar_bias_field_46` / `/layers.4/Relu` degrades with
+    /// `CpuMemoryExceeded { site: "patches full dense materialization",
+    /// required: 6_445_080_584, budget: 6_442_450_944 }`, caught by this
+    /// function's caller at the `Err(e) if matches!(.., CpuMemoryExceeded)` arm
+    /// of `collect_selected_crown_bounds_with_alpha_mode` and answered with the
+    /// reference bound. Two independent gates must fall for the objective-chunk
+    /// reroute to replace that fallback, and only the FIRST is in this crate's
+    /// budget policy:
+    ///
+    /// 1. `graph_native_target_exceeds_budget` charges the `[dim x dim]`
+    ///    identity pair (2 GiB here) while the failing site charges six
+    ///    `[rows x in_dim]` matrices (6 GiB here) — a 3x under-charge that is
+    ///    false regardless of the `crown_ibp_target_can_start_in_patches`
+    ///    exemption. See the `#patches-dense-peak` note on that predicate for
+    ///    the exact decomposition and the honest cost model.
+    ///
+    /// 2. Even with `Some(C)` returned here, the chunk request only selects the
+    ///    driver — it does not run it. `propagate_crown_to_node_core` hard-wires
+    ///    `deadline_is_hard = per_node_deadline.is_some()`
+    ///    (target_backward.rs), and `propagate_crown_to_node_chunked` opens with
+    ///    an unconditional `if deadline_is_hard { return Err(
+    ///    UnsupportedConfiguration("finite objective-chunk target backward is
+    ///    not cooperatively bounded ..")) }`. Every scored run carries a
+    ///    deadline, so on this benchmark the reroute is refused at driver entry
+    ///    and `UnsupportedConfiguration` lands on the SAME reference-bound arm
+    ///    the memory error did. The target degrades either way; only the log
+    ///    line changes.
+    ///
+    /// That second guard is the same PRESENCE-not-EXPIRY shape the
+    /// `NY_PATCHES_FINITE_EXPIRY` family repairs, and the crate already owns the
+    /// helper it should use —
+    /// `network::core::sequential::crown::patches_step::hard_finite_authority_refuses_patches(deadline_is_hard, deadline)`,
+    /// which returns `true` only once the deadline has actually EXPIRED when the
+    /// authority is armed. The chunk driver already re-checks expiry at entry
+    /// and polls between chunks, so deciding this refusal by expiry costs no
+    /// interruptibility. Until that one call site changes, widening the budget
+    /// predicate here buys nothing, so it is intentionally left alone.
     fn alpha_target_chunk_override(
         &self,
         node_name: &str,

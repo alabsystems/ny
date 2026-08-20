@@ -15,6 +15,22 @@
 //! As a linear op, CROWN-IBP equivalence should hold (within FP tolerance).
 //!
 //! Part of #3104: last remaining binary ops CROWN proptest gap (Concat).
+//!
+//! WALL-CLOCK POLICY FOR THIS FILE: every `#[ntest::timeout(..)]` below is a
+//! HANG SENTINEL, not a performance assertion, and the walls are deliberately
+//! far above these tests' isolated cost (well under a second each).
+//!
+//! They have to be. These tests participate in the `ny-test-utils` env lock --
+//! either holding the shared half so a concurrent writer cannot leak
+//! `NY_DENSE_BUDGET_MB` into them mid-run, or holding the exclusive half
+//! themselves. Waiting on that lock is CORRECT behaviour, not a hang, and the
+//! wait can be long: `margin_row`'s `root_build_bit_identical_across_conv_grain`
+//! holds the exclusive half across a loop that runs over 60 seconds. A 10s wall
+//! turns that legitimate wait into a spurious failure -- measured, 17 of 20
+//! full-suite failures at --test-threads=8 were exactly this, with zero
+//! remaining `crown=-inf` leaks.
+//!
+//! MEASURE BEFORE LOWERING THEM.
 
 use crate::layers::binary_ops::ConcatLayer;
 use crate::LinearBounds;
@@ -48,7 +64,7 @@ proptest! {
     /// For Y = concat(A, B) with A: [2], B: [2], output: [4].
     /// Concat is linear so CROWN-IBP equivalence should hold.
     /// Verifies both CROWN-IBP equivalence and sampling soundness.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_concat_crown_identity_same_size(
         la0 in -5.0f32..5.0, da0 in 0.01f32..3.0,
@@ -56,6 +72,13 @@ proptest! {
         lb0 in -5.0f32..5.0, db0 in 0.01f32..3.0,
         lb1 in -5.0f32..5.0, db1 in 0.01f32..3.0,
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let ua0 = (la0 + da0).min(5.0);
         let ua1 = (la1 + da1).min(5.0);
         let ub0 = (lb0 + db0).min(5.0);
@@ -147,7 +170,7 @@ proptest! {
     /// For Y = concat(A, B) with A: [3], B: [2], output: [5].
     /// Tests the asymmetric split path — coefficient matrix columns [0..3] → A,
     /// columns [3..5] → B.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_concat_crown_identity_different_sizes(
         la0 in -5.0f32..5.0, da0 in 0.01f32..3.0,
@@ -156,6 +179,13 @@ proptest! {
         lb0 in -5.0f32..5.0, db0 in 0.01f32..3.0,
         lb1 in -5.0f32..5.0, db1 in 0.01f32..3.0,
     ) {
+        // Excluded from overlapping an env WRITER. The leak is specific and
+        // known: `NY_DENSE_BUDGET_MB`, read process-globally by
+        // `crown_memory::explicit_cpu_crown_dense_budget_bytes`. A concurrent
+        // test setting it to 0 starves this one's CROWN into an IBP fallback,
+        // which surfaces here as `crown=-inf` -- an enclosure violation that
+        // is really a race. Observed failing at --test-threads=4 and =8.
+        let _env = crate::tests::lock_env_shared();
         let ua0 = (la0 + da0).min(5.0);
         let ua1 = (la1 + da1).min(5.0);
         let ua2 = (la2 + da2).min(5.0);
@@ -251,7 +281,7 @@ proptest! {
     ///
     /// With A: [2], B: [2], output: [4], we apply k: [1, 4] × [4] → [1]
     /// representing a weighted sum of the concat output.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_concat_crown_nonidentity(
         la0 in -3.0f32..3.0, da0 in 0.01f32..2.0,
@@ -332,7 +362,7 @@ proptest! {
     /// Tests the bias-halving directed rounding path: when incoming bounds have
     /// non-zero bias, the bias is split as lower_b/2 (rounded down) and
     /// upper_b/2 (rounded up) between branches. Verifies the split remains sound.
-    #[ntest::timeout(10000)]
+    #[ntest::timeout(300000)]
     #[test]
     fn soundness_concat_crown_nonidentity_with_bias(
         la0 in -3.0f32..3.0, da0 in 0.01f32..2.0,

@@ -817,6 +817,35 @@ pub struct AlphaCrownConfig {
     #[serde(default)]
     pub joint_interm_alpha_every: usize,
 
+    /// #envelope-grad: use the concretization-argmin alpha-gradient rule instead
+    /// of the shipped local rule.
+    ///
+    /// The shipped rule is `SUM_j [A[j,i]]_+ * l_i`. Every factor is
+    /// sign-definite — `l_i < 0` by the unstable guard, and only `A > 0` terms
+    /// are admitted — so it is `<= 0` for every neuron, objective and iteration.
+    /// Adam can then only DECREASE alpha, monotonically to the 0 clamp; it
+    /// carries no direction, which is why the measured lr sweep 0.25 / 0.05 /
+    /// 0.01 leaves the bound BIT-IDENTICAL. Machine-checked in
+    /// `crates/ny-cert/proofs/lean/NyProof/AlphaGradientDefect.lean`.
+    ///
+    /// The envelope rule swaps the factor for `clamp(h_hat(x*), l, u)`, the
+    /// relaxed pre-activation at the binding row's concretization argmin. That
+    /// value CAN be positive, so the field is not sign-definite and alpha can
+    /// rise. Measured 2026-08-17 on cifar100 at the official budget: the census
+    /// MOVES for the first time in this campaign (idx_8600 83/99 -> 85/99 on a
+    /// row that is 83/99 in every other arm; idx_6659 67/99 -> 78/99), against
+    /// every prior alpha lever leaving it bit-identical. Mixed sign across rows
+    /// and NO verdict conversion is claimed.
+    ///
+    /// Soundness-neutral: gradients only select which alpha the ascent lands on,
+    /// and every alpha in `[0,1]` is a certified-sound relaxation
+    /// (`alpha_sound_regardless`). A wrong gradient costs tightness, never
+    /// validity. The real risk is SCHEDULE — the rule adds a point-forward pass
+    /// per iteration — which is why this is a per-benchmark key rather than a
+    /// compiled default.
+    #[serde(default)]
+    pub alpha_envelope_grad: bool,
+
     /// Optional absolute ceiling, in seconds, on the same aggregate reference-
     /// refresh pool. The effective pool is
     /// `min(remaining * reference_refresh_fraction, max_secs)`.
@@ -984,6 +1013,7 @@ impl Default for AlphaCrownConfig {
             reference_refresh_fraction: default_reference_refresh_fraction(),
             // Default OFF: byte-identical to the historical improved_output gate.
             joint_interm_alpha_every: 0,
+            alpha_envelope_grad: false,
             reference_refresh_max_secs: None,
             // Preserve the historical forward-linear -> CROWN-IBP refusal
             // chain unless a measured category opts into the cheaper sound

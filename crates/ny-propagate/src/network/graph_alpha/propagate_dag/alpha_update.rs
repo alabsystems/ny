@@ -296,7 +296,7 @@ pub(super) fn update_all_alphas(
             }
         }
     }
-    if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+    if crate::beta_gpu_probe_armed() {
         // #w4-root-alpha diagnosis: did THIS iteration's ReLU updates land in
         // the runtime alpha state? (root-state n_interior=0 with nonzero GPU
         // grads means either dead updates or a discarded state copy.)

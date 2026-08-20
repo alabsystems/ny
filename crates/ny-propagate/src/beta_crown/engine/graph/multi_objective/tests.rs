@@ -620,6 +620,7 @@ fn unchanged_root_boxes_keep_historical_spec_request() {
         None,
         &bootstrap,
         None,
+        None,
         false,
         false,
     )
@@ -1147,6 +1148,7 @@ fn test_multi_objective_root_fallback_respects_warmup_deadline_4260() {
         None,
         &bootstrap,
         global_deadline,
+        None,
         false,
         false,
     )
@@ -1199,6 +1201,7 @@ fn test_multi_objective_root_fallback_expired_global_authority_is_terminal_4260(
         None,
         &bootstrap,
         Some(expired),
+        None,
         false,
         false,
     ) {

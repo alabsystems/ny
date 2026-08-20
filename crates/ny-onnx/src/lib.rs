@@ -157,10 +157,10 @@ pub use model::{
 };
 /// Network optimization passes (e.g., peeling off final softmax layers).
 pub use optimization::{
-    load_and_peel_terminal_softmax_single_group,
+    admit_pre_softmax_attack_scoring, load_and_peel_terminal_softmax_single_group,
     load_and_peel_terminal_softmax_single_group_with_original_graph, peel_off_last_softmax_layer,
     peel_off_terminal_sigmoid_auto, strip_terminal_softmax, PeelOffReport,
-    STRIP_TERMINAL_SOFTMAX_ENV,
+    PreSoftmaxAttackAdmission, STRIP_TERMINAL_SOFTMAX_ENV,
 };
 /// Whisper model loading, encoder extraction, and block-compatibility APIs.
 pub use whisper::{

@@ -13,9 +13,22 @@ use std::path::{Path, PathBuf};
 use crate::vnnlib::load_vnnlib;
 
 /// Require the sparse-cloned benchmark root in the repo checkout.
+///
+/// Both spellings are accepted: upstream's repo is `vnncomp2026_benchmarks`, so
+/// a plain clone lands there, while the sibling corpora in this tree sit under
+/// their bare year. Hardcoding one made this fixture "missing" against a corpus
+/// that was present under the other name.
 fn benchmark_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let root = manifest.join("../../benchmarks/vnncomp2026_benchmarks/benchmarks");
+    let candidates = [
+        manifest.join("../../benchmarks/vnncomp2026_benchmarks/benchmarks"),
+        manifest.join("../../benchmarks/vnncomp2026/benchmarks"),
+    ];
+    let root = candidates
+        .iter()
+        .find(|candidate| candidate.is_dir())
+        .unwrap_or(&candidates[0])
+        .clone();
     assert!(
         root.is_dir(),
         "VNN-COMP 2026 benchmark fixture root is missing at {}; \

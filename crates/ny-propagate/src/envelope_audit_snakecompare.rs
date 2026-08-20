@@ -142,7 +142,7 @@ fn snake_candidates(
     grid_samples: usize,
     edge_samples: usize,
 ) -> Vec<f64> {
-    let mut xs = vec![l, u, 0.5 * (l + u)];
+    let mut xs = vec![l, u, l.midpoint(u)];
     let push_branch = |base: f64, xs: &mut Vec<f64>| {
         let kl = ((2.0 * a * l - base) / TWO_PI).ceil();
         let ku = ((2.0 * a * u - base) / TWO_PI).floor();
@@ -597,7 +597,7 @@ fn audit_compare() {
                     let mut xs = vec![
                         l64,
                         u64,
-                        0.5 * (l64 + u64),
+                        l64.midpoint(u64),
                         t64,
                         t64.next_up(),
                         t64.next_down(),
@@ -632,7 +632,7 @@ fn audit_compare() {
 // ---------------------------------------------------------------------------
 
 fn pw_candidates(l: f64, u: f64, grid_samples: usize, breakpoint_limit: f64) -> Vec<f64> {
-    let mut xs = vec![l, u, 0.5 * (l + u)];
+    let mut xs = vec![l, u, l.midpoint(u)];
     let k0 = l.ceil();
     let k1 = u.floor();
     // `k += 1.0` is only a STEP below 2^53; above it the f64 ulp exceeds 1 and
@@ -671,11 +671,7 @@ fn pw_candidates(l: f64, u: f64, grid_samples: usize, breakpoint_limit: f64) -> 
         }
     }
     // half-integers explicitly (Round's discontinuity set)
-    for h in [
-        l.ceil() - 0.5,
-        u.floor() + 0.5,
-        (0.5 * (l + u)).round() + 0.5,
-    ] {
+    for h in [l.ceil() - 0.5, u.floor() + 0.5, l.midpoint(u).round() + 0.5] {
         xs.push(h);
         xs.push(h.next_down());
         xs.push(h.next_up());

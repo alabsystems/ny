@@ -10,6 +10,19 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
 
+/// Total wall time inside the flat f64 conv-group column kernel, reported on
+/// the `[conv-share]` line in `network/ibp/crown_ibp.rs`.
+///
+/// The three sub-probes that used to sit beside this one -- FILL, GEMM and
+/// COPY, splitting the pollable CPU body -- are gone because they ANSWERED.
+/// 227560c01 measured them and recorded "Sub-probes in the pollable CPU body
+/// recorded ~nothing", which is what moved suspicion to the sound_f64_gemm
+/// engine-attempt path and produced [`CONV_GROUP_ENGINE_NANOS`]. Their writers
+/// were removed with that result; only the declarations were left behind, so
+/// they had become three statics nothing wrote and nothing read.
+pub(crate) static CONV_GROUP_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 use crate::faer_parallelism::mat_mul;
 
 const DEADLINE_GEMM_ROW_CHUNK: usize = 256;
@@ -2464,6 +2477,8 @@ fn conv_group_col_flat_f64_with_deadline(
     kw: usize,
     deadline: Instant,
 ) -> Result<Vec<f64>> {
+    let _share_timer =
+        crate::layers::convolution::crown_helpers::ShareTimer::new(&CONV_GROUP_NANOS);
     if Instant::now() >= deadline {
         return Err(per_node_deadline_exceeded());
     }
@@ -2489,6 +2504,7 @@ fn conv_group_col_flat_f64_with_deadline(
         .saturating_mul(out_c_per_group)
         .saturating_mul(kernel_cols_per_group);
     if macs >= CONV_SOUND_F64_GEMM_MIN_MACS {
+        let engine_t = Instant::now();
         let attempt = crate::sound_f64_gemm::with_engine_deadline(deadline, |engine| {
             conv_group_col_flat_f64_deadline_via_engine_or_cpu(
                 engine,
@@ -2504,6 +2520,10 @@ fn conv_group_col_flat_f64_with_deadline(
                 deadline,
             )
         })?;
+        CONV_GROUP_ENGINE_NANOS.fetch_add(
+            u64::try_from(engine_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(result) = attempt {
             return result;
         }
@@ -3019,6 +3039,16 @@ fn conv_group_col_flat_with_engine(
         _ => None,
     }
 }
+
+/// Wall time spent in the sound_f64_gemm ENGINE-ATTEMPT path of the conv-group
+/// arm, reported alongside the group total on `[conv-share]`.
+///
+/// This is the probe 61c628a76 landed to test its own claim that "the group
+/// arm's time sits in the sound_f64_gemm engine-attempt path". Reading it is
+/// the point: written-but-never-read, it measures into a void and the claim
+/// stays untested, which is the state it was in when restored.
+pub(crate) static CONV_GROUP_ENGINE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

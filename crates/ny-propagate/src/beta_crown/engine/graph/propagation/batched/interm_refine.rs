@@ -962,7 +962,7 @@ fn interm_refine_selective_topk() -> usize {
 /// per-batch refinement stats on stderr.
 fn probe_enabled() -> bool {
     std::env::var("NY_INTERM_REFINE_PROBE").ok().as_deref() == Some("1")
-        || std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1")
+        || crate::beta_gpu_probe_armed()
 }
 
 /// Cap on the seed-layer width (the refinement backward carries `pre_dim`
@@ -14780,7 +14780,7 @@ mod clip_chain_gather_gate {
     /// Env that would silently reroute one leg and void the differential: the
     /// closed leg must be the historical refusal, and the open leg's exit must be
     /// decided by the new gate alone.
-    fn guard_env() -> std::sync::MutexGuard<'static, ()> {
+    fn guard_env() -> std::sync::RwLockWriteGuard<'static, ()> {
         let env_lock = ny_test_utils::env::lock_env();
         for (var, why) in [
             ("NY_BAB_CHAIN_WIDE", "the closed leg would route wide too"),

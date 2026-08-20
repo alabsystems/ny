@@ -14,7 +14,7 @@
 pub(crate) mod compose;
 mod crown_batched;
 mod crown_dense;
-mod crown_patches;
+pub(crate) mod crown_patches;
 mod crown_patches_alpha;
 mod crown_patches_alpha_in_place;
 mod crown_patches_sparse;

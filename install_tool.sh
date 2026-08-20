@@ -189,6 +189,23 @@ fi
 # checkout URL or write credential-bearing rewrites into the user's global Git
 # config; callers of the source fallback must provide process-scoped access.
 
+# Trust-pin diagnostic: rust-toolchain.toml pins the Trust toolchain
+# (channel = "trust"), a locally linked rustup toolchain, and .cargo/config.toml
+# carries its `-Ztrust-verify=off` opt-out, which stock rustc rejects at flag
+# parse. On a host without a linked `trust` toolchain this source build cannot
+# succeed: rustup fails fast at the first cargo invocation ("toolchain 'trust'
+# is not installed") — before the long build, not 30 minutes into it. That
+# fail-fast is deliberate (publish/DECISIONS.md, trust-flip entry): the
+# supported installation is the validated prebuilt triplet above; the source
+# fallback remains only for hosts that carry the Trust toolchain.
+if ! rustup toolchain list 2>/dev/null | grep -q '^trust'; then
+    echo "WARNING: rust-toolchain.toml pins the locally linked Trust toolchain" >&2
+    echo "  (channel = \"trust\") and no rustup toolchain named 'trust' is linked on" >&2
+    echo "  this host. The source fallback cannot build here; install via the" >&2
+    echo "  validated prebuilt triplet instead. Proceeding so rustup can fail" >&2
+    echo "  closed with its own error..." >&2
+fi
+
 # Toolchain-era diagnostic before the (long) build: source builds on hosts
 # older than the Ubuntu 24.04 toolchain era are known to fail at the FINAL
 # link (see the floor comment above), i.e. only after the whole workspace has

@@ -69,7 +69,7 @@ const LO: [f32; 5] = [0.6, -0.5, -0.5, 0.45, -0.5];
 const HI: [f32; 5] = [0.679_857_77, 0.5, 0.5, 0.5, -0.45];
 
 fn input_star() -> Star {
-    let center: Vec<f32> = (0..5).map(|i| 0.5 * (LO[i] + HI[i])).collect();
+    let center: Vec<f32> = (0..5).map(|i| LO[i].midpoint(HI[i])).collect();
     let radius: Vec<f32> = (0..5).map(|i| 0.5 * (HI[i] - LO[i])).collect();
     // One symbol per input, each scaled to its own half-width.
     let mut coeffs = vec![0.0f32; 6 * 5];

@@ -3236,6 +3236,10 @@ impl<'a> Reader<'a> {
         let raw = self.bytes(byte_count)?;
         let mut values = Vec::new();
         budget.reserve_vec(&mut values, count, reserve_label, check)?;
+        // Keep `chunks_exact` + the fallible `try_into` decode: the tippy
+        // `as_chunks` rewrite would delete the explicit truncation error path.
+        #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         for chunk in raw.chunks_exact(4) {
             values.push(u32::from_le_bytes(chunk.try_into().map_err(|_| {
                 invalid(format!("retained-BaB {label} value is truncated"))
@@ -3274,6 +3278,10 @@ impl<'a> Reader<'a> {
         let raw = self.bytes(byte_count)?;
         let mut values = Vec::new();
         budget.reserve_vec(&mut values, count, reserve_label, check)?;
+        // Same rationale as the u32 decode above: keep the explicit
+        // truncation error path.
+        #[allow(unknown_lints)] // stock 1.95 clippy (public pin) does not know the lint below
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         for chunk in raw.chunks_exact(8) {
             values.push(u64::from_le_bytes(chunk.try_into().map_err(|_| {
                 invalid(format!("retained-BaB {label} value is truncated"))

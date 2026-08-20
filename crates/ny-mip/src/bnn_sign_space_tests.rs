@@ -435,7 +435,7 @@ fn forward_matches_the_independent_reference_at_many_points() {
                 if mask >> (p % 8) & 1 == 0 {
                     net.lo[p]
                 } else {
-                    0.5 * (net.lo[p] + net.hi[p])
+                    net.lo[p].midpoint(net.hi[p])
                 }
             })
             .collect();
@@ -506,7 +506,7 @@ fn realizability_lp_primal_satisfies_every_constraint() {
     let net = search_net(0);
     let limits = SignSpaceLimits::default();
     let midpoint: Vec<f64> = (0..net.n_pixels())
-        .map(|p| 0.5 * (net.lo[p] + net.hi[p]))
+        .map(|p| net.lo[p].midpoint(net.hi[p]))
         .collect();
     let (slack, x) = realizability_probe_unwired(&net.request(), &limits, &midpoint)
         .expect("the LP must not error")
@@ -525,7 +525,7 @@ fn realizability_lp_primal_is_a_real_point_on_the_boundary_net() {
     let net = boundary_net();
     let limits = SignSpaceLimits::default();
     let x0: Vec<f64> = (0..net.n_pixels())
-        .map(|p| 0.5 * (net.lo[p] + net.hi[p]))
+        .map(|p| net.lo[p].midpoint(net.hi[p]))
         .collect();
     let (slack, x) = realizability_probe_unwired(&net.request(), &limits, &x0)
         .expect("the LP must not error")
@@ -2297,7 +2297,7 @@ fn the_recomputed_pattern_at_the_chosen_point_is_what_the_engine_believes() {
     let admitted = admit(&request, &limits).expect("the deep net is admitted");
     let classification = admitted.classify();
     let midpoint: Vec<f64> = (0..admitted.n_pixels)
-        .map(|p| 0.5 * (admitted.lo[p] + admitted.hi[p]))
+        .map(|p| admitted.lo[p].midpoint(admitted.hi[p]))
         .collect();
     let x0 = admitted
         .to_replay_bytes(&midpoint)
@@ -2514,7 +2514,7 @@ fn a_trust_region_only_shrinks_the_feasible_set() {
     // 2. end to end, over many patterns and every arm.
     let free = admitted.classify().free;
     let midpoint: Vec<f64> = (0..admitted.n_pixels)
-        .map(|p| 0.5 * (admitted.lo[p] + admitted.hi[p]))
+        .map(|p| admitted.lo[p].midpoint(admitted.hi[p]))
         .collect();
     let x0 = admitted
         .to_replay_bytes(&midpoint)
@@ -2591,7 +2591,7 @@ fn trust_region_infeasibility_declines_and_expands_it_never_concludes() {
     let admitted = admit(&request, &base).expect("the search net is admitted");
     let free = admitted.classify().free;
     let midpoint: Vec<f64> = (0..admitted.n_pixels)
-        .map(|p| 0.5 * (admitted.lo[p] + admitted.hi[p]))
+        .map(|p| admitted.lo[p].midpoint(admitted.hi[p]))
         .collect();
     let x0 = admitted
         .to_replay_bytes(&midpoint)
@@ -2701,7 +2701,7 @@ fn trust_expansion_terminates_at_the_full_box_and_only_then_may_decline() {
     let base = SignSpaceLimits::default();
     let admitted = admit(&request, &base).expect("admitted");
     let x0: Vec<f64> = (0..admitted.n_pixels)
-        .map(|p| 0.5 * (admitted.lo[p] + admitted.hi[p]))
+        .map(|p| admitted.lo[p].midpoint(admitted.hi[p]))
         .collect();
     for arm in TRUST_ARMS {
         let limits = SignSpaceLimits {
@@ -2776,7 +2776,7 @@ fn the_trust_region_point_is_exactly_inside_the_box() {
     let admitted = admit(&request, &base).expect("the jagged-box net is admitted");
     let free = admitted.classify().free;
     let midpoint: Vec<f64> = (0..admitted.n_pixels)
-        .map(|p| 0.5 * (admitted.lo[p] + admitted.hi[p]))
+        .map(|p| admitted.lo[p].midpoint(admitted.hi[p]))
         .collect();
     let x0 = admitted
         .to_replay_bytes(&midpoint)
@@ -2828,7 +2828,7 @@ fn the_trust_region_default_is_the_full_box_and_changes_nothing() {
     let base = SignSpaceLimits::default();
     let admitted = admit(&request, &base).expect("admitted");
     let x0: Vec<f64> = (0..admitted.n_pixels)
-        .map(|p| 0.5 * (admitted.lo[p] + admitted.hi[p]))
+        .map(|p| admitted.lo[p].midpoint(admitted.hi[p]))
         .collect();
     // The default arms NO region, so no bound anywhere is narrowed.
     let trust = TrustState::new(&admitted, &base, &x0);
@@ -2900,6 +2900,145 @@ fn every_trust_region_arm_produces_a_validated_witness_or_an_honest_exhaustion()
                 } => assert!(best_logit_margin <= 0),
                 SignSpaceOutcome::Refused(refusal) => panic!("unexpected refusal: {refusal:?}"),
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #lane-value-stall
+// ---------------------------------------------------------------------------
+
+/// (d) THE DEFAULT IS UNCHANGED — the value-stall rule is OFF, and off means
+/// the shipped walk byte for byte.
+///
+/// The rule exists because the SHIPPED one (`stall_lp_solves`) asks a
+/// never-started question. Measured on `traffic_signs model_48_idx_1703_eps_1`
+/// at HEAD, both dark levers at their defaults: 370 LP solves, **34 accepted
+/// flips**, best pattern margin -82, no candidate, the whole 217.52 s lane
+/// budget spent — `flips == 0` was false from the first accepted flip, so the
+/// rule was permanently disarmed. (This also contradicts the shipped
+/// documentation in `configs/vnncomp25/traffic_signs_recognition_2023.yaml`
+/// and `sign_space_falsify.rs`, which both assert 0 accepted flips on all nine
+/// open 48x48/64x64 rows.)
+#[test]
+fn the_margin_stall_rule_is_off_by_default_and_off_changes_nothing() {
+    assert_eq!(
+        SignSpaceLimits::default().stall_margin_lp_solves,
+        0,
+        "the shipped walk must not gain a stall rule that has not been swept"
+    );
+    for target in 0..3usize {
+        let net = search_net(target);
+        let shipped = SignSpaceLimits::default();
+        let explicit_off = SignSpaceLimits {
+            stall_margin_lp_solves: 0,
+            ..SignSpaceLimits::default()
+        };
+        let a = falsify_bnn_sign_suffix_unwired(&net.request(), &shipped).expect("no error");
+        let b = falsify_bnn_sign_suffix_unwired(&net.request(), &explicit_off).expect("no error");
+        match (a, b) {
+            (SignSpaceOutcome::Candidate(a), SignSpaceOutcome::Candidate(b)) => {
+                assert_eq!(a.input, b.input);
+                assert_eq!(a.flips, b.flips);
+                assert_eq!(a.lp_solves, b.lp_solves);
+            }
+            (
+                SignSpaceOutcome::Exhausted {
+                    best_logit_margin: ma,
+                    margin_gain: ga,
+                    flips: fa,
+                    lp_solves: la,
+                    ..
+                },
+                SignSpaceOutcome::Exhausted {
+                    best_logit_margin: mb,
+                    margin_gain: gb,
+                    flips: fb,
+                    lp_solves: lb,
+                    ..
+                },
+            ) => assert_eq!((ma, ga, fa, la), (mb, gb, fb, lb)),
+            (x, y) => panic!("the default and an explicit 0 disagree: {x:?} vs {y:?}"),
+        }
+    }
+}
+
+/// The rule can only bring `Exhausted` FORWARD. It is a budget rule, not a
+/// correctness one: the two reachable ends are `Candidate` and `Exhausted`, so
+/// stopping the walk early can never turn a SAT into anything else — it can
+/// only decline to keep paying for a search whose own value signal is flat.
+#[test]
+fn the_margin_stall_rule_only_shortens_the_walk_and_never_loses_a_candidate() {
+    for target in 0..3usize {
+        let net = search_net(target);
+        let shipped = falsify_bnn_sign_suffix_unwired(&net.request(), &SignSpaceLimits::default())
+            .expect("no error");
+        let stalled = falsify_bnn_sign_suffix_unwired(
+            &net.request(),
+            &SignSpaceLimits {
+                // The tightest possible arm: yield the moment one LP passes
+                // without the margin moving.
+                stall_margin_lp_solves: 1,
+                ..SignSpaceLimits::default()
+            },
+        )
+        .expect("no error");
+        let solves = |o: &SignSpaceOutcome| match o {
+            SignSpaceOutcome::Candidate(c) => c.lp_solves,
+            SignSpaceOutcome::Exhausted { lp_solves, .. } => *lp_solves,
+            SignSpaceOutcome::Refused(_) => 0,
+        };
+        assert!(
+            solves(&stalled) <= solves(&shipped),
+            "target {target}: the stall rule must never make the walk pay MORE \
+             ({} vs {})",
+            solves(&stalled),
+            solves(&shipped)
+        );
+        // And whatever it does return is still an honest outcome, validated
+        // from scratch, never a verdict.
+        match stalled {
+            SignSpaceOutcome::Candidate(candidate) => validate_candidate(&net, &candidate),
+            SignSpaceOutcome::Exhausted {
+                best_logit_margin,
+                margin_gain,
+                ..
+            } => {
+                assert!(best_logit_margin <= 0);
+                assert!(margin_gain >= 0, "value is a GAIN, never negative");
+            }
+            SignSpaceOutcome::Refused(refusal) => panic!("unexpected refusal: {refusal:?}"),
+        }
+    }
+}
+
+/// The reported VALUE is the lane's own unit, and it is not `flips`.
+///
+/// `margin_gain` is `best - initial`, so it is `>= 0` by construction and it
+/// answers the question the scheduler actually asks: did the thing the search
+/// is trying to move MOVE? The measured 34-flip row moved it to -82 and banked
+/// nothing.
+#[test]
+fn the_walk_reports_its_margin_gain_as_a_nonnegative_value_in_its_own_units() {
+    for target in 0..3usize {
+        let net = search_net(target);
+        match falsify_bnn_sign_suffix_unwired(&net.request(), &SignSpaceLimits::default())
+            .expect("no error")
+        {
+            SignSpaceOutcome::Exhausted {
+                best_logit_margin,
+                margin_gain,
+                lp_solves,
+                ..
+            } => {
+                assert!(margin_gain >= 0);
+                assert!(
+                    best_logit_margin - margin_gain <= best_logit_margin,
+                    "the initial margin cannot be above the best one"
+                );
+                let _denominator = lp_solves;
+            }
+            SignSpaceOutcome::Candidate(_) | SignSpaceOutcome::Refused(_) => {}
         }
     }
 }

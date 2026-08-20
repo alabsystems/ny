@@ -235,6 +235,7 @@ impl Harness {
 #[ntest::timeout(300000)]
 #[test]
 fn replay_gradient_matches_fold_finite_differences_on_conv_residual_fixture() {
+    let _env = crate::tests::lock_env_shared();
     let h = Harness::new();
     let st = h.interior_alpha_state();
 

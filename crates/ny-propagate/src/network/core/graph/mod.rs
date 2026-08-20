@@ -591,11 +591,7 @@ fn crown_ibp_per_node_threshold() -> usize {
 /// make two collectors on the same graph disagree about the arm.
 pub(crate) fn crown_ibp_binary_relax_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("NY_CROWN_IBP_BINARY")
-            .ok()
-            .is_some_and(|v| v == "1")
-    })
+    *ENABLED.get_or_init(|| std::env::var("NY_CROWN_IBP_BINARY").is_ok_and(|v| v == "1"))
 }
 
 impl GraphNetwork {

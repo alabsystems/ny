@@ -316,6 +316,18 @@ fn apply_solver_and_bab_settings(
     if let Some(enabled) = bab.root_comprehensive_gpu_interm {
         config.root_comprehensive_gpu_interm = enabled;
     }
+    // #bab-floor: carried as Option so "absent" stays distinguishable from
+    // "0.0". Absent means the arbitration does not exist; 0.0 is the explicit
+    // kill switch that keeps the other two parseable.
+    if let Some(frac) = bab.root_bab_reserve_frac {
+        config.root_bab_reserve_frac = Some(frac);
+    }
+    if let Some(frac) = bab.root_spec_frac {
+        config.root_spec_frac = Some(frac);
+    }
+    if let Some(frac) = bab.root_alpha_frac {
+        config.root_alpha_frac = Some(frac);
+    }
     if let Some(chunks) = bab.root_comprehensive_gpu_interm_chunks {
         config.root_comprehensive_gpu_interm_chunks = chunks;
     }
@@ -580,6 +592,9 @@ fn apply_alpha_preset(config: &mut AlphaCrownConfig, preset: &AlphaCrownPreset) 
     }
     if let Some(every) = preset.joint_interm_alpha_every {
         config.joint_interm_alpha_every = every;
+    }
+    if let Some(enabled) = preset.alpha_envelope_grad {
+        config.alpha_envelope_grad = enabled;
     }
     if let Some(fraction) = preset.reference_refresh_fraction {
         config.reference_refresh_fraction = fraction;

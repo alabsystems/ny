@@ -258,7 +258,7 @@ impl BetaCrownVerifier {
                     if let Some((name, idx, score)) = picked {
                         // Pick telemetry (probe-gated): which layer class does
                         // the gather score choose — the OOM forensics need it.
-                        if std::env::var("NY_BETA_GPU_PROBE").ok().as_deref() == Some("1") {
+                        if crate::beta_gpu_probe_armed() {
                             eprintln!(
                                 "[gather-score] mode={mode} pick={name}:{idx} score={score:.3e} depth={}",
                                 domain.depth
