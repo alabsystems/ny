@@ -201,6 +201,12 @@ fn propagate_sequential_backward_node(
                 *linear_bounds = next;
             }
         }
+        Layer::IntervalConst(ic) => {
+            // Same scalar backward as Linear; see `layers::interval_const`.
+            if let Cow::Owned(next) = ic.propagate_linear(linear_bounds)? {
+                *linear_bounds = next;
+            }
+        }
         Layer::ReLU(relu) => {
             if let Some(&relu_idx) = context.relu_name_to_idx.get(node_name) {
                 if let Some(new_bounds) = propagate_sequential_relu_with_alpha(
@@ -241,7 +247,7 @@ fn propagate_sequential_backward_node(
         // === All other layers: exhaustive trait dispatch (#3424) ===
         // Every variant listed — no catch-all. Compiler catches new variants.
         #[rustfmt::skip]
-        Layer::Conv1d(_) | Layer::Conv2d(_) | Layer::ConvTranspose1d(_) | Layer::ConvTranspose2d(_)
+        Layer::Conv1d(_) | Layer::Conv2d(_) | Layer::Conv3d(_) | Layer::ConvTranspose1d(_) | Layer::ConvTranspose2d(_)
         | Layer::Slice(_) | Layer::Gather(_) | Layer::ScatterAdd(_) | Layer::IndexAdd(_)
         | Layer::ScatterNd(_) | Layer::Pad(_) | Layer::Resize(_)
         | Layer::Add(_) | Layer::Sub(_) | Layer::Concat(_) | Layer::MatMul(_) | Layer::BilinearCrown(_)
@@ -263,6 +269,7 @@ fn propagate_sequential_backward_node(
         | Layer::Topk(_) | Layer::ArgMax(_) | Layer::ArgMin(_) | Layer::ArgSort(_)
         | Layer::Flatten(_) | Layer::Reshape(_) | Layer::Squeeze(_) | Layer::Unsqueeze(_)
         | Layer::QdqPerturbation(_)
+        | Layer::EpsilonExpand(_)
         | Layer::AveragePool(_) | Layer::MaxPool2d(_) | Layer::RoPE(_) | Layer::NonZero(_) | Layer::SelfAttention(_) => {
             *linear_bounds = propagate_sequential_generic_layer_backward(
                 layer,

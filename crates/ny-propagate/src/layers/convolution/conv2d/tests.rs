@@ -4596,11 +4596,16 @@ fn certified_f64_deadline_conv2d_deadline_error_is_typed_and_engine_free() -> Re
         "expired certified arm must refuse before any engine launch"
     );
 
-    // Mid-loop: ~33M taps at a 5ms deadline cannot finish before a poll fires.
+    // Mid-loop: the workload must be far larger than the deadline can cover on
+    // ANY route this entry can take. RESIZED for #pollable-conv-ibp: the shape
+    // was 16x256x3x3 over 32x32 (~38M taps), which the old per-MAC scalar kernel
+    // could not finish in 5 ms but the blocked kernel plausibly can — a test
+    // that only held because the implementation was slow. ~604M taps keeps a
+    // >10x margin over a fully parallel blocked run.
     let big = CertifiedF64Case {
         name: "mid_loop",
-        out_c: 16,
-        in_c: 256,
+        out_c: 64,
+        in_c: 1024,
         kh: 3,
         kw: 3,
         stride: (1, 1),
@@ -4617,7 +4622,7 @@ fn certified_f64_deadline_conv2d_deadline_error_is_typed_and_engine_free() -> Re
     let soon = std::time::Instant::now() + std::time::Duration::from_millis(5);
     let error = layer
         .propagate_ibp_sound_with_engine_and_deadline(&input, None, Some(soon))
-        .expect_err("a 5ms deadline on a ~33M-tap conv must abort mid-loop");
+        .expect_err("a 5ms deadline on a ~604M-tap conv must abort mid-loop");
     assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
     Ok(())
 }
@@ -4747,4 +4752,559 @@ fn wall_deadwork_convtranspose_skip_expired_deadline_aborts() {
             "expected DeadlineExceeded, got {err:?}"
         );
     });
+}
+
+// ---- #pollable-conv-ibp: blocked-pollable certified f64 finite-deadline arm ----
+//
+// The finite-deadline certified Conv2d IBP forward now runs a BLOCKED kernel
+// (`ops_ibp_blocked.rs`) that folds every output over the same live taps in the
+// same order as the per-MAC scalar oracle (`ops_ibp_fwd.rs`) but hoists the tap
+// arithmetic, reads contiguous slices, accumulates all of a group's output
+// channels together, and polls the deadline between MAC-budgeted OUTPUT BLOCKS
+// instead of every 4096 MACs.
+//
+// Bit-identity is therefore the bar, not an approximation target, and these
+// tests are what makes `NY_CONV_IBP_BLOCKED` admissible as a `ValueNeutral`
+// `DefaultOn` lever. They pin: (1) blocked == scalar bit-for-bit across a
+// geometry spread and across block sizes and both parallel arms; (2) the same
+// on a cancellation/magnitude fixture where f64 summation ORDER is visible in
+// the published f32; (3) that the bit-identity assertion has TEETH — a blocked
+// implementation that reorders the accumulation FAILS it; (4) that an expired
+// deadline refuses promptly and with the scalar route's exact typed error; and
+// (5) the lever's three-way arming predicate.
+
+/// Far-future deadline for the "just run the kernel" arms below.
+fn blocked_far_future() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_mins(10)
+}
+
+/// Run the per-MAC scalar ORACLE on a fixture.
+fn blocked_case_scalar(
+    layer: &Conv2dLayer,
+    input: &BoundedTensor,
+    deadline: std::time::Instant,
+) -> Result<ops_ibp_fwd::ConvIbpForward> {
+    ops_ibp_fwd::conv2d_ibp_forward_grouped_certified_f64_with_deadline(
+        input.lower().view(),
+        input.upper().view(),
+        &layer.kernel,
+        layer.bias.as_ref(),
+        layer.stride,
+        layer.padding,
+        layer.dilation,
+        layer.groups,
+        deadline,
+    )
+}
+
+/// Run the BLOCKED kernel on a fixture at an explicit block quantum / arm.
+fn blocked_case_blocked(
+    layer: &Conv2dLayer,
+    input: &BoundedTensor,
+    deadline: std::time::Instant,
+    block_macs: usize,
+    parallel: bool,
+) -> Result<ops_ibp_fwd::ConvIbpForward> {
+    ops_ibp_blocked::conv2d_ibp_forward_grouped_certified_f64_blocked_with_deadline(
+        input.lower().view(),
+        input.upper().view(),
+        &layer.kernel,
+        layer.bias.as_ref(),
+        layer.stride,
+        layer.padding,
+        layer.dilation,
+        layer.groups,
+        deadline,
+        block_macs,
+        parallel,
+    )
+}
+
+fn assert_blocked_forward_bits_eq(
+    expected: &ops_ibp_fwd::ConvIbpForward,
+    actual: &ops_ibp_fwd::ConvIbpForward,
+    label: &str,
+) {
+    assert_eq!(expected.out_h, actual.out_h, "{label}: out_h");
+    assert_eq!(expected.out_w, actual.out_w, "{label}: out_w");
+    assert_eq!(
+        expected.lower.shape(),
+        actual.lower.shape(),
+        "{label}: lower shape"
+    );
+    assert_eq!(
+        expected.upper.shape(),
+        actual.upper.shape(),
+        "{label}: upper shape"
+    );
+    for (index, (a, b)) in expected.lower.iter().zip(actual.lower.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "{label}: lower[{index}] {a} != {b} (blocking must not move a single bit)"
+        );
+    }
+    for (index, (a, b)) in expected.upper.iter().zip(actual.upper.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "{label}: upper[{index}] {a} != {b} (blocking must not move a single bit)"
+        );
+    }
+}
+
+/// The geometry spread the blocked kernel must reproduce bit-for-bit: stride>1,
+/// padding, groups/depthwise, dilation, non-square kernels and inputs, 1x1, and
+/// a shape whose ENTIRE output is smaller than one block.
+fn blocked_bit_identity_cases() -> Vec<CertifiedF64Case> {
+    vec![
+        CertifiedF64Case {
+            name: "blocked_dense_wide",
+            out_c: 3,
+            in_c: 3,
+            kh: 2,
+            kw: 2,
+            stride: (1, 1),
+            padding: (0, 0),
+            dilation: (1, 1),
+            groups: 1,
+            in_h: 4,
+            in_w: 4,
+            bias: true,
+            half_width: 0.5,
+            center_scale: 1.0,
+        },
+        CertifiedF64Case {
+            name: "blocked_grouped_padded",
+            out_c: 4,
+            in_c: 4,
+            kh: 3,
+            kw: 3,
+            stride: (1, 1),
+            padding: (1, 1),
+            dilation: (1, 1),
+            groups: 2,
+            in_h: 5,
+            in_w: 5,
+            bias: true,
+            half_width: 0.25,
+            center_scale: 2.0,
+        },
+        CertifiedF64Case {
+            name: "blocked_dilated_strided_nonsquare",
+            out_c: 2,
+            in_c: 3,
+            kh: 3,
+            kw: 2,
+            stride: (1, 2),
+            padding: (1, 1),
+            dilation: (2, 1),
+            groups: 1,
+            in_h: 6,
+            in_w: 5,
+            bias: false,
+            half_width: 1.0,
+            center_scale: 0.5,
+        },
+        CertifiedF64Case {
+            name: "blocked_depthwise_stride2_asym_pad",
+            out_c: 3,
+            in_c: 3,
+            kh: 2,
+            kw: 2,
+            stride: (2, 2),
+            padding: (2, 1),
+            dilation: (1, 1),
+            groups: 3,
+            in_h: 5,
+            in_w: 5,
+            bias: true,
+            half_width: 0.0, // degenerate box (l == u)
+            center_scale: 1.5,
+        },
+        CertifiedF64Case {
+            name: "blocked_pointwise_1x1",
+            out_c: 5,
+            in_c: 6,
+            kh: 1,
+            kw: 1,
+            stride: (1, 1),
+            padding: (0, 0),
+            dilation: (1, 1),
+            groups: 1,
+            in_h: 4,
+            in_w: 7,
+            bias: true,
+            half_width: 0.75,
+            center_scale: 3.0,
+        },
+        CertifiedF64Case {
+            // Whole output is ONE element: smaller than any block, and it also
+            // exercises `units_per_block` clamping to `total_units`.
+            name: "blocked_single_output_element",
+            out_c: 1,
+            in_c: 2,
+            kh: 3,
+            kw: 3,
+            stride: (1, 1),
+            padding: (0, 0),
+            dilation: (1, 1),
+            groups: 1,
+            in_h: 3,
+            in_w: 3,
+            bias: true,
+            half_width: 0.5,
+            center_scale: 1.0,
+        },
+        CertifiedF64Case {
+            // Large per-output fan-in relative to the tiny quantum used below,
+            // so a single work unit exceeds `block_macs` and the granularity
+            // floor (one whole output element per block) is exercised.
+            name: "blocked_wide_fanin_magnitude_box",
+            out_c: 2,
+            in_c: 8,
+            kh: 3,
+            kw: 3,
+            stride: (1, 1),
+            padding: (1, 1),
+            dilation: (1, 1),
+            groups: 1,
+            in_h: 6,
+            in_w: 6,
+            bias: true,
+            half_width: 4.0,
+            center_scale: 100.0,
+        },
+    ]
+}
+
+/// THE PARITY TEST named by `ny_levers::decls::conv_ibp_blocked::CONV_IBP_BLOCKED`.
+///
+/// Blocked == scalar oracle, BIT FOR BIT, across the geometry spread, at three
+/// block quanta (one block for the whole layer, the production quantum, and a
+/// quantum of 1 that forces one output element per block) and on both the
+/// sequential and Rayon arms. A block boundary must never fall inside a
+/// reduction, and thread assignment must never reorder one.
+#[ntest::timeout(120000)]
+#[test]
+fn conv2d_blocked_certified_f64_bit_identical_to_scalar_route() -> Result<()> {
+    for case in blocked_bit_identity_cases() {
+        let (layer, input, _, _) = certified_f64_case_fixture(&case)?;
+        let deadline = blocked_far_future();
+        let oracle = blocked_case_scalar(&layer, &input, deadline)?;
+        for block_macs in [usize::MAX, ops_ibp_blocked::CONV_IBP_BLOCK_MACS, 1] {
+            for parallel in [false, true] {
+                let blocked = blocked_case_blocked(&layer, &input, deadline, block_macs, parallel)?;
+                assert_blocked_forward_bits_eq(
+                    &oracle,
+                    &blocked,
+                    &format!(
+                        "{} (block_macs={block_macs}, parallel={parallel})",
+                        case.name
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Same claim through the LAYER entry, so the wiring in `bound.rs` is covered
+/// and not just the kernels: whatever route the process latched, the 3D and 4D
+/// certified entries must agree with the scalar oracle bit for bit.
+///
+/// (The route itself is a `OnceLock`, so it cannot be flipped in-process; this
+/// checks the arm the test binary actually runs, and the kernel-level test
+/// above covers the other arms.)
+#[ntest::timeout(60000)]
+#[test]
+fn conv2d_blocked_certified_f64_layer_entry_matches_scalar_oracle() -> Result<()> {
+    let case = CertifiedF64Case {
+        name: "layer_entry",
+        out_c: 4,
+        in_c: 4,
+        kh: 3,
+        kw: 3,
+        stride: (2, 1),
+        padding: (1, 1),
+        dilation: (1, 1),
+        groups: 2,
+        in_h: 7,
+        in_w: 6,
+        bias: true,
+        half_width: 0.5,
+        center_scale: 2.0,
+    };
+    let (layer, input, _, _) = certified_f64_case_fixture(&case)?;
+    let deadline = blocked_far_future();
+    let oracle = blocked_case_scalar(&layer, &input, deadline)?;
+    let published =
+        layer.propagate_ibp_sound_with_engine_and_deadline(&input, None, Some(deadline))?;
+    for (index, (a, b)) in oracle
+        .lower
+        .iter()
+        .zip(published.lower().iter())
+        .enumerate()
+    {
+        assert_eq!(a.to_bits(), b.to_bits(), "layer entry lower[{index}]");
+    }
+    for (index, (a, b)) in oracle
+        .upper
+        .iter()
+        .zip(published.upper().iter())
+        .enumerate()
+    {
+        assert_eq!(a.to_bits(), b.to_bits(), "layer entry upper[{index}]");
+    }
+    Ok(())
+}
+
+/// A 1x1 fold in the SAME shared helpers the production kernels publish
+/// through, so the ONLY difference between `reverse = false` and
+/// `reverse = true` is the order of the f64 additions.
+fn blocked_teeth_fold(weights: &[f32], input: f32, reverse: bool) -> (f32, f32) {
+    let (gamma, abs_inflate) = ops_ibp_fwd::certified_f64_gamma_and_inflate(weights.len());
+    let mut lower = 0.0f64;
+    let mut upper = 0.0f64;
+    let mut abs = 0.0f64;
+    let mut order: Vec<usize> = (0..weights.len()).collect();
+    if reverse {
+        order.reverse();
+    }
+    for index in order {
+        let weight = f64::from(weights[index]);
+        let value = f64::from(input);
+        lower += weight * value;
+        upper += weight * value;
+        abs += weight.abs() * value.abs();
+    }
+    let err = ops_ibp_fwd::certified_err_term(abs, gamma, abs_inflate);
+    (
+        ops_ibp_fwd::certified_cast_lower_f32(lower - err),
+        ops_ibp_fwd::certified_cast_upper_f32(upper + err),
+    )
+}
+
+/// TEETH. A blocked implementation that reorders the accumulation must FAIL the
+/// bit-identity test — otherwise the test above proves nothing.
+///
+/// Fixture: a 1x1 conv over `W = [2^53, 1, -2^53, 1]` at the all-ones point.
+/// Every f32xf32 product is exact in f64, so the ONLY thing that can move the
+/// answer is the order of the four additions:
+///
+/// ```text
+/// ascending : ((((0 + 2^53) + 1) - 2^53) + 1) = 1     (the `1` is absorbed)
+/// descending: ((((0 + 1) - 2^53) + 1) + 2^53) = 2     (it is not)
+/// ```
+///
+/// Both orders give the same `acc_abs = 2^54` and hence the same `err`, so the
+/// difference survives into the published f32 endpoints. The production blocked
+/// kernel must match ASCENDING (the oracle's order) and must NOT match
+/// descending.
+#[ntest::timeout(30000)]
+#[test]
+fn conv2d_blocked_reordered_accumulation_fails_bit_identity() -> Result<()> {
+    let power = (1u64 << 53) as f32;
+    let weights = vec![power, 1.0, -power, 1.0];
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 4, 1, 1]), weights.clone()).expect("kernel");
+    let layer = Conv2dLayer::new(kernel, None, (1, 1), (0, 0))?;
+    let input = BoundedTensor::concrete(
+        ArrayD::from_shape_vec(IxDyn(&[4, 1, 1]), vec![1.0f32; 4]).expect("point"),
+    )?;
+    let deadline = blocked_far_future();
+
+    let ascending = blocked_teeth_fold(&weights, 1.0, false);
+    let descending = blocked_teeth_fold(&weights, 1.0, true);
+    assert_ne!(
+        (ascending.0.to_bits(), ascending.1.to_bits()),
+        (descending.0.to_bits(), descending.1.to_bits()),
+        "fixture is not order-sensitive; the teeth case would be vacuous \
+         (ascending {ascending:?} vs descending {descending:?})"
+    );
+
+    let oracle = blocked_case_scalar(&layer, &input, deadline)?;
+    assert_eq!(
+        oracle.lower[[0, 0, 0]].to_bits(),
+        ascending.0.to_bits(),
+        "the scalar oracle folds ASCENDING"
+    );
+    assert_eq!(oracle.upper[[0, 0, 0]].to_bits(), ascending.1.to_bits());
+
+    for parallel in [false, true] {
+        let blocked = blocked_case_blocked(&layer, &input, deadline, 1, parallel)?;
+        assert_eq!(
+            blocked.lower[[0, 0, 0]].to_bits(),
+            ascending.0.to_bits(),
+            "blocked (parallel={parallel}) must reproduce the ascending fold"
+        );
+        assert_eq!(blocked.upper[[0, 0, 0]].to_bits(), ascending.1.to_bits());
+        assert_ne!(
+            blocked.lower[[0, 0, 0]].to_bits(),
+            descending.0.to_bits(),
+            "a reordered fold must be DISTINGUISHABLE here, or this test has no teeth"
+        );
+    }
+    Ok(())
+}
+
+/// Poll responsiveness, and refusal parity with the scalar route.
+///
+/// 1. An ALREADY-EXPIRED deadline refuses before doing the node's work: the
+///    call returns in a small fraction of the time the same call takes to
+///    complete (self-calibrated, so it does not encode this box's speed).
+/// 2. A deadline that lapses MID-NODE aborts around where it lapses, not after
+///    the full node — which is the whole point of blocking on a MAC budget.
+/// 3. Both refusals are the SAME typed value the scalar route returns, message
+///    included, so every caller's fallback behaviour is unchanged.
+#[ntest::timeout(120000)]
+#[test]
+fn conv2d_blocked_certified_f64_expired_deadline_refuses_promptly() -> Result<()> {
+    let case = CertifiedF64Case {
+        name: "poll_responsiveness",
+        out_c: 16,
+        in_c: 512,
+        kh: 3,
+        kw: 3,
+        stride: (1, 1),
+        padding: (1, 1),
+        dilation: (1, 1),
+        groups: 1,
+        in_h: 24,
+        in_w: 24,
+        bias: true,
+        half_width: 0.5,
+        center_scale: 1.0,
+    };
+    let (layer, input, _, _) = certified_f64_case_fixture(&case)?;
+    let quantum = ops_ibp_blocked::CONV_IBP_BLOCK_MACS;
+
+    // Calibrate: how long does this node take when nothing interrupts it?
+    let start = std::time::Instant::now();
+    let complete = blocked_case_blocked(&layer, &input, blocked_far_future(), quantum, false)?;
+    let full_time = start.elapsed();
+    assert_eq!(complete.out_h, 24);
+
+    // (1) Already expired: refuse without running the node.
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .expect("Instant supports a 1ms subtraction");
+    let start = std::time::Instant::now();
+    let error = blocked_case_blocked(&layer, &input, expired, quantum, false)
+        .expect_err("an expired deadline must refuse");
+    let refusal_time = start.elapsed();
+    assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    assert!(
+        refusal_time * 4 < full_time,
+        "expired refusal took {refusal_time:?} against a {full_time:?} node — \
+         the entry poll did not fire before the work"
+    );
+
+    // (2) Lapses a quarter of the way in: abort near there, not at the end.
+    let soon = std::time::Instant::now() + full_time / 4;
+    let start = std::time::Instant::now();
+    let error = blocked_case_blocked(&layer, &input, soon, quantum, false)
+        .expect_err("a mid-node deadline must abort");
+    let aborted_time = start.elapsed();
+    assert!(error.is_deadline_exceeded(), "unexpected error: {error}");
+    assert!(
+        aborted_time * 4 < full_time * 3,
+        "mid-node abort took {aborted_time:?} against a {full_time:?} node — \
+         the between-block poll is not firing"
+    );
+
+    // (3) Refusal parity with the per-MAC scalar route, message included.
+    let scalar_error = blocked_case_scalar(&layer, &input, expired)
+        .expect_err("the scalar route refuses an expired deadline too");
+    let blocked_error = blocked_case_blocked(&layer, &input, expired, quantum, true)
+        .expect_err("the blocked route refuses an expired deadline too");
+    assert_eq!(
+        blocked_error.to_string(),
+        scalar_error.to_string(),
+        "the blocked route must return the scalar route's typed refusal verbatim"
+    );
+    Ok(())
+}
+
+/// Shape refusals are the scalar route's too — both validate through the shared
+/// `conv2d_deadline_geometry`, so a caller cannot see one route accept what the
+/// other rejects.
+#[ntest::timeout(30000)]
+#[test]
+fn conv2d_blocked_certified_f64_shape_refusals_match_scalar() -> Result<()> {
+    let kernel = ArrayD::from_shape_vec(
+        IxDyn(&[2, 3, 2, 2]),
+        (0..24).map(|i| (i as f32) * 0.1 - 1.0).collect(),
+    )
+    .expect("kernel");
+    let layer = Conv2dLayer::new(kernel, None, (1, 1), (0, 0))?;
+    let deadline = blocked_far_future();
+    // Wrong channel count for the kernel (expects 3, gets 2).
+    let lower = ArrayD::from_shape_vec(IxDyn(&[2, 4, 4]), vec![0.0f32; 32]).expect("lower");
+    let upper = lower.clone();
+    let scalar = ops_ibp_fwd::conv2d_ibp_forward_grouped_certified_f64_with_deadline(
+        lower.view(),
+        upper.view(),
+        &layer.kernel,
+        None,
+        layer.stride,
+        layer.padding,
+        layer.dilation,
+        layer.groups,
+        deadline,
+    )
+    .expect_err("channel mismatch must be refused");
+    let blocked =
+        ops_ibp_blocked::conv2d_ibp_forward_grouped_certified_f64_blocked_with_deadline(
+            lower.view(),
+            upper.view(),
+            &layer.kernel,
+            None,
+            layer.stride,
+            layer.padding,
+            layer.dilation,
+            layer.groups,
+            deadline,
+            ops_ibp_blocked::CONV_IBP_BLOCK_MACS,
+            true,
+        )
+        .expect_err("channel mismatch must be refused on the blocked route too");
+    assert_eq!(blocked.to_string(), scalar.to_string());
+    Ok(())
+}
+
+/// The lever's arming rule, as a pure predicate — the spec of
+/// `NY_CONV_IBP_BLOCKED`, which is why it lives in the production path rather
+/// than being restated here.
+#[ntest::timeout(10000)]
+#[test]
+fn conv2d_blocked_route_token_predicate() {
+    use super::ops_ibp_blocked::{conv_ibp_blocked_route_from_token, ConvIbpBlockedRoute};
+    // Engaged by absence, and by every unrecognised token.
+    assert_eq!(
+        conv_ibp_blocked_route_from_token(None),
+        ConvIbpBlockedRoute::BlockedParallel
+    );
+    for token in ["", " ", "1", "true", "yes", "2", "blocked", "par"] {
+        assert_eq!(
+            conv_ibp_blocked_route_from_token(Some(token)),
+            ConvIbpBlockedRoute::BlockedParallel,
+            "token {token:?} must leave the shipped arm engaged"
+        );
+    }
+    // The kill switch, and its friendly spellings, whitespace-tolerant.
+    for token in ["0", " 0 ", "false", "FALSE", "off", "Off", "no", "NO"] {
+        assert_eq!(
+            conv_ibp_blocked_route_from_token(Some(token)),
+            ConvIbpBlockedRoute::Scalar,
+            "token {token:?} must select the scalar oracle"
+        );
+    }
+    // The single-threaded blocked arm.
+    for token in ["seq", "SEQ", " sequential "] {
+        assert_eq!(
+            conv_ibp_blocked_route_from_token(Some(token)),
+            ConvIbpBlockedRoute::BlockedSequential,
+            "token {token:?} must select the sequential blocked arm"
+        );
+    }
 }

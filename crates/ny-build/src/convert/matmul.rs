@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ny_core::{NyError, Result};
-use ny_propagate::layers::{BilinearCrownLayer, LinearLayer};
+use ny_propagate::layers::{BilinearCrownLayer, IntervalConstLayer, LinearLayer};
 use ny_propagate::Layer;
 use tracing::{debug, warn};
 
+use super::interval_const::center_and_radius;
 use super::{i64_to_f32_checked, AttributeValue, ConvertContext, LayerSpec};
 
 impl ConvertContext<'_> {
@@ -63,6 +64,36 @@ impl ConvertContext<'_> {
                     spec.name, scale
                 )));
             }
+        }
+
+        // INTERVAL-VALUED CONSTANT OPERAND.
+        //
+        // The const-folder could not represent this constant exactly and stored
+        // a rigorous enclosure instead. An enclosure is still a CONSTANT, so the
+        // classification is the one it always had — `activation @ constant` is a
+        // Linear, not a bilinear MatMul — and the rank-1 "MatMul requires at
+        // least 2D inputs" raise that used to kill alpha-CROWN never fires.
+        //
+        // Only the `activation @ interval` shape is carried. Everything else
+        // (interval on the left, both sides interval, or a `scale` attribute
+        // whose exact-scaling helper has no interval form) REFUSES here and
+        // degrades to the sound unbounded skip below.
+        let a_is_interval = self.weights.get_interval(input_a).is_some();
+        let b_is_interval = self.weights.get_interval(input_b).is_some();
+        if b_is_interval && !a_is_interval && !a_is_weight {
+            return self.convert_matmul_interval_weight(spec, input_b, transpose_b, scale);
+        }
+        if a_is_interval || b_is_interval {
+            warn!(
+                "MatMul {} has an interval-valued constant in a position the carrier does not \
+                 support (a_interval={a_is_interval}, b_interval={b_is_interval}, \
+                 a_weight={a_is_weight}, b_weight={b_is_weight}); failing closed to a sound skip",
+                spec.name
+            );
+            return Err(NyError::UnsupportedOp(format!(
+                "MatMul {} has an interval-valued constant operand in an unsupported position",
+                spec.name
+            )));
         }
 
         if b_is_weight && !a_is_weight {
@@ -252,12 +283,10 @@ impl ConvertContext<'_> {
                 })?,
             ))
         } else {
-            // Both inputs are constant. The const-folder deliberately declines to
-            // fold this when the dot product rounds: `try_fold_matmul_exact`
-            // (const_fold/ops/elementwise.rs:174, comment at :171-173) keeps it a
-            // graph operation rather than exactifying a rounded center.
+            // Both inputs are constant, and NEITHER the bit-exact fold nor the
+            // interval carrier produced a value for this node.
             //
-            // But `Layer::MatMul` is the BOUNDED BINARY op — it requires two
+            // `Layer::MatMul` is the BOUNDED BINARY op — it requires two
             // ACTIVATION inputs and here it has none, so graph construction hard
             // errors ("expects 2 activation inputs for binary op, got 0") and the
             // whole model fails to load. On lsnc_relu that is one model backing
@@ -270,13 +299,25 @@ impl ConvertContext<'_> {
             // derived from a tainted output, and a `sat` still has to clear the
             // ONNX-Runtime oracle gate.
             //
-            // MEASURED on lsnc_relu (80 rows, scored path): 0 solved before, 9 sat
-            // after. A deliberately UNSOUND upper bound — folding the whole cone to
-            // rounded f32 point constants, i.e. zero interval width and therefore
-            // strictly tighter than any sound carrier could be — also yields
-            // exactly those same 9 rows and zero unsat. So the interval-valued
-            // frozen-constant program is bounded above by this on this benchmark;
-            // there is nothing further to win here by carrying the residual.
+            // WHAT THIS COMMENT USED TO SAY, AND WHY IT WAS WRONG. It claimed that
+            // an UNSOUND point-fold of the whole cone "also yields exactly those
+            // same 9 rows and zero unsat ... there is nothing further to win here
+            // by carrying the residual". The MEASUREMENT is the opposite: an
+            // offline bit-exact pre-fold (max |orig - folded| = 0.0 over 2000
+            // points in the official box) makes beta-CROWN actually RUN — root gap
+            // -29.86 -> -0.0008 in 7 s, depth 13, 5801 domains, all 9 sampled rows
+            // moving `unknown` -> `TIMEOUT`. The mechanism the comment described
+            // ("nothing to win") confused a bound that cannot be computed with a
+            // bound that is already tight.
+            //
+            // WHAT IS ACTUALLY TRUE, AND IT MATTERS FOR SCOPE. The point fold is
+            // an UPPER BOUND on what any sound carrier can achieve, because it has
+            // zero width. That ceiling was measured at 9 sat / 0 unsat, with the
+            // root gap flat at ~1e-4 from t=16 s to t=80 s while the domain queue
+            // grew 10x to 40,526. So what the interval carrier buys on this family
+            // is that the verifier RUNS AT ALL, and that a +-inf leaves a scored
+            // path — not points. The residue behind it is a RELAXATION FLOOR, a
+            // second wall, and it is not a carrier problem.
             warn!(
                 "MatMul {} has both constant inputs and did not constant-fold (the exact-dot \
                  gate declined a rounded product); failing closed to a sound skip rather than \
@@ -289,6 +330,86 @@ impl ConvertContext<'_> {
                 spec.name
             )))
         }
+    }
+}
+
+impl ConvertContext<'_> {
+    /// Lower `activation @ interval_constant` to [`Layer::IntervalConst`].
+    ///
+    /// Mirrors the point `b_is_weight && !a_is_weight` branch above — the same
+    /// 1-D promotion, the same 2-D requirement, the same transpose convention —
+    /// applied to BOTH endpoints of the enclosure, then converted to the
+    /// `center +- radius` form the propagation layer consumes.
+    fn convert_matmul_interval_weight(
+        &self,
+        spec: &LayerSpec,
+        input_b: &str,
+        transpose_b: bool,
+        scale: Option<f32>,
+    ) -> Result<Layer> {
+        if scale.is_some() {
+            // `exact_scale_weights` publishes a scaled constant only when the
+            // product is exactly representable; there is no interval form of
+            // that certificate yet, and silently scaling the midpoint alone
+            // would drop the enclosure.
+            return Err(NyError::UnsupportedOp(format!(
+                "MatMul {} scales an interval-valued constant; no exact interval scaling \
+                 certificate exists",
+                spec.name
+            )));
+        }
+        let (lower, upper) = self.weights.get_interval(input_b).ok_or_else(|| {
+            NyError::ModelLoad(format!(
+                "MatMul {} missing interval constant input '{}'",
+                spec.name, input_b
+            ))
+        })?;
+        let context = format!("MatMul {}", spec.name);
+        let (center, radius) = center_and_radius(lower, upper, &context)?;
+
+        let promote = |value: ndarray::ArrayD<f32>| -> Result<ndarray::Array2<f32>> {
+            let value = if value.ndim() == 1 {
+                let k = value.len();
+                value
+                    .into_shape_with_order(ndarray::IxDyn(&[k, 1]))
+                    .map_err(|e| {
+                        NyError::ModelLoad(format!(
+                            "Cannot reshape 1D interval MatMul constant to 2D: {e}"
+                        ))
+                    })?
+            } else {
+                value
+            };
+            if value.ndim() != 2 {
+                return Err(NyError::ModelLoad(format!(
+                    "MatMul interval constant must be 2D, got {}D",
+                    value.ndim()
+                )));
+            }
+            let two_d = value.into_dimensionality::<ndarray::Ix2>().map_err(|e| {
+                NyError::ModelLoad(format!("Cannot reshape MatMul interval constant: {e}"))
+            })?;
+            // Linear expects (out, in); MatMul without `transpose_b` supplies
+            // (in, out). The transpose is a pure permutation — exact for the
+            // center and for the radius alike.
+            Ok(if transpose_b {
+                two_d
+            } else {
+                two_d.t().to_owned()
+            })
+        };
+
+        let center = promote(center)?;
+        let radius = promote(radius)?;
+        let layer = IntervalConstLayer::try_new_linear(LinearLayer::new(center, None)?, radius)?;
+        debug!(
+            "MatMul {} with an interval-valued constant second input converted to {} \
+             (max radius {:e})",
+            spec.name,
+            layer.kind_name(),
+            layer.max_radius()
+        );
+        Ok(Layer::IntervalConst(layer))
     }
 }
 

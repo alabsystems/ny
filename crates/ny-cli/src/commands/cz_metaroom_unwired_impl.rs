@@ -1437,6 +1437,8 @@ fn try_reserve<T>(
         .map_err(|_| CertifiedCzStemError::AllocationFailure { resource })
 }
 
-#[cfg(test)]
-#[path = "cz_metaroom_qualification.rs"]
-mod tests;
+// The qualification/measurement module (with the wired #cz-hybrid cascade
+// core) is declared by `cz_metaroom_unwired.rs`, NOT here: a `#[path]` module
+// declared inside this include!-shared file would resolve relative to
+// whichever file includes it, and the example under `examples/` would
+// recursively include itself.

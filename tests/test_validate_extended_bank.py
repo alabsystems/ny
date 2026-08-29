@@ -1307,5 +1307,147 @@ class EnvironmentDependencyTests(unittest.TestCase):
         self.assertNotIn("MOAT", result.stdout)
 
 
+class CeFalsifiedWatchlistTests(unittest.TestCase):
+    """Bank-time refusal for extended-track rows the FIELD already falsified.
+
+    The regular 16 tracks refuse an ``unsat`` promotion against published
+    ``violated`` truth.  These tests hold the extended tracks to the same
+    standard, in both directions, against the REAL shipped watchlist.
+    """
+
+    TRACK = "traffic_signs_recognition_2023"
+    # instances.csv row 0: alpha_beta_crown was credited as falsifier with an
+    # organizer-accepted counterexample, yet `True Result:` reads "unsat".
+    FALSIFIED = (
+        "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+        "vnnlib/model_30_idx_7573_eps_1.00000.vnnlib",
+    )
+    # instances.csv row 5: no tool falsified it, so an ny unsat is a real win.
+    CLEAN = (
+        "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+        "vnnlib/model_30_idx_11379_eps_1.00000.vnnlib",
+    )
+
+    def _args(self, root: Path, onnx: str, vnnlib: str, *, watchlist: Path | None):
+        source = root / "source.csv"
+        with source.open("w", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow(
+                [self.TRACK, onnx, vnnlib, "0", "unsat", "4", "run-id"]
+            )
+        ny_bin = root / "ny"
+        ny_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        ny_bin.chmod(0o755)
+        benchmark_dir = root / "bench" / self.TRACK
+        for relative in (onnx, vnnlib):
+            path = benchmark_dir / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(relative.encode("utf-8"))
+        argv = [
+            self.TRACK,
+            str(source),
+            "--repo-root",
+            str(root),
+            "--ny-bin",
+            str(ny_bin),
+            "--bench-root",
+            str(root / "bench"),
+            "--output",
+            str(root / "bank.csv"),
+        ]
+        if watchlist is not None:
+            argv += ["--ce-falsified-watchlist", str(watchlist)]
+        return validate_bank._resolve_cli(
+            validate_bank.build_parser().parse_args(argv)
+        )
+
+    def test_field_falsified_unsat_is_refused_and_banked_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._args(root, *self.FALSIFIED, watchlist=None)
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    validate_bank, "_load_validator", side_effect=AssertionError
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                returncode = validate_bank.bank(args)
+            with args.output.open(encoding="utf-8", newline="") as bank_file:
+                rows = list(csv.reader(bank_file))
+        self.assertEqual(returncode, 4)
+        self.assertEqual(
+            rows, [[self.TRACK, *self.FALSIFIED, "unknown", "4"]]
+        )
+        self.assertIn("CE-FALSIFIED", output.getvalue())
+        self.assertIn("alpha_beta_crown", output.getvalue())
+
+    def test_clean_unsat_still_banks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = self._args(root, *self.CLEAN, watchlist=None)
+            with (
+                mock.patch.object(
+                    validate_bank, "_load_validator", side_effect=AssertionError
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                returncode = validate_bank.bank(args)
+            with args.output.open(encoding="utf-8", newline="") as bank_file:
+                rows = list(csv.reader(bank_file))
+        self.assertEqual(returncode, 0)
+        self.assertEqual(rows, [[self.TRACK, *self.CLEAN, "unsat", "4"]])
+
+    def test_unusable_watchlist_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = root / "absent.json"
+            args = self._args(root, *self.FALSIFIED, watchlist=missing)
+            with self.assertRaisesRegex(
+                validate_bank.BankValidationError, "CE-falsified watchlist is unusable"
+            ):
+                validate_bank.bank(args)
+
+    def test_watchlist_binding_is_fully_verified_against_instances_csv(self) -> None:
+        watchlist = json.loads(
+            (SCRIPT_DIR / "ce_falsified_extended_v1.json").read_text(encoding="utf-8")
+        )
+        binding = watchlist["binding"]
+        self.assertEqual(binding["mismatches"], [])
+        self.assertEqual(binding["verified"], binding["considered"])
+        self.assertEqual(len(watchlist["entries"]), 115)
+        per_track = {
+            track: stats["falsified"]
+            for track, stats in watchlist["per_track"].items()
+        }
+        self.assertEqual(
+            per_track,
+            {
+                "collins_aerospace_benchmark": 6,
+                "lsnc_relu": 12,
+                "relusplitter": 20,
+                "cctsdb_yolo_2023": 28,
+                "vggnet16_2022": 1,
+                "ml4acopf_2024": 5,
+                "vit_2023": 0,
+                "yolo_2023": 0,
+                "traffic_signs_recognition_2023": 43,
+            },
+        )
+
+    def test_true_result_line_would_have_missed_these_rows(self) -> None:
+        """The whole point: `True Result:` is not the falsification signal."""
+        watchlist = json.loads(
+            (SCRIPT_DIR / "ce_falsified_extended_v1.json").read_text(encoding="utf-8")
+        )
+        missed = [
+            entry
+            for entry in watchlist["entries"]
+            if entry["true_result_line"] != "sat"
+        ]
+        self.assertTrue(missed)
+        for entry in missed:
+            self.assertTrue(entry["falsifiers"])
+
+
 if __name__ == "__main__":
     unittest.main()

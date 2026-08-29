@@ -269,8 +269,8 @@ safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2467.vnnlib,prepared,sat,0.35,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_1429.vnnlib,prepared,sat,0.37,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2224.vnnlib,prepared,unsat,2.25,l1audit-20260804-d1282d23
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3270.vnnlib,prepared,timeout,30.21
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5975.vnnlib,prepared,timeout,30.22
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3270.vnnlib,prepared,timeout,16.8,rebank-20260824-r4904-4250d245
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5975.vnnlib,prepared,timeout,16.8,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_1762.vnnlib,prepared,unsat,0.37,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3528.vnnlib,prepared,unsat,1.97,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_1734.vnnlib,prepared,unsat,1.97,l1audit-20260804-d1282d23
@@ -565,7 +565,7 @@ safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_274
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3495.vnnlib,prepared,sat,0.36,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_4291.vnnlib,prepared,timeout,16.1
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_1464.vnnlib,prepared,unsat,0.43,l1audit-20260804-d1282d23
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7154.vnnlib,0,unknown,17,20260726-safenlp-overbudget-budget20-main2ef9d274
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7154.vnnlib,prepared,timeout,16.8,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_262.vnnlib,prepared,unsat,2.11,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_831.vnnlib,prepared,unsat,2.07,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6807.vnnlib,prepared,sat,0.4,l1audit-20260804-d1282d23
@@ -576,7 +576,7 @@ safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_4
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_1602.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2543.vnnlib,prepared,sat,0.41,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2660.vnnlib,prepared,sat,0.36,l1audit-20260804-d1282d23
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_942.vnnlib,prepared,timeout,30.16
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_942.vnnlib,prepared,timeout,16.8,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6702.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7681.vnnlib,prepared,sat,0.36,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_506.vnnlib,prepared,unsat,1.96,l1audit-20260804-d1282d23
@@ -586,7 +586,7 @@ safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_262
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7016.vnnlib,prepared,sat,0.43,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_4456.vnnlib,prepared,unsat,2.22,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_2119.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6119.vnnlib,prepared,timeout,30.25
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6119.vnnlib,prepared,timeout,16.5,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3870.vnnlib,0,unknown,15,20260726-safenlp-overbudget-budget20-main2ef9d274
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7203.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5984.vnnlib,0,unknown,15,20260726-safenlp-overbudget-budget20-main2ef9d274
@@ -603,7 +603,7 @@ safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_943
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6315.vnnlib,prepared,sat,0.4,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_722.vnnlib,prepared,unsat,2.19,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_956.vnnlib,prepared,timeout,28.64
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3319.vnnlib,prepared,timeout,15.9
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3319.vnnlib,prepared,timeout,16.6,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_34.vnnlib,prepared,unsat,2.17,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5397.vnnlib,prepared,unsat,2.16,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7225.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
@@ -689,7 +689,7 @@ safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_839
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_959.vnnlib,prepared,sat,0.43,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5155.vnnlib,prepared,sat,0.42,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_1739.vnnlib,0,unknown,17,20260726-safenlp-overbudget-budget20-main2ef9d274
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2734.vnnlib,0,timeout,16.05,l1audit-20260804-d1282d23
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2734.vnnlib,prepared,timeout,16.8,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_4230.vnnlib,prepared,sat,0.4,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6377.vnnlib,prepared,sat,0.4,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_790.vnnlib,prepared,unsat,2.44,l1audit-20260804-d1282d23
@@ -725,7 +725,7 @@ safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7735.vnnlib,prepared,sat,0.36,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2784.vnnlib,prepared,sat,0.36,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2697.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
-safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_2101.vnnlib,prepared,timeout,16.1
+safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_2101.vnnlib,prepared,timeout,16.7,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3016.vnnlib,prepared,sat,0.36,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6536.vnnlib,prepared,sat,0.37,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7578.vnnlib,prepared,sat,0.42,l1audit-20260804-d1282d23
@@ -907,7 +907,7 @@ safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_108
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5072.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2695.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_1793.vnnlib,prepared,unsat,2.17,l1audit-20260804-d1282d23
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7288.vnnlib,prepared,timeout,29.49
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7288.vnnlib,prepared,timeout,16.6,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_243.vnnlib,prepared,unsat,2.19,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_4041.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_920.vnnlib,prepared,unsat,2.16,l1audit-20260804-d1282d23
@@ -929,7 +929,7 @@ safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5644.vnnlib,prepared,sat,0.42,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3110.vnnlib,prepared,sat,0.37,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3945.vnnlib,0,unknown,17,20260726-safenlp-overbudget-budget20-main2ef9d274
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2132.vnnlib,prepared,timeout,30.15
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_2132.vnnlib,prepared,timeout,16.6,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5429.vnnlib,prepared,sat,0.37,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_279.vnnlib,prepared,unsat,2.14,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6561.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
@@ -1046,7 +1046,7 @@ safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_216
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_910.vnnlib,prepared,sat,0.4,l1audit-20260804-d1282d23
 safenlp_2024,onnx/medical/perturbations_0.onnx,vnnlib/medical/hyperrectangle_1220.vnnlib,prepared,unsat,2.22,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_593.vnnlib,prepared,sat,0.41,l1audit-20260804-d1282d23
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7676.vnnlib,prepared,timeout,30.19
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7676.vnnlib,prepared,timeout,16.8,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5921.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7792.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3500.vnnlib,prepared,sat,0.4,l1audit-20260804-d1282d23
@@ -1056,7 +1056,7 @@ safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_6014.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_7773.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_337.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
-safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3241.vnnlib,0,timeout,16.1,l1audit-20260804-d1282d23
+safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_3241.vnnlib,prepared,timeout,16.8,rebank-20260824-r4904-4250d245
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_396.vnnlib,prepared,sat,0.39,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_79.vnnlib,prepared,sat,0.38,l1audit-20260804-d1282d23
 safenlp_2024,onnx/ruarobot/perturbations_0.onnx,vnnlib/ruarobot/hyperrectangle_5579.vnnlib,prepared,sat,0.44,l1audit-20260804-d1282d23

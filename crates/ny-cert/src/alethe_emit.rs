@@ -56,29 +56,85 @@ pub struct AletheEmission {
 
 /// Why a certificate could not be emitted as Alethe (fail-closed: any
 /// unsupported shape declines instead of emitting wrong proof text).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EmitError {
     /// The certificate failed its own verifier — never emit an unproven claim.
-    #[error("certificate failed local verification: {0}")]
-    Check(#[from] CheckError),
+    Check(CheckError),
     /// The branch-tree certificate failed [`check_branch_tree`].
-    #[error("branch-tree certificate failed verification: {0}")]
-    Branch(#[from] BranchError),
+    Branch(BranchError),
     /// Constraint `{0}` is an equality. `la_generic` needs a *signed* arg
     /// convention for equalities that [`check_farkas`] (where an `Eq`'s two
     /// normalized halves cancel) cannot pre-validate — so we refuse.
-    #[error("constraint {0} is an equality; Alethe emission supports inequalities only")]
     UnsupportedEq(usize),
     /// A variable name is not a safe SMT-LIB simple symbol.
-    #[error("variable name {0:?} is not a safe SMT-LIB simple symbol")]
     BadSymbol(String),
     /// The branch tree is outside the supported single-affine, lower-bound
     /// fragment (details in the message).
-    #[error("unsupported branch-tree shape: {0}")]
     UnsupportedBranchShape(String),
     /// Exact arithmetic failure (infallible in practice — full bignum).
-    #[error(transparent)]
-    Rat(#[from] RatError),
+    Rat(RatError),
+}
+
+impl core::fmt::Display for EmitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EmitError::Check(e) => {
+                write!(f, "certificate failed local verification: {0}", e)
+            }
+            EmitError::Branch(e) => {
+                write!(f, "branch-tree certificate failed verification: {0}", e)
+            }
+            EmitError::UnsupportedEq(i) => write!(
+                f,
+                "constraint {0} is an equality; Alethe emission supports inequalities only",
+                i
+            ),
+            EmitError::BadSymbol(name) => write!(
+                f,
+                "variable name {0:?} is not a safe SMT-LIB simple symbol",
+                name
+            ),
+            EmitError::UnsupportedBranchShape(why) => {
+                write!(f, "unsupported branch-tree shape: {0}", why)
+            }
+            // Transparent variant: forward verbatim to the inner error.
+            EmitError::Rat(e) => core::fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl core::error::Error for EmitError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            // Converting variants report their wrapped error as the source.
+            EmitError::Check(e) => Some(e as &(dyn core::error::Error + 'static)),
+            EmitError::Branch(e) => Some(e as &(dyn core::error::Error + 'static)),
+            EmitError::UnsupportedEq(_) => None,
+            EmitError::BadSymbol(_) => None,
+            EmitError::UnsupportedBranchShape(_) => None,
+            // Transparent variant: delegate to the inner error's own source
+            // rather than reporting the inner error as this error's source.
+            EmitError::Rat(e) => core::error::Error::source(e),
+        }
+    }
+}
+
+impl From<CheckError> for EmitError {
+    fn from(value: CheckError) -> Self {
+        EmitError::Check(value)
+    }
+}
+
+impl From<BranchError> for EmitError {
+    fn from(value: BranchError) -> Self {
+        EmitError::Branch(value)
+    }
+}
+
+impl From<RatError> for EmitError {
+    fn from(value: RatError) -> Self {
+        EmitError::Rat(value)
+    }
 }
 
 /// Words that cannot be emitted unquoted as variables in both artifacts.

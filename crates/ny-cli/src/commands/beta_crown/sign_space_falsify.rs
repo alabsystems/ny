@@ -100,6 +100,10 @@ use ny_mip::{
 use ny_onnx::vnnlib::{OutputConstraint, VnnLibSpec};
 use ny_onnx::OnnxModel;
 
+use crate::commands::bnn_falsification_policy::{
+    BnnFalsificationPolicy, SignSpaceTrustRegionPolicy,
+};
+
 /// Counts every call that actually reaches
 /// [`ny_mip::falsify_bnn_sign_suffix_unwired`].
 ///
@@ -127,6 +131,30 @@ pub(crate) fn ste_core_call_count() -> usize {
     STE_CORE_CALLS.load(Ordering::Relaxed)
 }
 
+fn segment_move(policy: BnnFalsificationPolicy) -> SegmentMove {
+    if policy.minimal_move {
+        SegmentMove::MinimalTheta
+    } else {
+        SignSpaceLimits::default().segment_move
+    }
+}
+
+fn core_trust_region(policy: SignSpaceTrustRegionPolicy) -> TrustRegion {
+    match policy {
+        SignSpaceTrustRegionPolicy::FullBox => SignSpaceLimits::default().trust_region,
+        SignSpaceTrustRegionPolicy::Box => TrustRegion::Doubling {
+            initial_fraction: 0.125,
+        },
+        SignSpaceTrustRegionPolicy::Tight => TrustRegion::Doubling {
+            initial_fraction: 0.015_625,
+        },
+        SignSpaceTrustRegionPolicy::Linf => TrustRegion::Nearest {
+            initial_fraction: 0.015_625,
+            refine: 4,
+        },
+    }
+}
+
 /// Whether the `NY_BNN_SIGN_SPACE` gate is armed, given the typed preset
 /// answer for this category (`attack.bnn_sign_space`).
 ///
@@ -145,6 +173,7 @@ pub(crate) fn ste_core_call_count() -> usize {
 ///
 /// A `config` value that the declaration would reject cannot happen for a
 /// `Bool` lever handed a `Bool`; if it somehow did, this fails CLOSED.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn sign_space_falsify_armed(config: Option<bool>) -> bool {
     ny_levers::read_over_config(
         &ny_levers::decls::dark_probes::BNN_SIGN_SPACE_LANE,
@@ -157,10 +186,10 @@ pub(crate) fn sign_space_falsify_armed(config: Option<bool>) -> bool {
 /// The arming rule as a pure predicate over one raw environment string and one
 /// typed preset answer.
 ///
-/// Same declaration, same parser, same chokepoint as
-/// [`sign_space_falsify_armed`] — only the lookup is injected — so a test of
-/// this function is a test of the production arming rule and not of a
-/// re-implementation of it.
+/// Same declaration and parser as [`sign_space_falsify_armed`], with only the
+/// lookup injected. This compatibility helper tests the layering rule used to
+/// build the entry-time `LeverSet`; scored production consumes the resulting
+/// immutable [`BnnFalsificationPolicy`] instead of reopening this reader.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn sign_space_falsify_armed_from(raw: Option<&str>, config: Option<bool>) -> bool {
     let owned = raw.map(str::to_owned);
@@ -184,6 +213,7 @@ pub(crate) fn sign_space_falsify_armed_from(raw: Option<&str>, config: Option<bo
 /// Exact `"1"` arms it, exact `"0"` disarms it, and any other byte sequence is
 /// a recorded rejection that falls back through the same order. This fails
 /// CLOSED.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ste_pgd_falsify_armed(config: Option<bool>) -> bool {
     ny_levers::read_over_config(
         &ny_levers::decls::dark_probes::BNN_STE_PGD_LANE,
@@ -196,9 +226,10 @@ pub(crate) fn ste_pgd_falsify_armed(config: Option<bool>) -> bool {
 /// The arming rule as a pure predicate over one raw environment string and one
 /// typed preset answer.
 ///
-/// Same declaration and same parser as [`ste_pgd_falsify_armed`] — only the
-/// lookup is injected — so a test of this function is a test of the production
-/// arming rule and not of a re-implementation of it.
+/// Same declaration and parser as [`ste_pgd_falsify_armed`], with only the
+/// lookup injected. This compatibility helper tests the layering rule used to
+/// build the entry-time `LeverSet`; scored production consumes the resulting
+/// immutable [`BnnFalsificationPolicy`] instead of reopening this reader.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ste_pgd_falsify_armed_from(raw: Option<&str>, config: Option<bool>) -> bool {
     let owned = raw.map(str::to_owned);
@@ -223,26 +254,14 @@ pub(crate) fn ste_pgd_falsify_armed_from(raw: Option<&str>, config: Option<bool>
 /// fixtures are narrower than 1, so an absolute radius would mean a different
 /// experiment on every row.
 fn trust_region_from_value(raw: Option<&str>) -> TrustRegion {
-    match raw {
-        Some("box") => TrustRegion::Doubling {
-            initial_fraction: 0.125,
-        },
-        Some("tight") => TrustRegion::Doubling {
-            initial_fraction: 0.015_625,
-        },
-        Some("linf") => TrustRegion::Nearest {
-            initial_fraction: 0.015_625,
-            refine: 4,
-        },
-        _ => SignSpaceLimits::default().trust_region,
-    }
+    core_trust_region(SignSpaceTrustRegionPolicy::from_value(raw).unwrap_or_default())
 }
 
 /// The trust-region arm one raw environment string selects.
 ///
-/// Same declaration, same `Enum` parser, same chokepoint as
-/// [`SignSpaceProblem::trust_region`] — only the lookup is injected — so a test
-/// of this is a test of the production rule, not of a re-implementation.
+/// Same declaration, same `Enum` parser and same pure arm mapping as
+/// [`core_trust_region`]. Scored production instead lowers the immutable
+/// [`BnnFalsificationPolicy`] carried from the entry-time receipt.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn trust_region_from(raw: Option<&str>) -> TrustRegion {
     let owned = raw.map(str::to_owned);
@@ -290,6 +309,9 @@ pub(crate) enum SignSpaceLaneOutcome {
         flips: usize,
         /// Realizability LPs solved.
         lp_solves: usize,
+        /// LP solves for the sign-space lane; gradient steps plus probes for
+        /// STE-PGD. This is the causal execution denominator, not elapsed time.
+        work_units: usize,
     },
     /// The realizability LP machinery itself failed.
     SolverError(String),
@@ -298,6 +320,53 @@ pub(crate) enum SignSpaceLaneOutcome {
 }
 
 impl SignSpaceLaneOutcome {
+    /// Stable execution-evidence token for a terminal that no longer needs
+    /// the original-model re-forward. A candidate deliberately has no token:
+    /// the caller must first turn it into `candidate_reforwarded` or
+    /// `candidate_reforward_failed` rather than emit the raw claim.
+    pub(crate) const fn stable_terminal_token(&self) -> Option<&'static str> {
+        match self {
+            Self::Disarmed => Some("disarmed"),
+            Self::NotAdmitted(_) => Some("not_admitted"),
+            Self::Refused(_) => Some("core_refused"),
+            Self::Exhausted { .. } => Some("exhausted"),
+            Self::SolverError(_) => Some("solver_error"),
+            Self::Candidate(_) => None,
+        }
+    }
+
+    /// Whether this outcome proves that the selected search core consumed its
+    /// frozen policy. Extraction-only refusals do not earn parameter credit.
+    pub(crate) const fn work_started(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused(_) | Self::Exhausted { .. } | Self::SolverError(_) | Self::Candidate(_)
+        )
+    }
+
+    /// `(free_units, accepted_flips, lane_work_units)` for the strict terminal
+    /// receipt. The LP lane's work unit is a realizability solve; the STE lane
+    /// reports gradient iterations plus local-search probes.
+    pub(crate) fn evidence_counts(&self) -> (u64, u64, u64) {
+        let widen = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        match self {
+            Self::Exhausted {
+                free_units,
+                flips,
+                work_units,
+                ..
+            } => (widen(*free_units), widen(*flips), widen(*work_units)),
+            Self::Candidate(candidate) => (
+                widen(candidate.free_units),
+                widen(candidate.flips),
+                widen(candidate.work_units),
+            ),
+            Self::Disarmed | Self::NotAdmitted(_) | Self::Refused(_) | Self::SolverError(_) => {
+                (0, 0, 0)
+            }
+        }
+    }
+
     /// The claimed counterexample input, if any.
     ///
     /// This is the ONLY accessor that can yield something publishable, and it
@@ -331,21 +400,24 @@ impl SignSpaceLaneOutcome {
                 free_units,
                 flips,
                 lp_solves,
+                work_units,
             } => format!(
                 "exhausted (best pattern-space margin {best_logit_margin}, \
                  margin gain +{margin_gain} over {lp_solves} LP solves, \
-                 {free_units} free units, {flips} flips)"
+                 {work_units} total work units, {free_units} free units, {flips} flips)"
             ),
             Self::SolverError(error) => format!("realizability LP failed: {error}"),
             Self::Candidate(candidate) => format!(
                 "candidate (logit margin +{}, argmax {}, slack {:.4}, {} free units, \
-                 {} flips, {} LP solves, {:.1}s) — PENDING the trusted-oracle gate",
+                 {} flips, {} LP solves, {} total work units, {:.1}s) — PENDING the \
+                 trusted-oracle gate",
                 candidate.logit_margin,
                 candidate.argmax,
                 candidate.lp_slack,
                 candidate.free_units,
                 candidate.flips,
                 candidate.lp_solves,
+                candidate.work_units,
                 candidate.elapsed.as_secs_f64(),
             ),
         }
@@ -359,7 +431,7 @@ impl SignSpaceLaneOutcome {
 /// prepass plus the layout/engine self-check alone cost a few seconds. Starting
 /// under this floor spends budget the ordinary lanes could have used and cannot
 /// realistically finish.
-const MIN_LANE_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const MIN_LANE_BUDGET: Duration = Duration::from_secs(20);
 
 /// Slack left to the caller between the lane's deadline and the instance
 /// deadline, so the trusted-oracle gate (model load + ORT forward + true-`f64`
@@ -494,15 +566,34 @@ fn trailing_lane_budget(remaining: Option<Duration>) -> Option<Duration> {
 /// returns [`SignSpaceLaneOutcome::Disarmed`] before touching `onnx` or
 /// `vnnlib` at all, so an unarmed category pays nothing and behaves
 /// identically.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn run_sign_space_lane(
     onnx: &Path,
     vnnlib: &Path,
     remaining: Option<Duration>,
     config: Option<bool>,
 ) -> SignSpaceLaneOutcome {
+    let trust_region = crate::preset_gates::bnn_sign_space_trust_region_arm();
+    let policy = BnnFalsificationPolicy {
+        sign_space_enabled: sign_space_falsify_armed(config),
+        minimal_move: crate::preset_gates::bnn_sign_space_minimal_move_enabled(),
+        trust_region: SignSpaceTrustRegionPolicy::from_value(trust_region.as_deref())
+            .unwrap_or_default(),
+        ste_pgd_enabled: false,
+    };
+    run_sign_space_lane_with_policy(onnx, vnnlib, remaining, policy)
+}
+
+/// Receipt-owned scored entry for the LP-guided lane.
+pub(crate) fn run_sign_space_lane_with_policy(
+    onnx: &Path,
+    vnnlib: &Path,
+    remaining: Option<Duration>,
+    policy: BnnFalsificationPolicy,
+) -> SignSpaceLaneOutcome {
     // THE GATE. Everything below this line — model load, property parse,
     // request construction, the core call — is unreachable on the dark arm.
-    if !sign_space_falsify_armed(config) {
+    if !policy.sign_space_enabled {
         return SignSpaceLaneOutcome::Disarmed;
     }
     let Some(budget) = lane_budget(remaining) else {
@@ -512,26 +603,18 @@ pub(crate) fn run_sign_space_lane(
             remaining
         ));
     };
-    run_sign_space_lane_granted(onnx, vnnlib, budget, 0)
+    run_sign_space_lane_granted_with_policy(onnx, vnnlib, budget, 0, policy)
 }
 
-/// The LP lane with the window CHOSEN BY THE CALLER.
-///
-/// Split out of [`run_sign_space_lane`] so the marginal-value lane scheduler
-/// can hand this lane a cap it planned against the LIVE remaining budget,
-/// instead of the lane re-deriving a private fraction of whatever it was
-/// handed. The arming gate is the CALLER's here — the scheduler only ever
-/// reaches this after [`sign_space_falsify_armed`] has already said yes — so
-/// there is no second arming decision to get out of step with the first.
-///
-/// `value_stall_lp_solves` is the lane's own YIELD rule in its own units: stop
-/// after that many realizability LPs with no strict improvement in the pattern
-/// margin. `0` is the shipped walk.
-pub(crate) fn run_sign_space_lane_granted(
+/// Receipt-owned scored entry for an LP lane whose wall cap was chosen by the
+/// caller. The caller owns the arming decision; this function owns the exact
+/// frozen refinements passed to the search core.
+pub(crate) fn run_sign_space_lane_granted_with_policy(
     onnx: &Path,
     vnnlib: &Path,
     budget: Duration,
     value_stall_lp_solves: usize,
+    policy: BnnFalsificationPolicy,
 ) -> SignSpaceLaneOutcome {
     // PROPERTY FIRST, ON PURPOSE. Parsing the VNN-LIB is far cheaper than
     // loading and shape-inferring an ONNX graph, and the argmax-complement test
@@ -558,7 +641,7 @@ pub(crate) fn run_sign_space_lane_granted(
         Ok(problem) => problem,
         Err(reason) => return SignSpaceLaneOutcome::NotAdmitted(reason),
     };
-    problem.solve(budget, value_stall_lp_solves)
+    problem.solve(budget, value_stall_lp_solves, policy)
 }
 
 /// Consult the STE-PGD falsification lane.
@@ -573,14 +656,33 @@ pub(crate) fn run_sign_space_lane_granted(
 /// therefore its STRUCTURAL admission: a net outside the binarized fragment is
 /// declined by the same reader on the same evidence, at the same cost. Nothing
 /// here looks at a filename, a directory or a benchmark category.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn run_ste_pgd_lane(
     onnx: &Path,
     vnnlib: &Path,
     remaining: Option<Duration>,
     config: Option<bool>,
 ) -> SignSpaceLaneOutcome {
+    run_ste_pgd_lane_with_policy(
+        onnx,
+        vnnlib,
+        remaining,
+        BnnFalsificationPolicy {
+            ste_pgd_enabled: ste_pgd_falsify_armed(config),
+            ..BnnFalsificationPolicy::default()
+        },
+    )
+}
+
+/// Receipt-owned scored entry for the STE-PGD lane.
+pub(crate) fn run_ste_pgd_lane_with_policy(
+    onnx: &Path,
+    vnnlib: &Path,
+    remaining: Option<Duration>,
+    policy: BnnFalsificationPolicy,
+) -> SignSpaceLaneOutcome {
     // THE GATE. Everything below this line is unreachable on the dark arm.
-    if !ste_pgd_falsify_armed(config) {
+    if !policy.ste_pgd_enabled {
         return SignSpaceLaneOutcome::Disarmed;
     }
     // TRAILING lane: it sizes itself by subtraction, not by halving what the
@@ -598,7 +700,8 @@ pub(crate) fn run_ste_pgd_lane(
 /// The STE-PGD lane with the window CHOSEN BY THE CALLER.
 ///
 /// Same split, same reason, same arming contract as
-/// [`run_sign_space_lane_granted`]. This lane is BUDGET-PARAMETERIZED — its
+/// [`run_sign_space_lane_granted_with_policy`]. This lane is
+/// BUDGET-PARAMETERIZED — its
 /// stage boundary is `started + max_wall_time * (1 - climb_fraction)`, measured
 /// at 88.1 s under a 117.51 s cap and 180.1 s under a 240.10 s cap — so it must
 /// be handed a CAP it can plan against and never a dribble of leftover seconds.
@@ -725,38 +828,9 @@ impl SignSpaceProblem {
     /// MINIMAL_MOVE=1` selects the closed-form minimal segment move instead, so
     /// the two shapes can be A/B'd on the same row.
     ///
-    /// Deliberately NOT a preset key: it is an A/B instrument, and promoting it
-    /// to the config layer would let it reach a scored run before it has a
-    /// measurement to stand on.
-    fn segment_move(&self) -> SegmentMove {
-        if ny_levers::read(&ny_levers::decls::dark_probes::BNN_SIGN_SPACE_MINIMAL_MOVE)
-            .value
-            .as_bool()
-        {
-            SegmentMove::MinimalTheta
-        } else {
-            SignSpaceLimits::default().segment_move
-        }
-    }
-
-    /// Where the realizability LP is allowed to put the pixel vector.
-    ///
-    /// DARK BY DEFAULT: absent the lever this is whatever the core ships
-    /// (`TrustRegion::FullBox` — the vnnlib box on every pixel column), so the
-    /// scored path is byte-identical to the configuration every banked row was
-    /// measured on. The three arms are A/B instruments for the SIDEWAYS half of
-    /// the §10 wall, and like `MINIMAL_MOVE` this is deliberately NOT a preset
-    /// key: promoting it to the config layer would let it reach a scored run
-    /// before it has a measurement to stand on.
-    fn trust_region(&self) -> TrustRegion {
-        trust_region_from_value(
-            ny_levers::read(&ny_levers::decls::dark_probes::BNN_SIGN_SPACE_TRUST_REGION)
-                .value
-                .as_str(),
-        )
-    }
-
-    /// Build the plain-data request and the limits, then hand BOTH to `run`.
+    /// The caller supplies the entry-time frozen policy. No environment or
+    /// compatibility cell is reopened while the request is built. Build the
+    /// plain-data request and the limits, then hand BOTH to `run`.
     ///
     /// A closure rather than a return value because the request BORROWS the
     /// lowered `stages` vector, which lives only for this call. Both search
@@ -767,6 +841,7 @@ impl SignSpaceProblem {
         budget: Duration,
         max_free_units: usize,
         value_stall_lp_solves: usize,
+        policy: BnnFalsificationPolicy,
         run: impl FnOnce(&SignSpaceRequest<'_>, &SignSpaceLimits) -> R,
     ) -> R {
         let conv1 = ConvSpec::valid_unit_stride(
@@ -865,8 +940,8 @@ impl SignSpaceProblem {
             max_wall_time: budget,
             max_free_units,
             tolerance: self.tolerance(),
-            segment_move: self.segment_move(),
-            trust_region: self.trust_region(),
+            segment_move: segment_move(policy),
+            trust_region: core_trust_region(policy.trust_region),
             // #lane-value-stall. 0 everywhere except under the marginal-value
             // lane scheduler, and 0 is the shipped walk.
             stall_margin_lp_solves: value_stall_lp_solves,
@@ -880,11 +955,17 @@ impl SignSpaceProblem {
     /// `value_stall_lp_solves` is `SignSpaceLimits::stall_margin_lp_solves`:
     /// `0` (every caller but the marginal-value lane scheduler) is the shipped
     /// walk, byte for byte.
-    fn solve(&self, budget: Duration, value_stall_lp_solves: usize) -> SignSpaceLaneOutcome {
+    fn solve(
+        &self,
+        budget: Duration,
+        value_stall_lp_solves: usize,
+        policy: BnnFalsificationPolicy,
+    ) -> SignSpaceLaneOutcome {
         self.with_request(
             budget,
             LP_LANE_MAX_FREE_UNITS,
             value_stall_lp_solves,
+            policy,
             |request, limits| {
                 // The one and only entry to the search core.
                 CORE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -898,6 +979,7 @@ impl SignSpaceProblem {
                         free_units,
                         flips,
                         lp_solves,
+                        work_units,
                         ..
                     }) => SignSpaceLaneOutcome::Exhausted {
                         best_logit_margin,
@@ -905,6 +987,7 @@ impl SignSpaceProblem {
                         free_units,
                         flips,
                         lp_solves,
+                        work_units,
                     },
                     Ok(SignSpaceOutcome::Refused(refusal)) => {
                         SignSpaceLaneOutcome::Refused(format!("{refusal:?}"))
@@ -919,7 +1002,7 @@ impl SignSpaceProblem {
     ///
     /// Everything about the request — geometry, tensors, folded thresholds,
     /// the vnnlib `lo`/`hi`, the target and the challengers — is built by the
-    /// SAME [`Self::request`] the LP lane uses, so the two lanes cannot drift
+    /// SAME [`Self::with_request`] builder the LP lane uses, so the two lanes cannot drift
     /// apart on what the network is. Only the search differs.
     fn solve_ste_pgd(&self, budget: Duration) -> SignSpaceLaneOutcome {
         let schedule = ny_mip::StePgdLimits {
@@ -928,32 +1011,40 @@ impl SignSpaceProblem {
         };
         // The STE search has no LP walk, so the LP value-stall rule does not
         // apply to it: it prices itself on probes, not realizability solves.
-        self.with_request(budget, STE_LANE_MAX_FREE_UNITS, 0, |request, limits| {
-            // The one and only entry to the STE-PGD core.
-            STE_CORE_CALLS.fetch_add(1, Ordering::Relaxed);
-            match ny_mip::falsify_bnn_ste_pgd_unwired(request, limits, &schedule) {
-                SignSpaceOutcome::Candidate(candidate) => {
-                    SignSpaceLaneOutcome::Candidate(candidate)
+        self.with_request(
+            budget,
+            STE_LANE_MAX_FREE_UNITS,
+            0,
+            BnnFalsificationPolicy::default(),
+            |request, limits| {
+                // The one and only entry to the STE-PGD core.
+                STE_CORE_CALLS.fetch_add(1, Ordering::Relaxed);
+                match ny_mip::falsify_bnn_ste_pgd_unwired(request, limits, &schedule) {
+                    SignSpaceOutcome::Candidate(candidate) => {
+                        SignSpaceLaneOutcome::Candidate(candidate)
+                    }
+                    SignSpaceOutcome::Exhausted {
+                        best_logit_margin,
+                        margin_gain,
+                        free_units,
+                        flips,
+                        lp_solves,
+                        work_units,
+                        ..
+                    } => SignSpaceLaneOutcome::Exhausted {
+                        best_logit_margin,
+                        margin_gain,
+                        free_units,
+                        flips,
+                        lp_solves,
+                        work_units,
+                    },
+                    SignSpaceOutcome::Refused(refusal) => {
+                        SignSpaceLaneOutcome::Refused(format!("{refusal:?}"))
+                    }
                 }
-                SignSpaceOutcome::Exhausted {
-                    best_logit_margin,
-                    margin_gain,
-                    free_units,
-                    flips,
-                    lp_solves,
-                    ..
-                } => SignSpaceLaneOutcome::Exhausted {
-                    best_logit_margin,
-                    margin_gain,
-                    free_units,
-                    flips,
-                    lp_solves,
-                },
-                SignSpaceOutcome::Refused(refusal) => {
-                    SignSpaceLaneOutcome::Refused(format!("{refusal:?}"))
-                }
-            }
-        })
+            },
+        )
     }
 
     /// Join the already-checked property to the binarized conv suffix of a
@@ -1945,13 +2036,14 @@ mod tests {
         }
     }
 
-    /// (b'') THE TRUST-REGION LEVER IS DARK BY DEFAULT AND HAS NO PRESET ROUTE.
+    /// (b'') THE ABSENT TRUST-REGION POLICY IS THE HISTORICAL FULL BOX.
     ///
-    /// With the variable absent the LP gets the vnnlib box on every pixel
-    /// column, which is the configuration every banked traffic-signs row was
-    /// measured on. Exactly three tokens select a region; everything else —
-    /// including the near misses that a hand-rolled `contains`/`trim` parser
-    /// would have accepted — is a recorded rejection that falls back to it.
+    /// The typed preset route exists, but the shipped traffic preset leaves it
+    /// absent. The entry-time frozen policy therefore gives the LP the vnnlib
+    /// box on every pixel column, which is the configuration every banked row
+    /// was measured on. This compatibility environment reader has exactly
+    /// three explicit tokens; everything else is a recorded rejection that
+    /// falls back to the same full-box declaration default.
     #[test]
     fn the_trust_region_lever_is_dark_by_default_and_only_three_tokens_arm_it() {
         assert_eq!(
@@ -2051,6 +2143,7 @@ mod tests {
                 free_units: 488,
                 flips: 250,
                 lp_solves: 1234,
+                work_units: 1234,
             },
             SignSpaceLaneOutcome::SolverError("lowering failed".into()),
         ];

@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ny_core::{NyError, Result};
-use ny_propagate::layers::{Conv1dLayer, Conv2dLayer, ConvTranspose1dLayer, ConvTranspose2dLayer};
+use ny_propagate::layers::{
+    Conv1dLayer, Conv2dLayer, Conv3dLayer, ConvTranspose1dLayer, ConvTranspose2dLayer,
+};
 use ny_propagate::Layer;
 use tracing::debug;
 
@@ -162,6 +164,53 @@ fn parse_symmetric_padding_2d(spec: &LayerSpec, op_name: &str) -> Result<(usize,
         ))),
         _ => Err(NyError::ModelLoad(format!(
             "{} layer {} has invalid pads length {}, expected 1, 2, or 4",
+            op_name,
+            spec.name,
+            values.len()
+        ))),
+    }
+}
+
+/// Parse a symmetric ONNX `pads` attribute at spatial rank 3.
+///
+/// ONNX orders `pads` as `[x1_begin, …, xN_begin, x1_end, …, xN_end]`, so the
+/// rank-3 form is `[d_b, h_b, w_b, d_e, h_e, w_e]`. Accepts length 1
+/// (broadcast), 3 (already symmetric), or 6 (checked symmetric); an ASYMMETRIC
+/// 6-tuple is refused by name rather than silently symmetrised, because
+/// `Conv3dLayer` has one padding value per axis and quietly widening one side
+/// would change which input cells the kernel sees.
+fn parse_symmetric_padding_3d(spec: &LayerSpec, op_name: &str) -> Result<[usize; 3]> {
+    let values = match spec.attributes.get("pads") {
+        None => return Ok([0, 0, 0]),
+        Some(AttributeValue::Int(v)) => vec![*v],
+        Some(AttributeValue::Ints(v)) if v.is_empty() => return Ok([0, 0, 0]),
+        Some(AttributeValue::Ints(v)) => v.clone(),
+        Some(_) => {
+            return Err(NyError::ModelLoad(format!(
+                "{} layer {} has invalid pads attribute type",
+                op_name, spec.name
+            )));
+        }
+    };
+
+    let parse = |value: i64| parse_non_negative_usize(value, op_name, &spec.name, "pads");
+    match values.as_slice() {
+        [p] => {
+            let pad = parse(*p)?;
+            Ok([pad, pad, pad])
+        }
+        [d, h, w] => Ok([parse(*d)?, parse(*h)?, parse(*w)?]),
+        [d_begin, h_begin, w_begin, d_end, h_end, w_end]
+            if d_begin == d_end && h_begin == h_end && w_begin == w_end =>
+        {
+            Ok([parse(*d_begin)?, parse(*h_begin)?, parse(*w_begin)?])
+        }
+        [_, _, _, _, _, _] => Err(NyError::UnsupportedConfiguration(format!(
+            "{} layer {} uses asymmetric pads {:?}, which is not supported",
+            op_name, spec.name, values
+        ))),
+        _ => Err(NyError::ModelLoad(format!(
+            "{} layer {} has invalid pads length {}, expected 1, 3, or 6",
             op_name,
             spec.name,
             values.len()
@@ -333,6 +382,29 @@ impl ConvertContext<'_> {
         [h, w]
     }
 
+    /// Infer the trailing three spatial dimensions `[depth, height, width]` of a
+    /// 3D conv input from known static shapes. `None` unless ALL three are
+    /// statically known and positive — a partially known volume is not a
+    /// geometry `Conv3dLayer` should be told it has.
+    fn infer_conv3d_input_spatial(&self, input_name: &str) -> Option<[usize; 3]> {
+        let shape = self.tensor_shapes.get(input_name)?;
+        if shape.len() < 3 {
+            return None;
+        }
+        let to_dim = |v: i64| -> Option<usize> {
+            if v > 0 {
+                usize::try_from(v).ok()
+            } else {
+                None
+            }
+        };
+        Some([
+            to_dim(shape[shape.len() - 3])?,
+            to_dim(shape[shape.len() - 2])?,
+            to_dim(shape[shape.len() - 1])?,
+        ])
+    }
+
     pub(crate) fn convert_conv1d(&self, spec: &LayerSpec) -> Result<Layer> {
         if spec.inputs.len() < 2 {
             return Err(NyError::ModelLoad(format!(
@@ -451,6 +523,77 @@ impl ConvertContext<'_> {
         }
         Ok(Layer::Conv2d(conv))
     }
+    /// Convert an ONNX rank-5-kernel `Conv` into a [`Conv3dLayer`].
+    ///
+    /// Supports exactly what the layer supports — `strides`, `pads` (symmetric),
+    /// `dilations`, `group` — and refuses the rest by name through the shared
+    /// attribute parsers (`auto_pad` via
+    /// [`Self::ensure_supported_conv_attributes`], asymmetric or wrong-length
+    /// `pads` via [`parse_symmetric_padding_3d`], non-positive strides/dilations
+    /// via [`parse_stride_attr`]/[`parse_dilation_attr`]).
+    ///
+    /// The resulting layer is IBP-only (its CROWN backward fails closed), so a
+    /// converted Conv3d node degrades the network to IBP at that node instead
+    /// of being dropped as unsupported — which is what happened before this
+    /// arm existed.
+    pub(crate) fn convert_conv3d(&self, spec: &LayerSpec) -> Result<Layer> {
+        if spec.inputs.len() < 2 {
+            return Err(NyError::ModelLoad(format!(
+                "Conv3d layer {} has fewer than 2 inputs",
+                spec.name
+            )));
+        }
+
+        let kernel_name = &spec.inputs[1];
+        let kernel = self
+            .constant_value(kernel_name)
+            .ok_or_else(|| NyError::ModelLoad(format!("Kernel {} not found", kernel_name)))?;
+
+        if kernel.ndim() != 5 {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![0, 0, 0, 0, 0],
+                got: kernel.shape().to_vec(),
+            });
+        }
+
+        let bias = if let Some(bias_name) = spec.inputs.get(2).filter(|name| !name.is_empty()) {
+            let bias_arr = self
+                .constant_value(bias_name)
+                .ok_or_else(|| NyError::ModelLoad(format!("Bias {} not found", bias_name)))?;
+            let bias_1d = bias_arr
+                .clone()
+                .into_dimensionality::<ndarray::Ix1>()
+                .map_err(|_| {
+                    NyError::shape_mismatch(vec![kernel.shape()[0]], bias_arr.shape().to_vec())
+                })?;
+            Some(bias_1d)
+        } else {
+            None
+        };
+
+        self.ensure_supported_conv_attributes(spec, "Conv3d", 3)?;
+        let groups = Self::parse_group_attr(spec, "Conv3d")?;
+        let stride_values = parse_stride_attr(spec, "Conv3d", 3)?;
+        let stride = [stride_values[0], stride_values[1], stride_values[2]];
+        let dilation_values = parse_dilation_attr(spec, "Conv3d", 3)?;
+        let dilation = [dilation_values[0], dilation_values[1], dilation_values[2]];
+        let padding = parse_symmetric_padding_3d(spec, "Conv3d")?;
+
+        debug!(
+            "Conv3d: kernel {:?}, stride {:?}, padding {:?}, dilation {:?}, groups {}",
+            kernel.shape(),
+            stride,
+            padding,
+            dilation,
+            groups,
+        );
+        let mut conv = Conv3dLayer::new_dilated(kernel, bias, stride, padding, dilation, groups)?;
+        if let Some(input_shape) = self.infer_conv3d_input_spatial(&spec.inputs[0]) {
+            conv.set_input_shape(input_shape);
+        }
+        Ok(Layer::Conv3d(conv))
+    }
+
     fn ensure_conv_transpose_attributes(
         &self,
         spec: &LayerSpec,

@@ -99,11 +99,25 @@ pub(crate) const CLOSE_EPS: f64 = 1e-4;
 /// same exact-`"1"` arming rule this read had before the migration, and records
 /// a near-miss token (`"true"`, `" 1"`) as a REJECTION instead of losing it.
 pub(crate) fn enabled() -> bool {
+    // #closure-adaptive: β is TIER 1 of the runtime ladder, so this can be
+    // armed mid-search by the policy in `margin_row::closure`. The OnceLock
+    // caches only the ENV read (which cannot change); the tier is a live
+    // relaxed load, so the gate must not be latched as a whole.
+    //
+    // SOUND EITHER WAY (weak duality): for any `β >= 0` on a constraint valid
+    // over the domain, the Lagrangian minimum lower-bounds the constrained
+    // minimum, and `β = 0` reproduces the base bound exactly. Arming this
+    // between two expansions therefore cannot invalidate a bound already
+    // pushed — that bound was scored at `β = 0`, which is still a valid dual
+    // point of the same domain.
+    env_enabled() || super::closure::tier() >= super::closure::TIER_BETA
+}
+
+/// The env/preset half of [`enabled`], latched once per process.
+fn env_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_BETA)
-            .value
-            .as_bool();
+        let on = crate::preset_gates::margin_row_beta_enabled();
         if on {
             // Engagement telemetry (R9): an armed run announces itself once
             // even if no domain ever carries a split (e.g. closed at root),
@@ -124,28 +138,35 @@ pub(crate) fn eta() -> f64 {
         // CLOSED lower bound at zero; the `> 0.0` half of the legacy filter
         // stays HERE on purpose, so an explicit `0` remains distinguishable
         // from absence at the chokepoint (both still resolve to 0.5).
-        ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_BETA_ETA)
-            .value
-            .as_f64()
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(0.5)
+        let value = crate::preset_gates::margin_row_beta_eta();
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            0.5
+        }
     })
 }
 
 /// Ascent trials per domain evaluation (each = one certified pass).
 pub(crate) fn iters() -> usize {
+    // #closure-adaptive TIER 2 (`beta_deep`). The ladder can only ask for MORE
+    // ascent, never less, so a research arm that configured its own iteration
+    // count is never quietly weakened. Sound for the same reason one trial is:
+    // every trial is scored by the same certified pass and only an ACCEPTED
+    // improvement is kept, so more trials search the same valid dual set harder
+    // and cannot leave it.
+    env_iters().max(super::closure::beta_iters_floor())
+}
+
+/// The env/default half of [`iters`], latched once per process.
+fn env_iters() -> usize {
     static I: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *I.get_or_init(|| {
         // `clamp(1, 8)` stays at the reader: the chokepoint hands back an
         // explicit `0` rather than swallowing it, and "explicitly zero" and
         // "absent" are different facts for the receipt even though both end
         // up running one trial.
-        ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_BETA_ITERS)
-            .value
-            .as_u64()
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(1)
-            .clamp(1, 8)
+        crate::preset_gates::margin_row_beta_iters().clamp(1, 8)
     })
 }
 
@@ -157,11 +178,12 @@ pub(crate) fn lambda() -> f64 {
         // The `> 0.0` half of the legacy filter stays here: the chokepoint hands
         // an explicit `0` back rather than swallowing it, so the receipt can
         // still distinguish "explicitly zero" from "absent". Both land on 1.0.
-        ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_BETA_LAMBDA)
-            .value
-            .as_f64()
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0)
+        let value = crate::preset_gates::margin_row_beta_lambda();
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            1.0
+        }
     })
 }
 
@@ -183,60 +205,14 @@ pub(crate) fn polyak() -> bool {
     static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // OPT-OUT: declared `Bool(true)`, so absence and any non-`0` token keep it
     // engaged exactly as `!= Some("0")` did.
-    *P.get_or_init(|| {
-        ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_BETA_POLYAK)
-            .value
-            .as_bool()
-    })
+    *P.get_or_init(crate::preset_gates::margin_row_beta_polyak_enabled)
 }
 
 /// Head-split β terms (`NY_MARGIN_ROW_BETA_HEADS`): default ON when β is
 /// armed; exactly `"0"` = trunk-only (the heads attribution arm).
 pub(crate) fn heads_on() -> bool {
     static H: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *H.get_or_init(|| {
-        ny_levers::read(&ny_levers::decls::margin_row::MARGIN_ROW_BETA_HEADS)
-            .value
-            .as_bool()
-    })
-}
-
-/// #margin-row-beta-percol (`NY_MARGIN_ROW_BETA_PERCOL=1`, default OFF): each
-/// of the K worst FAILING columns carries and ascends its OWN β vector instead
-/// of one shared vector scored against the single worst column. Exact `"1"`
-/// only; OFF preserves the shared-vector lane bit-identically. Only meaningful
-/// with `NY_MARGIN_ROW_BETA=1`; the per-column ascent always uses the Polyak
-/// rule (the legacy sign-step has no per-column gap to target).
-pub(crate) fn percol() -> bool {
-    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *P.get_or_init(|| {
-        let on = std::env::var("NY_MARGIN_ROW_BETA_PERCOL").ok().as_deref() == Some("1");
-        if on {
-            // Engagement telemetry (R9): announce arming once even if no
-            // domain ever reaches the ascent.
-            eprintln!(
-                "[beta-pc] armed (NY_MARGIN_ROW_BETA_PERCOL=1, cols={})",
-                beta_cols()
-            );
-        }
-        on
-    })
-}
-
-/// #margin-row-beta-percol: how many worst failing columns get their own β
-/// (`NY_MARGIN_ROW_BETA_COLS`, default 8, clamped to `[1, 32]`). The honest
-/// budget: each selected column costs one single-column linearized walk per
-/// ascent iteration (milliseconds); the certified pass — the dominant cost —
-/// stays ONE per iteration regardless of K.
-pub(crate) fn beta_cols() -> usize {
-    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *K.get_or_init(|| {
-        std::env::var("NY_MARGIN_ROW_BETA_COLS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(8)
-            .clamp(1, 32)
-    })
+    *H.get_or_init(crate::preset_gates::margin_row_beta_heads_enabled)
 }
 
 /// Install `betas` (aligned with `trunk`) as the domain's engine terms.

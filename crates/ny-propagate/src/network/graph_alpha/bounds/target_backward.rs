@@ -10,6 +10,7 @@ use super::target_backward_patches::{
 use super::*;
 use crate::bounds::patches::PatchesMaterializationPurpose;
 use crate::bounds::LinearBounds;
+use crate::network::core::graph::CrownIbpRuntimePolicy;
 use crate::network::core::apply_dense_backward_dispatch_result_with_deadline;
 use crate::network::CrownMergeAccumulator;
 use ndarray::{Array1, Array2, Ix1};
@@ -481,8 +482,7 @@ fn build_output_conditioned_output_seed(
 ///   concretize each chunk independently, and scatter into a pre-sized output.
 ///   Bound-equivalent to the single pass by row-independence (conv col2im scatter,
 ///   per-row error bounds, and per-row concretize are all row-local).
-const CROWN_OBJ_CHUNK_ENV: &str = "NY_CROWN_OBJ_CHUNK";
-
+///
 /// Hard objective-row cap for deadline-bearing backward walks that cross a
 /// ConvTranspose layer.
 ///
@@ -504,8 +504,6 @@ const DEADLINE_CONV_TRANSPOSE_OBJ_CHUNK_ROWS: usize = 32;
 /// deadline. Strict callers still discard the walk; an explicitly armed
 /// CROWN-IBP collector can retain already completed rows over its certified
 /// IBP seed. See [`chunk_projection_abort_enabled`].
-const NO_CHUNK_ABORT_ENV: &str = "NY_NO_CHUNK_ABORT";
-
 /// Minimum measured chunks before the projection is trusted (#chunk-abort).
 ///
 /// One sample can be distorted by first-touch allocation/cache effects; two
@@ -525,9 +523,6 @@ const CHUNK_ABORT_SLACK: f64 = 1.25;
 ///
 /// `NY_NO_CHUNK_GROW=1` restores the fixed-width partition (every chunk exactly
 /// `effective_target_chunk_size` rows).
-const NO_CHUNK_GROW_ENV: &str = "NY_NO_CHUNK_GROW";
-const NO_CHUNK_WAVE_PAR_ENV: &str = "NY_NO_CHUNK_WAVE_PAR";
-
 /// Target wall time for ONE unpolled objective chunk (#chunk-grow).
 ///
 /// The 32-row `DEADLINE_CONV_TRANSPOSE_OBJ_CHUNK_ROWS` cap exists because the
@@ -635,38 +630,6 @@ fn chunk_post_join_now(
     _completed_chunks: usize,
 ) -> std::time::Instant {
     std::time::Instant::now()
-}
-
-/// Whether adaptive objective-chunk widening is enabled (default: yes).
-pub(in crate::network::graph_alpha) fn chunk_adaptive_growth_enabled() -> bool {
-    !matches!(std::env::var(NO_CHUNK_GROW_ENV).ok().as_deref(), Some("1"))
-}
-
-/// Whether deadline-bearing objective chunks use the fixed-width wave driver.
-pub(in crate::network::graph_alpha) fn chunk_wave_parallel_enabled() -> bool {
-    !matches!(
-        std::env::var(NO_CHUNK_WAVE_PAR_ENV).ok().as_deref(),
-        Some("1")
-    )
-}
-
-/// Whether the measured-projection early abort is enabled (default: yes).
-///
-/// A deadline-bearing chunked backward that cannot finish inside its per-node
-/// budget should stop before spending the whole share. When the default-dark
-/// salvage policy is armed, the collector preserves fully completed rows over
-/// certified IBP and marks the target explicitly truncated; otherwise it and
-/// strict callers retain the historical `DeadlineExceeded`.
-/// Measured on cgan_2023
-/// (cGAN_imgSz32_nCh_1 prop_1, 900 s official budget, preset loaded):
-/// `ConvTranspose_7` burned its whole 150.002 s per-node cap and produced
-/// nothing, inside a disjunctive precheck phase that owns 0.85 of the budget.
-/// Projecting the finish from the measured chunk cost and aborting as soon as
-/// the projection passes the deadline hands the unspent seconds back to the
-/// remaining targets (and, through the phase ledger, to BaB) while retaining
-/// every already certified row.
-pub(in crate::network::graph_alpha) fn chunk_projection_abort_enabled() -> bool {
-    !matches!(std::env::var(NO_CHUNK_ABORT_ENV).ok().as_deref(), Some("1"))
 }
 
 /// Hard aggregate heap cap for the opt-in target-to-input linear-certificate
@@ -901,15 +864,6 @@ fn target_input_linear_chunk_rows(
     })
 }
 
-/// Parse the objective row-chunk size. Returns 0 (disabled) when unset, empty,
-/// non-numeric, or explicitly 0 — preserving the single-pass default.
-pub(in crate::network::graph_alpha) fn crown_obj_chunk_size() -> usize {
-    std::env::var(CROWN_OBJ_CHUNK_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(0)
-}
-
 /// Combine the caller/env chunk request with the deadline-safety cap.
 /// A zero requested size means "no explicit chunking", but cannot disable the
 /// safety cap when a deadline-bearing ConvTranspose walk needs it.
@@ -968,8 +922,9 @@ pub(in crate::network::graph_alpha) enum ObjectiveChunkDriverRoute {
 /// Central objective-chunk driver decision used by execution and M1 planning.
 ///
 /// Keeping this pure makes every routing input explicit: deadline authority,
-/// cut context, wave kill switch, IMB anchor mode, adaptive-growth switch,
-/// Rayon worker count, and the memory-derived concurrency cap.
+/// cut context, experimental parallel opt-in, IMB anchor mode,
+/// adaptive-growth switch, Rayon worker count, and the legacy row-derived
+/// concurrency cap.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network::graph_alpha) fn objective_chunk_driver_route(
     target_rows: usize,
@@ -996,7 +951,8 @@ pub(in crate::network::graph_alpha) fn objective_chunk_driver_route(
             wave_size,
             wave_count,
         })
-    } else if anchor_parallel_enabled && !has_cut_context && !has_deadline {
+    } else if wave_parallel_enabled && anchor_parallel_enabled && !has_cut_context && !has_deadline
+    {
         ObjectiveChunkDriverRoute::AnchorParallel
     } else {
         ObjectiveChunkDriverRoute::Sequential {
@@ -1012,6 +968,8 @@ pub(in crate::network::graph_alpha) fn live_objective_chunk_driver_route(
     chunk_ceiling: usize,
     has_deadline: bool,
     has_cut_context: bool,
+    wave_parallel_enabled: bool,
+    adaptive_growth_enabled: bool,
 ) -> ObjectiveChunkDriverRoute {
     objective_chunk_driver_route(
         target_rows,
@@ -1019,9 +977,9 @@ pub(in crate::network::graph_alpha) fn live_objective_chunk_driver_route(
         chunk_ceiling,
         has_deadline,
         has_cut_context,
-        chunk_wave_parallel_enabled(),
+        wave_parallel_enabled,
         crate::imb::anchor_chunk_parallel(),
-        chunk_adaptive_growth_enabled(),
+        adaptive_growth_enabled,
         rayon::current_num_threads(),
     )
 }
@@ -1299,6 +1257,7 @@ impl GraphNetwork {
             collector_patches_override,
             chunk_override,
             cut_ctx,
+            None,
             false,
             expected_fixed_waves,
         )?
@@ -1327,6 +1286,7 @@ impl GraphNetwork {
         cut_ctx: Option<&CrownCutContext>,
         deadline_salvage_policy: PartialCrownDeadlineSalvagePolicy,
         expected_fixed_waves: Option<ObjectiveChunkFixedWavePlan>,
+        runtime_policy: CrownIbpRuntimePolicy,
     ) -> Result<TargetCrownCollectionResult> {
         self.propagate_crown_to_node_core_impl(
             input,
@@ -1341,6 +1301,7 @@ impl GraphNetwork {
             collector_patches_override,
             chunk_override,
             cut_ctx,
+            Some(runtime_policy),
             deadline_salvage_policy.is_enabled(),
             expected_fixed_waves,
         )
@@ -1361,6 +1322,7 @@ impl GraphNetwork {
         collector_patches_override: bool,
         chunk_override: Option<usize>,
         cut_ctx: Option<&CrownCutContext>,
+        runtime_policy_override: Option<CrownIbpRuntimePolicy>,
         salvage_deadline_chunks: bool,
         expected_fixed_waves: Option<ObjectiveChunkFixedWavePlan>,
     ) -> Result<TargetCrownCollectionResult> {
@@ -1418,7 +1380,9 @@ impl GraphNetwork {
         // BEFORE seed construction: chunking exists precisely so an over-budget
         // target never materializes its full `[dim x dim]` dense identity pair
         // (6.6 GB for cgan_2023's 28,800-dim BatchNormalization_11).
-        let requested_chunk_size = chunk_override.unwrap_or_else(crown_obj_chunk_size);
+        let runtime_policy =
+            runtime_policy_override.unwrap_or_else(|| self.crown_ibp_runtime_policy());
+        let requested_chunk_size = chunk_override.unwrap_or(runtime_policy.objective_chunk_rows);
         let has_conv_transpose = relevant_nodes.iter().any(|name| {
             self.nodes.get(name).is_some_and(|node| {
                 matches!(
@@ -1484,6 +1448,7 @@ impl GraphNetwork {
                 cut_ctx,
                 salvage_deadline_chunks,
                 expected_fixed_waves,
+                runtime_policy,
             );
         }
 
@@ -1530,6 +1495,7 @@ impl GraphNetwork {
             &gpu_suffix_plan,
             initial_bounds,
             cut_ctx,
+            Some(runtime_policy.patches_deadline_flat_bias_enabled),
         )?;
         if per_node_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Err(NyError::DeadlineExceeded(format!(
@@ -1920,6 +1886,7 @@ impl GraphNetwork {
         gpu_suffix_plan: &GpuSuffixPlan,
         initial_bounds: CrownBounds,
         cut_ctx: Option<&CrownCutContext>,
+        flat_bias_enabled: Option<bool>,
     ) -> Result<Option<BoundedTensor>> {
         match self.run_target_backward_pass_core(
             input,
@@ -1943,6 +1910,7 @@ impl GraphNetwork {
             None,
             None,
             false,
+            flat_bias_enabled,
         )? {
             TargetBackwardPassResult::NoInputContribution => Ok(None),
             TargetBackwardPassResult::Concrete(bounds) => Ok(Some(bounds)),
@@ -1999,6 +1967,7 @@ impl GraphNetwork {
             None,
             None,
             true,
+            None,
         )? {
             TargetBackwardPassResult::NoInputContribution => Ok(None),
             TargetBackwardPassResult::InputLinear(linear) => Ok(Some(linear)),
@@ -2032,7 +2001,12 @@ impl GraphNetwork {
         additional_seed: Option<AdditionalTargetBackwardSeed<'_>>,
         stacked_seed_plan: Option<&StackedSeedInjectionPlan>,
         capture_input_linear: bool,
+        flat_bias_enabled: Option<bool>,
     ) -> Result<TargetBackwardPassResult> {
+        let flat_bias_enabled = flat_bias_enabled.unwrap_or_else(|| {
+            self.crown_ibp_runtime_policy()
+                .patches_deadline_flat_bias_enabled
+        });
         let has_additional_seed = additional_seed.is_some();
         let has_stacked_seed_plan = stacked_seed_plan.is_some();
         // #cgan-stacked-backward admission: the stacked lane is dense-only
@@ -2394,6 +2368,7 @@ impl GraphNetwork {
                     engine,
                     per_node_deadline,
                     deadline_is_hard,
+                    flat_bias_enabled,
                     collector_patches_override,
                     alpha_state,
                 )?
@@ -3289,6 +3264,7 @@ impl GraphNetwork {
         cut_ctx: Option<&CrownCutContext>,
         salvage_deadline_chunks: bool,
         expected_fixed_waves: Option<ObjectiveChunkFixedWavePlan>,
+        runtime_policy: CrownIbpRuntimePolicy,
     ) -> Result<TargetCrownCollectionResult> {
         if let Some(limit) = per_node_deadline {
             if std::time::Instant::now() >= limit {
@@ -3385,6 +3361,7 @@ impl GraphNetwork {
                 gpu_suffix_plan,
                 seed,
                 ctx,
+                Some(runtime_policy.patches_deadline_flat_bias_enabled),
             )?;
 
             // A layer kernel may cross the deadline before it can return to
@@ -3460,50 +3437,52 @@ impl GraphNetwork {
             }
         };
 
-        // PARALLEL chunk driver — opt-in via the IMB anchor scope
-        // (`crate::imb::anchor_chunk_parallel`). The chunks are row-independent, so a
-        // parallel evaluation is bound-equivalent AND order-independent (each writes a
-        // DISJOINT `out_*[r0..r1]` range) ⇒ deterministic. Faer stays Seq-guarded
-        // inside the rayon workers (`current_par`), so the parallelism is across
-        // chunks, not nested. Every OTHER caller (the collector's over-budget chunking
-        // included) keeps the sequential loop below → byte-identical.
+        // LEGACY PARALLEL chunk drivers — reachable only when the graph-local
+        // aggregate-memory guard has been explicitly disarmed. The chunks are
+        // row-independent, so a parallel evaluation is bound-equivalent AND
+        // order-independent (each writes a DISJOINT `out_*[r0..r1]` range) ⇒
+        // deterministic. Faer stays Seq-guarded inside the rayon workers
+        // (`current_par`), so the parallelism is across chunks, not nested.
+        // Production keeps every caller on the sequential loop below.
         // The cut-segment context (`NY_CROWN_CUT_SEGMENT`) carries interior
         // mutability (`Cell` hit counters) and is not `Sync`; every parallel
         // caller (the IMB anchor scope) passes `cut_ctx: None`, so ctx-carrying
-        // sweeps simply keep the sequential branch. Deadline-bearing chunks
-        // are also sequential: launching all ranges at once would defeat the
-        // bounded-work guarantee and the between-chunk deadline poll.
+        // sweeps simply keep the sequential branch. The experimental deadline
+        // route launches bounded fixed-width waves and polls between them; the
+        // no-deadline IMB anchor route may launch its full partition in parallel.
         let chunk_out: Vec<CompletedCrownChunk> = {
             //
-            // #chunk-wave-par: a per-node DEADLINE no longer forces the sequential
-            // driver. It used to, and that is why this parallel branch never ran
-            // for the CROWN-IBP collector -- which always sets a per-node deadline.
-            // The consequence was measured on CIFAR100_resnet_medium: ny reported
+            // #chunk-wave-par legacy experiment: the original motivation was that a
+            // per-node deadline forced the sequential driver, so this parallel branch
+            // never ran for the CROWN-IBP collector -- which always sets a per-node
+            // deadline. The consequence was measured on CIFAR100_resnet_medium: ny reported
             // "8/11 DEMANDED targets reverted to IBP (PerNodeDeadlineExceeded=8)"
             // while ~95% of a 32-thread machine sat in rayon's idle path. The
             // sequential driver's answer to a target that cannot finish in budget
             // is to ABORT it early (#chunk-abort) -- optimal only if going faster
             // is impossible, which it plainly was not with 30 cores parked.
             //
-            // A deadline-bearing sweep now runs its chunks in parallel WAVES: each
-            // wave is a bounded amount of work, and the deadline poll and the
-            // projection abort both happen BETWEEN waves. That keeps exactly the
-            // two properties the sequential driver existed to provide (bounded
-            // unpolled work, early abort of a walk that cannot land) while using
-            // the idle cores. Output is unchanged: the ranges partition the
-            // objective rows, each chunk writes a DISJOINT `out_*[r0..r1]`, and row
-            // values are partition-invariant, so the result is bound-identical and
-            // deterministic regardless of wave scheduling.
-            // `NY_NO_CHUNK_WAVE_PAR=1` restores the sequential deadline driver.
+            // Under explicit opt-in, a deadline-bearing sweep runs its chunks in
+            // parallel WAVES: each wave is a bounded amount of work, and the deadline
+            // poll and projection abort both happen BETWEEN waves. That retains the
+            // two intended scheduling properties (bounded unpolled work and early
+            // abort of a walk that cannot land) while using the otherwise idle cores.
+            // Output is unchanged: the ranges partition the objective rows, each chunk
+            // writes a DISJOINT `out_*[r0..r1]` range, and row values are
+            // partition-invariant, so the result is bound-identical and deterministic
+            // regardless of wave scheduling.
+            // Production is sequential: one chunk may consume the entire
+            // request-local Dense budget, so no honest contract admits two
+            // simultaneous workers. `NY_NO_CHUNK_WAVE_PAR=0` explicitly
+            // restores this measurement-only wave driver.
             //
             // MEASURED BENEFIT: NONE YET, on CIFAR100_resnet_medium. A/B at a 300s
             // budget with the CROWN-IBP collector forced live
             // (NY_NO_FORWARD_LINEAR_REF=1) gave 186.8s sequential vs 185.3s wave --
-            // indistinguishable. The change is kept because the gate it removes is
-            // wrong in principle -- a deadline should not force serial execution
-            // while the machine is ~95% idle -- and because it is bound-identical
-            // and covered by the chunk-equivalence proptests, NOT because it has
-            // been shown to help. Do not cite it as a speedup.
+            // indistinguishable. That result does not license the aggregate
+            // memory over-admission of several full backward frontiers, so the
+            // branch is retained only for controlled measurement. Do not cite
+            // it as a speedup or enable it in an uncontained run.
             //
             // The two candidate explanations above were "targets partition into a
             // single chunk, so the wave path is skipped" vs "the collector's cost
@@ -3529,6 +3508,8 @@ impl GraphNetwork {
                     chunk_ceiling,
                     per_node_deadline.is_some(),
                     cut_ctx.is_some(),
+                    runtime_policy.chunk_wave_parallel_enabled,
+                    runtime_policy.chunk_adaptive_growth_enabled,
                 ),
                 expected_fixed_waves,
                 label,
@@ -3538,11 +3519,28 @@ impl GraphNetwork {
                 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
                 let deadline =
                     per_node_deadline.expect("fixed-wave route requires a per-node deadline");
+                info!(
+                    "[objective-chunk-wave] stage=selected route=fixed target='{target_node}' \
+                     chunk_rows={} chunk_count={} wave_size={} wave_count={}",
+                    wave_plan.chunk_rows,
+                    wave_plan.chunk_count,
+                    wave_plan.wave_size,
+                    wave_plan.wave_count,
+                );
+                eprintln!(
+                    "[NY_OBJECTIVE_CHUNK_WAVE_V1] stage=selected route=fixed \
+                     target='{target_node}' chunk_rows={} chunk_count={} wave_size={} wave_count={}",
+                    wave_plan.chunk_rows,
+                    wave_plan.chunk_count,
+                    wave_plan.wave_size,
+                    wave_plan.wave_count,
+                );
                 debug_assert_eq!(ranges.len(), wave_plan.chunk_count);
-                let abort_enabled_for_wave = chunk_projection_abort_enabled();
+                let abort_enabled_for_wave = runtime_policy.chunk_projection_abort_enabled;
 
                 let mut bounded: Vec<(usize, Vec<f32>, Vec<f32>)> =
                     Vec::with_capacity(ranges.len());
+                let mut engagement_committed = false;
                 let mut spent = std::time::Duration::ZERO;
                 let mut rows_done = 0usize;
                 for chunk_of_ranges in ranges.chunks(wave_plan.wave_size) {
@@ -3587,6 +3585,19 @@ impl GraphNetwork {
                     let wave_rows: usize = chunk_of_ranges.iter().map(|(a, b)| b - a).sum();
                     rows_done += wave_rows;
                     bounded.append(&mut got);
+                    if !engagement_committed {
+                        engagement_committed = true;
+                        info!(
+                            "[objective-chunk-wave] stage=committed route=fixed \
+                             target='{target_node}' chunk_rows={} committed_rows={wave_rows}",
+                            wave_plan.chunk_rows,
+                        );
+                        eprintln!(
+                            "[NY_OBJECTIVE_CHUNK_WAVE_V1] stage=committed route=fixed \
+                             target='{target_node}' chunk_rows={} committed_rows={wave_rows}",
+                            wave_plan.chunk_rows,
+                        );
+                    }
                     if rows_done >= target_dim {
                         break;
                     }
@@ -3623,13 +3634,34 @@ impl GraphNetwork {
                 bounded
             } else if matches!(driver_route, ObjectiveChunkDriverRoute::AnchorParallel) {
                 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+                info!(
+                    "[objective-chunk-wave] stage=selected route=anchor target='{target_node}' \
+                     chunk_rows={chunk_size} chunk_count={}",
+                    ranges.len(),
+                );
+                eprintln!(
+                    "[NY_OBJECTIVE_CHUNK_WAVE_V1] stage=selected route=anchor \
+                     target='{target_node}' chunk_rows={chunk_size} chunk_count={}",
+                    ranges.len(),
+                );
                 // `ctx = None` at compile level: the cut context is `Cell`-bearing
                 // (not `Sync`), and every parallel caller passes `None` anyway
                 // (enforced by the `cut_ctx.is_none()` gate above).
-                ranges
+                let completed = ranges
                     .par_iter()
                     .map(|r| bound_chunk(r, None))
-                    .collect::<Result<Vec<_>>>()?
+                    .collect::<Result<Vec<_>>>()?;
+                info!(
+                    "[objective-chunk-wave] stage=committed route=anchor target='{target_node}' \
+                     chunk_rows={chunk_size} committed_chunks={}",
+                    completed.len(),
+                );
+                eprintln!(
+                    "[NY_OBJECTIVE_CHUNK_WAVE_V1] stage=committed route=anchor \
+                     target='{target_node}' chunk_rows={chunk_size} committed_chunks={}",
+                    completed.len(),
+                );
+                completed
             } else {
                 // SEQUENTIAL (deadline-bearing) driver: adaptive chunk width
                 // (#chunk-grow) plus the measured-projection early abort
@@ -3644,7 +3676,7 @@ impl GraphNetwork {
                 // seconds are reclaimed for the remaining targets.
                 // `NY_NO_CHUNK_ABORT=1` restores the burn-the-whole-budget
                 // behavior; `NY_NO_CHUNK_GROW=1` restores the fixed-width partition.
-                let abort_enabled = chunk_projection_abort_enabled();
+                let abort_enabled = runtime_policy.chunk_projection_abort_enabled;
                 let ObjectiveChunkDriverRoute::Sequential {
                     adaptive_growth: grow_enabled,
                 } = driver_route
@@ -3901,6 +3933,7 @@ impl GraphNetwork {
             &gpu_suffix_plan,
             seed,
             cut_ctx,
+            None,
         )?;
         // A layer kernel may cross the deadline before returning to the
         // per-node poll; a late result must not be accepted as on-time.
@@ -4137,6 +4170,7 @@ impl GraphNetwork {
             additional_seed,
             None,
             false,
+            None,
         )?;
         if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
             return Err(NyError::DeadlineExceeded(
@@ -4332,6 +4366,7 @@ impl GraphNetwork {
             None,
             Some(&plan),
             false,
+            None,
         )?;
         if per_node_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             return Err(NyError::DeadlineExceeded(format!(
@@ -7019,11 +7054,29 @@ mod cut_segment_env_tests {
     }
 
     #[test]
+    fn objective_chunk_parallelism_is_exact_opt_in_and_production_is_sequential() {
+        assert_eq!(
+            objective_chunk_driver_route(28_800, 32, 28_800, true, false, false, false, true, 32,),
+            ObjectiveChunkDriverRoute::Sequential {
+                adaptive_growth: true,
+            },
+            "the cGAN deadline route must not launch 32 independently full-budget frontiers"
+        );
+        assert_eq!(
+            objective_chunk_driver_route(28_800, 32, 28_800, false, false, false, true, true, 32,),
+            ObjectiveChunkDriverRoute::Sequential {
+                adaptive_growth: true,
+            },
+            "the no-deadline anchor must not bypass the same production containment"
+        );
+    }
+
+    #[test]
     fn objective_chunk_driver_models_fixed_wave_grouping_and_growth_fallbacks() {
         let fixed =
             objective_chunk_driver_route(28_800, 32, 9_320, true, false, true, false, true, 32);
         let ObjectiveChunkDriverRoute::FixedWaves(plan) = fixed else {
-            panic!("deadline/no-cut/default-wave route must be fixed waves");
+            panic!("an explicitly admitted deadline/no-cut experiment must use fixed waves");
         };
         assert_eq!(plan.chunk_rows, 32);
         assert_eq!(plan.chunk_count, 900);
@@ -7035,7 +7088,7 @@ mod cut_segment_env_tests {
             ObjectiveChunkDriverRoute::Sequential {
                 adaptive_growth: true,
             },
-            "wave kill switch must route to the adaptive sequential driver"
+            "production containment must route to the adaptive sequential driver"
         );
         assert_eq!(
             objective_chunk_driver_route(28_800, 32, 9_320, true, true, true, false, false, 32,),
@@ -7177,7 +7230,7 @@ mod cut_segment_env_tests {
     /// historical chunk/salvage mechanics covered while finite chunk admission
     /// itself remains fail-closed at O(1).
     #[test]
-    fn deterministic_controller_deadline_retains_rows_on_legacy_chunk_route() {
+    fn deterministic_controller_deadline_uses_frozen_chunk_width_and_retains_rows() {
         ny_test_utils::env::with_env_edits(|env| {
             for key in [
                 "NY_CROWN_OBJ_CHUNK",
@@ -7189,9 +7242,15 @@ mod cut_segment_env_tests {
             ] {
                 env.remove(key);
             }
-            env.set("NY_CROWN_OBJ_CHUNK", "32");
-
-            let (graph, input) = demanded_conv_transpose_33();
+            let frozen = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(
+                ny_levers::all(),
+                |name| {
+                    (name == ny_levers::decls::crown_ibp_budget::CROWN_OBJ_CHUNK.name)
+                        .then(|| "32".to_owned())
+                },
+            ));
+            let (mut graph, input) = demanded_conv_transpose_33();
+            graph.set_frozen_levers(Some(frozen));
             let ibp = graph.collect_node_bounds(&input).expect("certified IBP");
             let _injected = TestChunkDeadlineGuard::after_committed_chunks(1);
             let result = graph

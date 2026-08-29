@@ -347,7 +347,18 @@ fn prohibited_doctest_ignore_lines(source: &str) -> Vec<usize> {
             let is_inner_doc = bytes[cursor..].starts_with(b"/*!");
             cursor += 2;
             let content_start = cursor + usize::from(is_outer_doc || is_inner_doc);
-            let mut content_end = cursor;
+            // Clamp to `content_start`, never to the raw cursor. For a DOC block
+            // comment `content_start` is one past the cursor (it skips the third
+            // byte of `/**` / `/*!`), so an EMPTY one — `/**/`, which `/**`
+            // matches — closes on the first loop iteration with the delimiter
+            // sitting AT the cursor, leaving content_end one BELOW content_start
+            // and slicing an inverted range:
+            //   byte range starts at 201603 but ends at 201602
+            // That is a panic in the checker, not a policy finding, so the whole
+            // `rust_tests_cannot_be_ignored` lane aborted rather than reporting.
+            // Live trigger in-tree: the `/**/` column separators in
+            // ny-trace-bridge's ops_misc.rs vec! literals.
+            let mut content_end = content_start;
             let mut depth = 1_usize;
             while cursor < bytes.len() && depth > 0 {
                 if bytes[cursor..].starts_with(b"/*") {
@@ -355,7 +366,7 @@ fn prohibited_doctest_ignore_lines(source: &str) -> Vec<usize> {
                     cursor += 2;
                 } else if bytes[cursor..].starts_with(b"*/") {
                     depth -= 1;
-                    content_end = cursor;
+                    content_end = cursor.max(content_start);
                     cursor += 2;
                 } else {
                     line += usize::from(bytes[cursor] == b'\n');
@@ -363,7 +374,7 @@ fn prohibited_doctest_ignore_lines(source: &str) -> Vec<usize> {
                 }
             }
             if depth > 0 {
-                content_end = cursor;
+                content_end = cursor.max(content_start);
             }
             if is_outer_doc || is_inner_doc {
                 for (offset, documentation) in

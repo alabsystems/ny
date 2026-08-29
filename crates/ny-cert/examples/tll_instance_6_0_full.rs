@@ -229,13 +229,13 @@ fn main() {
         let env = branch_tree_to_json(&cert).unwrap();
         std::fs::write(
             format!("{dir}/tll_instance_6_0_branch_tree.json"),
-            serde_json::to_string_pretty(&env).unwrap(),
+            ny_cert::json::to_string_pretty(&env),
         )
         .unwrap();
         let batch = branch_tree_leaf_batch_json(&cert).unwrap();
         std::fs::write(
             format!("{dir}/tll_instance_6_0_leaf_batch.json"),
-            serde_json::to_string_pretty(&batch).unwrap(),
+            ny_cert::json::to_string_pretty(&batch),
         )
         .unwrap();
         println!("wrote branch-tree envelope + Clean batch ({n_ents} entailments) to {dir}/");

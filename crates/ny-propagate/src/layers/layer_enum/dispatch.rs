@@ -115,6 +115,13 @@ impl Layer {
         //   - NONLINEAR ops that CANNOT carry it (softmax, norms, …): discharge any
         //     INCOMING error precisely into the bias (or to conservative rows) before
         //     the op (sound; those are relaxation surfaces anyway).
+        //
+        // `Layer::IntervalConst` is deliberately ABSENT from both sides: its
+        // batched arm below returns `UnsupportedOp`, so neither the direct nor
+        // the carrier branch can ever run for it. If batched support is added,
+        // it must join the DIRECT set — its backward composes against the
+        // absolute weight exactly like `Linear`, and the carrier re-run would
+        // under-estimate the penalty for an `A*W` contraction.
         let batched_propagates_err_directly = self.is_elementwise_activation()
             || matches!(self, Layer::Linear(_) | Layer::BatchNorm(_));
         // BatchNorm (#cgan-conv-err-compose): its batched backward is an EXACT
@@ -474,6 +481,9 @@ impl Layer {
                         let pre = require_pre_activation()?;
                         qdq.propagate_linear_batched_with_bounds(bounds, pre)
                     }
+                    // EpsilonExpand: identity coefficients + outward bias
+                    // widening, no pre-activation needed (total on R).
+                    Layer::EpsilonExpand(ee) => ee.propagate_linear_batched(bounds),
                     Layer::CumSum(c) => {
                         let pre = require_pre_activation()?;
                         c.propagate_linear_batched(bounds, pre)
@@ -492,11 +502,25 @@ impl Layer {
                     // Adding a new Layer variant is a compile error until
                     // it's added to a supported arm above or here.
                     //
+                    // Conv3d: IBP-only by design. Its CROWN backward fails
+                    // closed (no certified rank-3-spatial transposed
+                    // convolution exists), so the BATCHED backward must refuse
+                    // too — a batched arm here could only publish the vacuous
+                    // or uncertified relation the scalar path already refuses,
+                    // and Conv3d is correspondingly absent from
+                    // `supports_batched_crown` and the carrier set above.
+                    Layer::Conv3d(_)
                     // Pooling (spatial ops, not batched-compatible):
-                    Layer::AveragePool(_) | Layer::MaxPool2d(_)
+                    | Layer::AveragePool(_) | Layer::MaxPool2d(_)
                     // Gather (index-based, not batched-compatible):
                     | Layer::Gather(_) | Layer::ScatterAdd(_) | Layer::IndexAdd(_) | Layer::ScatterNd(_)
                     | Layer::Topk(_) | Layer::ArgMax(_) | Layer::ArgMin(_) | Layer::ArgSort(_)
+                    // Interval-valued frozen constant: batched CROWN would have
+                    // to carry `(|A| + err_in) * R` through the BATCHED error
+                    // channel, which is separate work. Refusing degrades the
+                    // domain-batched path to the scalar backward, which does
+                    // discharge the enclosure — never to a verdict.
+                    | Layer::IntervalConst(_)
                     // Skip/passthrough:
                     | Layer::SkipMerge(_) | Layer::OpaqueSkip(_)
                     // Data-dependent:
@@ -588,7 +612,8 @@ macro_rules! impl_layer_bound_propagation {
 impl_layer_bound_propagation! {
     unary {
         // Linear / convolution
-        Linear(l), Conv1d(c), Conv2d(c), ConvTranspose1d(c), ConvTranspose2d(c),
+        Linear(l), IntervalConst(ic), Conv1d(c), Conv2d(c), Conv3d(c),
+        ConvTranspose1d(c), ConvTranspose2d(c),
         // Pooling
         AveragePool(ap), MaxPool2d(mp),
         // Activations
@@ -618,7 +643,7 @@ impl_layer_bound_propagation! {
         SelfAttention(sa), Where(w), NonZero(nz),
         Floor(f), Ceil(c), Round(r), Trunc(tc), Sign(s),
         Compare(cmp),
-        SkipMerge(sm), OpaqueSkip(os), QdqPerturbation(qdq),
+        SkipMerge(sm), OpaqueSkip(os), QdqPerturbation(qdq), EpsilonExpand(ee),
     }
     binary {
         // Binary ops (two bounded inputs, no BoundPropagation trait impl)

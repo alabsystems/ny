@@ -187,6 +187,24 @@ impl EnvEditor {
         std::env::set_var(key, value);
     }
 
+    /// Set `key` to a raw [`OsStr`] until the end of the [`with_env_edits`]
+    /// scope or the next edit of `key`.
+    ///
+    /// The [`set`](Self::set) twin takes `&str` and therefore cannot express a
+    /// NON-UTF-8 value — which is exactly what a presence-vs-readability test
+    /// needs, since `env::var` hands `None` to its predicate for such a value
+    /// while `var_os` still reports it PRESENT. Without this, such a test has to
+    /// call `std::env::set_var` directly and carry its own allow, which is the
+    /// unserialized mutation the env wall exists to stop.
+    pub fn set_os(&mut self, key: &str, value: &OsStr) {
+        self.save_once(key);
+        // Blessed choke point: serialized by with_env_edits, restored on
+        // scope exit. (`env_mutation`: Trust-only deny-by-default env wall.)
+        #[allow(clippy::disallowed_methods)]
+        #[allow(unknown_lints, env_mutation)]
+        std::env::set_var(key, value);
+    }
+
     /// Remove `key` until the end of the [`with_env_edits`] scope or the
     /// next edit of `key`.
     pub fn remove(&mut self, key: &str) {

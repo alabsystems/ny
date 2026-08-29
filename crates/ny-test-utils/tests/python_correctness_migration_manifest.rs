@@ -39,15 +39,55 @@ const TOOLING_TESTS: &[&str] = &[
     "test_benchmark_vnncomp_all_script.py",
     "test_benchmark_vnncomp_preset_bounded.py",
     "test_benchmark_vnncomp_script.py",
+    // Tooling, by its subject, on the same ground as `test_vnnlib_ce_tensor_specs.py`
+    // below: every assertion exercises `scripts/bound_containment.py` — its
+    // dump parser, its BatchNorm-fold walk, its inverted-interval refusal and
+    // its one-sided reporting. There is no Rust contract here with a Python
+    // mirror; migrating the test would mean porting the script, and the script's
+    // oracle IS onnxruntime. Note `crates/ny-onnx` does carry an optional `ort`
+    // feature, so a Rust port is not impossible — it is simply a different piece
+    // of work from this test, and would re-author the oracle rather than move an
+    // assertion.
+    //
+    // Hard-imports numpy/onnx/onnxruntime rather than `pytest.importorskip`, so
+    // it fails fast instead of silently skipping — matching
+    // test_canonicalize_vnncomp_ce_y.py and test_audit_unsat_by_falsification.py,
+    // and required by gate.sh check (e) ("no skips permitted").
+    "test_bound_containment.py",
     "test_bounds_doc_citations.py",
     "test_canonicalize_vnncomp_ce_y.py",
     "test_ce_falsified_watchlist.py",
+    // Landed by 964b4c47e with the banked-row cause classifier fix and no
+    // disposition — the same omission this manifest records against 380cd179e
+    // below, and it left this gate RED on main until this entry. Tooling, by
+    // its subject: every assertion is about `scripts/check_banked_rows.py`'s
+    // `ny_internal_solver_deadline` / `CAUSE_BUDGET_WALL` decision, a Python
+    // script's own arithmetic, not a Rust contract with a Python mirror.
+    // Migrating it would mean porting the script. Stdlib-only (unittest +
+    // importlib), no `importorskip`, so it cannot silently skip.
+    "test_check_banked_rows_classify.py",
     "test_cifar100_attack_fast_kernels_qualify.py",
     "test_cifar100_bound_parity.py",
     "test_constrained_zonotope_dual_oracle.py",
     "test_constrained_zonotope_remainder_oracle.py",
     "test_download_benchmarks_script.py",
+    // Landed 2026-08-27 in be7077dc9 ("fix(gate): keep help independent of Trust
+    // frontend") WITHOUT this entry, which left the manifest assertion — and so
+    // gate.sh check [a] — red on main until 2026-08-28. Exactly the drift this
+    // inventory exists to catch; the same omission is recorded against
+    // `test_vnnlib_ce_*` in the comments above. Tooling by its subject: it
+    // black-box drives `scripts/gate.sh` through subprocess with a fake
+    // rustup/rustc/targo/cargo on PATH, so there is no Rust contract to mirror.
+    "test_gate_help.py",
     "test_git_dep_pin_tooling.py",
+    // Same subject and same harness as `test_gate_help.py`: it drives
+    // `scripts/check_github_credential.sh`, `scripts/gate.sh` and
+    // `scripts/ny_box.sh` as subprocesses with a fake `git` on PATH supplying
+    // the captured ls-remote responses. The assertions are about shell exit
+    // codes, refusal ordering relative to the box lock, and the ABSENCE of a
+    // token value in captured output — process-level properties of scripts, not
+    // of a Rust API, so migrating the test would mean porting the scripts.
+    "test_github_credential_check.py",
     "test_gpu_crown_backward_refresh_policy.py",
     "test_gpu_crown_backward_regression.py",
     "test_gpu_crown_backward_regression_cli.py",
@@ -90,6 +130,14 @@ const TOOLING_TESTS: &[&str] = &[
     "test_vnncomp_prepare_instance_script.py",
     "test_vnncomp_publication.py",
     "test_vnncomp_trust_linux_build.py",
+    // Tooling, by its subject, exactly like `test_vnnlib_ce_tensor_specs.py`
+    // below: it pins `scripts/extended_bank/vnnlib_ce.py`'s own scan rule —
+    // which X_i a mixed `(or (and <box> <output claim>) ...)` provably bounds,
+    // and the projection gate that then enforces the box. Migrating it would
+    // mean porting the script. Its negative controls (an X bounded in only ONE
+    // arm stays free; `not` refuses the projection) are the reason the widened
+    // scan cannot over-admit, so they belong beside the script they constrain.
+    "test_vnnlib_ce_nested_input_domain.py",
     // Landed by 380cd179e with the VNN-LIB 2.0 tensor-name validator fix and no
     // disposition, which is what this manifest exists to refuse. Tooling, by
     // its subject: it exercises `scripts/extended_bank/vnnlib_ce.py`, a Python
@@ -111,15 +159,20 @@ const EXTERNAL_TOOLING_TESTS: &[&str] = &[
     "test_measure_ny_scorecard_provenance.py::external_completion_write_failure_propagates_nonzero_from_trap",
     "test_measure_ny_scorecard_provenance.py::external_configs_dir_is_passed_and_content_addressed",
     "test_measure_ny_scorecard_provenance.py::external_configs_dir_rejects_relative_or_missing_path",
+    "test_measure_ny_scorecard_provenance.py::external_configs_parent_is_pinned_to_selected_corpus_year",
+    "test_measure_ny_scorecard_provenance.py::external_configs_year_selection_fails_closed_before_start",
     "test_measure_ny_scorecard_provenance.py::external_default_scratch_is_unique_and_keyed_by_run_id",
+    "test_measure_ny_scorecard_provenance.py::external_decided_measurement_flags_stale_duplicate_bank_occurrence",
     "test_measure_ny_scorecard_provenance.py::external_exact_instance_selector_is_provenanced_and_runs_only_that_row",
     "test_measure_ny_scorecard_provenance.py::external_explicit_noncuda_debug_measurement_skips_cuda_selfcheck",
     "test_measure_ny_scorecard_provenance.py::external_explicit_solver_binary_is_allowed_captured_and_sealed",
     "test_measure_ny_scorecard_provenance.py::external_explicit_twenty_cpu_lane_is_attested_and_provenanced",
+    "test_measure_ny_scorecard_provenance.py::external_five_column_cersyve_bank_schema_is_decoded",
     "test_measure_ny_scorecard_provenance.py::external_integrity_failure_propagates_nonzero_from_completion_trap",
     "test_measure_ny_scorecard_provenance.py::external_isolated_output_reruns_legacy_row_and_honors_row_cap",
     "test_measure_ny_scorecard_provenance.py::external_missing_input_fails_without_emitting_unarchived_csv_row",
     "test_measure_ny_scorecard_provenance.py::external_multiple_vnnlib_versions_require_explicit_selection",
+    "test_measure_ny_scorecard_provenance.py::external_noncanonical_joint_predicate_fails_before_solver_row",
     "test_measure_ny_scorecard_provenance.py::external_scorecard_ignores_ignored_sibling_python_bytecode",
     "test_measure_ny_scorecard_provenance.py::external_scorecard_ignores_path_prepended_env_and_timeout_shims",
     "test_measure_ny_scorecard_provenance.py::external_scorecard_reexecs_through_gpu_guard_before_measurement",
@@ -143,7 +196,9 @@ const EXTERNAL_TOOLING_TESTS: &[&str] = &[
     "test_measure_ny_scorecard_provenance.py::external_sweep_refuses_failed_sealed_cuda_selfcheck",
     "test_measure_ny_scorecard_provenance.py::external_sweep_rejects_ld_library_path_with_non_cuda_override",
     "test_measure_ny_scorecard_provenance.py::external_sweep_rejects_unreviewed_solver_runtime_environment",
+    "test_measure_ny_scorecard_provenance.py::external_same_family_joint_predicate_reaches_sealed_solver_and_archive",
     "test_measure_ny_scorecard_provenance.py::external_top_level_instances_list_precedes_nested_payload_list",
+    "test_measure_ny_scorecard_provenance.py::external_truncated_measurement_row_is_rejected_before_resume",
     "test_ny_measurement_provenance.py::external_non_utf8_byte_paths_are_deterministic_and_not_normalized",
     "test_ny_safe_gpu_run.py::external_guard_preserves_environment_status_and_attests_limits",
     "test_ny_safe_gpu_run.py::external_guard_preserves_literal_argument_boundaries",
@@ -154,6 +209,16 @@ const EXTERNAL_TOOLING_TESTS: &[&str] = &[
     "test_replay_vnncomp2025_counterexample.py::external_consumer_safe_bound_replay_executes_retained_worker",
     "test_replay_vnncomp2025_counterexample.py::external_official_checker_sources_match_commit_and_retained_copy",
     "test_replay_vnncomp2025_counterexample.py::external_retained_runtime_matches_all_exact_pins",
+    // #nn4sys-nested-domain's three corpus contracts. They carried
+    // `unittest.SkipTest` on the nn4sys directory, which the source policy
+    // prohibits for the reason this manifest exists: they are the ONLY
+    // contracts that pin the widened input-domain scan against the real 182
+    // specs it was written for, and a lane that quietly vanishes is
+    // indistinguishable from one that ran. They need
+    // benchmarks/vnncomp2025/benchmarks/nn4sys and fail, not skip, without it.
+    "test_vnnlib_ce_nested_input_domain.py::external_a_previously_refused_spec_is_refused_for_no_reason_at_all",
+    "test_vnnlib_ce_nested_input_domain.py::external_every_reachable_spec_scans",
+    "test_vnnlib_ce_nested_input_domain.py::external_the_projection_gate_is_the_only_in_box_gate_on_a_real_row",
     // 8776f96f2 moved these seven off `pytest.mark.skipif` and onto the
     // external lane, which is the right fix -- but the lane's own manifest is
     // what makes the move explicit rather than another disappearance. They

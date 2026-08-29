@@ -16,6 +16,28 @@ use super::NORMALIZATION_MIN_EPS;
 /// Validate eps: must be finite and at least [`NORMALIZATION_MIN_EPS`].
 ///
 /// `layer_name` is used in the error message (e.g., "LayerNorm", "RMSNorm").
+///
+/// # Scope: the DATA-VARIANCE family only
+///
+/// This is the gate for the normalizations whose variance is computed from
+/// the input — LayerNorm, RMSNorm, InstanceNorm, GroupNorm, and AdaIN through
+/// its InstanceNorm delegate. Their denominator is `sqrt(var + eps)` with
+/// `var` data-dependent, so an input box containing a constant vector drives
+/// `var` to exactly 0 and the whole denominator to `sqrt(eps)`: `eps == 0`
+/// makes the represented function `0/0` at a reachable point, and no
+/// enclosure of it exists. The floor is not merely `> 0` because below
+/// [`NORMALIZATION_MIN_EPS`] these layers' derivations (the RMSNorm L2 sphere
+/// argument, the CROWN slope bounds, the f32 fused paths) are not validated —
+/// and eps is never silently rounded up to reach it, because changing eps
+/// changes the represented function.
+///
+/// BatchNorm deliberately does NOT use this gate: its variance is a stored
+/// constant, so `eps == 0` is sound whenever every channel's `var + eps` is
+/// strictly positive, which is what `BatchNormLayer::new` checks per channel.
+/// `ny-trace-bridge`'s `translate::validate_eps` /
+/// `translate::validate_constant_variance_eps` mirror this same split at the
+/// trace boundary, so a trace is refused where its op can be named rather
+/// than deep in graph construction.
 #[inline]
 pub(crate) fn validate_norm_eps(eps: f32, layer_name: &str) -> Result<f32> {
     if !eps.is_finite() || eps < NORMALIZATION_MIN_EPS {

@@ -488,6 +488,11 @@ fn a_returned_candidate_is_exactly_in_box_and_integral() {
         candidate.logit_margin > 0,
         "a candidate must be a violation"
     );
+    assert_eq!(candidate.lp_solves, 0, "stage A does not run ILS probes");
+    assert!(
+        candidate.work_units > candidate.lp_solves,
+        "stage-A gradient work must not disappear from execution evidence"
+    );
     assert_in_box_and_integral(&candidate.input, &net.lo, &net.hi);
 }
 

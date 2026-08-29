@@ -1,0 +1,55 @@
+# PRESET CAPABILITY-ZERO FRONTIER — struct literals in first-party non-test
+# source that set TWO OR MORE capacity fields to a literal zero.
+#
+# Columns:  file <TAB> sorted-field-set <TAB> count <TAB> class <TAB> note
+#
+# Classes:
+#   lane-disabled     the zeros make the mechanism a no-op or restrict it to a
+#                     degenerate case. The note must say WHAT IT DEGRADES TO,
+#                     because the type name will keep claiming otherwise.
+#   telemetry-init    counters and statistics initialised to zero.
+#   not-a-capacity    zero genuinely means "no limit" or "not applicable" here.
+#   legacy-unreviewed measured, not yet adjudicated. Capped by
+#                     BASELINE_LEGACY_UNREVIEWED.
+#
+# WHY TWO. One zeroed capacity is routinely an honest "unlimited" or a counter.
+# A literal that zeroes SEVERAL at once is a lane that has been configured out
+# of existence, which is exactly what happened to the metaroom
+# constrained-zonotope front. Single-zero literals and single-LINE struct
+# literals are outside this scan; both are known bounds, not oversights.
+#
+# ---------------------------------------------------------------------------
+# THE CONSTRAINED-ZONOTOPE LANES ARE CONFIGURED TO REFUSE CONSTRAINTS
+#
+# `ny-mip`'s CZ steps all guard with
+#   check_limit("constraint count", input.constraint_count(), limits.max_constraint_count)
+# (`constrained_zonotope_conv2d.rs`, `_affine.rs`, `_conv_transpose2d.rs`,
+# `_batch_norm.rs`, `_tail_lp.rs` and siblings), and `check_limit` REFUSES when
+# the observed value exceeds the limit. At `max_constraint_count: 0` the only
+# input that survives is one with zero constraint rows — an ordinary,
+# unconstrained zonotope. The step is not broken; it is restricted to the case
+# the word "constrained" was supposed to rule in.
+#
+# ny-mip's own unit test says so in as many words:
+# `constrained_zonotope_affine.rs` sets `max_constraint_count = 0` and asserts
+# the limit FIRES ("constraint count").
+#
+# So every row below marked `lane-disabled` is a CZ step that can only ever run
+# on an unconstrained domain. `cz_metaroom_qualification::metaroom_tail_lp_config`
+# is the one that matters most: it is an UNCONDITIONAL struct literal on the
+# production cascade path, with `max_constraints`, `max_constraint_elements` and
+# `max_constraint_nonzeros` all zero, so the metaroom tail LP has never priced a
+# constraint. Note that `hybrid_tail_resource_configs_seal_measured_caps` PINS
+# the zero, so a fix has to change that test too — the pin is the reason this
+# stayed invisible.
+crates/ny-cli/src/commands/cz_cgan_sequential_unwired.rs	max_constraint_count+max_constraint_elements	4	lane-disabled	cGAN CZ conv/affine steps restricted to unconstrained zonotopes; degrades to plain zonotope arithmetic. The file name says `unwired`, so no scored row reaches these today.
+crates/ny-cli/src/commands/cz_cgan_sequential_unwired.rs	max_constraint_elements+max_constraints	2	lane-disabled	same restriction on the cGAN tail steps; degrades to plain zonotope arithmetic.
+crates/ny-cli/src/commands/cz_cgan_sequential_unwired.rs	max_scalar_products+max_weight_elements	1	not-a-capacity	CertifiedBox64Limits for the independent Box bridge, which performs no weighted operation at all, so a weight/product capacity is not applicable rather than exhausted.
+crates/ny-cli/src/commands/cz_metaroom_qualification.rs	max_constraint_count+max_constraint_elements	5	lane-disabled	metaroom CZ conv/stem steps restricted to unconstrained zonotopes; the constrained-zonotope stem degrades to DeepZ-equivalent arithmetic.
+crates/ny-cli/src/commands/cz_metaroom_qualification.rs	max_constraint_elements+max_constraint_nonzeros+max_constraints	2	lane-disabled	metaroom_tail_lp_config and metaroom_tail_dual_config. UNCONDITIONAL literals on the production cascade path: every domain carrying a constraint row is refused at plan time, so the tail LP has never priced a constraint. The zero is PINNED by hybrid_tail_resource_configs_seal_measured_caps, which is why nothing else flagged it.
+crates/ny-cli/src/commands/cz_metaroom_qualification.rs	max_constraint_elements+max_constraints	1	lane-disabled	a third metaroom limits literal with the same restriction.
+crates/ny-gpu/src/wgpu_device/ops/twin_composition_probe.rs	max_abs_ulp_delta+max_under_ulp	1	telemetry-init	TwinAgreement ULP counters starting at zero and only ever raised by observation.
+crates/ny-propagate/src/beta_crown/engine/graph/input_split/root_bounds.rs	max_ascent_iterations_attempted+max_selected_rows	1	telemetry-init	spec-ascent observation counters starting at zero.
+crates/ny-propagate/src/execution_telemetry.rs	max_ascent_iterations_attempted+max_effective_iters+max_selected_rows	1	telemetry-init	execution-telemetry counters starting at zero.
+crates/ny-propagate/src/margin_row/bab.rs	max_batch+max_open	2	telemetry-init	FrontierExecutionEvidence::joint and ::classwise high-water marks, raised by observe(); the CONFIGURED widths in the same literals are deliberately clamped to at least 1.
+crates/ny-propagate/src/margin_row/bab.rs	outer_head_available_max+outer_trunk_available_max	1	telemetry-init	PolicyExecutionEvidence high-water marks for the branch-width candidate sets, raised by observation. These are the fields that make margin_row.k_head / k_trunk requested-vs-delivered visible.

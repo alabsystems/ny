@@ -6,9 +6,9 @@
 //! default must declare how that result reaches the scored path.
 //!
 //! WHY THIS EXISTS. The workspace reads several hundred distinct `NY_*` variables,
-//! but the scored entry point exports exactly ONE of them:
-//! `vnncomp_scripts/run_instance.sh` sets `NY_UPFRONT_ATTACK=1` for `safenlp_2024`
-//! and nothing else. Everything else runs at its COMPILED DEFAULT during scoring.
+//! but the scored entry point exports none of them. Every lever therefore runs
+//! at its typed preset/contextual/default layer during scoring unless the harness
+//! explicitly injects an operator override.
 //! So an `NY_*` gate that is default-off is, in competition, dead code — no matter
 //! what its A/B measured. Several investigations have ended with "the lever is
 //! already implemented and measured, it just cannot fire", and each time the
@@ -73,8 +73,11 @@ const MIN_EXPECTED_READ_SITES: usize = 400;
 
 /// Preset sources that constitute a typed delivery path.
 const PRESET_DIR: &str = "crates/ny-cli/src/preset";
-/// The scored entry point; the only script that exports an `NY_*` for scoring.
+/// The scored entry point. Its zero-`NY_*` export contract is pinned below.
 const RUN_INSTANCE: &str = "vnncomp_scripts/run_instance.sh";
+/// The organizer-facing wrapper. Since #scored-env-closure this is the ONE
+/// file in the repo that deliberately exports `NY_*`, so it needs its own pin.
+const ROOT_RUN_INSTANCE: &str = "run_instance.sh";
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is <root>/crates/ny-cli.
@@ -324,21 +327,120 @@ fn is_stranded(site: &GateSite, delivered: &BTreeSet<String>) -> bool {
     !names.iter().any(|name| delivered.contains(name))
 }
 
-/// `NY_*` names that a per-benchmark preset or the scored entry point can reach.
+/// Extract actual `export NY_NAME[=value]` commands from shell source.
+///
+/// Merely mentioning a variable in a comment or reading a caller-supplied
+/// value is not delivery. Treating all script tokens as exports used to let
+/// comments make env-only mechanisms look reachable in competition.
+/// Names an `unset` command clears, using the same comment/word-splitting
+/// discipline as [`shell_exported_ny_tokens`].
+fn shell_unset_tokens(script: &str) -> BTreeSet<String> {
+    let mut cleared = BTreeSet::new();
+    for line in script.lines() {
+        let code = line.split('#').next().unwrap_or_default();
+        let commands = code.replace("&&", ";").replace("||", ";").replace('|', ";");
+        for command in commands.split(';') {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            let Some(unset_at) = words.iter().position(|word| *word == "unset") else {
+                continue;
+            };
+            for name in &words[unset_at + 1..] {
+                cleared.insert((*name).to_owned());
+            }
+        }
+    }
+    cleared
+}
+
+fn shell_exported_ny_tokens(script: &str) -> BTreeSet<String> {
+    let mut exported = BTreeSet::new();
+    for line in script.lines() {
+        let code = line.split('#').next().unwrap_or_default();
+        let commands = code.replace("&&", ";").replace("||", ";").replace('|', ";");
+        for command in commands.split(';') {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            let Some(export_at) = words.iter().position(|word| *word == "export") else {
+                continue;
+            };
+            for assignment in &words[export_at + 1..] {
+                let name = assignment.split('=').next().unwrap_or_default();
+                if name.starts_with("NY_")
+                    && name.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+                {
+                    exported.insert(name.to_owned());
+                }
+            }
+        }
+    }
+    exported
+}
+
+/// `NY_*` names that a per-benchmark preset or an actual scored-wrapper export
+/// can reach.
 fn delivery_tokens(root: &Path) -> BTreeSet<String> {
-    let mut text = std::fs::read_to_string(root.join(RUN_INSTANCE)).unwrap_or_else(|e| {
+    let script = std::fs::read_to_string(root.join(RUN_INSTANCE)).unwrap_or_else(|e| {
         panic!("cannot read {RUN_INSTANCE}: {e} — the scored entry point must exist")
     });
+    let mut delivered = shell_exported_ny_tokens(&script);
     let mut files = Vec::new();
     rust_sources(&root.join(PRESET_DIR), root, &mut files);
     for (rel, path) in files {
         if is_test_path(&rel) {
             continue;
         }
-        text.push('\n');
-        text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        delivered.extend(ny_tokens(
+            &std::fs::read_to_string(&path).unwrap_or_default(),
+        ));
     }
-    ny_tokens(&text)
+    delivered
+}
+
+#[test]
+fn scored_wrapper_exports_no_ny_variables() {
+    let root = workspace_root();
+    let script = std::fs::read_to_string(root.join(RUN_INSTANCE))
+        .unwrap_or_else(|error| panic!("cannot read {RUN_INSTANCE}: {error}"));
+    assert!(
+        shell_exported_ny_tokens(&script).is_empty(),
+        "the scored wrapper must not create a shell-only parameter authority"
+    );
+}
+
+/// The organizer-facing entry point re-exports exactly two control-plane
+/// names across its namespace scrub, and the delegated helper removes them
+/// before `exec`. BOTH halves are pinned here because deleting either one
+/// silently reopens ambient solver authority on the scored path, and
+/// `scored_wrapper_exports_no_ny_variables` above reads only the helper.
+#[test]
+fn scored_root_wrapper_exports_only_the_control_plane_the_helper_removes() {
+    let root = workspace_root();
+    let entry = std::fs::read_to_string(root.join(ROOT_RUN_INSTANCE))
+        .unwrap_or_else(|error| panic!("cannot read {ROOT_RUN_INSTANCE}: {error}"));
+    let helper = std::fs::read_to_string(root.join(RUN_INSTANCE))
+        .unwrap_or_else(|error| panic!("cannot read {RUN_INSTANCE}: {error}"));
+
+    // This assertion deliberately NAMES NOTHING. Hard-coding a lever spelling
+    // here would add raw `NY_*` literals to the executable source frontier for
+    // a file that reads no environment at all — real debt, bought for nothing.
+    // The contract is structural: whatever the entry point re-exports as its
+    // control plane, the delegated helper must remove before it execs ny.
+    let exported = shell_exported_ny_tokens(&entry);
+    assert!(
+        !exported.is_empty(),
+        "{ROOT_RUN_INSTANCE} is expected to carry a binary-location control \
+         plane across its namespace scrub; finding none means either the \
+         re-export or the scrub itself was dropped"
+    );
+    let cleared = shell_unset_tokens(&helper);
+    let leaked: Vec<&String> = exported.difference(&cleared).collect();
+    assert!(
+        leaked.is_empty(),
+        "every NY_* the scored entry point re-exports must be unset by \
+         {RUN_INSTANCE} before it execs ny; these would otherwise reach the \
+         verifier process: {leaked:?}"
+    );
 }
 
 fn scan_workspace(root: &Path) -> Vec<GateSite> {
@@ -387,9 +489,9 @@ fn every_measured_default_off_gate_declares_a_delivery_path() {
     assert!(
         violations.is_empty(),
         "{} MEASURED, default-off NY_* lever(s) have no way to reach the scored path:\n{}\n\n\
-         `vnncomp_scripts/run_instance.sh` exports exactly one NY_* variable \
-         (NY_UPFRONT_ATTACK, fenced to safenlp_2024), so a default-off gate is dead code \
-         during scoring and the measured result above it can never be collected.\n\n\
+         `vnncomp_scripts/run_instance.sh` exports no NY_* variables, so a default-off \
+         env-only gate is dead code during scoring and the measured result above it can \
+         never be collected.\n\n\
          Pick one, in the gate's own doc comment:\n\
          \x20 (a) DELIVER it — add a typed key in {PRESET_DIR} (see \
          `MarginRowPreset::reserve_max_frac`, \"Typed form of `NY_MARGIN_ROW_RESERVE_MAX_FRAC`\") \
@@ -547,6 +649,28 @@ fn reentry() -> bool {
         assert!(
             !is_stranded(&only_site(src), &delivered()),
             "MEASURED inside a variable NAME is not a documented measurement"
+        );
+    }
+
+    #[test]
+    fn shell_comments_and_reads_do_not_fake_delivery() {
+        let script = r#"
+# export NY_COMMENT_ONLY=1 is deliberately not a command.
+: "${NY_CALLER_OVERRIDE-}"
+export OMP_NUM_THREADS=1
+export NY_REAL_DELIVERY=1
+export OMP_DYNAMIC=0 NY_MULTI_ASSIGNMENT=1
+[ -n "$x" ] && export NY_INLINE_CONTROL=1
+"#;
+        assert_eq!(
+            shell_exported_ny_tokens(script),
+            [
+                "NY_INLINE_CONTROL".to_owned(),
+                "NY_MULTI_ASSIGNMENT".to_owned(),
+                "NY_REAL_DELIVERY".to_owned(),
+            ]
+            .into_iter()
+            .collect()
         );
     }
 

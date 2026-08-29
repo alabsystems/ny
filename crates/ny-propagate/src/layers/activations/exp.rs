@@ -32,34 +32,24 @@ impl ExpLayer {
 impl BoundPropagation for ExpLayer {
     /// IBP for Exp: y = exp(x)
     ///
-    /// Exp is monotonically increasing, so bounds are straightforward.
-    /// Returns `NumericalInstability` if any input bound is non-finite or
-    /// if upper bounds exceed the f32 exp overflow threshold (~88).
+    /// Exp is monotonically increasing, so bounds are straightforward —
+    /// including at the extended-real limits: exp(-inf) = 0 and exp(+inf) =
+    /// +inf are mapped exactly, and a FINITE upper endpoint beyond the f32
+    /// overflow threshold saturates the output upper endpoint to +inf
+    /// (deep-stack IBP overflow saturation, dc9da0fde class) instead of
+    /// aborting verification. Only NaN input bounds fail closed.
     ///
     /// Category B per domain validation policy (designs/2026-02-07-domain-validation-policy.md):
-    /// exp is defined for all real inputs, but f32 exp overflows for x > ~88.
+    /// exp is defined for all real inputs; overflow of the f32 range is a
+    /// sound saturation, not an error.
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
-        // Guard: reject non-finite inputs
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        // Guard: NaN input bounds fail closed — NaN carries no bound
+        // information and (NaN as f64).exp() = NaN would flow into the output.
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "Exp IBP: non-finite input bounds".to_string(),
+                "Exp IBP: NaN input bounds".to_string(),
             ));
-        }
-
-        // Guard: reject overflow-risk upper bounds
-        if input.upper().iter().any(|&x| x > EXP_OVERFLOW_THRESHOLD) {
-            let max_upper = input
-                .upper()
-                .iter()
-                .cloned()
-                .fold(f32::NEG_INFINITY, nan_propagating_max);
-            return Err(NyError::NumericalInstability(format!(
-                "Exp IBP: upper bound {:.1} exceeds overflow threshold {:.1}",
-                max_upper, EXP_OVERFLOW_THRESHOLD
-            )));
         }
 
         // Directed rounding: compute exp in f64 for precision, cast to f32 with
@@ -68,13 +58,44 @@ impl BoundPropagation for ExpLayer {
         // Range clamp: exp(x) >= 0 for all real x. next_down_f32 can push past
         // zero for extreme underflow (e.g., exp(-1000) → 0 → -1e-45). (#3316)
         // NaN-propagating: .max() swallows NaN (IEEE 754-2008). (#3316)
-        let lower = input
-            .lower()
-            .mapv(|x| nan_propagating_max_zero(next_down_f32(f64_to_f32_down((x as f64).exp()))));
-        let upper = input
-            .upper()
-            .mapv(|x| next_up_f32(f64_to_f32_up((x as f64).exp())));
-        BoundedTensor::new(lower, upper)
+        let lower = input.lower().mapv(|x| {
+            if x == f32::NEG_INFINITY {
+                // Exact limit: exp(-inf) = 0.
+                0.0
+            } else if x == f32::INFINITY {
+                // Saturated endpoint maps to its exact limit: exp(+inf) = +inf.
+                f32::INFINITY
+            } else {
+                let e = (x as f64).exp();
+                if e.is_infinite() {
+                    // FINITE x whose f64 exp overflowed (x > ~709.78): the true
+                    // e^x is finite, merely > f32::MAX, so f32::MAX is the
+                    // largest sound LOWER endpoint. (+inf here would be a
+                    // false proof — it asserts e^x = +inf for a finite value.
+                    // `f64_to_f32_down` already rounds a finite-but->MAX f64
+                    // down to f32::MAX; this branch covers the f64 overflow.)
+                    f32::MAX
+                } else {
+                    nan_propagating_max_zero(next_down_f32(f64_to_f32_down(e)))
+                }
+            }
+        });
+        // Upper endpoints need no overflow special case: `f64_to_f32_up`
+        // saturates any value beyond f32::MAX to +inf, which IS the sound
+        // upper direction (finite inputs above EXP_OVERFLOW_THRESHOLD
+        // saturate the upper endpoint instead of refusing). exp(-inf) = 0 is
+        // pinned exactly rather than widened a subnormal ULP upward.
+        let upper = input.upper().mapv(|x| {
+            if x == f32::NEG_INFINITY {
+                0.0
+            } else {
+                next_up_f32(f64_to_f32_up((x as f64).exp()))
+            }
+        });
+        // Conservative-bounds convention (dc9da0fde class): infinite upper
+        // endpoints from saturation are sound; reject only NaN (fail closed,
+        // already impossible given the entry guard).
+        BoundedTensor::new_allow_infinite(lower, upper)
     }
     impl_elementwise_activation!(
         @trait_methods

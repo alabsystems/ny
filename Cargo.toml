@@ -23,6 +23,7 @@ members = [
     "crates/ny-groundtruth",
     "crates/ny-lint-guard",
     "crates/ny-levers",
+    "crates/ny-claims",
     "crates/ny-falsify",
 ]
 # Kani proofs excluded: verified separately with `cargo kani`
@@ -48,7 +49,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
 license = "Apache-2.0"
@@ -241,18 +242,22 @@ pollster = "0.4"  # For blocking on async wgpu calls
 bytemuck = { version = "1.20", features = ["derive"] }
 
 # ONNX support
-# ONNX Runtime bindings. Spell out the upstream defaults so the build uses
-# rustls for the optional prebuilt-runtime download instead of requiring a
-# system OpenSSL development package just to build the default CLI.
+# ONNX Runtime bindings. Only the API-level features are shared here; which
+# ENGINE sits behind that API is chosen per-target in ny-onnx, because upstream
+# publishes no prebuilt ONNX Runtime for Intel macOS. Every other target keeps
+# the C++ runtime (its `download-binaries` and rustls TLS — so the build needs
+# no system OpenSSL — are requested in that target's block); Intel macOS links
+# the pure-Rust `ort-tract` backend through this same `ort` API.
 ort = { version = "2.0.0-rc.12", default-features = false, features = [
     "std",
     "ndarray",
     "tracing",
-    "download-binaries",
-    "tls-rustls",
-    "copy-dylibs",
-    "api-24",
 ] }
+
+# Pure-Rust ONNX execution backend (tract), used through ort's
+# `alternative-backend` seam. Carries no C or C++ dependency, so it
+# cross-compiles to any target cargo can reach.
+ort-tract = "0.4.1"
 prost = "0.14"
 
 # SafeTensors support
@@ -331,6 +336,14 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# #binary-identity: `ny --build-id` and the sweep's per-row swap check hash the
+# whole executable. Unoptimized, that is 23 s on a 667 MB debug binary — enough
+# to make a debug-binary sweep unusable and to tempt someone into disabling the
+# check, which is how the provenance hole reopens. Optimizing just this crate
+# brings it to well under a second and changes nothing about the digest.
+[profile.dev.package.sha2]
+opt-level = 3
 
 [profile.release]
 lto = true

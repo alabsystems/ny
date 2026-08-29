@@ -601,9 +601,13 @@ fn dispatch_opaque_skip_multi_input_returns_nary() {
             bias_lower,
             bias_upper,
         } => {
-            assert_eq!(entries.len(), 3, "Expected 3 entries for 3 inputs");
+            assert_eq!(
+                entries.onnx_slots().len(),
+                3,
+                "Expected 3 entries for 3 inputs"
+            );
             assert!(
-                entries.iter().all(|e| e.is_some()),
+                entries.onnx_slots().iter().all(|e| e.is_some()),
                 "All entries should be Some"
             );
             // OpaqueSkip's propagate_linear returns unbounded [-inf, +inf] bias
@@ -618,7 +622,7 @@ fn dispatch_opaque_skip_multi_input_returns_nary() {
                 "OpaqueSkip bias_upper should be +inf (unbounded)"
             );
             // A-matrix bounds should have zero bias
-            for entry in entries.iter().flatten() {
+            for entry in entries.onnx_slots().iter().flatten() {
                 assert!(
                     entry.lower_b.iter().all(|&v| v == 0.0),
                     "OpaqueSkip entry lower_b should be zero (bias in separate channel)"
@@ -1162,10 +1166,13 @@ fn dispatch_concat_nary_constant_input_bias_in_separate_channel_2617() {
             bias_lower,
             bias_upper,
         } => {
-            assert_eq!(entries.len(), 3);
-            assert!(entries[1].is_none(), "Constant input should be None");
-            assert!(entries[0].is_some(), "Input 0 should be Some");
-            assert!(entries[2].is_some(), "Input 2 should be Some");
+            assert_eq!(entries.onnx_slots().len(), 3);
+            assert!(
+                entries.onnx_slots()[1].is_none(),
+                "Constant input should be None"
+            );
+            assert!(entries.onnx_slots()[0].is_some(), "Input 0 should be Some");
+            assert!(entries.onnx_slots()[2].is_some(), "Input 2 should be Some");
             // Bias = incoming bias + W*constant for constant positions (#4112).
             // lower_a slice for the constant (col 2) is ones(1,1), constant=42.0
             // → contribution ≈ 42.0; total ≈ 0.9 + 42.0 = 42.9
@@ -1184,7 +1191,7 @@ fn dispatch_concat_nary_constant_input_bias_in_separate_channel_2617() {
                 expected_upper,
             );
             // Per-entry bounds must have zero bias
-            for entry in entries.iter().flatten() {
+            for entry in entries.onnx_slots().iter().flatten() {
                 assert!(
                     entry.lower_b.iter().all(|&v| v == 0.0),
                     "entry lower_b should be zero"
@@ -1227,8 +1234,11 @@ fn dispatch_concat_nary_no_constants_bias_in_separate_channel_2617() {
             bias_lower,
             bias_upper,
         } => {
-            assert_eq!(entries.len(), 3);
-            assert!(entries.iter().all(|e| e.is_some()), "All should be Some");
+            assert_eq!(entries.onnx_slots().len(), 3);
+            assert!(
+                entries.onnx_slots().iter().all(|e| e.is_some()),
+                "All should be Some"
+            );
             // Bias in separate channel must equal incoming bias (tolerance for directed rounding)
             assert!(
                 (bias_lower[0] - 0.9).abs() < 1e-6,
@@ -1241,7 +1251,7 @@ fn dispatch_concat_nary_no_constants_bias_in_separate_channel_2617() {
                 bias_upper[0]
             );
             // Per-entry bounds must have zero bias
-            for entry in entries.iter().flatten() {
+            for entry in entries.onnx_slots().iter().flatten() {
                 assert!(
                     entry.lower_b.iter().all(|&v| v == 0.0),
                     "entry lower_b should be zero"

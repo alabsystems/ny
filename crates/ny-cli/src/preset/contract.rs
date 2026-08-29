@@ -717,6 +717,11 @@ mod tests {
             .iter()
             .map(|entry| entry.field)
             .collect();
+        // `bab.clip.interm_domain` left this list 2026-08-21: the sequential
+        // provenance conversion landed (all three flip gates, incl. the
+        // measured moat sweep), so the live capability honours it. Its
+        // capability GATING is still proven below with an explicit
+        // capability-off fixture.
         assert_eq!(
             now,
             vec![
@@ -725,7 +730,6 @@ mod tests {
                 "attack.pgd_order",
                 "attack.attack_tolerance",
                 "solver.mip.parallel_solvers",
-                "bab.clip.interm_domain",
                 "bab.pruning_in_iteration",
                 "bab.branching.nonlinear_split.filter",
                 "bab.branching.nonlinear_split.filter_beta",
@@ -733,6 +737,19 @@ mod tests {
                 "bab.invprop.share_gammas",
             ],
             "the registry must report every knob this preset sets, in YAML order"
+        );
+        let clip_capability_off = EngineContract {
+            sequential_clip_interm_domain: false,
+            ..EngineContract::all_honoured()
+        };
+        let clip_only: Vec<&str> = validate_preset(&preset, &clip_capability_off)
+            .iter()
+            .map(|entry| entry.field)
+            .collect();
+        assert_eq!(
+            clip_only,
+            vec!["bab.clip.interm_domain"],
+            "the clip entry must stay gated on its capability, not deleted outright"
         );
         let fixed = validate_preset(&preset, &EngineContract::all_honoured());
         assert!(
@@ -795,7 +812,14 @@ mod tests {
     fn strict_mode_orders_the_three_positions() {
         let mut preset = PresetConfig::default();
         preset.bab.clip.interm_domain = Some(true);
-        let entries = validate_preset(&preset, &EngineContract::current());
+        // Capability-off FIXTURE: the live engine honours this knob since
+        // 2026-08-21, so the mismatch this severity-ordering test needs is
+        // constructed explicitly rather than read from the live contract.
+        let clip_capability_off = EngineContract {
+            sequential_clip_interm_domain: false,
+            ..EngineContract::all_honoured()
+        };
+        let entries = validate_preset(&preset, &clip_capability_off);
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.severity, ContractSeverity::VerdictAffecting);

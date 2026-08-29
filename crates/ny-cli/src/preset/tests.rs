@@ -229,6 +229,21 @@ fn apply_preset_sets_solver_build_batch_size_4354() {
     );
 }
 
+#[test]
+fn solver_dark_probe_keys_are_typed_and_default_silent() {
+    let absent: PresetConfig =
+        serde_yaml::from_str("solver: {}\n").expect("empty solver preset should parse");
+    assert_eq!(absent.solver.const_matmul_interval, None);
+    assert_eq!(absent.solver.joint_bilinear_quad, None);
+
+    let configured: PresetConfig = serde_yaml::from_str(
+        "solver:\n  const_matmul_interval: true\n  joint_bilinear_quad: false\n",
+    )
+    .expect("typed solver research gates should parse");
+    assert_eq!(configured.solver.const_matmul_interval, Some(true));
+    assert_eq!(configured.solver.joint_bilinear_quad, Some(false));
+}
+
 /// #ml4acopf-bab-queue-mem: `bab.max_queue_bytes` arms the graph ReLU-split
 /// queue's byte budget, and a preset that omits it leaves the queue unlimited
 /// (0), i.e. byte-identical to today for every category that does not opt in.
@@ -334,6 +349,165 @@ fn parse_reduce_op_rejects_unknown() {
         msg.contains("average"),
         "error should mention the typo: {msg}"
     );
+}
+
+#[test]
+fn kfsb_preset_fields_keep_ordinary_and_multi_objective_policies_isolated() {
+    let generic_only = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                candidates: Some(7),
+                reduceop: Some("max".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut generic_config = BetaCrownConfig::default();
+    apply_preset(&mut generic_config, &generic_only).expect("generic kFSB policy should apply");
+    assert_eq!(generic_config.fsb_candidates, 7);
+    assert_eq!(generic_config.kfsb_reduce_op, KfsbReduceOp::Max);
+    assert_eq!(
+        generic_config.kfsb_multi_candidates, None,
+        "ordinary candidate tuning must not populate the multi-objective override"
+    );
+    assert_eq!(
+        generic_config.kfsb_multi_reduce_op, None,
+        "ordinary reduce-op tuning must not populate the multi-objective override"
+    );
+
+    let dedicated_only = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                kfsb_multi_candidates: Some(2),
+                kfsb_multi_reduceop: Some("max".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let generic_defaults = BetaCrownConfig::default();
+    let mut dedicated_config = BetaCrownConfig::default();
+    apply_preset(&mut dedicated_config, &dedicated_only)
+        .expect("multi-objective kFSB policy should apply");
+    assert_eq!(
+        dedicated_config.fsb_candidates, generic_defaults.fsb_candidates,
+        "multi-objective candidate tuning must not retune ordinary FSB/kFSB"
+    );
+    assert_eq!(
+        dedicated_config.kfsb_reduce_op, generic_defaults.kfsb_reduce_op,
+        "multi-objective reduction tuning must not retune ordinary kFSB"
+    );
+    assert_eq!(dedicated_config.kfsb_multi_candidates, Some(2));
+    assert_eq!(
+        dedicated_config.kfsb_multi_reduce_op,
+        Some(KfsbReduceOp::Max)
+    );
+
+    let both = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                candidates: Some(10),
+                reduceop: Some("max".to_string()),
+                kfsb_multi_candidates: Some(5),
+                kfsb_multi_reduceop: Some("min".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut both_config = BetaCrownConfig::default();
+    apply_preset(&mut both_config, &both).expect("independent kFSB policies should apply");
+    assert_eq!(both_config.fsb_candidates, 10);
+    assert_eq!(both_config.kfsb_reduce_op, KfsbReduceOp::Max);
+    assert_eq!(both_config.kfsb_multi_candidates, Some(5));
+    assert_eq!(both_config.kfsb_multi_reduce_op, Some(KfsbReduceOp::Min));
+}
+
+#[test]
+fn shipped_wave_kfsb_presets_mirror_generic_policy_without_changing_it() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let configs = repo_root.join("configs/vnncomp25");
+    // Seven presets explicitly select kFSB; four high-dimensional image/DAG
+    // presets deliberately rely on model-class auto-selection of kFSB. Other
+    // branching routes (input, impact, nonlinear, relu, sb, babsr) must not be
+    // given selector-scoped values merely because they carry generic fields.
+    let expected = [
+        ("cctsdb_yolo_2023.yaml", 7),
+        ("cifar100_2024.yaml", 7),
+        ("collins_rul_cnn_2022.yaml", 8),
+        ("cora_2024.yaml", 10),
+        ("malbeware.yaml", 5),
+        ("relusplitter.yaml", 10),
+        ("relusplitter_rsplitter_multiobjective_wgpu.yaml", 10),
+        ("soundnessbench.yaml", 5),
+        ("tinyimagenet_2024.yaml", 10),
+        ("traffic_signs_recognition_2023.yaml", 5),
+        ("yolo_2023.yaml", 10),
+    ];
+
+    let expected_names = expected
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut mirrored_names = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(&configs).expect("VNN-COMP 2025 config directory should exist") {
+        let path = entry
+            .expect("config directory entry should be readable")
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("yaml") {
+            continue;
+        }
+        let preset = load_preset(&path).expect("shipped VNN-COMP 2025 preset should load");
+        let branching = &preset.bab.branching;
+        if branching.kfsb_multi_candidates.is_some() || branching.kfsb_multi_reduceop.is_some() {
+            mirrored_names.insert(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("config filename should be UTF-8")
+                    .to_owned(),
+            );
+        }
+    }
+    assert_eq!(
+        mirrored_names, expected_names,
+        "only wave-kFSB-eligible presets should carry selector-scoped mirrors"
+    );
+
+    for (name, candidates) in expected {
+        let preset = load_preset(&configs.join(name)).expect("wave-kFSB preset should load");
+        let branching = &preset.bab.branching;
+        assert_eq!(branching.candidates, Some(candidates), "preset={name}");
+        assert_eq!(
+            branching.kfsb_multi_candidates,
+            Some(candidates),
+            "preset={name}"
+        );
+        assert_eq!(branching.reduceop.as_deref(), Some("max"), "preset={name}");
+        assert_eq!(
+            branching.kfsb_multi_reduceop.as_deref(),
+            Some("max"),
+            "preset={name}"
+        );
+
+        let mut config = BetaCrownConfig::default();
+        apply_preset(&mut config, &preset).expect("wave-kFSB preset should apply");
+        assert_eq!(config.fsb_candidates, candidates, "preset={name}");
+        assert_eq!(
+            config.kfsb_multi_candidates,
+            Some(candidates),
+            "preset={name}"
+        );
+        assert_eq!(config.kfsb_reduce_op, KfsbReduceOp::Max, "preset={name}");
+        assert_eq!(
+            config.kfsb_multi_reduce_op,
+            Some(KfsbReduceOp::Max),
+            "preset={name}"
+        );
+    }
 }
 
 #[test]
@@ -2231,4 +2405,414 @@ fn every_shipped_vnncomp_preset_loads_with_no_unknown_keys() {
         "presets with unknown or invalid keys:\n{}",
         failures.join("\n")
     );
+}
+
+/// #dist-shift-5291: the typed nested-deadline authority key
+/// (`bab.branching.input_split.nested_deadline`) must map onto
+/// `BetaCrownConfig::input_split_nested_deadline`, and its absence must leave
+/// the shipped deadline-carrying default untouched.
+#[test]
+fn input_split_nested_deadline_preset_maps_to_config() {
+    // Absent: shipped default (None = keep the nested deadline).
+    let preset = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_nested_deadline, None);
+
+    // Explicit relaxation: the dist_shift ship shape.
+    let preset = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                input_split: InputSplitPreset {
+                    nested_deadline: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_nested_deadline, Some(false));
+
+    // Explicit keep round-trips too (a preset may pin the shipped arm).
+    let preset = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                input_split: InputSplitPreset {
+                    nested_deadline: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_nested_deadline, Some(true));
+}
+
+/// #dist-shift-5291 pinning test: the shipped dist_shift preset does NOT yet
+/// arm the nested-deadline relaxation. The ship gate
+/// (docs/DIST_SHIFT_NESTED_DEADLINE_2026-08-20.md) is 3/arm on
+/// index5291_delta0.13 plus the category sentinels; flipping the yaml without
+/// updating this assertion is the drift this test exists to catch.
+#[test]
+fn dist_shift_2023_nested_deadline_is_not_yet_armed() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let preset = load_preset(&repo_root.join("configs/vnncomp25/dist_shift_2023.yaml")).unwrap();
+    assert_eq!(preset.bab.branching.input_split.nested_deadline, None);
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_nested_deadline, None);
+}
+
+/// #cgan-dark-tail FIX-1: the typed per-child bound cap
+/// (`bab.branching.input_split.child_bound_max_secs`) must map onto
+/// `BetaCrownConfig::input_split_child_bound_max_secs`, and its ABSENCE must
+/// leave the shipped no-cap default (`None`) untouched — the key ships DARK.
+#[test]
+fn input_split_child_bound_max_secs_preset_maps_to_config() {
+    // Absent: shipped default = NO CAP = today's behaviour byte-for-byte.
+    let preset = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(
+        config.input_split_child_bound_max_secs, None,
+        "the per-child cap must ship dark (None = no cap)"
+    );
+
+    // Named: the measurement shape.
+    let preset = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                input_split: InputSplitPreset {
+                    child_bound_max_secs: Some(20.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_child_bound_max_secs, Some(20.0));
+}
+
+/// #cgan-dark-tail FIX-1 pinning test: the shipped cgan preset does NOT yet
+/// name the per-child cap. FIX-1 lands dark on purpose — the R9 gate is all
+/// three of `frozen_fallback_completions` 0-1 -> >>1, the last trajectory `t=`
+/// 565-606 -> >=880, and `explored=` roughly doubling, PLUS the lever's own
+/// `[child-bound-cap] final ... capped_calls=` > 0 (armed is not engaged).
+///
+/// The arming diff is pre-staged and COMMENTED OUT in
+/// `configs/vnncomp25/cgan_2023.yaml` together with the measurement that
+/// motivates it; uncommenting it is a pure `# ` removal, and it must land in
+/// the same commit as the updated assertion here. Flipping the yaml without
+/// updating this assertion is exactly the drift this test catches.
+#[test]
+fn cgan_2023_child_bound_max_secs_is_not_yet_armed() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let preset = load_preset(&repo_root.join("configs/vnncomp25/cgan_2023.yaml")).unwrap();
+    assert_eq!(preset.bab.branching.input_split.child_bound_max_secs, None);
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_child_bound_max_secs, None);
+}
+
+/// #cost-observer: the typed self-calibrating per-child allowance key
+/// (`bab.branching.input_split.child_bound_calibration`) must map onto
+/// `BetaCrownConfig::input_split_child_bound_calibration`, and its ABSENCE must
+/// leave `None` — i.e. the `child_bound_max_secs` constant stays in charge and
+/// the route is byte-for-byte the shipped one.
+#[test]
+fn input_split_child_bound_calibration_preset_maps_to_config() {
+    // Absent: the constant governs. This is the byte-identity leg.
+    let preset = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(
+        config.input_split_child_bound_calibration, None,
+        "calibration must ship dark; the constant stays in charge"
+    );
+
+    // Present but EMPTY: arming needs no numbers at all, because every number
+    // it would need is measured. This is the intended production shape.
+    let preset = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                input_split: InputSplitPreset {
+                    child_bound_calibration: Some(
+                        InputSplitChildBoundCalibrationPreset::default(),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    let armed = config
+        .input_split_child_bound_calibration
+        .expect("an empty block still arms — presence is the switch");
+    assert_eq!(armed.headroom, None, "unnamed fields stay unnamed");
+    let policy = armed.to_policy();
+    let default_policy = ny_core::cost_observer::SlicePolicy::default();
+    assert_eq!(
+        policy, default_policy,
+        "an empty block must resolve to the shipped SlicePolicy default"
+    );
+
+    // Named: each dimensionless field overrides its own default and nothing else.
+    let preset = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                input_split: InputSplitPreset {
+                    child_bound_calibration: Some(InputSplitChildBoundCalibrationPreset {
+                        headroom: Some(64.0),
+                        max_share_of_remaining: Some(0.4),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    let policy = config
+        .input_split_child_bound_calibration
+        .expect("named block arms")
+        .to_policy();
+    assert_eq!(policy.headroom, 64.0);
+    assert_eq!(policy.max_share_of_remaining, 0.4);
+    assert_eq!(
+        policy.probe_share, default_policy.probe_share,
+        "an unnamed field must keep its default, not be zeroed"
+    );
+    assert_eq!(policy.window, default_policy.window);
+}
+
+/// #cost-observer: the key must be reachable through the REAL yaml route, from
+/// a file on disk, with no environment variable involved anywhere.
+///
+/// `vnncomp_scripts/run_instance.sh` exports ZERO `NY_*` variables, so a
+/// mechanism reachable only from an env var is dead capability in competition.
+/// This key has no env route at all by design — the assertion that matters is
+/// that the yaml one carries every field end-to-end.
+#[test]
+fn child_bound_calibration_is_reachable_from_a_yaml_file_on_disk() {
+    let yaml = r"
+bab:
+  branching:
+    input_split:
+      child_bound_calibration:
+        headroom: 96.0
+        max_share_of_remaining: 0.3
+        probe_share: 0.02
+        min_samples: 4
+        window: 64
+        growth: 3.0
+";
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("armed.yaml");
+    fs::write(&path, yaml).unwrap();
+    let preset = load_preset(&path).expect("armed yaml must parse");
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    let policy = config
+        .input_split_child_bound_calibration
+        .expect("the yaml route must arm the calibration")
+        .to_policy();
+    assert_eq!(policy.headroom, 96.0);
+    assert_eq!(policy.max_share_of_remaining, 0.3);
+    assert_eq!(policy.probe_share, 0.02);
+    assert_eq!(policy.min_samples, 4);
+    assert_eq!(policy.window, 64);
+    assert_eq!(policy.growth, 3.0);
+}
+
+/// #cost-observer pinning test: the shipped cgan preset does NOT yet name the
+/// calibration block, so the mechanism lands dark exactly like FIX-1 did.
+///
+/// Arming it is a pure `# ` removal in `configs/vnncomp25/cgan_2023.yaml`,
+/// pre-staged there together with the measurement that motivates it, and it
+/// must land in the same commit as the updated assertion here.
+#[test]
+fn cgan_2023_child_bound_calibration_is_not_yet_armed() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let preset = load_preset(&repo_root.join("configs/vnncomp25/cgan_2023.yaml")).unwrap();
+    assert!(preset
+        .bab
+        .branching
+        .input_split
+        .child_bound_calibration
+        .is_none());
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_child_bound_calibration, None);
+}
+
+/// #cgan-f64-tail (design B step B5): the typed f64-tail key
+/// (`bab.branching.input_split.f64_tail.{enabled, band, max_escalations}`)
+/// must map onto `BetaCrownConfig::input_split_f64_tail_*`, and its absence
+/// must leave every field `None` (dark, byte-identical).
+#[test]
+fn input_split_f64_tail_preset_maps_to_config() {
+    // Absent: dark default.
+    let preset = PresetConfig::default();
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_f64_tail_enabled, None);
+    assert_eq!(config.input_split_f64_tail_band, None);
+    assert_eq!(config.input_split_f64_tail_max_escalations, None);
+
+    // The cgan ship shape: enabled, 5e-4 band, cap 8.
+    let preset = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                input_split: InputSplitPreset {
+                    f64_tail: Some(InputSplitF64TailPreset {
+                        enabled: Some(true),
+                        band: Some(5e-4),
+                        max_escalations: Some(8),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_f64_tail_enabled, Some(true));
+    assert_eq!(config.input_split_f64_tail_band, Some(5e-4));
+    assert_eq!(config.input_split_f64_tail_max_escalations, Some(8));
+
+    // Explicit disarm round-trips (a preset may pin the mechanism off).
+    let preset = PresetConfig {
+        bab: BabPreset {
+            branching: BranchingPreset {
+                input_split: InputSplitPreset {
+                    f64_tail: Some(InputSplitF64TailPreset {
+                        enabled: Some(false),
+                        band: None,
+                        max_escalations: None,
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_f64_tail_enabled, Some(false));
+    assert_eq!(config.input_split_f64_tail_band, None);
+    assert_eq!(config.input_split_f64_tail_max_escalations, None);
+}
+
+/// #cgan-f64-tail pinning test: the shipped cgan preset does NOT yet arm the
+/// f64 tail. The ship gate is the design-B measurement protocol (A/B 3/arm on
+/// cgan row 2 at 900 s with `anchor_source=warm-refined` engagement lines,
+/// then the cgan moat: 12 sat rows + test_nano unsat + the lsnc regression
+/// rows). Flipping cgan_2023.yaml without updating this assertion is the
+/// drift this test exists to catch.
+///
+/// Why it stays dark despite a very strong measurement. At band 5e-4 the
+/// certified tail closes 484/484 escalations with ZERO residuals over 3 runs
+/// — but cgan's frontier sits at gap ~ -8e-4, OUTSIDE that band, so the
+/// measured conversion count is ZERO: arming at 5e-4 is verdict-NEUTRAL, not
+/// strictly better. Band 2e-3 (87.3% recovery, 0.1235 s mean, throughput
+/// -positive) is the conversion PROBE and has not been run. The arming diff
+/// for it is pre-staged and commented out in `cgan_2023.yaml`.
+#[test]
+fn cgan_2023_f64_tail_is_not_yet_armed() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let preset = load_preset(&repo_root.join("configs/vnncomp25/cgan_2023.yaml")).unwrap();
+    assert!(preset.bab.branching.input_split.f64_tail.is_none());
+
+    let mut config = BetaCrownConfig::default();
+    apply_preset(&mut config, &preset).unwrap();
+    assert_eq!(config.input_split_f64_tail_enabled, None);
+    assert_eq!(config.input_split_f64_tail_band, None);
+    assert_eq!(config.input_split_f64_tail_max_escalations, None);
+}
+
+#[test]
+fn margin_row_declined_schedule_fractions_preserve_historical_fallback() {
+    for value in [0.0_f32, 1.0, -0.25, f32::NAN, f32::INFINITY] {
+        let mut max_fraction = PresetConfig::default();
+        max_fraction.margin_row.reserve_max_frac = Some(value);
+        apply_preset(&mut BetaCrownConfig::default(), &max_fraction)
+            .expect("a declined optional reserve ceiling restores absence");
+
+        let mut release_fraction = PresetConfig::default();
+        release_fraction.margin_row.release_frac = Some(value);
+        apply_preset(&mut BetaCrownConfig::default(), &release_fraction)
+            .expect("a declined adaptive threshold restores the 0.40 default");
+    }
+
+    let mut admitted = PresetConfig::default();
+    admitted.margin_row.reserve_max_frac = Some(0.35_f32);
+    admitted.margin_row.release_frac = Some(0.40_f32);
+    apply_preset(&mut BetaCrownConfig::default(), &admitted)
+        .expect("finite open-unit scheduler fractions remain admissible");
+}
+
+#[test]
+fn margin_row_schedule_yaml_preserves_exact_typed_scalar_boundaries() {
+    for malformed in [
+        "margin_row:\n  reserve_secs: \"0\"\n",
+        "margin_row:\n  reserve_secs: false\n",
+        "margin_row:\n  adaptive_reserve: 1\n",
+        "margin_row:\n  reserve_max_frac: \"0.25\"\n",
+        "margin_row:\n  release_frac: []\n",
+        "margin_row:\n  early_exit: 1\n",
+        "margin_row:\n  verifier_threads: \"0\"\n",
+        "margin_row:\n  verifier_threads: -1\n",
+        "margin_row:\n  concurrent_threads: false\n",
+        "margin_row:\n  concurrent_threads: []\n",
+        "margin_row: []\n",
+    ] {
+        assert!(
+            serde_yaml::from_str::<PresetConfig>(malformed).is_err(),
+            "wrong-typed scheduler YAML must fail before runtime projection: {malformed:?}"
+        );
+    }
+
+    let explicit_zero = serde_yaml::from_str::<PresetConfig>(
+        "margin_row:\n  early_exit: false\n  verifier_threads: 0\n  concurrent_threads: 0\n",
+    )
+    .expect("canonical scheduler resource scalars must deserialize");
+    assert_eq!(explicit_zero.margin_row.early_exit, Some(false));
+    assert_eq!(explicit_zero.margin_row.verifier_threads, Some(0));
+    assert_eq!(explicit_zero.margin_row.concurrent_threads, Some(0));
+
+    let positive = serde_yaml::from_str::<PresetConfig>(
+        "margin_row:\n  verifier_threads: 7\n  concurrent_threads: 11\n",
+    )
+    .expect("positive scheduler widths must deserialize");
+    assert_eq!(positive.margin_row.verifier_threads, Some(7));
+    assert_eq!(positive.margin_row.concurrent_threads, Some(11));
 }

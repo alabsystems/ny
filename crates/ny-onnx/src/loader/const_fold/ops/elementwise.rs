@@ -446,18 +446,101 @@ fn compare_le(x: f32, y: f32) -> f32 {
     }
 }
 
+/// Fold a dot product of binary32 operands, returning the binary32 result only
+/// when it is EXACTLY the real (infinitely precise) dot product.
+///
+/// # Why this accumulates in binary64
+///
+/// The obvious implementation chains `exact_f32_sum`/`exact_f32_product` over a
+/// binary32 accumulator, which demands that every PARTIAL SUM be exactly
+/// representable in binary32. That is far stronger than the property the caller
+/// needs — it rejects `[1e10, 1.0, -1e10] . [1, 1, 1]`, whose real value is
+/// exactly `1.0`, because the first partial sum `1e10 + 1` is not a binary32
+/// number. Cancellation later in the dot product cannot rescue a prefix the
+/// gate has already declined.
+///
+/// Accumulating in binary64 with a TwoSum residual removes that prefix
+/// condition, and the certificate is still a proof rather than a heuristic:
+///
+///  * Each product is EXACT in binary64. Two binary32 significands are 24 bits
+///    each, so the product needs at most 48 <= 53 significand bits, and the
+///    exponent range is comfortable (the smallest nonzero magnitude is
+///    `2^-149 * 2^-149 = 2^-298`, whose lowest set bit is at worst `2^-345`,
+///    far above the binary64 subnormal floor `2^-1074`; the largest is below
+///    `2^256 < 2^1024`). No rounding occurs, so no check is needed here.
+///  * TwoSum reports the rounding error of a binary64 addition EXACTLY. When
+///    that error is zero at every step, the running binary64 sum IS the real
+///    partial sum, by induction over the terms.
+///  * The final narrowing to binary32 is accepted only when it round-trips
+///    through binary64 unchanged, i.e. when the real dot product is itself a
+///    binary32 number.
+///
+/// This is strictly more permissive than the binary32 chain and never accepts
+/// anything it accepted before on different grounds: if every binary32 partial
+/// sum was exact, each of those values is representable in binary64 too, so
+/// every TwoSum residual here is zero and the same result is returned.
+///
+/// Returns `None` — decline, never a rounded answer — whenever exactness cannot
+/// be certified.
 fn exact_dot<'a>(
     lhs: impl Iterator<Item = &'a f32>,
     rhs: impl Iterator<Item = &'a f32>,
 ) -> Option<f32> {
-    let mut sum = 0.0_f32;
+    let mut sum = 0.0_f64;
     for (&lhs, &rhs) in lhs.zip(rhs) {
-        sum = exact_f32_sum(sum, exact_f32_product(lhs, rhs)?)?;
+        if !lhs.is_finite() || !rhs.is_finite() {
+            return None;
+        }
+        // Exact by the significand/exponent argument above.
+        let product = f64::from(lhs) * f64::from(rhs);
+        // Knuth TwoSum: `error` is the exact rounding error of `sum + product`.
+        let total = sum + product;
+        if !total.is_finite() {
+            return None;
+        }
+        let product_virtual = total - sum;
+        let error = (sum - (total - product_virtual)) + (product - product_virtual);
+        if error != 0.0 {
+            return None;
+        }
+        sum = total;
     }
-    Some(sum)
+    let rounded = sum as f32;
+    (rounded.is_finite() && f64::from(rounded) == sum).then_some(rounded)
 }
 
-fn try_fold_matmul_exact(lhs: &ArrayD<f32>, rhs: &ArrayD<f32>) -> Option<ArrayD<f32>> {
+/// Fold a both-constant `MatMul`, publishing a value only when every entry is
+/// EXACTLY the real dot product (see [`exact_dot`]).
+///
+/// # What declining costs, measured
+///
+/// A decline here is not free: `crates/ny-build/src/convert/matmul.rs` then has
+/// no carrier for the node and fails closed to an `OpaqueSkip`, which taints
+/// every consumer and can reach the graph output as unbounded bounds.
+///
+/// Measured 2026-08-25 over 1346 `.onnx` files (24 of the 30 scored 2026
+/// families, `.onnx.gz` decompressed), counting every both-constant `MatMul`:
+///
+/// | quantity | count |
+/// |---|---|
+/// | both-constant `MatMul` nodes | 19 |
+/// | dot-product entries | 1736 |
+/// | accepted by this gate | 16 |
+/// | exactly representable in binary32 | 16 |
+/// | representable but declined | **0** |
+///
+/// So on the current board this gate declines exactly the entries that are
+/// genuinely NOT binary32 numbers, and nothing else. The declines that matter
+/// are lsnc_relu's `/lyapunov/MatMul` (58 significand bits needed),
+/// `/dynamics_relu/model/model.0_1/MatMul` (47) and
+/// `/controller/net/net/net.2_1/MatMul` (49) — ordinary ~1-ulp dot-product
+/// residues, unreachable by ANY summation order or accumulator width.
+///
+/// The consequence is worth stating plainly, because it has been re-litigated
+/// several times: making this gate more accurate cannot fix lsnc_relu. The only
+/// sound carrier for a constant that is not a binary32 number is an enclosure,
+/// not a float, which is what `const_fold/interval.rs` exists for.
+pub(super) fn try_fold_matmul_exact(lhs: &ArrayD<f32>, rhs: &ArrayD<f32>) -> Option<ArrayD<f32>> {
     if lhs.ndim() == 1 && rhs.ndim() == 1 {
         let lhs = lhs.clone().into_dimensionality::<Ix1>().ok()?;
         let rhs = rhs.clone().into_dimensionality::<Ix1>().ok()?;
@@ -507,4 +590,245 @@ fn try_fold_matmul_exact(lhs: &ArrayD<f32>, rhs: &ArrayD<f32>) -> Option<ArrayD<
         return ArrayD::from_shape_vec(IxDyn(&[lhs.nrows()]), values).ok();
     }
     None
+}
+
+#[cfg(test)]
+mod exact_dot_tests {
+    use super::super::super::common::{exact_f32_product, exact_f32_sum};
+    use super::exact_dot;
+
+    /// The accumulation `exact_dot` used before: a binary32 accumulator that
+    /// demands every PARTIAL SUM be exactly representable. Kept here as the
+    /// baseline the new gate must dominate.
+    fn prefix_exact_dot_f32(lhs: &[f32], rhs: &[f32]) -> Option<f32> {
+        let mut sum = 0.0_f32;
+        for (&lhs, &rhs) in lhs.iter().zip(rhs.iter()) {
+            sum = exact_f32_sum(sum, exact_f32_product(lhs, rhs)?)?;
+        }
+        Some(sum)
+    }
+
+    /// Exact value of a finite binary32 as `mantissa * 2^exponent`, derived from
+    /// the bit pattern rather than from any float arithmetic. Independent of the
+    /// production code path under test.
+    fn decompose(value: f32) -> (i128, i32) {
+        assert!(value.is_finite());
+        let bits = value.to_bits();
+        let sign = if bits >> 31 == 1 { -1i128 } else { 1i128 };
+        let biased = ((bits >> 23) & 0xff) as i32;
+        let fraction = (bits & 0x007f_ffff) as i128;
+        if biased == 0 {
+            // Subnormal: no implicit leading bit, fixed exponent.
+            (sign * fraction, -149)
+        } else {
+            (sign * (fraction | 0x0080_0000), biased - 127 - 23)
+        }
+    }
+
+    /// The real dot product, as an exact dyadic rational `(mantissa, exponent)`.
+    /// Uses only integer arithmetic; panics rather than wrapping on overflow, so
+    /// a silent oracle failure cannot masquerade as agreement.
+    fn exact_real_dot(lhs: &[f32], rhs: &[f32]) -> (i128, i32) {
+        let mut terms: Vec<(i128, i32)> = Vec::new();
+        for (&a, &b) in lhs.iter().zip(rhs.iter()) {
+            let (ma, ea) = decompose(a);
+            let (mb, eb) = decompose(b);
+            if ma == 0 || mb == 0 {
+                continue;
+            }
+            terms.push((
+                ma.checked_mul(mb).expect("oracle product overflow"),
+                ea + eb,
+            ));
+        }
+        if terms.is_empty() {
+            return (0, 0);
+        }
+        let min_exponent = terms.iter().map(|&(_, e)| e).min().expect("non-empty");
+        let mut total: i128 = 0;
+        for (mantissa, exponent) in terms {
+            let shift = u32::try_from(exponent - min_exponent).expect("non-negative shift");
+            assert!(shift < 100, "oracle exponent spread too wide for i128");
+            total = total
+                .checked_add(
+                    mantissa
+                        .checked_shl(shift)
+                        .expect("oracle alignment overflow"),
+                )
+                .expect("oracle sum overflow");
+        }
+        normalize(total, min_exponent)
+    }
+
+    fn normalize(mut mantissa: i128, mut exponent: i32) -> (i128, i32) {
+        if mantissa == 0 {
+            return (0, 0);
+        }
+        while mantissa % 2 == 0 {
+            mantissa /= 2;
+            exponent += 1;
+        }
+        (mantissa, exponent)
+    }
+
+    /// Exact value of a finite binary32, in the same normalized form.
+    fn exact_value_of(value: f32) -> (i128, i32) {
+        let (mantissa, exponent) = decompose(value);
+        normalize(mantissa, exponent)
+    }
+
+    /// CONTAINMENT, not finiteness: whatever `exact_dot` publishes must BE the
+    /// real dot product, checked against the integer oracle. Declining is always
+    /// permitted; publishing a rounded value never is.
+    fn assert_published_value_is_the_real_dot(lhs: &[f32], rhs: &[f32]) {
+        if let Some(folded) = exact_dot(lhs.iter(), rhs.iter()) {
+            assert_eq!(
+                exact_value_of(folded),
+                exact_real_dot(lhs, rhs),
+                "exact_dot published {folded:?} for {lhs:?} . {rhs:?}, which is NOT the real dot product"
+            );
+        }
+    }
+
+    #[test]
+    fn oracle_self_test_disagrees_with_a_deliberately_wrong_value() {
+        // The oracle must be able to say NO, or the containment assertions above
+        // it prove nothing.
+        assert_eq!(
+            exact_real_dot(&[1.0, 2.0], &[3.0, 4.0]),
+            exact_value_of(11.0)
+        );
+        assert_ne!(
+            exact_real_dot(&[1.0, 2.0], &[3.0, 4.0]),
+            exact_value_of(11.000001)
+        );
+        // 1 + 2^-30 needs 31 significand bits: representable as a real dyadic,
+        // NOT representable in binary32.
+        let (mantissa, _) = exact_real_dot(&[1.0, 1.0], &[1.0, f32::from_bits(0x3080_0000)]);
+        assert!(
+            mantissa.unsigned_abs().next_power_of_two().trailing_zeros() > 24,
+            "oracle should report more than 24 significand bits for 1 + 2^-30"
+        );
+    }
+
+    #[test]
+    fn recovers_a_cancelling_dot_the_binary32_prefix_gate_rejected() {
+        // Real value is exactly 1.0. The old gate declined because the FIRST
+        // partial sum (1e10 + 1) is not a binary32 number; the cancellation that
+        // makes the answer exact happens only at the last term.
+        let lhs = [1.0e10_f32, 1.0, -1.0e10];
+        let rhs = [1.0_f32, 1.0, 1.0];
+
+        assert_eq!(
+            prefix_exact_dot_f32(&lhs, &rhs),
+            None,
+            "baseline sanity: the binary32 prefix chain must be the one that declines"
+        );
+        assert_eq!(
+            exact_dot(lhs.iter(), rhs.iter()),
+            Some(1.0),
+            "error-free accumulation must fold this exactly"
+        );
+        assert_eq!(exact_value_of(1.0), exact_real_dot(&lhs, &rhs));
+    }
+
+    #[test]
+    fn recovers_a_product_that_is_inexact_in_binary32_but_cancels() {
+        // Each product needs 46 significand bits, so `exact_f32_product` declined
+        // both. Their sum is exactly zero.
+        let a = f32::from_bits(0x3fc0_0001); // 1.5000001
+        let lhs = [a, a];
+        let rhs = [a, -a];
+
+        assert_eq!(prefix_exact_dot_f32(&lhs, &rhs), None);
+        assert_eq!(exact_dot(lhs.iter(), rhs.iter()), Some(0.0));
+        assert_published_value_is_the_real_dot(&lhs, &rhs);
+    }
+
+    #[test]
+    fn still_declines_a_dot_product_that_is_not_representable_in_binary32() {
+        // 1 + 2^-30 is a perfectly good real number and a perfectly good binary64
+        // number, but it is not a binary32 number. Folding it would silently
+        // rewrite the model, so the gate must decline.
+        let tiny = f32::from_bits(0x3080_0000); // 2^-30
+        assert_eq!(
+            exact_dot([1.0_f32, tiny].iter(), [1.0_f32, 1.0].iter()),
+            None
+        );
+
+        // The lsnc_relu witness class: an ordinary ~1-ulp dot-product residue.
+        // 58 significand bits are needed; no summation order can rescue it.
+        let lhs = [2.395_070_8_f32, 1.0];
+        let rhs = [1.0_f32, f32::from_bits(0x3380_0000)]; // 2^-24
+        assert_eq!(exact_dot(lhs.iter(), rhs.iter()), None);
+    }
+
+    #[test]
+    fn declines_non_finite_operands_and_overflow() {
+        assert_eq!(exact_dot([f32::NAN].iter(), [1.0_f32].iter()), None);
+        assert_eq!(exact_dot([f32::INFINITY].iter(), [1.0_f32].iter()), None);
+        assert_eq!(
+            exact_dot([1.0_f32].iter(), [f32::NEG_INFINITY].iter()),
+            None
+        );
+        // Real sum is 2 * 3.4e38, which overflows binary32 but NOT binary64, so
+        // the final narrowing is what must catch it.
+        let big = f32::MAX;
+        assert_eq!(exact_dot([big, big].iter(), [1.0_f32, 1.0].iter()), None);
+    }
+
+    #[test]
+    fn empty_dot_product_is_exactly_zero() {
+        let empty: [f32; 0] = [];
+        assert_eq!(exact_dot(empty.iter(), empty.iter()), Some(0.0));
+    }
+
+    #[test]
+    fn dominates_the_binary32_prefix_gate_and_never_publishes_a_rounded_value() {
+        // Deterministic LCG: no dev-dependency, and the failing seed is printable.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut recovered = 0usize;
+        for _ in 0..20_000 {
+            let len = (next() % 6) as usize + 1;
+            let mut lhs = Vec::with_capacity(len);
+            let mut rhs = Vec::with_capacity(len);
+            for _ in 0..len {
+                // Small integers scaled by modest powers of two: an exponent
+                // spread the integer oracle can align without overflow, and a
+                // regime where exact folds actually occur.
+                let mantissa = (next() % 2_048) as i32 - 1_024;
+                let scale = (next() % 21) as i32 - 10;
+                lhs.push((mantissa as f32) * (2.0_f32).powi(scale));
+                let mantissa = (next() % 2_048) as i32 - 1_024;
+                let scale = (next() % 21) as i32 - 10;
+                rhs.push((mantissa as f32) * (2.0_f32).powi(scale));
+            }
+
+            // CONTAINMENT: anything published must equal the real dot product.
+            assert_published_value_is_the_real_dot(&lhs, &rhs);
+
+            // DOMINANCE: the new gate accepts everything the old one accepted,
+            // with the identical value.
+            if let Some(baseline) = prefix_exact_dot_f32(&lhs, &rhs) {
+                assert_eq!(
+                    exact_dot(lhs.iter(), rhs.iter()),
+                    Some(baseline),
+                    "regressed on {lhs:?} . {rhs:?}"
+                );
+            } else if exact_dot(lhs.iter(), rhs.iter()).is_some() {
+                recovered += 1;
+            }
+        }
+        assert!(
+            recovered > 0,
+            "the sweep never exercised a recovered fold; it is not testing the change"
+        );
+        println!("recovered {recovered} folds the binary32 prefix gate declined (of 20000)");
+    }
 }

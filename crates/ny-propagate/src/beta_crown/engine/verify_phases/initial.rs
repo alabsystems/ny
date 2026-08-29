@@ -10,7 +10,9 @@ use ny_tensor::BoundedTensor;
 use tracing::info;
 
 use crate::beta_crown::bab_cuts::CutPool;
-use crate::beta_crown::result::{BabVerificationStatus, BetaCrownResult};
+use crate::beta_crown::result::{
+    record_global_timeout_deadline_source, BabVerificationStatus, BetaCrownResult,
+};
 use crate::Network;
 
 use super::super::cut_gate::CutGateState;
@@ -45,22 +47,29 @@ impl BetaCrownVerifier {
         cut_pool: &mut CutPool,
         overall_deadline: Option<Instant>,
     ) -> Result<InitialPhaseOutcome> {
-        let effective_total = match overall_deadline {
-            Some(dl) => dl.saturating_duration_since(start_time),
-            None => self.config.timeout,
+        let crown_deadline = match overall_deadline {
+            Some(deadline) => Some(deadline),
+            None => Some(start_time.checked_add(self.config.timeout).ok_or_else(|| {
+                NyError::InvalidConfig(format!(
+                    "effective timeout {:?} is too large for the platform monotonic clock",
+                    self.config.timeout
+                ))
+            })?),
         };
-        let crown_deadline = Some(start_time.checked_add(effective_total).ok_or_else(|| {
-            NyError::InvalidConfig(format!(
-                "effective timeout {:?} is too large for the platform monotonic clock",
-                effective_total
-            ))
-        })?);
+        let effective_total = crown_deadline
+            .expect("the engine always has a finite configured or caller deadline")
+            .saturating_duration_since(start_time);
         let pgd_frac = self
             .config
             .phase_budget
             .post_bab_pgd_fraction
             .clamp(0.0, 0.5);
         let bab_timeout = effective_total.mul_f32(1.0 - pgd_frac);
+        let bab_deadline = start_time.checked_add(bab_timeout).ok_or_else(|| {
+            NyError::InvalidConfig(
+                "BaB timeout is too large for the platform monotonic clock".to_string(),
+            )
+        })?;
         let pgd_deadline = crown_deadline;
         let initial_deadline = {
             let frac = self
@@ -147,9 +156,19 @@ impl BetaCrownVerifier {
             }));
         }
 
+        let bab_prof =
+            ny_levers::read_raw(&ny_levers::decls::bab_diagnostics::ACASXU_PROF).is_some();
         let layer_bounds = if let Some(layer_bounds) = initial_computation.root_layer_bounds {
+            if bab_prof {
+                eprintln!("[NY_ACASXU_PROF] root layer_bounds arm: root_layer_bounds (from initial computation)");
+            }
             layer_bounds
         } else if self.config.use_crown_ibp {
+            if bab_prof {
+                eprintln!(
+                    "[NY_ACASXU_PROF] root layer_bounds arm: sequential CROWN-IBP collection"
+                );
+            }
             self.collect_sequential_crown_ibp_bounds_with_status(
                 network,
                 input,
@@ -159,8 +178,23 @@ impl BetaCrownVerifier {
             )?
             .bounds
         } else {
+            if bab_prof {
+                eprintln!("[NY_ACASXU_PROF] root layer_bounds arm: RAW IBP");
+            }
             network.collect_ibp_bounds_with_deadline(input, initial_deadline)?
         };
+        if bab_prof {
+            let total_width: f64 = layer_bounds
+                .iter()
+                .map(|b| {
+                    let f = b.flatten();
+                    (0..f.len())
+                        .map(|i| (f.upper()[[i]] - f.lower()[[i]]) as f64)
+                        .sum::<f64>()
+                })
+                .sum();
+            eprintln!("[NY_ACASXU_PROF] root layer_bounds total width: {total_width:.1}");
+        }
         let base_layer_bounds: Vec<Arc<BoundedTensor>> =
             layer_bounds.iter().cloned().map(Arc::new).collect();
 
@@ -191,15 +225,15 @@ impl BetaCrownVerifier {
                 cuts_generated: 0,
                 domains_verified: 0,
             };
-            return Ok(InitialPhaseOutcome::Early(
-                self.try_pgd_attack_with_deadline(
-                    network,
-                    input,
-                    threshold,
-                    timeout_result,
-                    pgd_deadline,
-                )?,
-            ));
+            record_global_timeout_deadline_source(Some(bab_deadline));
+            let result = self.try_pgd_attack_with_deadline(
+                network,
+                input,
+                threshold,
+                timeout_result,
+                pgd_deadline,
+            )?;
+            return Ok(InitialPhaseOutcome::Early(result));
         }
 
         Ok(InitialPhaseOutcome::Proceed {

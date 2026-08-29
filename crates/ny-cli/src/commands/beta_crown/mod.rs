@@ -102,8 +102,8 @@ mod verify;
 // can drive `handle_beta_crown_command` and read the rendered competition JSON
 // without shelling out to a second `ny` process.
 pub(crate) use output::{
-    begin_capture, end_capture, take_captured_json, take_captured_terminal_ingress,
-    CapturedTerminalIngress,
+    begin_capture, end_capture, take_captured_deadline_plan, take_captured_json,
+    take_captured_terminal_ingress, CapturedDeadlinePlan, CapturedTerminalIngress,
 };
 
 /// Run the explicit-path Pensieve fractional-head diagnostic.
@@ -859,6 +859,22 @@ impl BetaCrownPresetSnapshot {
 /// has already been resolved.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BetaCrownInstanceOverrides {
+    /// Exact receipt-owning authority for this scored run. Interactive calls
+    /// retain `None` and use the compatibility freeze boundary.
+    pub(crate) frozen_levers: Option<Arc<ny_levers::LeverSet>>,
+    /// Exact-VJP PGD policy resolved from VNN-COMP's entry-time frozen
+    /// [`ny_levers::LeverSet`]. `None` identifies the interactive/compatibility
+    /// route, which preserves the historical process-environment overlay at
+    /// this one configuration boundary.
+    pub(crate) pgd_exact_vjp: Option<ny_propagate::ExactVjpPgdConfig>,
+    /// Proof-carrying kFSB certificate-reuse decision resolved from the same
+    /// entry-time LeverSet as the scored flight receipt. `None` preserves the
+    /// interactive environment-over-config compatibility resolver.
+    pub(crate) kfsb_cert_reuse_armed: Option<bool>,
+    /// Positive objective-chunk wave decision derived from VNN-COMP's frozen
+    /// aggregate-memory guard. `None` preserves the interactive compatibility
+    /// read at this one configuration boundary.
+    pub(crate) chunk_wave_parallel_enabled: Option<bool>,
     /// Arm bounded sparse root CROWN for the sealed adaptive-release route.
     pub(crate) root_sparse_interm_crown: bool,
     /// Absolute outer deadline already anchored by the in-process VNN-COMP
@@ -896,8 +912,9 @@ pub(crate) struct BetaCrownInstanceOverrides {
 
 /// Category authority carried into the imgSz32 cGAN input-leaf attachment.
 ///
-/// This intentionally has no string-bearing or generic variant: a future cGAN
-/// category must earn a separate route rather than inheriting the 2023 seal.
+/// This intentionally has no string-bearing or generic variant. The router may
+/// map only an explicitly reviewed, byte-identical category allowlist onto this
+/// audited payload route; unrelated future cGAN categories cannot inherit it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CganInputLeafRoute {
     Cgan2023,
@@ -967,10 +984,57 @@ fn resolve_internal_authority_deadline(
     ))
 }
 
+/// Whether the CLI-local configured deadline is strictly earlier than every
+/// independently frozen authority that can stop this verifier invocation.
+/// Equality is deliberately not binding evidence: removing a reserve cannot
+/// move a deadline when another authority owns the same instant.
+fn configured_deadline_strictly_wins(
+    configured_deadline: Option<std::time::Instant>,
+    authoritative_deadline: Option<std::time::Instant>,
+    outer_wrapper_owns_deferred_pgd: bool,
+    frozen_outer_deferred_deadline: Option<std::time::Instant>,
+) -> bool {
+    configured_deadline.is_some_and(|configured| {
+        authoritative_deadline.is_none_or(|authority| configured < authority)
+            && (!outer_wrapper_owns_deferred_pgd
+                || frozen_outer_deferred_deadline.is_some_and(|authority| configured < authority))
+    })
+}
+
+fn resolve_pgd_exact_vjp(
+    current: ny_propagate::ExactVjpPgdConfig,
+    frozen: Option<ny_propagate::ExactVjpPgdConfig>,
+    legacy_resolver: impl FnOnce(
+        ny_propagate::ExactVjpPgdConfig,
+    ) -> std::result::Result<ny_propagate::ExactVjpPgdConfig, String>,
+) -> Result<ny_propagate::ExactVjpPgdConfig> {
+    match frozen {
+        Some(frozen) => Ok(frozen),
+        None => legacy_resolver(current).map_err(anyhow::Error::msg),
+    }
+}
+
+fn resolve_chunk_wave_parallel_enabled(frozen: Option<bool>) -> bool {
+    frozen.unwrap_or_else(|| {
+        !ny_levers::read(&ny_levers::decls::crown_ibp_budget::NO_CHUNK_WAVE_PAR)
+            .value
+            .as_bool()
+    })
+}
+
 fn apply_instance_overrides(
     config: &mut BetaCrownConfig,
     instance_overrides: &BetaCrownInstanceOverrides,
-) {
+) -> Result<()> {
+    config.frozen_levers = instance_overrides.frozen_levers.clone();
+    config.pgd_exact_vjp = resolve_pgd_exact_vjp(
+        config.pgd_exact_vjp,
+        instance_overrides.pgd_exact_vjp,
+        ny_propagate::ExactVjpPgdConfig::legacy_env_over,
+    )?;
+    config.kfsb_cert_reuse_runtime = instance_overrides.kfsb_cert_reuse_armed;
+    config.chunk_wave_parallel_enabled =
+        resolve_chunk_wave_parallel_enabled(instance_overrides.chunk_wave_parallel_enabled);
     if instance_overrides.root_sparse_interm_crown {
         // Exact per-instance performance route. The root policy's raw
         // `NY_ROOT_SPARSE_INTERM_CROWN=0` resolver remains the final kill
@@ -983,6 +1047,7 @@ fn apply_instance_overrides(
         // every model/property/profile/provenance mismatch.
         config.input_split_input_leaf_oracle = true;
     }
+    Ok(())
 }
 
 /// Frontend policy for terminal-activation peeling.
@@ -1145,6 +1210,12 @@ pub(crate) fn handle_beta_crown_command(
         preset.as_deref(),
         instance_overrides.preset_snapshot.as_ref(),
     )?;
+    // Interactive calls load by path instead of receiving VNN-COMP's already
+    // validated snapshot. Validate immediately, before process-global research
+    // gates or ONNX loading can observe a quarantined/invalid typed field.
+    if let Some(loaded) = preset_config.as_ref() {
+        preset::validate_preset(loaded)?;
+    }
     if let (Some(preset_path), Some(loaded)) = (preset.as_deref(), preset_config.as_ref()) {
         info!("Loaded preset config: {}", preset_path.display());
         // #preset-contract (design S3). `load_preset` proves every key is a key
@@ -1156,6 +1227,23 @@ pub(crate) fn handle_beta_crown_command(
         // (`preset::contract`). `NY_PRESET_STRICT=0` silences it entirely.
         preset::enforce_preset_contract(preset_path, loaded)?;
     }
+    // Initialize the two default-silent solver research gates before either
+    // ONNX loading or bound propagation can read them. These layers cannot be
+    // represented in BetaCrownConfig: one is consumed while folding the model,
+    // and the other is consulted by a post-CROWN graph hook. Passing `None` is
+    // intentional—it clears any earlier in-process selection and restores the
+    // historical OFF default. The lower layers use `read_over_config`, so exact
+    // legacy environment tokens retain precedence in both directions.
+    // The carrier's typed route is quarantined as EnvOnly. Semantic validation
+    // above rejects even `Some(false)` so old files fail loudly; clear the
+    // process-global typed layer unconditionally as defense in depth. The
+    // audited exact environment gate remains independent and can still arm it.
+    ny_onnx::set_const_matmul_interval_preset(None);
+    ny_propagate::set_joint_bilinear_preset(
+        preset_config
+            .as_ref()
+            .and_then(|preset| preset.solver.joint_bilinear_quad),
+    );
     let onnx_load_config = preset_config
         .as_ref()
         .map(preset::build_onnx_load_config)
@@ -1276,8 +1364,8 @@ pub(crate) fn handle_beta_crown_command(
     // These A/B levers only suppress the optional CPU engine-presence handle.
     // They may never discard a successfully qualified WGPU proof device.
     if !qualified_wgpu_proof_active
-        && (std::env::var("NY_ROOT_JOINT_INTERM_ALPHA").ok().as_deref() == Some("1")
-            || std::env::var("NY_CPU_COMPUTE_ENGINE").ok().as_deref() == Some("0"))
+        && (ny_propagate::preset_gates::root_joint_interm_alpha_enabled()
+            || !crate::preset_gates::cpu_compute_engine_enabled())
     {
         compute_device = None;
     }
@@ -1855,7 +1943,7 @@ pub(crate) fn handle_beta_crown_command(
         branching::apply_resolved_auto_branching_runtime_policy(&mut config, resolved);
     }
     apply_vgg_abcrown_bound_mode(&mut config, vgg_abcrown_decision);
-    apply_instance_overrides(&mut config, &instance_overrides);
+    apply_instance_overrides(&mut config, &instance_overrides)?;
     apply_root_post_c_survivor_env(&mut config);
 
     // CLI flags override preset values ONLY when explicitly provided.
@@ -2077,6 +2165,8 @@ pub(crate) fn handle_beta_crown_command(
     // floor and derive the cap adaptively from the remaining collection budget.
     if let BetaCrownModel::Graph(graph) = &mut model_net {
         graph.set_crown_ibp_per_node_time_budget(config.crown_ibp_per_node_time_budget());
+        graph.set_chunk_wave_parallel_enabled(config.chunk_wave_parallel_enabled);
+        graph.set_frozen_levers(config.frozen_levers.clone());
     }
 
     // Auto-promote gpu_bab for graph models with supported heuristics on
@@ -2180,6 +2270,20 @@ pub(crate) fn handle_beta_crown_command(
         outer_wrapper_owns_deferred_pgd,
         instance_overrides.outer_deferred_internal_deadline,
     )?;
+    let configured_deadline = (!config.timeout.is_zero())
+        .then(|| verification_start.checked_add(config.timeout))
+        .flatten();
+    let configured_deadline_strictly_won = configured_deadline_strictly_wins(
+        configured_deadline,
+        instance_overrides.authoritative_deadline,
+        outer_wrapper_owns_deferred_pgd,
+        instance_overrides.outer_deferred_internal_deadline,
+    );
+    output::record_captured_deadline_plan(
+        config.timeout,
+        configured_deadline,
+        configured_deadline_strictly_won,
+    );
 
     // CNF-recovery driver: a
     // SAT-encoded ReLU gadget (sat_relu) is decompiled to its source CNF and

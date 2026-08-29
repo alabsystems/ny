@@ -546,6 +546,7 @@ fn search(
     let mut rng = Rng::new(schedule.seed);
     let mut anchors: Vec<Vec<f64>> = vec![centre.clone()];
     let mut restart = 0usize;
+    let mut ste_steps = 0usize;
 
     // ---- stage A: momentum STE-PGD with ILS restarts ----------------------
     while restart < schedule.max_restarts && Instant::now() < climb_at {
@@ -572,6 +573,7 @@ fn search(
             if Instant::now() >= climb_at {
                 break;
             }
+            ste_steps = ste_steps.saturating_add(1);
             let trace = admitted.ste_trace(&plan, &x);
             let (margin, _) = admitted.margin(&trace.logits);
             if margin > best_margin {
@@ -590,6 +592,7 @@ fn search(
                     free_units,
                     hamming(&base_s1, &trace.s1),
                     0,
+                    ste_steps,
                     started.elapsed(),
                 ) {
                     return Ok(SignSpaceOutcome::Candidate(Box::new(candidate)));
@@ -651,6 +654,7 @@ fn search(
                         free_units,
                         hamming(&base_s1, &trace.s1),
                         probes,
+                        ste_steps.saturating_add(probes),
                         started.elapsed(),
                     ) {
                         return Ok(SignSpaceOutcome::Candidate(Box::new(candidate)));
@@ -679,6 +683,7 @@ fn search(
         free_units,
         flips,
         lp_solves: probes,
+        work_units: ste_steps.saturating_add(probes),
         elapsed: started.elapsed(),
     })
 }

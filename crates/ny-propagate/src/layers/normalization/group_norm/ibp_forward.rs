@@ -163,15 +163,20 @@ impl GroupNormLayer {
             // envelope stays a sound enclosure. NaN-propagating max/min so a NaN Jacobian
             // bound (degenerate std) survives the intersection and fires downstream guards.
             if max_norm_safe.is_finite() {
+                // f64 helper, not raw f32 — this envelope is INTERSECTED into the
+                // published Jacobian bound below, so an endpoint rounded at the
+                // product's magnitude rather than the cancelled sum's pulls the
+                // bound INWARD past reachable outputs (see affine_fallback_up's
+                // doc in ibp.rs: same class 5d48d59e9 fixed in the fallback path).
                 let (env_lower, env_upper) = if ny_s >= 0.0 {
                     (
-                        next_down_f32(beta_s - ny_s * max_norm_safe),
-                        next_up_f32(beta_s + ny_s * max_norm_safe),
+                        super::ibp::affine_fallback_down(beta_s, ny_s, -max_norm_safe),
+                        super::ibp::affine_fallback_up(beta_s, ny_s, max_norm_safe),
                     )
                 } else {
                     (
-                        next_down_f32(beta_s + ny_s * max_norm_safe),
-                        next_up_f32(beta_s - ny_s * max_norm_safe),
+                        super::ibp::affine_fallback_down(beta_s, ny_s, max_norm_safe),
+                        super::ibp::affine_fallback_up(beta_s, ny_s, -max_norm_safe),
                     )
                 };
                 jac_lower = nan_propagating_max(jac_lower, env_lower);

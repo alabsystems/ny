@@ -168,29 +168,55 @@ fn test_exp_crown_wide_interval() {
     }
 }
 
-// ==================== Overflow guard tests (#1654) ====================
+// ==================== Overflow saturation tests ====================
+// (#1654 introduced a hard refusal; the dc9da0fde deep-stack overflow
+// saturation class replaced it: finite inputs beyond the f32 exp range
+// SATURATE the upper endpoint to +inf instead of aborting verification.)
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_exp_ibp_overflow_guard_1654() {
-    // exp(89) overflows f32. Guard should reject upper > 88.
+fn test_exp_ibp_overflow_saturates_upper_to_inf() {
+    // exp(100) overflows f32: the output upper endpoint saturates to +inf
+    // (a sound, maximally conservative bound); the lower endpoint stays the
+    // ordinary finite exp(0) bound.
     let lower = ArrayD::from_elem(IxDyn(&[1]), 0.0f32);
     let upper = ArrayD::from_elem(IxDyn(&[1]), 100.0f32);
     let input = BoundedTensor::new(lower, upper).unwrap();
 
     let exp = ExpLayer::new();
-    let err = exp
+    let output = exp
         .propagate_ibp(&input)
-        .expect_err("exp with upper=100 should return overflow error");
-    match err {
-        NyError::NumericalInstability(msg) => {
-            assert!(
-                msg.contains("overflow threshold"),
-                "unexpected message: {msg}"
-            );
-        }
-        other => panic!("unexpected error type: {other:?}"),
-    }
+        .expect("finite input beyond the overflow threshold must saturate, not error");
+    assert!(
+        (output.lower()[[0]] - 1.0).abs() < 1e-5,
+        "lower stays exp(0) = 1, got {}",
+        output.lower()[[0]]
+    );
+    assert!(
+        output.upper()[[0]].is_infinite() && output.upper()[[0]].is_sign_positive(),
+        "upper must saturate to +inf, got {}",
+        output.upper()[[0]]
+    );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_exp_ibp_lower_beyond_f64_range_stays_finite() {
+    // A FINITE lower endpoint so large that even f64 exp overflows (x > ~710):
+    // the true e^x is finite, so the LOWER output endpoint must stay finite
+    // (f32::MAX) — a +inf lower bound would be a false proof.
+    let lower = ArrayD::from_elem(IxDyn(&[1]), 800.0f32);
+    let upper = ArrayD::from_elem(IxDyn(&[1]), 900.0f32);
+    let input = BoundedTensor::new(lower, upper).unwrap();
+
+    let exp = ExpLayer::new();
+    let output = exp.propagate_ibp(&input).unwrap();
+    assert_eq!(
+        output.lower()[[0]],
+        f32::MAX,
+        "finite input with f64-overflowing exp must floor the lower endpoint at f32::MAX"
+    );
+    assert!(output.upper()[[0]].is_infinite() && output.upper()[[0]].is_sign_positive());
 }
 
 #[ntest::timeout(10000)]
@@ -208,23 +234,29 @@ fn test_exp_ibp_at_threshold_boundary_1654() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_exp_ibp_just_above_threshold_1654() {
-    // upper=88.1 exceeds threshold — should error.
+fn test_exp_ibp_just_above_threshold_saturates() {
+    // upper=88.1 exceeds the old refusal threshold: exp(88.1) ≈ 1.8e38 is
+    // still within f32 range, so the bound stays finite and sound; no error.
     let lower = ArrayD::from_elem(IxDyn(&[1]), 0.0f32);
     let upper = ArrayD::from_elem(IxDyn(&[1]), 88.1f32);
     let input = BoundedTensor::new(lower, upper).unwrap();
 
     let exp = ExpLayer::new();
+    let output = exp
+        .propagate_ibp(&input)
+        .expect("exp with upper=88.1 must propagate, not refuse");
     assert!(
-        exp.propagate_ibp(&input).is_err(),
-        "exp with upper=88.1 should be rejected"
+        output.upper()[[0]] >= ((88.1f32 as f64).exp()) as f32,
+        "upper must enclose exp(88.1_f32), got {}",
+        output.upper()[[0]]
     );
 }
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_exp_ibp_nan_input_1654() {
-    // NaN in bounds should be rejected.
+fn test_exp_ibp_nan_input_fails_closed_1654() {
+    // NaN in bounds must still fail closed: saturation is for legitimate
+    // ±inf only, never for NaN.
     let lower = ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NAN, 0.0]).unwrap();
     let upper = ArrayD::from_elem(IxDyn(&[2]), 1.0f32);
     let input = BoundedTensor::new_unchecked(lower, upper).unwrap();
@@ -235,7 +267,7 @@ fn test_exp_ibp_nan_input_1654() {
         .expect_err("NaN input should be rejected");
     match err {
         NyError::NumericalInstability(msg) => {
-            assert!(msg.contains("non-finite"), "unexpected message: {msg}");
+            assert!(msg.contains("NaN"), "unexpected message: {msg}");
         }
         other => panic!("unexpected error type: {other:?}"),
     }
@@ -243,22 +275,42 @@ fn test_exp_ibp_nan_input_1654() {
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_exp_ibp_inf_input_1654() {
-    // Infinity in bounds should be rejected.
+fn test_exp_ibp_saturated_input_flows_with_exact_limits() {
+    // ±Inf endpoints are the deep-stack IBP overflow convention (dc9da0fde
+    // class) and map to the exact extended-real limits instead of refusing:
+    // exp(+inf) = +inf, exp(-inf) = 0.
     let lower = ArrayD::from_elem(IxDyn(&[1]), 0.0f32);
     let upper = ArrayD::from_elem(IxDyn(&[1]), f32::INFINITY);
-    let input = BoundedTensor::new_unchecked(lower, upper).unwrap();
+    let input = BoundedTensor::new_allow_infinite(lower, upper).unwrap();
 
     let exp = ExpLayer::new();
-    let err = exp
+    let output = exp
         .propagate_ibp(&input)
-        .expect_err("infinite input should be rejected");
-    match err {
-        NyError::NumericalInstability(msg) => {
-            assert!(msg.contains("non-finite"), "unexpected message: {msg}");
-        }
-        other => panic!("unexpected error type: {other:?}"),
-    }
+        .expect("saturated upper endpoint must propagate, not error");
+    assert!(
+        (output.lower()[[0]] - 1.0).abs() < 1e-5,
+        "lower stays exp(0) = 1"
+    );
+    assert!(
+        output.upper()[[0]].is_infinite() && output.upper()[[0]].is_sign_positive(),
+        "exp(+inf) limit is +inf, got {}",
+        output.upper()[[0]]
+    );
+
+    // exp(-inf) = 0 exactly, on both endpoints of a [-inf, -inf] box.
+    let neg = ArrayD::from_elem(IxDyn(&[1]), f32::NEG_INFINITY);
+    let input = BoundedTensor::new_allow_infinite(neg.clone(), neg).unwrap();
+    let output = exp.propagate_ibp(&input).unwrap();
+    assert_eq!(
+        output.lower()[[0]],
+        0.0,
+        "exp(-inf) lower limit is exactly 0"
+    );
+    assert_eq!(
+        output.upper()[[0]],
+        0.0,
+        "exp(-inf) upper limit is exactly 0"
+    );
 }
 
 #[ntest::timeout(10000)]

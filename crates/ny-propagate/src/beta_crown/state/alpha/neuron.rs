@@ -70,6 +70,12 @@ impl AlphaNeuronState {
     }
 
     /// The accumulated gradient.
+    /// Scale the accumulated gradient (row-count normalization for the
+    /// row-aggregated analytical α step; NaN-safe via the multiply).
+    pub fn scale_grad(&mut self, factor: f32) {
+        self.grad *= factor;
+    }
+
     pub fn grad(&self) -> f32 {
         self.grad
     }

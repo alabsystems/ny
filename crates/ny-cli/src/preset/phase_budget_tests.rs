@@ -556,6 +556,26 @@ fn empty_phase_budget_preset_preserves_defaults_2206() {
     );
 }
 
+#[test]
+fn postbab_fixed_reserve_is_wrapper_only() {
+    let preset = PresetConfig {
+        bab: BabPreset {
+            phase_budget: PhaseBudgetPreset {
+                post_bab_reserve_secs: Some(100),
+                ..PhaseBudgetPreset::default()
+            },
+            ..BabPreset::default()
+        },
+        ..PresetConfig::default()
+    };
+    let mut config = BetaCrownConfig::default();
+    let before = config.phase_budget.clone();
+
+    apply_preset(&mut config, &preset).unwrap();
+
+    assert_eq!(config.phase_budget, before);
+}
+
 /// #attack-floor: the lsnc_relu preset must carry the disjunctive-attack floor
 /// all the way into the runtime ledger, and no other category may acquire it by
 /// accident.

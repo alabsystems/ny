@@ -304,7 +304,7 @@ class TestVersion:
         """Module should have version."""
         assert hasattr(ny, "__version__")
         assert isinstance(ny.__version__, str)
-        assert ny.__version__ == "0.2.0"
+        assert ny.__version__ == "0.4.0"
 
 
 # ==============================================================================

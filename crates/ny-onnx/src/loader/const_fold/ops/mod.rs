@@ -42,3 +42,12 @@ pub(super) fn try_fold_all_const_node(
         .or_else(|| range::try_fold(node, weights))
         .or_else(|| shape_ops::try_fold(node, weights, model_unbatched))
 }
+
+/// Test-only passthrough to the UNMODIFIED bit-exact MatMul fold.
+#[cfg(test)]
+pub(super) fn try_fold_matmul_exact_for_test(
+    lhs: &ndarray::ArrayD<f32>,
+    rhs: &ndarray::ArrayD<f32>,
+) -> Option<ndarray::ArrayD<f32>> {
+    elementwise::try_fold_matmul_exact(lhs, rhs)
+}

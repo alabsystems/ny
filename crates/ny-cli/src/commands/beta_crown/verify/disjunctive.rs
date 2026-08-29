@@ -243,7 +243,26 @@ pub(super) fn verify_multi_clause_disjunction(
     // only the dead falsification time is reclaimed for BaB. Measurement
     // lever for hold-heavy sweeps; competition keeps PGD (a missed sat is a
     // lost +10 — or worse, a wrong-verdict risk taken by BaB instead).
-    let skip_disj_pgd = matches!(std::env::var("NY_SKIP_DISJ_PGD").ok().as_deref(), Some("1"));
+    let skip_disj_pgd_env = matches!(std::env::var("NY_SKIP_DISJ_PGD").ok().as_deref(), Some("1"));
+    // #disj-demand (typed preset key `bab.phase_budget.demand_sized_disjunctive_pgd`,
+    // default OFF): zero the disjunctive attack slice when the ledger's static
+    // probe proved the net is outside the exact-gradient fragment, so the phase
+    // could only spend the slice on SPSA over point-IBP forwards. MEASURED on
+    // vit_2023 at the official 100 s budget: 4.75 s of a 95 s tier per row,
+    // zero counterexamples ever. The skip takes the SAME path as
+    // NY_SKIP_DISJ_PGD below (warm still runs, #attack-extend retry skipped),
+    // and the seconds flow to BaB because the fast path re-bases on
+    // `ledger.remaining()`. Attack-scheduling only; the eprintln is the
+    // lever's own observable.
+    let disj_pgd_demand_zeroed = ledger.disjunctive_pgd_demand_zeroed();
+    if pgd_attack && disj_pgd_demand_zeroed && !skip_disj_pgd_env {
+        eprintln!(
+            "[disj-pgd] demand-zeroed: net is statically outside the exact-gradient fragment \
+             and the preset armed demand_sized_disjunctive_pgd; the disjunctive attack slice \
+             goes to BaB (#disj-demand)"
+        );
+    }
+    let skip_disj_pgd = skip_disj_pgd_env || disj_pgd_demand_zeroed;
     if pgd_attack && skip_disj_pgd {
         if let BetaCrownModel::Graph(g) = model_net {
             if graph_has_conv2d_layers(model_net)

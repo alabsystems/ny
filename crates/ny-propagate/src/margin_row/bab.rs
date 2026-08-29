@@ -48,13 +48,50 @@ pub type TrunkSplit = (usize, usize, i8);
 /// Head fix: (head neuron, direction).
 pub type HeadFix = (usize, i8);
 
+/// Hard cap on incremental epoch frames simultaneously nested on one branch.
+///
+/// This is a trusted code limit, not a per-driver attempt counter: every edge
+/// carries and decrements the same budget, and even a manually constructed
+/// oversized [`BabConfig`] is clamped before it can recurse.
+pub(crate) const EPOCH_PARENT_GENERATION_CAP: usize = 4;
+
+/// Invocation frame used to keep outer treatment work distinct from work
+/// performed inside an epoch-created subtree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochFrameRoute {
+    /// Top-level joint tree or one top-level classwise tree.
+    Outer,
+    /// Subtree created by a full-tableau epoch rebuild.
+    NestedFull,
+    /// Subtree created by an incremental parent-frame refresh.
+    NestedIncremental,
+}
+
 /// Tuning knobs (defaults = the verified Part-B protocol).
 #[derive(Clone)]
 pub struct BabConfig {
-    /// Head candidates per expansion.
+    /// Configured head candidates per expansion. This immutable base is kept
+    /// separate from the one-way adaptive operational width below.
     pub k_head: usize,
-    /// Trunk candidates per expansion.
+    /// Exact lower-authority head width for execution counterfactuals.
+    pub contextual_k_head: usize,
+    /// Configured trunk candidates per expansion.
     pub k_trunk: usize,
+    /// Exact lower-authority trunk width for execution counterfactuals.
+    pub contextual_k_trunk: usize,
+    /// Current operational head width. Public entries seed this from
+    /// `k_head`; nested epoch entries inherit the parent's ratcheted value.
+    pub effective_k_head: usize,
+    /// Current lower-authority operational head width.
+    pub effective_contextual_k_head: usize,
+    /// Current operational trunk width.
+    pub effective_k_trunk: usize,
+    /// Current lower-authority operational trunk width.
+    pub effective_contextual_k_trunk: usize,
+    /// Receipt-owned adaptive-width authority.
+    pub adaptive: bool,
+    /// Exact lower-authority adaptive-width choice.
+    pub contextual_adaptive: bool,
     /// Expansion cap.
     pub max_expansions: usize,
     /// Wall-clock deadline.
@@ -66,31 +103,42 @@ pub struct BabConfig {
     /// Each domain's bound is computed bit-identically to serial; only the
     /// tree exploration order changes (still a sound per-point sign cover).
     pub frontier: usize,
+    /// Effective frontier width the same invocation would have received after
+    /// removing the `NY_MARGIN_ROW_PARALLEL` environment treatment while
+    /// retaining its typed base preset. This is frozen beside `frontier` so
+    /// post-run evidence compares one tree decision in the same Rayon context
+    /// rather than reopening process-global state after the run.
+    pub frontier_contextual: usize,
     /// Default-off cross-domain candidate-score stacking canary.  Only the
     /// `score_candidates` backward passes of a parallel frontier batch are
     /// stacked; node evaluation, candidate selection, and heap merge retain
     /// their established per-domain paths and deterministic ordering.
     pub domain_stack: bool,
-    /// Tier-0 (#epoch-bab): number of candidates that get the exact Tier-1
-    /// pass after rank-1 variant ranking. `0` = legacy shortlist protocol
-    /// (`k_head`/`k_trunk` candidates, no Tier-0). Requires `retained`.
-    pub tier0_exact: usize,
-    /// Tier-0 per-layer trunk universe cap (top by dynamic `|coef|·c`).
-    pub tier0_universe: usize,
+    /// Immutable entry-time authority for per-domain alpha optimization.
+    /// Every class and nested epoch driver inherits this policy unchanged.
+    pub domain_alpha_policy: super::DomainAlphaRuntimePolicy,
+    /// Immutable entry-time authority for the complete Tier-0/Tier-2 epoch
+    /// family. Nested drivers carry this receipt-owned policy unchanged.
+    pub epoch_policy: super::EpochRuntimePolicy,
+    /// Evidence-only identity of this driver frame.
+    pub epoch_frame_route: EpochFrameRoute,
     /// Retained tableau rows for the Tier-0 trunk variant ranker
     /// (`RootGates::build_retaining`). Ranker-only; shared with the parallel
     /// frontier via `Arc`.
     pub retained: Option<Arc<RetainedRows>>,
-    /// Tier-2 epochs (#epoch-bab): when a popped domain carries at least
-    /// this many trunk splits, rebuild the trunk tableau with those splits
-    /// BAKED (exact fixed lines -> every downstream gate re-derived from
-    /// tighter boxes) and run the subtree as a nested lane under the epoch
-    /// gates. `0` = off.
-    pub epoch_depth: usize,
-    /// Max epoch attempts per run that end `Unknown` (a closing epoch does
-    /// not count against the budget; failed rebuilds are capped so the lane
-    /// cannot thrash on expensive tableau builds).
-    pub epoch_max_attempts: usize,
+    /// Operational Tier-2 cadence for this tree. The entry tree seeds it from
+    /// `epoch_policy.depth`; a nested full rebuild sets it to zero, while the
+    /// closure controller may arm its own cadence only when the configured
+    /// depth is zero. This separation prevents adaptive rollback from erasing
+    /// an explicit scored treatment.
+    pub epoch_trigger_depth: usize,
+    /// Operational failed-attempt cap for this tree. The entry tree seeds it
+    /// from `epoch_policy.max_attempts`; nested full rebuilds set it to zero.
+    pub epoch_attempt_cap: usize,
+    /// Remaining incremental-epoch nesting generations on this branch. The
+    /// lane entry seeds a fixed finite budget; every nested refresh decrements
+    /// it, making the maximum call-stack depth explicit and non-resetting.
+    pub epoch_parent_generations_left: usize,
     /// Measured root tableau build seconds (set by the lane entry); an epoch
     /// is only attempted when the remaining deadline exceeds a multiple of
     /// this (the rebuild costs about one root build).
@@ -109,29 +157,1289 @@ pub struct BabConfig {
     /// SURVIVING columns. Cfg-carried (not read at eval) so tests can arm it
     /// without process-global env mutation.
     pub col_retire: bool,
+    /// Use independent beta state for selected failing output columns.
+    pub beta_per_column: bool,
+    /// Maximum live per-column beta states, clamped to the historical 1..=32.
+    pub beta_columns: usize,
+    /// Prebuild deterministic y-packs for multi-domain frontier batches.
+    pub parallel_prebuild: bool,
+    /// Immutable authority for rebakes and nested epoch roots. Execution
+    /// evidence is deliberately not read back into this policy.
+    pub root_precision_policy: super::RootPrecisionRuntimePolicy,
+    /// Root-build execution evidence for the root-precision family.
+    pub root_precision_execution: super::RootPrecisionExecutionEvidence,
+    /// Root-build execution evidence for the frozen backward-intermediate
+    /// family. Evidence-only; no tree decision reads it.
+    pub backward_interm_execution: super::BackwardIntermExecutionEvidence,
+    /// One closed receipt for the entry root's standalone alpha and rebake
+    /// phases. Evidence-only and never recomputed by nested class/tree runs.
+    pub root_alpha_execution: super::RootAlphaExecutionEvidence,
 }
 
 impl Default for BabConfig {
     fn default() -> Self {
         Self {
             k_head: 8,
+            contextual_k_head: 8,
             k_trunk: 8,
+            contextual_k_trunk: 8,
+            effective_k_head: 8,
+            effective_contextual_k_head: 8,
+            effective_k_trunk: 8,
+            effective_contextual_k_trunk: 8,
+            adaptive: false,
+            contextual_adaptive: false,
             max_expansions: 20_000,
             deadline: None,
             lru_cap: 6,
             frontier: 1,
+            frontier_contextual: 1,
             domain_stack: false,
-            tier0_exact: 0,
-            tier0_universe: 64,
+            domain_alpha_policy: super::DomainAlphaRuntimePolicy::default(),
+            epoch_policy: super::EpochRuntimePolicy::default(),
+            epoch_frame_route: EpochFrameRoute::Outer,
             retained: None,
-            epoch_depth: 0,
-            epoch_max_attempts: 2,
+            epoch_trigger_depth: 0,
+            epoch_attempt_cap: 2,
+            epoch_parent_generations_left: 0,
             root_build_secs: 0.0,
             retain_cfg: None,
             initial_heads: Vec::new(),
             initial_ybox: None,
-            col_retire: col_retire_enabled(),
+            col_retire: false,
+            beta_per_column: false,
+            beta_columns: 8,
+            parallel_prebuild: false,
+            root_precision_policy: super::RootPrecisionRuntimePolicy::default(),
+            root_precision_execution: super::RootPrecisionExecutionEvidence::default(),
+            backward_interm_execution: super::BackwardIntermExecutionEvidence::default(),
+            root_alpha_execution: super::RootAlphaExecutionEvidence::default(),
         }
+    }
+}
+
+impl BabConfig {
+    /// Canonicalize the operational epoch state at a public outer-tree entry.
+    ///
+    /// Nested epoch drivers bypass `run` and `run_classwise` through
+    /// `run_inner`, so their deliberately suppressed/decremented operational
+    /// values are preserved. Public callers, however, must not be able to
+    /// execute one cadence or attempt cap while reporting a different frozen
+    /// receipt policy.
+    fn seed_outer_epoch(mut self) -> Self {
+        self.epoch_frame_route = EpochFrameRoute::Outer;
+        self.epoch_trigger_depth = self.epoch_policy.depth;
+        self.epoch_attempt_cap = self.epoch_policy.max_attempts;
+        self.epoch_parent_generations_left = super::epoch_parent_generation_budget(
+            self.epoch_policy.parent_topk,
+            self.epoch_policy.depth,
+            self.epoch_policy.max_attempts,
+        );
+        self.effective_k_head = self.k_head;
+        self.effective_contextual_k_head = self.contextual_k_head;
+        self.effective_k_trunk = self.k_trunk;
+        self.effective_contextual_k_trunk = self.contextual_k_trunk;
+        self
+    }
+}
+
+/// Stable route carried by the margin-row frontier execution receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrontierRoute {
+    /// The established joint multi-margin tree, where the configured frontier
+    /// controls best-first batching.
+    Joint,
+    /// The experimental classwise schedule, which forcibly serializes every
+    /// per-class tree for exact global expansion accounting.
+    Classwise,
+}
+
+impl FrontierRoute {
+    /// Stable machine token consumed by `scripts/ny_search.py`.
+    #[must_use]
+    pub const fn stable_token(self) -> &'static str {
+        match self {
+            Self::Joint => "joint",
+            Self::Classwise => "classwise",
+        }
+    }
+}
+
+/// Per-invocation evidence that a frontier override changed a real tree
+/// scheduling decision relative to the exact lower-layer width policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrontierExecutionEvidence {
+    /// Tree route that owned these counters.
+    pub route: FrontierRoute,
+    /// Effective configured frontier width (`0` is normalized to serial `1`).
+    pub configured: usize,
+    /// Effective lower-layer width in this invocation's Rayon context.
+    pub contextual: usize,
+    /// Tree scheduling decisions that reached executable domain work.
+    pub steps: usize,
+    /// Decisions whose planned batch differs from the contextual policy.
+    pub counterfactual_differences: usize,
+    /// Largest open heap at an observed decision.
+    pub max_open: usize,
+    /// Largest configured planned batch at an observed decision.
+    pub max_batch: usize,
+}
+
+impl FrontierExecutionEvidence {
+    #[must_use]
+    pub fn joint(configured: usize, contextual: usize) -> Self {
+        Self {
+            route: FrontierRoute::Joint,
+            configured: configured.max(1),
+            contextual: contextual.max(1),
+            steps: 0,
+            counterfactual_differences: 0,
+            max_open: 0,
+            max_batch: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn classwise() -> Self {
+        Self {
+            route: FrontierRoute::Classwise,
+            configured: 1,
+            contextual: 1,
+            steps: 0,
+            counterfactual_differences: 0,
+            max_open: 0,
+            max_batch: 0,
+        }
+    }
+
+    /// Observe one executable best-first decision.  `open` is captured before
+    /// the selected domain(s) leave the heap, after the loop's budget/deadline
+    /// gates.  The planned batch is therefore an exact `min(width, open)` for
+    /// both the configured and exact lower-layer policies.
+    pub(crate) fn observe(&mut self, open: usize) {
+        if open == 0 {
+            return;
+        }
+        let batch = self.configured.min(open);
+        let contextual_batch = self.contextual.min(open);
+        self.steps = self.steps.saturating_add(1);
+        if batch != contextual_batch {
+            self.counterfactual_differences = self.counterfactual_differences.saturating_add(1);
+        }
+        self.max_open = self.max_open.max(open);
+        self.max_batch = self.max_batch.max(batch);
+    }
+
+    fn absorb(&mut self, other: Self) {
+        debug_assert_eq!(self.route, other.route);
+        debug_assert_eq!(self.configured, other.configured);
+        debug_assert_eq!(self.contextual, other.contextual);
+        if self.route != other.route
+            || self.configured != other.configured
+            || self.contextual != other.contextual
+        {
+            return;
+        }
+        self.steps = self.steps.saturating_add(other.steps);
+        self.counterfactual_differences = self
+            .counterfactual_differences
+            .saturating_add(other.counterfactual_differences);
+        self.max_open = self.max_open.max(other.max_open);
+        self.max_batch = self.max_batch.max(other.max_batch);
+    }
+}
+
+/// Frozen branch-width policy plus causal execution counters for the ordinary
+/// head/trunk selectors. Tier-0 has its own ranker and deliberately contributes
+/// no selector credit here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WidthExecutionEvidence {
+    /// Configured immutable head-width base.
+    pub configured_k_head: usize,
+    /// Exact lower-authority head-width base.
+    pub contextual_k_head: usize,
+    /// Configured immutable trunk-width base.
+    pub configured_k_trunk: usize,
+    /// Exact lower-authority trunk-width base.
+    pub contextual_k_trunk: usize,
+    /// Configured adaptive-width authority.
+    pub adaptive_enabled: bool,
+    /// Exact lower-authority adaptive-width authority.
+    pub contextual_adaptive: bool,
+    /// Frozen Tier-0 exact width; a nonzero executable Tier-0 route bypasses
+    /// both ordinary selectors.
+    pub tier0_exact: usize,
+    /// Largest operational head width reached by an ordinary selector route.
+    pub effective_k_head_max: usize,
+    /// Largest operational trunk width reached by an ordinary selector route.
+    pub effective_k_trunk_max: usize,
+    /// Largest exact lower-authority head width reached by an ordinary route.
+    pub effective_contextual_k_head_max: usize,
+    /// Largest exact lower-authority trunk width reached by an ordinary route.
+    pub effective_contextual_k_trunk_max: usize,
+    /// Ordinary outer/classwise head selector calls.
+    pub outer_head_selection_calls: usize,
+    /// Largest eligible head identity set seen by an outer selector.
+    pub outer_head_available_max: usize,
+    /// Head identities actually submitted across outer exact-score calls.
+    pub outer_head_selected_total: usize,
+    /// Successful exact-score calls whose actual head identity set differed
+    /// from the exact contextual-width set.
+    pub outer_head_binding_scored_calls: usize,
+    /// Ordinary outer/classwise trunk selector calls.
+    pub outer_trunk_selection_calls: usize,
+    /// Largest eligible trunk identity set seen by an outer selector.
+    pub outer_trunk_available_max: usize,
+    /// Trunk identities actually submitted across outer exact-score calls.
+    pub outer_trunk_selected_total: usize,
+    /// Successful exact-score calls whose actual trunk identity set differed
+    /// from the exact contextual-width set.
+    pub outer_trunk_binding_scored_calls: usize,
+    /// Ordinary head selector calls inside nested epoch trees.
+    pub nested_head_selection_calls: usize,
+    /// Ordinary trunk selector calls inside nested epoch trees.
+    pub nested_trunk_selection_calls: usize,
+    /// Frontier observations that reached a configured adaptive threshold on
+    /// an ordinary selector route.
+    pub configured_adaptive_threshold_opportunities: usize,
+    /// Configured threshold observations that increased at least one
+    /// operational treatment width.
+    pub configured_adaptive_escalations: usize,
+    /// Frontier observations that reached the exact lower-authority adaptive
+    /// threshold on an ordinary selector route.
+    pub contextual_adaptive_threshold_opportunities: usize,
+    /// Contextual threshold observations that increased at least one exact
+    /// lower-authority operational width.
+    pub contextual_adaptive_escalations: usize,
+    /// A class/nested merge observed a different supposedly-frozen policy.
+    pub policy_mismatch: bool,
+}
+
+impl WidthExecutionEvidence {
+    fn from_config(config: &BabConfig) -> Self {
+        Self {
+            configured_k_head: config.k_head,
+            contextual_k_head: config.contextual_k_head,
+            configured_k_trunk: config.k_trunk,
+            contextual_k_trunk: config.contextual_k_trunk,
+            adaptive_enabled: config.adaptive,
+            contextual_adaptive: config.contextual_adaptive,
+            tier0_exact: config.epoch_policy.tier0_exact,
+            effective_k_head_max: config.effective_k_head,
+            effective_k_trunk_max: config.effective_k_trunk,
+            effective_contextual_k_head_max: config.effective_contextual_k_head,
+            effective_contextual_k_trunk_max: config.effective_contextual_k_trunk,
+            outer_head_selection_calls: 0,
+            outer_head_available_max: 0,
+            outer_head_selected_total: 0,
+            outer_head_binding_scored_calls: 0,
+            outer_trunk_selection_calls: 0,
+            outer_trunk_available_max: 0,
+            outer_trunk_selected_total: 0,
+            outer_trunk_binding_scored_calls: 0,
+            nested_head_selection_calls: 0,
+            nested_trunk_selection_calls: 0,
+            configured_adaptive_threshold_opportunities: 0,
+            configured_adaptive_escalations: 0,
+            contextual_adaptive_threshold_opportunities: 0,
+            contextual_adaptive_escalations: 0,
+            policy_mismatch: false,
+        }
+    }
+
+    fn same_policy(&self, other: &Self) -> bool {
+        self.configured_k_head == other.configured_k_head
+            && self.contextual_k_head == other.contextual_k_head
+            && self.configured_k_trunk == other.configured_k_trunk
+            && self.contextual_k_trunk == other.contextual_k_trunk
+            && self.adaptive_enabled == other.adaptive_enabled
+            && self.contextual_adaptive == other.contextual_adaptive
+            && self.tier0_exact == other.tier0_exact
+    }
+
+    fn absorb(&mut self, other: Self) {
+        if !self.same_policy(&other) {
+            self.policy_mismatch = true;
+            return;
+        }
+        self.policy_mismatch |= other.policy_mismatch;
+        self.effective_k_head_max = self.effective_k_head_max.max(other.effective_k_head_max);
+        self.effective_k_trunk_max = self.effective_k_trunk_max.max(other.effective_k_trunk_max);
+        self.effective_contextual_k_head_max = self
+            .effective_contextual_k_head_max
+            .max(other.effective_contextual_k_head_max);
+        self.effective_contextual_k_trunk_max = self
+            .effective_contextual_k_trunk_max
+            .max(other.effective_contextual_k_trunk_max);
+        self.outer_head_available_max = self
+            .outer_head_available_max
+            .max(other.outer_head_available_max);
+        self.outer_trunk_available_max = self
+            .outer_trunk_available_max
+            .max(other.outer_trunk_available_max);
+        macro_rules! add {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            };
+        }
+        add!(
+            outer_head_selection_calls,
+            outer_head_selected_total,
+            outer_head_binding_scored_calls,
+            outer_trunk_selection_calls,
+            outer_trunk_selected_total,
+            outer_trunk_binding_scored_calls,
+            nested_head_selection_calls,
+            nested_trunk_selection_calls,
+            configured_adaptive_threshold_opportunities,
+            configured_adaptive_escalations,
+            contextual_adaptive_threshold_opportunities,
+            contextual_adaptive_escalations,
+        );
+    }
+
+    fn observe_selection(
+        &mut self,
+        route: EpochFrameRoute,
+        observation: WidthSelectionObservation,
+    ) {
+        match route {
+            EpochFrameRoute::Outer => {
+                self.outer_head_selection_calls = self.outer_head_selection_calls.saturating_add(1);
+                self.outer_head_available_max = self
+                    .outer_head_available_max
+                    .max(observation.head_available);
+                self.outer_head_selected_total = self
+                    .outer_head_selected_total
+                    .saturating_add(observation.head_selected);
+                self.outer_trunk_selection_calls =
+                    self.outer_trunk_selection_calls.saturating_add(1);
+                self.outer_trunk_available_max = self
+                    .outer_trunk_available_max
+                    .max(observation.trunk_available);
+                self.outer_trunk_selected_total = self
+                    .outer_trunk_selected_total
+                    .saturating_add(observation.trunk_selected);
+            }
+            EpochFrameRoute::NestedFull | EpochFrameRoute::NestedIncremental => {
+                self.nested_head_selection_calls =
+                    self.nested_head_selection_calls.saturating_add(1);
+                self.nested_trunk_selection_calls =
+                    self.nested_trunk_selection_calls.saturating_add(1);
+            }
+        }
+    }
+
+    fn observe_successful_score(
+        &mut self,
+        route: EpochFrameRoute,
+        observation: WidthSelectionObservation,
+    ) {
+        if route != EpochFrameRoute::Outer {
+            return;
+        }
+        if observation.head_counterfactual {
+            self.outer_head_binding_scored_calls =
+                self.outer_head_binding_scored_calls.saturating_add(1);
+        }
+        if observation.trunk_counterfactual {
+            self.outer_trunk_binding_scored_calls =
+                self.outer_trunk_binding_scored_calls.saturating_add(1);
+        }
+    }
+
+    fn observe_adaptive_threshold(
+        &mut self,
+        ordinary_route: bool,
+        configured_old: (usize, usize),
+        configured_new: (usize, usize),
+        contextual_old: (usize, usize),
+        contextual_new: (usize, usize),
+    ) {
+        if !ordinary_route {
+            return;
+        }
+        if self.adaptive_enabled {
+            self.configured_adaptive_threshold_opportunities = self
+                .configured_adaptive_threshold_opportunities
+                .saturating_add(1);
+            if configured_old != configured_new {
+                self.configured_adaptive_escalations =
+                    self.configured_adaptive_escalations.saturating_add(1);
+                self.effective_k_head_max = self.effective_k_head_max.max(configured_new.0);
+                self.effective_k_trunk_max = self.effective_k_trunk_max.max(configured_new.1);
+            }
+        }
+        if self.contextual_adaptive {
+            self.contextual_adaptive_threshold_opportunities = self
+                .contextual_adaptive_threshold_opportunities
+                .saturating_add(1);
+            if contextual_old != contextual_new {
+                self.contextual_adaptive_escalations =
+                    self.contextual_adaptive_escalations.saturating_add(1);
+                self.effective_contextual_k_head_max =
+                    self.effective_contextual_k_head_max.max(contextual_new.0);
+                self.effective_contextual_k_trunk_max =
+                    self.effective_contextual_k_trunk_max.max(contextual_new.1);
+            }
+        }
+    }
+}
+
+impl Default for WidthExecutionEvidence {
+    fn default() -> Self {
+        Self::from_config(&BabConfig::default())
+    }
+}
+
+/// Selection-local identity comparison retained until the actual exact score
+/// pass succeeds. The counterfactual booleans are computed from complete,
+/// deterministic actual and contextual identity lists, not candidate counts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct WidthSelectionObservation {
+    head_available: usize,
+    head_selected: usize,
+    head_counterfactual: bool,
+    trunk_available: usize,
+    trunk_selected: usize,
+    trunk_counterfactual: bool,
+}
+
+/// Frozen policy plus counters proving that the new governed margin-row
+/// controls reached executable work rather than merely appearing in a receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyExecutionEvidence {
+    /// Frozen per-column beta gate.
+    pub beta_per_column: bool,
+    /// Frozen maximum beta-column width after the historical clamp.
+    pub beta_columns: usize,
+    /// Frozen certificate-backed column-retirement gate.
+    pub column_retire: bool,
+    /// Frozen parallel-prebuild gate.
+    pub parallel_prebuild: bool,
+    /// Frozen per-domain alpha gate.
+    pub domain_alpha_enabled: bool,
+    /// Frozen per-domain alpha trial cap.
+    pub domain_alpha_iters: usize,
+    /// Frozen initial per-domain alpha step, stored as exact f64 bits.
+    pub domain_alpha_eta_bits: u64,
+    /// Live node evaluations whose first non-deadline ascent iteration
+    /// consumed a per-column candidate set.
+    pub beta_per_column_evals: usize,
+    /// Per-column evaluations where this width changed the selected set
+    /// relative to the historical width 8.
+    pub beta_columns_binding_evals: usize,
+    /// Largest live failing-column candidate set observed.
+    pub beta_columns_max_candidates: usize,
+    /// Columns newly certified and placed in an inherited retirement set.
+    pub newly_retired_columns: usize,
+    /// Descendant evaluations actually narrowed by an inherited retirement.
+    pub inherited_retirement_evals: usize,
+    /// Multi-domain batches for which at least one missing pack was prebuilt.
+    pub parallel_prebuild_batches: usize,
+    /// Missing domain packs actually built through the prebuild path.
+    pub parallel_prebuild_domains: usize,
+    /// Armed evaluations that reached the per-domain alpha admission site.
+    pub domain_alpha_gate_evals: usize,
+    /// Armed evaluations with at least one movable relaxation triangle.
+    pub domain_alpha_movable_evals: usize,
+    /// Movable relaxation triangles observed across those evaluations.
+    pub domain_alpha_movable_slots: usize,
+    /// Ancestor alpha entries actually applied to eligible child slots.
+    pub domain_alpha_warm_applied: usize,
+    /// Evaluations that started at least one certified alpha trial.
+    pub domain_alpha_ascent_calls: usize,
+    /// Certified alpha proposals that reached the scorer.
+    pub domain_alpha_trials_started: usize,
+    /// Trial passes that returned a scoreable result.
+    pub domain_alpha_trial_passes_completed: usize,
+    /// Trial passes that failed before producing a result.
+    pub domain_alpha_trial_pass_failures: usize,
+    /// Completed trial passes whose certified composite was finite.
+    pub domain_alpha_finite_trial_scores: usize,
+    /// Scored proposals whose certified composite improved and was retained.
+    pub domain_alpha_trials_accepted: usize,
+    /// Sparse accepted alpha entries carried from evaluated nodes to children.
+    pub domain_alpha_carried_entries: usize,
+    /// Domains where the configured trial cap causally differed from two.
+    pub domain_alpha_iters_counterfactual_domains: usize,
+    /// Domains where an ETA-different proposal received a finite score.
+    pub domain_alpha_eta_counterfactual_scored_domains: usize,
+    /// Outer epoch-frame domains that started at least one trial.
+    pub domain_alpha_outer_ascent_calls: usize,
+    /// Finite certified trial scores produced in outer epoch frames.
+    pub domain_alpha_outer_finite_trial_scores: usize,
+    /// Outer domains with a causally binding iteration counterfactual.
+    pub domain_alpha_outer_iters_counterfactual_domains: usize,
+    /// Outer domains with a finite-scored ETA counterfactual.
+    pub domain_alpha_outer_eta_counterfactual_scored_domains: usize,
+    /// A nested/classwise stats merge observed a different supposedly-frozen
+    /// policy. Such a run may still carry a sound verdict, but its optimizer
+    /// attribution must fail closed.
+    pub policy_mismatch: bool,
+}
+
+impl PolicyExecutionEvidence {
+    fn from_config(config: &BabConfig) -> Self {
+        let domain_alpha = config.domain_alpha_policy.normalized();
+        Self {
+            beta_per_column: config.beta_per_column,
+            beta_columns: config.beta_columns.clamp(1, 32),
+            column_retire: config.col_retire,
+            parallel_prebuild: config.parallel_prebuild,
+            domain_alpha_enabled: domain_alpha.enabled,
+            domain_alpha_iters: domain_alpha.iters,
+            domain_alpha_eta_bits: domain_alpha.eta.to_bits(),
+            beta_per_column_evals: 0,
+            beta_columns_binding_evals: 0,
+            beta_columns_max_candidates: 0,
+            newly_retired_columns: 0,
+            inherited_retirement_evals: 0,
+            parallel_prebuild_batches: 0,
+            parallel_prebuild_domains: 0,
+            domain_alpha_gate_evals: 0,
+            domain_alpha_movable_evals: 0,
+            domain_alpha_movable_slots: 0,
+            domain_alpha_warm_applied: 0,
+            domain_alpha_ascent_calls: 0,
+            domain_alpha_trials_started: 0,
+            domain_alpha_trial_passes_completed: 0,
+            domain_alpha_trial_pass_failures: 0,
+            domain_alpha_finite_trial_scores: 0,
+            domain_alpha_trials_accepted: 0,
+            domain_alpha_carried_entries: 0,
+            domain_alpha_iters_counterfactual_domains: 0,
+            domain_alpha_eta_counterfactual_scored_domains: 0,
+            domain_alpha_outer_ascent_calls: 0,
+            domain_alpha_outer_finite_trial_scores: 0,
+            domain_alpha_outer_iters_counterfactual_domains: 0,
+            domain_alpha_outer_eta_counterfactual_scored_domains: 0,
+            policy_mismatch: false,
+        }
+    }
+
+    fn absorb(&mut self, other: Self) {
+        if self.beta_per_column != other.beta_per_column
+            || self.beta_columns != other.beta_columns
+            || self.column_retire != other.column_retire
+            || self.parallel_prebuild != other.parallel_prebuild
+            || self.domain_alpha_enabled != other.domain_alpha_enabled
+            || self.domain_alpha_iters != other.domain_alpha_iters
+            || self.domain_alpha_eta_bits != other.domain_alpha_eta_bits
+        {
+            self.policy_mismatch = true;
+            return;
+        }
+        self.policy_mismatch |= other.policy_mismatch;
+        self.beta_per_column_evals = self
+            .beta_per_column_evals
+            .saturating_add(other.beta_per_column_evals);
+        self.beta_columns_binding_evals = self
+            .beta_columns_binding_evals
+            .saturating_add(other.beta_columns_binding_evals);
+        self.beta_columns_max_candidates = self
+            .beta_columns_max_candidates
+            .max(other.beta_columns_max_candidates);
+        self.newly_retired_columns = self
+            .newly_retired_columns
+            .saturating_add(other.newly_retired_columns);
+        self.inherited_retirement_evals = self
+            .inherited_retirement_evals
+            .saturating_add(other.inherited_retirement_evals);
+        self.parallel_prebuild_batches = self
+            .parallel_prebuild_batches
+            .saturating_add(other.parallel_prebuild_batches);
+        self.parallel_prebuild_domains = self
+            .parallel_prebuild_domains
+            .saturating_add(other.parallel_prebuild_domains);
+        self.domain_alpha_gate_evals = self
+            .domain_alpha_gate_evals
+            .saturating_add(other.domain_alpha_gate_evals);
+        self.domain_alpha_movable_evals = self
+            .domain_alpha_movable_evals
+            .saturating_add(other.domain_alpha_movable_evals);
+        self.domain_alpha_movable_slots = self
+            .domain_alpha_movable_slots
+            .saturating_add(other.domain_alpha_movable_slots);
+        self.domain_alpha_warm_applied = self
+            .domain_alpha_warm_applied
+            .saturating_add(other.domain_alpha_warm_applied);
+        self.domain_alpha_ascent_calls = self
+            .domain_alpha_ascent_calls
+            .saturating_add(other.domain_alpha_ascent_calls);
+        self.domain_alpha_trials_started = self
+            .domain_alpha_trials_started
+            .saturating_add(other.domain_alpha_trials_started);
+        self.domain_alpha_trial_passes_completed = self
+            .domain_alpha_trial_passes_completed
+            .saturating_add(other.domain_alpha_trial_passes_completed);
+        self.domain_alpha_trial_pass_failures = self
+            .domain_alpha_trial_pass_failures
+            .saturating_add(other.domain_alpha_trial_pass_failures);
+        self.domain_alpha_finite_trial_scores = self
+            .domain_alpha_finite_trial_scores
+            .saturating_add(other.domain_alpha_finite_trial_scores);
+        self.domain_alpha_trials_accepted = self
+            .domain_alpha_trials_accepted
+            .saturating_add(other.domain_alpha_trials_accepted);
+        self.domain_alpha_carried_entries = self
+            .domain_alpha_carried_entries
+            .saturating_add(other.domain_alpha_carried_entries);
+        self.domain_alpha_iters_counterfactual_domains = self
+            .domain_alpha_iters_counterfactual_domains
+            .saturating_add(other.domain_alpha_iters_counterfactual_domains);
+        self.domain_alpha_eta_counterfactual_scored_domains = self
+            .domain_alpha_eta_counterfactual_scored_domains
+            .saturating_add(other.domain_alpha_eta_counterfactual_scored_domains);
+        self.domain_alpha_outer_ascent_calls = self
+            .domain_alpha_outer_ascent_calls
+            .saturating_add(other.domain_alpha_outer_ascent_calls);
+        self.domain_alpha_outer_finite_trial_scores = self
+            .domain_alpha_outer_finite_trial_scores
+            .saturating_add(other.domain_alpha_outer_finite_trial_scores);
+        self.domain_alpha_outer_iters_counterfactual_domains = self
+            .domain_alpha_outer_iters_counterfactual_domains
+            .saturating_add(other.domain_alpha_outer_iters_counterfactual_domains);
+        self.domain_alpha_outer_eta_counterfactual_scored_domains = self
+            .domain_alpha_outer_eta_counterfactual_scored_domains
+            .saturating_add(other.domain_alpha_outer_eta_counterfactual_scored_domains);
+    }
+}
+
+impl Default for PolicyExecutionEvidence {
+    fn default() -> Self {
+        Self::from_config(&BabConfig::default())
+    }
+}
+
+/// Frozen epoch policy plus causal execution counters for the Tier-0 ranker
+/// and Tier-2 rebuild paths. Evidence is accumulated beside, but never read by,
+/// bound or verdict code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochExecutionEvidence {
+    /// Receipt-owned policy that every class and nested driver must inherit.
+    pub policy: super::EpochRuntimePolicy,
+    /// Popped live domains that reached the epoch gate.
+    pub tree_entries: usize,
+    /// Attempts admitted by the explicitly configured depth.
+    pub configured_depth_admissions: usize,
+    /// Configured-depth attempts whose nested run returned owned stats.
+    pub configured_depth_nested_with_stats: usize,
+    /// Attempts admitted only by the closure-adaptive cadence.
+    pub adaptive_depth_admissions: usize,
+    /// Failure-cap decisions made after depth/generation admission.
+    pub attempt_cap_decisions: usize,
+    /// Decisions that differ from the historical cap of two failures.
+    pub attempt_cap_counterfactual_differences: usize,
+    /// Attempts refused by the configured operational failure cap.
+    pub attempt_cap_refusals: usize,
+    /// Eligible attempts refused because incremental generations were spent.
+    pub generation_refusals: usize,
+    /// Eligible attempts refused by the rebuild affordability guard.
+    pub deadline_refusals: usize,
+    /// Epoch builds that began after every admission gate.
+    pub attempts_started: usize,
+    /// Started attempts that ended without closing the outer domain.
+    pub attempt_failures: usize,
+    /// Started attempts that certified and closed the outer domain.
+    pub attempts_closed: usize,
+    /// Full attempts started by an outer/class tree.
+    pub outer_full_attempts: usize,
+    /// Incremental attempts started by an outer/class tree.
+    pub outer_incremental_attempts: usize,
+    /// Full attempts started inside a nested epoch frame.
+    pub nested_full_attempts: usize,
+    /// Incremental attempts started inside a nested epoch frame.
+    pub nested_incremental_attempts: usize,
+    /// Full-tableau builds returned a candidate root frame.
+    pub full_rebuilds_completed: usize,
+    /// Full-tableau build or interval-inheritance refusals.
+    pub full_rebuild_refusals: usize,
+    /// Incremental parent-frame refreshes that started.
+    pub parent_refreshes_started: usize,
+    /// Incremental parent-frame refreshes returned a candidate root frame.
+    pub parent_refreshes_completed: usize,
+    /// Incremental refreshes accepted for a nested run.
+    pub parent_refreshes_accepted: usize,
+    /// Incremental refresh errors or zero-progress returns.
+    pub parent_refresh_refusals: usize,
+    /// Certified prefix columns completed by incremental refreshes.
+    pub parent_refresh_columns: usize,
+    /// Incremental columns whose inherited interval shrank.
+    pub parent_refresh_tightened: usize,
+    /// Incremental columns that became sign-stable.
+    pub parent_refresh_stabilized: usize,
+    /// Nested epoch trees actually started.
+    pub nested_started: usize,
+    /// Nested results that carried execution stats (Unsat or Unknown+stats).
+    pub nested_runs_with_stats: usize,
+    /// Nested trees that certified their subtree.
+    pub nested_unsat: usize,
+    /// Nested trees that returned Unknown.
+    pub nested_unknown: usize,
+    /// Nested trees that returned an internal error.
+    pub nested_errors: usize,
+    /// Outer domains closed by a nested epoch verdict.
+    pub closures: usize,
+    /// Debug trace attempts emitted under the frozen diagnostic bit.
+    pub debug_emissions: usize,
+    /// Outer/class candidate selections that entered Tier-0.
+    pub outer_tier0_calls: usize,
+    /// Outer Tier-0 selections whose certified candidate score pass completed.
+    pub outer_tier0_scored_calls: usize,
+    /// Completed outer calls where exact-width truncation removed candidates.
+    pub outer_tier0_exact_binding_scored_calls: usize,
+    /// Completed outer calls where universe selection differed from width 64.
+    pub outer_universe_counterfactual_scored_calls: usize,
+    /// Completed outer calls where consumed retention differed from 128.
+    pub outer_retain_counterfactual_scored_calls: usize,
+    /// Tier-0 selections executed inside a full nested frame.
+    pub nested_full_tier0_calls: usize,
+    /// Tier-0 selections executed inside an incremental nested frame.
+    pub nested_incremental_tier0_calls: usize,
+    /// Nested/classwise evidence carried a different supposedly-frozen policy.
+    pub policy_mismatch: bool,
+}
+
+impl EpochExecutionEvidence {
+    fn from_config(config: &BabConfig) -> Self {
+        Self {
+            policy: config.epoch_policy,
+            tree_entries: 0,
+            configured_depth_admissions: 0,
+            configured_depth_nested_with_stats: 0,
+            adaptive_depth_admissions: 0,
+            attempt_cap_decisions: 0,
+            attempt_cap_counterfactual_differences: 0,
+            attempt_cap_refusals: 0,
+            generation_refusals: 0,
+            deadline_refusals: 0,
+            attempts_started: 0,
+            attempt_failures: 0,
+            attempts_closed: 0,
+            outer_full_attempts: 0,
+            outer_incremental_attempts: 0,
+            nested_full_attempts: 0,
+            nested_incremental_attempts: 0,
+            full_rebuilds_completed: 0,
+            full_rebuild_refusals: 0,
+            parent_refreshes_started: 0,
+            parent_refreshes_completed: 0,
+            parent_refreshes_accepted: 0,
+            parent_refresh_refusals: 0,
+            parent_refresh_columns: 0,
+            parent_refresh_tightened: 0,
+            parent_refresh_stabilized: 0,
+            nested_started: 0,
+            nested_runs_with_stats: 0,
+            nested_unsat: 0,
+            nested_unknown: 0,
+            nested_errors: 0,
+            closures: 0,
+            debug_emissions: 0,
+            outer_tier0_calls: 0,
+            outer_tier0_scored_calls: 0,
+            outer_tier0_exact_binding_scored_calls: 0,
+            outer_universe_counterfactual_scored_calls: 0,
+            outer_retain_counterfactual_scored_calls: 0,
+            nested_full_tier0_calls: 0,
+            nested_incremental_tier0_calls: 0,
+            policy_mismatch: false,
+        }
+    }
+
+    fn absorb(&mut self, other: Self) {
+        if self.policy != other.policy {
+            self.policy_mismatch = true;
+            return;
+        }
+        self.policy_mismatch |= other.policy_mismatch;
+        macro_rules! add {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field = self.$field.saturating_add(other.$field);)+
+            };
+        }
+        add!(
+            tree_entries,
+            configured_depth_admissions,
+            configured_depth_nested_with_stats,
+            adaptive_depth_admissions,
+            attempt_cap_decisions,
+            attempt_cap_counterfactual_differences,
+            attempt_cap_refusals,
+            generation_refusals,
+            deadline_refusals,
+            attempts_started,
+            attempt_failures,
+            attempts_closed,
+            outer_full_attempts,
+            outer_incremental_attempts,
+            nested_full_attempts,
+            nested_incremental_attempts,
+            full_rebuilds_completed,
+            full_rebuild_refusals,
+            parent_refreshes_started,
+            parent_refreshes_completed,
+            parent_refreshes_accepted,
+            parent_refresh_refusals,
+            parent_refresh_columns,
+            parent_refresh_tightened,
+            parent_refresh_stabilized,
+            nested_started,
+            nested_runs_with_stats,
+            nested_unsat,
+            nested_unknown,
+            nested_errors,
+            closures,
+            debug_emissions,
+            outer_tier0_calls,
+            outer_tier0_scored_calls,
+            outer_tier0_exact_binding_scored_calls,
+            outer_universe_counterfactual_scored_calls,
+            outer_retain_counterfactual_scored_calls,
+            nested_full_tier0_calls,
+            nested_incremental_tier0_calls,
+        );
+    }
+}
+
+impl Default for EpochExecutionEvidence {
+    fn default() -> Self {
+        Self::from_config(&BabConfig::default())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EpochSelectionObservation {
+    tier0: bool,
+    exact_binding: bool,
+    universe_counterfactual: bool,
+    retain_counterfactual: bool,
+}
+
+impl EpochExecutionEvidence {
+    fn observe_selection(
+        &mut self,
+        route: EpochFrameRoute,
+        observation: EpochSelectionObservation,
+    ) {
+        if !observation.tier0 {
+            return;
+        }
+        match route {
+            EpochFrameRoute::Outer => {
+                self.outer_tier0_calls = self.outer_tier0_calls.saturating_add(1);
+            }
+            EpochFrameRoute::NestedFull => {
+                self.nested_full_tier0_calls = self.nested_full_tier0_calls.saturating_add(1);
+            }
+            EpochFrameRoute::NestedIncremental => {
+                self.nested_incremental_tier0_calls =
+                    self.nested_incremental_tier0_calls.saturating_add(1);
+            }
+        }
+    }
+
+    fn observe_scored_selection(
+        &mut self,
+        route: EpochFrameRoute,
+        observation: EpochSelectionObservation,
+    ) {
+        if route != EpochFrameRoute::Outer || !observation.tier0 {
+            return;
+        }
+        self.outer_tier0_scored_calls = self.outer_tier0_scored_calls.saturating_add(1);
+        if observation.exact_binding {
+            self.outer_tier0_exact_binding_scored_calls = self
+                .outer_tier0_exact_binding_scored_calls
+                .saturating_add(1);
+        }
+        if observation.universe_counterfactual {
+            self.outer_universe_counterfactual_scored_calls = self
+                .outer_universe_counterfactual_scored_calls
+                .saturating_add(1);
+        }
+        if observation.retain_counterfactual {
+            self.outer_retain_counterfactual_scored_calls = self
+                .outer_retain_counterfactual_scored_calls
+                .saturating_add(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_execution_tests {
+    use super::{BabConfig, PolicyExecutionEvidence};
+
+    fn configured_policy() -> PolicyExecutionEvidence {
+        PolicyExecutionEvidence::from_config(&BabConfig {
+            beta_per_column: true,
+            beta_columns: 4,
+            col_retire: true,
+            parallel_prebuild: true,
+            domain_alpha_policy: super::super::DomainAlphaRuntimePolicy {
+                enabled: true,
+                iters: 4,
+                eta: 0.5,
+                min_depth: 0,
+                stride: 1,
+                gap: f64::INFINITY,
+            },
+            ..BabConfig::default()
+        })
+    }
+
+    #[test]
+    fn policy_execution_absorb_adds_maxima_and_poison_mismatches() {
+        let mut aggregate = configured_policy();
+        aggregate.beta_per_column_evals = 2;
+        aggregate.beta_columns_binding_evals = 1;
+        aggregate.beta_columns_max_candidates = 5;
+        aggregate.newly_retired_columns = 3;
+        aggregate.inherited_retirement_evals = 4;
+        aggregate.parallel_prebuild_batches = 1;
+        aggregate.parallel_prebuild_domains = 2;
+        aggregate.domain_alpha_gate_evals = 1;
+        aggregate.domain_alpha_finite_trial_scores = 2;
+        aggregate.domain_alpha_trials_accepted = 1;
+        aggregate.domain_alpha_outer_finite_trial_scores = 2;
+        aggregate.domain_alpha_outer_iters_counterfactual_domains = 1;
+
+        let mut other = configured_policy();
+        other.beta_per_column_evals = 3;
+        other.beta_columns_binding_evals = 2;
+        other.beta_columns_max_candidates = 7;
+        other.newly_retired_columns = 5;
+        other.inherited_retirement_evals = 6;
+        other.parallel_prebuild_batches = 2;
+        other.parallel_prebuild_domains = 5;
+        other.domain_alpha_gate_evals = 3;
+        other.domain_alpha_finite_trial_scores = 6;
+        other.domain_alpha_trials_accepted = 4;
+        other.domain_alpha_outer_finite_trial_scores = 5;
+        other.domain_alpha_outer_iters_counterfactual_domains = 2;
+        aggregate.absorb(other);
+
+        let mut merged = configured_policy();
+        merged.beta_per_column_evals = 5;
+        merged.beta_columns_binding_evals = 3;
+        merged.beta_columns_max_candidates = 7;
+        merged.newly_retired_columns = 8;
+        merged.inherited_retirement_evals = 10;
+        merged.parallel_prebuild_batches = 3;
+        merged.parallel_prebuild_domains = 7;
+        merged.domain_alpha_gate_evals = 4;
+        merged.domain_alpha_finite_trial_scores = 8;
+        merged.domain_alpha_trials_accepted = 5;
+        merged.domain_alpha_outer_finite_trial_scores = 7;
+        merged.domain_alpha_outer_iters_counterfactual_domains = 3;
+        assert_eq!(aggregate, merged, "add/max aggregation drifted");
+
+        let mut nested_mismatch = configured_policy();
+        nested_mismatch.policy_mismatch = true;
+        let mut propagated = merged;
+        propagated.absorb(nested_mismatch);
+        assert!(
+            propagated.policy_mismatch,
+            "a nested mismatch must poison its aggregate"
+        );
+
+        let mut different_policy = PolicyExecutionEvidence::from_config(&BabConfig {
+            beta_per_column: true,
+            beta_columns: 16,
+            col_retire: true,
+            parallel_prebuild: true,
+            ..BabConfig::default()
+        });
+        different_policy.beta_per_column_evals = 99;
+        different_policy.newly_retired_columns = 99;
+        different_policy.parallel_prebuild_domains = 99;
+        let mut mismatch_probe = merged;
+        mismatch_probe.absorb(different_policy);
+        let mut expected = merged;
+        expected.policy_mismatch = true;
+        assert_eq!(
+            mismatch_probe, expected,
+            "a frozen-policy mismatch must fail closed without mixing counters"
+        );
+
+        let mut domain_mismatch = configured_policy();
+        domain_mismatch.domain_alpha_iters = 1;
+        domain_mismatch.domain_alpha_finite_trial_scores = 99;
+        let mut domain_probe = merged;
+        domain_probe.absorb(domain_mismatch);
+        let mut domain_expected = merged;
+        domain_expected.policy_mismatch = true;
+        assert_eq!(
+            domain_probe, domain_expected,
+            "domain-alpha policy drift must poison without mixing causal work"
+        );
+    }
+}
+
+#[cfg(test)]
+mod width_execution_tests {
+    use super::{
+        ordinary_width_selectors_enabled, BabConfig, EpochFrameRoute, WidthExecutionEvidence,
+        WidthSelectionObservation,
+    };
+
+    fn configured() -> WidthExecutionEvidence {
+        WidthExecutionEvidence::from_config(&BabConfig {
+            k_head: 16,
+            contextual_k_head: 8,
+            k_trunk: 12,
+            contextual_k_trunk: 8,
+            effective_k_head: 16,
+            effective_contextual_k_head: 8,
+            effective_k_trunk: 12,
+            effective_contextual_k_trunk: 8,
+            adaptive: true,
+            contextual_adaptive: false,
+            ..BabConfig::default()
+        })
+    }
+
+    #[test]
+    fn binding_requires_a_successful_exact_score_and_nested_counts_stay_separate() {
+        let observation = WidthSelectionObservation {
+            head_available: 24,
+            head_selected: 16,
+            head_counterfactual: true,
+            trunk_available: 6,
+            trunk_selected: 6,
+            trunk_counterfactual: false,
+        };
+        let mut evidence = configured();
+        evidence.observe_selection(EpochFrameRoute::Outer, observation);
+        assert_eq!(evidence.outer_head_selection_calls, 1);
+        assert_eq!(evidence.outer_head_available_max, 24);
+        assert_eq!(evidence.outer_head_selected_total, 16);
+        assert_eq!(evidence.outer_head_binding_scored_calls, 0);
+        assert_eq!(evidence.outer_trunk_binding_scored_calls, 0);
+
+        evidence.observe_successful_score(EpochFrameRoute::Outer, observation);
+        assert_eq!(evidence.outer_head_binding_scored_calls, 1);
+        assert_eq!(evidence.outer_trunk_binding_scored_calls, 0);
+
+        evidence.observe_selection(EpochFrameRoute::NestedFull, observation);
+        evidence.observe_successful_score(EpochFrameRoute::NestedFull, observation);
+        assert_eq!(evidence.nested_head_selection_calls, 1);
+        assert_eq!(evidence.nested_trunk_selection_calls, 1);
+        assert_eq!(evidence.outer_head_selection_calls, 1);
+        assert_eq!(evidence.outer_head_binding_scored_calls, 1);
+    }
+
+    #[test]
+    fn aggregation_poison_preserves_owned_counters_on_policy_mismatch() {
+        let mut aggregate = configured();
+        aggregate.outer_head_selection_calls = 2;
+        let mut nested = configured();
+        nested.nested_head_selection_calls = 3;
+        aggregate.absorb(nested);
+        assert_eq!(aggregate.nested_head_selection_calls, 3);
+        assert!(!aggregate.policy_mismatch);
+
+        let mut mismatched = configured();
+        mismatched.configured_k_head = 32;
+        mismatched.outer_head_selection_calls = 99;
+        aggregate.absorb(mismatched);
+        assert!(aggregate.policy_mismatch);
+        assert_eq!(aggregate.outer_head_selection_calls, 2);
+    }
+
+    #[test]
+    fn adaptive_opportunities_escalate_once_and_tier0_bypasses_width_credit() {
+        assert!(ordinary_width_selectors_enabled(0, true));
+        assert!(ordinary_width_selectors_enabled(8, false));
+        assert!(!ordinary_width_selectors_enabled(8, true));
+
+        let mut evidence = configured();
+        evidence.observe_adaptive_threshold(true, (16, 12), (16, 16), (8, 8), (8, 8));
+        evidence.observe_adaptive_threshold(true, (16, 16), (16, 16), (8, 8), (8, 8));
+        assert_eq!(evidence.configured_adaptive_threshold_opportunities, 2);
+        assert_eq!(evidence.configured_adaptive_escalations, 1);
+        assert_eq!(evidence.contextual_adaptive_threshold_opportunities, 0);
+        assert_eq!(evidence.contextual_adaptive_escalations, 0);
+        assert_eq!(evidence.effective_k_head_max, 16);
+        assert_eq!(evidence.effective_k_trunk_max, 16);
+        assert_eq!(evidence.effective_contextual_k_head_max, 8);
+        assert_eq!(evidence.effective_contextual_k_trunk_max, 8);
+
+        evidence.observe_adaptive_threshold(false, (16, 16), (32, 32), (8, 8), (8, 8));
+        assert_eq!(evidence.configured_adaptive_threshold_opportunities, 2);
+        assert_eq!(evidence.configured_adaptive_escalations, 1);
+        assert_eq!(evidence.effective_k_head_max, 16);
+    }
+
+    #[test]
+    fn contextual_adaptive_control_is_counted_independently() {
+        let mut evidence = configured();
+        evidence.configured_k_head = 8;
+        evidence.configured_k_trunk = 8;
+        evidence.adaptive_enabled = false;
+        evidence.contextual_adaptive = true;
+        evidence.effective_k_head_max = 8;
+        evidence.effective_k_trunk_max = 8;
+        evidence.effective_contextual_k_head_max = 8;
+        evidence.effective_contextual_k_trunk_max = 8;
+
+        evidence.observe_adaptive_threshold(true, (8, 8), (8, 8), (8, 8), (16, 16));
+        assert_eq!(evidence.configured_adaptive_threshold_opportunities, 0);
+        assert_eq!(evidence.configured_adaptive_escalations, 0);
+        assert_eq!(evidence.contextual_adaptive_threshold_opportunities, 1);
+        assert_eq!(evidence.contextual_adaptive_escalations, 1);
+        assert_eq!(evidence.effective_k_head_max, 8);
+        assert_eq!(evidence.effective_k_trunk_max, 8);
+        assert_eq!(evidence.effective_contextual_k_head_max, 16);
+        assert_eq!(evidence.effective_contextual_k_trunk_max, 16);
+    }
+
+    #[test]
+    fn public_entry_reseeds_operational_widths_without_moving_frozen_policy() {
+        let seeded = BabConfig {
+            k_head: 16,
+            contextual_k_head: 8,
+            k_trunk: 12,
+            contextual_k_trunk: 6,
+            effective_k_head: 99,
+            effective_contextual_k_head: 99,
+            effective_k_trunk: 99,
+            effective_contextual_k_trunk: 99,
+            adaptive: true,
+            contextual_adaptive: false,
+            ..BabConfig::default()
+        }
+        .seed_outer_epoch();
+        assert_eq!(
+            (seeded.effective_k_head, seeded.effective_k_trunk),
+            (16, 12)
+        );
+        assert_eq!(
+            (
+                seeded.effective_contextual_k_head,
+                seeded.effective_contextual_k_trunk,
+            ),
+            (8, 6),
+        );
+        assert!(seeded.adaptive);
+        assert!(!seeded.contextual_adaptive);
+    }
+}
+
+#[cfg(test)]
+mod epoch_execution_tests {
+    use super::{BabConfig, EpochExecutionEvidence, EpochFrameRoute, EpochSelectionObservation};
+
+    fn configured() -> EpochExecutionEvidence {
+        EpochExecutionEvidence::from_config(&BabConfig {
+            epoch_policy: super::super::EpochRuntimePolicy {
+                depth: 3,
+                max_attempts: 5,
+                tier0_exact: 8,
+                tier0_universe: 32,
+                retain_per_layer: 64,
+                parent_topk: 0,
+                debug_trace: true,
+            },
+            ..BabConfig::default()
+        })
+    }
+
+    #[test]
+    fn public_outer_entry_reseeds_operational_epoch_state_from_policy() {
+        let seeded = BabConfig {
+            epoch_policy: super::super::EpochRuntimePolicy {
+                depth: 3,
+                max_attempts: 5,
+                parent_topk: 16,
+                ..super::super::EpochRuntimePolicy::default()
+            },
+            epoch_frame_route: EpochFrameRoute::NestedIncremental,
+            epoch_trigger_depth: 99,
+            epoch_attempt_cap: 101,
+            epoch_parent_generations_left: 0,
+            ..BabConfig::default()
+        }
+        .seed_outer_epoch();
+        assert_eq!(seeded.epoch_frame_route, EpochFrameRoute::Outer);
+        assert_eq!(seeded.epoch_trigger_depth, 3);
+        assert_eq!(seeded.epoch_attempt_cap, 5);
+        assert_eq!(
+            seeded.epoch_parent_generations_left,
+            super::EPOCH_PARENT_GENERATION_CAP
+        );
+    }
+
+    #[test]
+    fn tier0_credit_requires_outer_completed_scoring() {
+        let observation = EpochSelectionObservation {
+            tier0: true,
+            exact_binding: true,
+            universe_counterfactual: true,
+            retain_counterfactual: true,
+        };
+        let mut outer = configured();
+        outer.observe_selection(EpochFrameRoute::Outer, observation);
+        assert_eq!(outer.outer_tier0_calls, 1);
+        assert_eq!(outer.outer_tier0_scored_calls, 0);
+        outer.observe_scored_selection(EpochFrameRoute::Outer, observation);
+        assert_eq!(outer.outer_tier0_scored_calls, 1);
+        assert_eq!(outer.outer_tier0_exact_binding_scored_calls, 1);
+        assert_eq!(outer.outer_universe_counterfactual_scored_calls, 1);
+        assert_eq!(outer.outer_retain_counterfactual_scored_calls, 1);
+
+        let mut nested = configured();
+        nested.observe_selection(EpochFrameRoute::NestedFull, observation);
+        nested.observe_scored_selection(EpochFrameRoute::NestedFull, observation);
+        assert_eq!(nested.nested_full_tier0_calls, 1);
+        assert_eq!(nested.outer_tier0_calls, 0);
+        assert_eq!(nested.outer_tier0_scored_calls, 0);
+    }
+
+    #[test]
+    fn epoch_aggregation_adds_counters_and_poison_mismatches() {
+        let mut aggregate = configured();
+        aggregate.attempts_started = 2;
+        aggregate.attempt_failures = 1;
+        aggregate.attempts_closed = 1;
+        aggregate.outer_full_attempts = 2;
+        let mut nested = configured();
+        nested.attempts_started = 3;
+        nested.attempt_failures = 3;
+        nested.nested_incremental_attempts = 3;
+        aggregate.absorb(nested);
+        assert_eq!(aggregate.attempts_started, 5);
+        assert_eq!(aggregate.attempt_failures, 4);
+        assert_eq!(aggregate.attempts_closed, 1);
+        assert_eq!(aggregate.outer_full_attempts, 2);
+        assert_eq!(aggregate.nested_incremental_attempts, 3);
+
+        let mut different = configured();
+        different.policy.max_attempts = 7;
+        different.attempts_started = 99;
+        aggregate.absorb(different);
+        assert!(aggregate.policy_mismatch);
+        assert_eq!(aggregate.attempts_started, 5);
+    }
+}
+
+impl BabConfig {
+    /// Epoch settings inherited by one nested subtree. The generation count is
+    /// the non-resetting recursion budget: even though each nested driver owns
+    /// its own failed-attempt counter, every recursive edge consumes one here.
+    fn nested_epoch_limits(&self, incremental: bool) -> (usize, usize, usize) {
+        let generations = self
+            .epoch_parent_generations_left
+            .min(EPOCH_PARENT_GENERATION_CAP);
+        if !incremental || generations <= 1 {
+            return (0, 0, 0);
+        }
+        (
+            self.epoch_trigger_depth,
+            self.epoch_attempt_cap,
+            generations - 1,
+        )
     }
 }
 
@@ -170,6 +1478,14 @@ pub struct ClassBabStats {
     pub epochs_closed: usize,
     /// This class tree's exact Kraft-ledger result when it verified.
     pub ledger_ok: Option<bool>,
+    /// Forced-serial frontier decisions made by this class tree.
+    pub frontier_execution: FrontierExecutionEvidence,
+    /// Governed margin-row policy execution observed by this class tree.
+    pub policy_execution: PolicyExecutionEvidence,
+    /// Frozen epoch policy and causal work observed by this class tree.
+    pub epoch_execution: EpochExecutionEvidence,
+    /// Frozen width policy and ordinary-selector work observed by this class.
+    pub width_execution: WidthExecutionEvidence,
 }
 
 /// Run statistics (evidence numbers, not adjectives).
@@ -210,6 +1526,20 @@ pub struct BabStats {
     /// AND every nested epoch subtree's ledger verified too. Bookkeeping
     /// only — never moves a verdict; `None` when the lane did not verify.
     pub ledger_ok: Option<bool>,
+    /// Frozen parallel-frontier policy plus observed tree decisions.
+    pub frontier_execution: FrontierExecutionEvidence,
+    /// Governed margin-row policy execution observed by this invocation.
+    pub policy_execution: PolicyExecutionEvidence,
+    /// Frozen epoch policy and causal Tier-0/Tier-2 execution.
+    pub epoch_execution: EpochExecutionEvidence,
+    /// Frozen width policy and causal ordinary-selector execution.
+    pub width_execution: WidthExecutionEvidence,
+    /// Governed root-precision execution.
+    pub root_precision_execution: super::RootPrecisionExecutionEvidence,
+    /// Governed backward-intermediate root-build execution.
+    pub backward_interm_execution: super::BackwardIntermExecutionEvidence,
+    /// Governed standalone-alpha and rebake root-phase execution.
+    pub root_alpha_execution: super::RootAlphaExecutionEvidence,
 }
 
 /// Prefix-free leaf ledger (#epoch-bab Phase E). Records each closed leaf's
@@ -341,6 +1671,18 @@ struct DomainEntry {
     /// survivors. Inherits monotonically parent -> child (exactly like β).
     /// Always empty unless `NY_MARGIN_ROW_COL_RETIRE=1`.
     retired: Vec<u16>,
+    /// #margin-row-domain-alpha: the ancestor's ACCEPTED per-domain alpha, as a
+    /// sparse `(layer, neuron, alpha)` list sorted by `(layer, neuron)` — the
+    /// warm start alpha-beta-CROWN gets from `domain_updater.py:123-128`.
+    ///
+    /// Valid on this region for the same reason it was valid on the parent's:
+    /// `alpha*y <= relu(y)` holds pointwise on all of R for any
+    /// `alpha in [0, 1]`, so lower-line validity is BOX-INDEPENDENT. Entries
+    /// naming a neuron this domain has since split or clip-stabilized are
+    /// dropped rather than applied (`domain_alpha::apply_inherited` writes only
+    /// through the movable-slot list). Always empty unless
+    /// `NY_MARGIN_ROW_DOMAIN_ALPHA` is armed.
+    alpha: Vec<super::domain_alpha::AlphaCarry>,
 }
 
 impl PartialEq for DomainEntry {
@@ -389,6 +1731,23 @@ struct NodeState {
     /// closure threshold at THIS eval (root frame, sorted). Equals the
     /// entry's set verbatim when the gate is off.
     retired: Vec<u16>,
+    /// Invocation-local execution counters produced by this pure evaluation.
+    /// The parallel driver absorbs them only in deterministic pop order.
+    policy_execution: PolicyExecutionEvidence,
+    /// Invocation-local Tier-0 evidence, merged beside policy evidence.
+    epoch_execution: EpochExecutionEvidence,
+    /// Invocation-local ordinary width-selector evidence.
+    width_execution: WidthExecutionEvidence,
+    /// Selection-time facts held until the exact score pass completes.
+    epoch_selection: EpochSelectionObservation,
+    /// Ordinary width-selection identity facts held until exact scoring
+    /// completes. Tier-0 leaves this at its all-zero default.
+    width_selection: WidthSelectionObservation,
+    /// #margin-row-domain-alpha: the per-domain alpha this node's ACCEPTED
+    /// bound was scored under, sparse and root-relative (see
+    /// `DomainEntry::alpha`). Children inherit it verbatim. Equals the entry's
+    /// list when disarmed or when no trial improved.
+    alpha: Vec<super::domain_alpha::AlphaCarry>,
     /// #margin-row-col-retire: the narrowed margin batch this node's `ms`,
     /// `pass` and per-column side lanes were computed under (`None` = the
     /// driver's full tree batch). Candidate selection/scoring for this node
@@ -426,17 +1785,21 @@ struct ChildProto {
     /// #margin-row-col-retire: inherited retirement set (see
     /// `DomainEntry::retired`).
     retired: Vec<u16>,
+    /// #margin-row-domain-alpha: inherited per-domain alpha (see
+    /// `DomainEntry::alpha`). Carried verbatim; the child re-filters it against
+    /// its OWN movable slots at its own eval.
+    alpha: Vec<super::domain_alpha::AlphaCarry>,
 }
 
 /// Result of one domain evaluation (see [`MarginRowBab::eval_with_pack`]).
 enum EvalOut {
     /// Provably empty region: the domain is closed.
-    Infeasible,
+    Infeasible(PolicyExecutionEvidence),
     /// #deadline-poll (D2): an intra-expansion poll fired before the next
     /// costly phase. The caller aborts CLEANLY with no verdict — never a
     /// closure, never an error — exactly as the between-expansion check
     /// would have at the next loop head, just up to one engine pass sooner.
-    Deadline,
+    Deadline(PolicyExecutionEvidence),
     /// Refreshed bound + branching state (boxed: `NodeState` dwarfs the other
     /// variants).
     Node(f64, Box<NodeState>),
@@ -447,19 +1810,44 @@ enum EvalOut {
 /// and applied deterministically by the serial merge, keeping every stats
 /// delta and heap push bit-identical to what the serial lane would do for the
 /// same domain.
+#[derive(Clone, Copy)]
+struct DomainExecutionEvidence {
+    policy: PolicyExecutionEvidence,
+    epoch: EpochExecutionEvidence,
+    width: WidthExecutionEvidence,
+}
+
+impl DomainExecutionEvidence {
+    fn before_selection(policy: PolicyExecutionEvidence, config: &BabConfig) -> Self {
+        Self {
+            policy,
+            epoch: EpochExecutionEvidence::from_config(config),
+            width: WidthExecutionEvidence::from_config(config),
+        }
+    }
+
+    fn from_state(state: &NodeState) -> Self {
+        Self {
+            policy: state.policy_execution,
+            epoch: state.epoch_execution,
+            width: state.width_execution,
+        }
+    }
+}
+
 enum ExpandStep {
     /// `eval_with_pack` returned `None` (provably empty box): closed.
-    Infeasible,
+    Infeasible(DomainExecutionEvidence),
     /// #deadline-poll (D2): an intra-expansion poll fired inside this
     /// domain's eval or candidate scoring. The merge stops the tree loop with
     /// a wallclock stop reason; the domain is NOT closed and NOT counted.
-    DeadlineHit,
+    DeadlineHit(DomainExecutionEvidence),
     /// The refreshed bound already closes the domain.
-    ClosedAtEval,
+    ClosedAtEval(DomainExecutionEvidence),
     /// No split candidates remain: the instance cannot close here (Unknown).
-    NoCandidates,
+    NoCandidates(DomainExecutionEvidence),
     /// A verdict-bearing bound was non-finite: fail-closed to Unknown.
-    NonFiniteBound,
+    NonFiniteBound(DomainExecutionEvidence),
     /// Expanded into children.
     Expanded {
         /// Raw child-below-parent dips observed.
@@ -472,16 +1860,57 @@ enum ExpandStep {
         closed_children: usize,
         /// Child slots that incremented `domains_created`.
         created_children: usize,
+        /// Pure per-evaluation policy counters for deterministic serial merge.
+        execution: DomainExecutionEvidence,
     },
+}
+
+impl ExpandStep {
+    fn policy_execution(&self) -> PolicyExecutionEvidence {
+        match self {
+            Self::Infeasible(evidence)
+            | Self::DeadlineHit(evidence)
+            | Self::ClosedAtEval(evidence)
+            | Self::NoCandidates(evidence)
+            | Self::NonFiniteBound(evidence) => evidence.policy,
+            Self::Expanded { execution, .. } => execution.policy,
+        }
+    }
+
+    fn epoch_execution(&self) -> EpochExecutionEvidence {
+        match self {
+            Self::Infeasible(evidence)
+            | Self::DeadlineHit(evidence)
+            | Self::ClosedAtEval(evidence)
+            | Self::NoCandidates(evidence)
+            | Self::NonFiniteBound(evidence) => evidence.epoch,
+            Self::Expanded { execution, .. } => execution.epoch,
+        }
+    }
+
+    fn width_execution(&self) -> WidthExecutionEvidence {
+        match self {
+            Self::Infeasible(evidence)
+            | Self::DeadlineHit(evidence)
+            | Self::ClosedAtEval(evidence)
+            | Self::NoCandidates(evidence)
+            | Self::NonFiniteBound(evidence) => evidence.width,
+            Self::Expanded { execution, .. } => execution.width,
+        }
+    }
 }
 
 /// Gate-on two-phase expansion: domain evaluation and candidate selection stay
 /// independent; only `Ready` records contribute columns to the shared score
 /// pass. `Done` carries the unchanged terminal result for its batch position.
 enum PreparedExpand {
-    Done(ExpandStep),
-    // Boxed: ReadyExpand (NodeState + candidate vecs) is ~13x the Done variant;
-    // keeping it inline would size every batch slot at the large variant.
+    // Boxed: ExpandStep carries the per-domain evidence records and is now the
+    // LARGER variant (~848 bytes against Ready's boxed 8); keeping it inline
+    // would size every batch slot at it. Layout only — the payload, its
+    // construction order, and every verdict it carries are unchanged.
+    Done(Box<ExpandStep>),
+    // Boxed: ReadyExpand (NodeState + candidate vecs) is ~13x the unboxed Done
+    // variant; keeping it inline would size every batch slot at the large variant.
     Ready(Box<ReadyExpand>),
 }
 
@@ -521,6 +1950,20 @@ pub struct MarginRowBab<'a> {
     ledger: Ledger,
     /// AND of every nested epoch subtree's own ledger verdict.
     nested_ledgers_ok: bool,
+    /// B1 plan-residency cache for the certified GPU lane, OWNED HERE.
+    ///
+    /// Ownership is the staleness argument: the cache lives exactly as long
+    /// as the driver that owns `eng` (and therefore the `RootGates` its
+    /// statics were built from), so a hit can never describe a different
+    /// network. `PlanCache::probe` still re-validates a fail-closed identity
+    /// fingerprint and every hit re-runs the per-dom gate admission. Inert
+    /// (never probed) unless the lane is armed.
+    lane_cache: super::gpu_backward::cache::PlanCache,
+    /// #closure-adaptive: this tree's own child-closure observer. Owned per
+    /// driver (so a nested epoch subtree measures itself) while the TIER it
+    /// escalates to is process-global, which is what makes an escalation the
+    /// parent earned stay in force inside the epoch.
+    closure: super::closure::ClosureMonitor,
 }
 
 /// Root evaluation shared by the driver and callers: via-y bounds for all
@@ -565,17 +2008,76 @@ fn require_finite(context: &str, values: &[f64]) -> Result<()> {
 /// SOUNDNESS: width chooses only WHICH domains get split — every candidate is
 /// scored by the same certified batched pass, and no bound computation reads
 /// `k`. A wrong width costs proofs; it cannot manufacture one.
-fn adaptive_width_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        match ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_K_ADAPT).value {
-            // Bool(_) only when the env supplied an admissible "1"/"0"; every
-            // other resolution (absent, malformed) is Unset and defers to the
-            // preset, preserving the reader's original three-state contract.
-            ny_levers::LeverValue::Bool(forced) => forced,
-            _ => super::k_adaptive_preset(),
+const fn ordinary_width_selectors_enabled(tier0_exact: usize, retained: bool) -> bool {
+    !(tier0_exact > 0 && retained)
+}
+
+/// #branch-reduceop: THE single candidate-pick rule, shared by all three
+/// expansion paths.
+///
+/// WHY A HELPER AND NOT THREE COPIES. There are three pick sites — the serial
+/// loop, the parallel per-domain step, and the domain-stacked batch step — and
+/// the SCORED cifar100 lane runs the PARALLEL ones because the compiled
+/// `frontier` default is `rayon::current_num_threads()` (mod.rs:416). The first
+/// version of this lever patched only the
+/// serial site; its R9 observable then printed ZERO lines on a scored run and
+/// the whole A/B had to be voided. That is the campaign's rule 8c — "partial
+/// fixes of a set measure exactly zero" — and the fix is to make the set
+/// impossible to patch partially.
+///
+/// Returns `(pick, differs)`, where `differs` is true when the OTHER reduction
+/// would have chosen a different candidate. That is the R9 observable: it
+/// separates "the lever never ran" (no telemetry at all) from "it ran and the
+/// two reductions agree on this row" (`differs=0`, a REAL null) from "it ran and
+/// changed the branch" (`differs=1`).
+///
+/// `reduce_max` selects De Palma eq. (22), the original BaBSR s_SR score (rank a
+/// candidate by its BETTER child); `false` selects eq. (23), the FSB balanced
+/// score (rank by its WORSE child). abc's TUNED cifar100 and tinyimagenet
+/// configs both choose the former, overriding abc's own global default, on
+/// exactly the two benchmarks ny fails.
+///
+/// RANKER-ONLY, hence sound either way: every child bound still comes from the
+/// same certified pass and `closed()` is untouched, so a bad choice costs tree
+/// shape and can never manufacture a proof.
+fn pick_candidate(ch: &[(f64, f64)], reduce_max: bool) -> (usize, bool) {
+    let key_of = |pair: &(f64, f64), use_max: bool| {
+        let reduced = if use_max {
+            pair.0.max(pair.1)
+        } else {
+            pair.0.min(pair.1)
+        };
+        (reduced, pair.0 + pair.1)
+    };
+    let best_of = |use_max: bool| {
+        let mut pick = 0usize;
+        let mut best = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (i, pair) in ch.iter().enumerate() {
+            let key = key_of(pair, use_max);
+            if key.0 > best.0 || (key.0 == best.0 && key.1 >= best.1) {
+                best = key;
+                pick = i;
+            }
         }
-    })
+        pick
+    };
+    let pick = best_of(reduce_max);
+    let alt = best_of(!reduce_max);
+    (pick, pick != alt)
+}
+
+/// Rate-limited R9 line for [`pick_candidate`]. First 8 picks, then every 64th.
+fn note_reduceop(reduce_max: bool, site: &str, cands: usize, pick: usize, differs: bool) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    if n < 8 || n.is_multiple_of(64) {
+        eprintln!(
+            "[branch-reduceop] n={n} site={site} mode={} cands={cands} pick={pick} differs={}",
+            if reduce_max { "max" } else { "min" },
+            u8::from(differs),
+        );
+    }
 }
 
 fn closed(mode: RoundMode, b: f64) -> bool {
@@ -650,30 +2152,9 @@ fn clip_tighten_pack(eng: &BackwardEngine<'_>, splits: &[TrunkSplit], pack: &mut
     if !super::clip::any_rows_retained(root) {
         return;
     }
-    // FAIL-CLOSED FRAME GATE. `clip_rows_frame_holds` re-concretizes every
-    // retained row over the ROOT box and requires it to contain that neuron's
-    // stored `[l, u]`. A row in the wrong frame (transposed, output-relative,
-    // or missing the augmented bias) still produces plausible numbers, and the
-    // resulting halfspace would cut away part of the true subdomain — a
-    // false-`unsat` generator. Checked ONCE, and a failure disables the whole
-    // path for the run rather than degrading it quietly.
-    static FRAME_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*FRAME_OK.get_or_init(|| {
-        // TOLERANCE. `concretize_box` widens BOTH sides by an additive
-        // certified slack (`gam*(tabs + |bl| + |bu|)`, plus the f32 error term
-        // on that lane), which this reproduction does not re-derive. Measured
-        // on cifar100 idx_8600: stored [-2.370757e-1, 1.126760e-2] against
-        // reproduced [-2.370516e-1, 1.124350e-2] — symmetric, 2.4e-5, ~1e-4
-        // relative. 1e-3 leaves an order of magnitude of headroom while still
-        // being orders of magnitude tighter than any REAL frame error
-        // (transposed, output-relative, or bias-dropped rows are wrong by
-        // factors, not by one slack term in a symmetric direction).
-        let ok = super::root::clip_rows_frame_holds(root, 0.5);
-        if !ok {
-            eprintln!("[clip] FRAME CHECK FAILED - clip-and-verify disabled for this run");
-        }
-        ok
-    }) {
+    // FAIL-CLOSED FRAME GATE, now shared with the intermediate-gate consumer:
+    // see `clip::frame_ok` for why it moved out of this function.
+    if !super::clip::frame_ok(root) {
         return;
     }
     let hs = super::clip::halfspaces_for_splits(root, splits);
@@ -756,35 +2237,22 @@ sum_delta={total:.6e} moved_total={}",
     }
 }
 
-/// #clip-and-verify: default OFF. Env-only while it is being measured; if it
-/// pays it becomes a typed preset key, because `run_instance.sh` exports exactly
-/// one `NY_*` and an env setting cannot fire in competition.
+/// #clip-and-verify: default OFF. The typed preset route makes controlled scored
+/// A/Bs possible, but no shipped preset arms it; qualification still requires
+/// evidence rather than following automatically from delivery.
+///
+/// #closure-adaptive: deliberately NOT a rung of the runtime ladder. The 24-run
+/// matrix measured `clip` BIT-IDENTICAL to baseline (same expansions, same
+/// closures, 20 sample points) with the mechanism provably armed, and
+/// `beta+clip` bit-identical to `beta` alone — see `closure.rs` for the
+/// measurement and the high-dimensional geometry that explains it. Left on its
+/// own gate; a rung that costs time and changes nothing is worse than no
+/// rung. Note also that this particular sub-mechanism has never been VALIDLY
+/// measured on its own: the y-pack LRU serves cached packs, so `[clip] call=`
+/// tops out around 4 per run.
 fn clip_tighten_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_CLIP)
-            .value
-            .as_bool()
-    })
-}
-
-/// #margin-row-col-retire (`NY_MARGIN_ROW_COL_RETIRE=1`, default OFF): retire
-/// margin columns whose bound crossed the closure threshold at some ancestor,
-/// so descendant evals/scorings pay only for the SURVIVING columns. This env
-/// read seeds `BabConfig::default().col_retire`; the driver consults only the
-/// cfg (tests arm the cfg directly, no process-global mutation).
-///
-/// Env-only while it is being measured (same contract as `NY_MARGIN_ROW_BETA`);
-/// if it pays it ships as a typed preset key.
-fn col_retire_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var("NY_MARGIN_ROW_COL_RETIRE").ok().as_deref() == Some("1");
-        if on {
-            eprintln!("[col-retire] armed (NY_MARGIN_ROW_COL_RETIRE=1)");
-        }
-        on
-    })
+    *ON.get_or_init(crate::preset_gates::margin_row_clip_enabled)
 }
 
 /// #margin-row-col-retire engagement telemetry (R9): `newly=` columns retired
@@ -966,16 +2434,52 @@ pub(crate) fn classwise_schedule(t: usize, adv: &[usize], dj: &[f64]) -> Result<
     Ok(pending)
 }
 
+fn classwise_lru_cap(cap: usize) -> usize {
+    cap.max(1)
+}
+
 fn fresh_class_lru(cap: usize, root_pack: &Arc<YPack>) -> Lru {
     // Each class owns a fresh cache: an LRU key contains only trunk splits and
     // has no net/root/input identity. The immutable full-box root pack alone
     // is shared by Arc; no class partition, MarginBatch, candidate, or bound is.
     let mut lru = Lru {
-        cap: cap.max(1),
+        cap: classwise_lru_cap(cap),
         entries: Vec::new(),
     };
     lru.put(Vec::new(), root_pack.clone());
     lru
+}
+
+fn classwise_tree_config(cfg: &BabConfig, remaining_expansions: usize) -> BabConfig {
+    // Serial per-class trees make the one absolute/global expansion budget
+    // exact. A parallel frontier may complete frontier-1 extra expansions in
+    // its final batch, so classwise deliberately suppresses it.
+    BabConfig {
+        max_expansions: remaining_expansions,
+        frontier: 1,
+        frontier_contextual: 1,
+        ..cfg.clone()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn classwise_runtime_policy_for_test(
+    lru_cap: usize,
+    frontier: usize,
+    frontier_contextual: usize,
+) -> (usize, usize, usize) {
+    let cfg = BabConfig {
+        lru_cap,
+        frontier,
+        frontier_contextual,
+        ..BabConfig::default()
+    };
+    let cfg = classwise_tree_config(&cfg, cfg.max_expansions);
+    (
+        classwise_lru_cap(cfg.lru_cap),
+        cfg.frontier,
+        cfg.frontier_contextual,
+    )
 }
 
 #[cfg(test)]
@@ -1005,6 +2509,10 @@ fn class_record(class: usize, verified: bool, stats: &BabStats, stop: String) ->
         epochs_attempted: stats.epochs_attempted,
         epochs_closed: stats.epochs_closed,
         ledger_ok: stats.ledger_ok,
+        frontier_execution: stats.frontier_execution,
+        policy_execution: stats.policy_execution,
+        epoch_execution: stats.epoch_execution,
+        width_execution: stats.width_execution,
     }
 }
 
@@ -1017,6 +2525,12 @@ pub(crate) fn absorb_class_stats(aggregate: &mut BabStats, record: ClassBabStats
     aggregate.mono_worst = aggregate.mono_worst.min(record.mono_worst);
     aggregate.epochs_attempted += record.epochs_attempted;
     aggregate.epochs_closed += record.epochs_closed;
+    aggregate
+        .frontier_execution
+        .absorb(record.frontier_execution);
+    aggregate.policy_execution.absorb(record.policy_execution);
+    aggregate.epoch_execution.absorb(record.epoch_execution);
+    aggregate.width_execution.absorb(record.width_execution);
     aggregate.ledger_ok = Some(
         aggregate.ledger_ok == Some(true) && record.verified && record.ledger_ok == Some(true),
     );
@@ -1034,11 +2548,34 @@ pub(crate) fn classwise_conjunction_complete(
             .all(|(class, run)| *class == run.class && run.verified)
 }
 
-/// #parallel-prebuild gate. Exact `"1"`, read once -- it selects a scheduling
-/// strategy, never a bound, and cannot change during a run.
-fn parallel_prebuild_enabled() -> bool {
-    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *P.get_or_init(|| std::env::var("NY_MARGIN_ROW_PARALLEL_PREBUILD").is_ok_and(|v| v == "1"))
+fn closure_epoch_trigger(configured: usize, current: usize, tier: usize) -> usize {
+    if configured > 0 {
+        return current;
+    }
+    let adaptive = super::closure::EPOCH_DEPTH_ON_ESCALATION;
+    if tier >= super::closure::TIER_EPOCH {
+        adaptive
+    } else if current == adaptive {
+        0
+    } else {
+        current
+    }
+}
+
+#[cfg(test)]
+mod closure_epoch_trigger_tests {
+    use super::closure_epoch_trigger;
+
+    #[test]
+    fn adaptive_tiers_never_overwrite_configured_depth() {
+        let epoch_tier = super::super::closure::TIER_EPOCH;
+        assert_eq!(closure_epoch_trigger(4, 4, epoch_tier), 4);
+        assert_eq!(closure_epoch_trigger(4, 4, 0), 4);
+        assert_eq!(closure_epoch_trigger(4, 0, epoch_tier), 0);
+        let adaptive = super::super::closure::EPOCH_DEPTH_ON_ESCALATION;
+        assert_eq!(closure_epoch_trigger(0, 0, epoch_tier), adaptive);
+        assert_eq!(closure_epoch_trigger(0, adaptive, 0), 0);
+    }
 }
 
 impl<'a> MarginRowBab<'a> {
@@ -1060,6 +2597,19 @@ impl<'a> MarginRowBab<'a> {
         adv: &[usize],
         cfg: BabConfig,
     ) -> MarginRowOutcome {
+        if !root.mode.outward() {
+            return MarginRowOutcome::Unknown {
+                reason: "margin-row BaB requires certified outward rounding".into(),
+                stats: None,
+            };
+        }
+        let cfg = cfg.seed_outer_epoch();
+        // #closure-adaptive: one instance, one ladder. The tier is a
+        // process-global (the mechanism gates live four modules down and take
+        // no config), so a sweep that runs several rows in one process must not
+        // let row N-1's escalation pre-arm row N — that would silently turn the
+        // treatment arm into "always on" and destroy the measurement.
+        super::closure::reset();
         match Self::run_inner(net, root, t, adv, cfg) {
             Ok(out) => out,
             Err(e) => MarginRowOutcome::Unknown {
@@ -1088,6 +2638,13 @@ impl<'a> MarginRowBab<'a> {
                 stats: None,
             };
         }
+        let cfg = cfg.seed_outer_epoch();
+        // #closure-adaptive: one instance, one ladder (see `run`). The classwise
+        // schedule's per-class trees deliberately SHARE it — a tier class 1
+        // earned by measuring itself is exactly the knowledge class 2 should
+        // start from, and re-paying the warm-up per class would spend the
+        // budget on rediscovering the same fact.
+        super::closure::reset();
         match Self::run_classwise_inner(net, root, t, adv, cfg) {
             Ok(out) => out,
             Err(e) => MarginRowOutcome::Unknown {
@@ -1142,6 +2699,13 @@ impl<'a> MarginRowBab<'a> {
             epochs_attempted: 0,
             epochs_closed: 0,
             ledger_ok: Some(true),
+            frontier_execution: FrontierExecutionEvidence::classwise(),
+            policy_execution: PolicyExecutionEvidence::from_config(&cfg),
+            epoch_execution: EpochExecutionEvidence::from_config(&cfg),
+            width_execution: WidthExecutionEvidence::from_config(&cfg),
+            root_precision_execution: cfg.root_precision_execution,
+            backward_interm_execution: cfg.backward_interm_execution,
+            root_alpha_execution: cfg.root_alpha_execution,
         };
         if schedule.is_empty() {
             aggregate.elapsed_secs = t0.elapsed().as_secs_f64();
@@ -1176,6 +2740,13 @@ impl<'a> MarginRowBab<'a> {
                     epochs_attempted: 0,
                     epochs_closed: 0,
                     ledger_ok: None,
+                    frontier_execution: FrontierExecutionEvidence::classwise(),
+                    policy_execution: PolicyExecutionEvidence::from_config(&cfg),
+                    epoch_execution: EpochExecutionEvidence::from_config(&cfg),
+                    width_execution: WidthExecutionEvidence::from_config(&cfg),
+                    root_precision_execution: cfg.root_precision_execution,
+                    backward_interm_execution: cfg.backward_interm_execution,
+                    root_alpha_execution: cfg.root_alpha_execution,
                 };
                 absorb_class_stats(
                     &mut aggregate,
@@ -1205,6 +2776,13 @@ impl<'a> MarginRowBab<'a> {
                     epochs_attempted: 0,
                     epochs_closed: 0,
                     ledger_ok: None,
+                    frontier_execution: FrontierExecutionEvidence::classwise(),
+                    policy_execution: PolicyExecutionEvidence::from_config(&cfg),
+                    epoch_execution: EpochExecutionEvidence::from_config(&cfg),
+                    width_execution: WidthExecutionEvidence::from_config(&cfg),
+                    root_precision_execution: cfg.root_precision_execution,
+                    backward_interm_execution: cfg.backward_interm_execution,
+                    root_alpha_execution: cfg.root_alpha_execution,
                 };
                 absorb_class_stats(
                     &mut aggregate,
@@ -1216,15 +2794,7 @@ impl<'a> MarginRowBab<'a> {
                 });
             }
 
-            // Serial per-class trees make the one absolute/global expansion
-            // budget exact. The existing parallel frontier may complete up to
-            // frontier-1 extra expansions in its final batch, so it is not used
-            // by this bounded experiment.
-            let class_cfg = BabConfig {
-                max_expansions: remaining_expansions,
-                frontier: 1,
-                ..cfg.clone()
-            };
+            let class_cfg = classwise_tree_config(&cfg, remaining_expansions);
             let stats = BabStats {
                 root_bound: class_root_bound,
                 tree_classes: vec![class],
@@ -1241,6 +2811,13 @@ impl<'a> MarginRowBab<'a> {
                 epochs_attempted: 0,
                 epochs_closed: 0,
                 ledger_ok: None,
+                frontier_execution: FrontierExecutionEvidence::classwise(),
+                policy_execution: PolicyExecutionEvidence::from_config(&class_cfg),
+                epoch_execution: EpochExecutionEvidence::from_config(&class_cfg),
+                width_execution: WidthExecutionEvidence::from_config(&class_cfg),
+                root_precision_execution: class_cfg.root_precision_execution,
+                backward_interm_execution: class_cfg.backward_interm_execution,
+                root_alpha_execution: class_cfg.root_alpha_execution,
             };
             let class_lru = fresh_class_lru(class_cfg.lru_cap, &re.pack);
             let mut bab = Self {
@@ -1252,6 +2829,11 @@ impl<'a> MarginRowBab<'a> {
                 epoch_failures: 0,
                 ledger: Ledger::default(),
                 nested_ledgers_ok: true,
+                lane_cache: super::gpu_backward::cache::PlanCache::default(),
+                // #closure-adaptive: a fresh observer per class tree (each tree
+                // measures its OWN closure) over the shared process-global
+                // tier, so a tier class 1 earned carries into class 2.
+                closure: super::closure::ClosureMonitor::new(super::closure::armed()),
             };
             let class_t0 = Instant::now();
             let class_result = bab.tree_loop(class_root_bound, &re);
@@ -1375,6 +2957,16 @@ impl<'a> MarginRowBab<'a> {
             epochs_attempted: 0,
             epochs_closed: 0,
             ledger_ok: None,
+            frontier_execution: FrontierExecutionEvidence::joint(
+                cfg.frontier,
+                cfg.frontier_contextual,
+            ),
+            policy_execution: PolicyExecutionEvidence::from_config(&cfg),
+            epoch_execution: EpochExecutionEvidence::from_config(&cfg),
+            width_execution: WidthExecutionEvidence::from_config(&cfg),
+            root_precision_execution: cfg.root_precision_execution,
+            backward_interm_execution: cfg.backward_interm_execution,
+            root_alpha_execution: cfg.root_alpha_execution,
         };
         if re.tree_classes.is_empty() {
             stats.elapsed_secs = t0.elapsed().as_secs_f64();
@@ -1395,6 +2987,8 @@ impl<'a> MarginRowBab<'a> {
             epoch_failures: 0,
             ledger: Ledger::default(),
             nested_ledgers_ok: true,
+            lane_cache: super::gpu_backward::cache::PlanCache::default(),
+            closure: super::closure::ClosureMonitor::new(super::closure::armed()),
         };
         bab.lru.cap = bab.cfg.lru_cap;
         bab.lru.put(Vec::new(), re.pack.clone());
@@ -1418,6 +3012,10 @@ impl<'a> MarginRowBab<'a> {
         } else {
             bab.tree_loop(root_bound, &re)?
         };
+        // #margin-row-domain-alpha R9: one end-of-lane ledger line, so the
+        // mechanism's whole cost is readable from any run without waiting for a
+        // rate-limited sample. Silent (and free) when the lane is disarmed.
+        super::domain_alpha::cost_summary();
         Ok(outcome)
     }
 
@@ -1440,6 +3038,9 @@ impl<'a> MarginRowBab<'a> {
             beta_step: super::beta::lambda(),
             pc: Vec::new(),
             retired: Vec::new(),
+            // #margin-row-domain-alpha: the root domain has no ancestor, so it
+            // starts at the root's own (possibly `#alpha-opt`-optimized) alpha.
+            alpha: Vec::new(),
         }
     }
 
@@ -1477,6 +3078,11 @@ impl<'a> MarginRowBab<'a> {
         let trace = std::env::var("NY_MARGIN_ROW_TRACE").is_ok();
         while let Some(entry) = {
             self.adapt_width(heap.len() + 1);
+            // #closure-adaptive: observe THIS lane's own child-closure fraction
+            // and escalate the closure mechanisms if the children are not
+            // closing. `heap.len()` is the open frontier at this instant (the
+            // domain about to be popped is still in it).
+            self.closure_step(heap.len(), t0.elapsed().as_secs_f64(), &re.pack);
             heap.pop()
         } {
             if trace && self.stats.expansions.is_multiple_of(25) {
@@ -1531,19 +3137,28 @@ impl<'a> MarginRowBab<'a> {
                 stop = "wallclock_after_epoch_attempt".into();
                 break;
             }
-            let (b_eval, st) = match self.eval_node(&entry)? {
-                EvalOut::Infeasible => {
+            // The entry survived the budget/deadline, finite-bound, closed,
+            // and epoch gates and is about to enter executable domain work.
+            // Include the already-popped entry in the pre-decision open count.
+            self.stats.frontier_execution.observe(heap.len() + 1);
+            let (b_eval, mut st) = match self.eval_node(&entry)? {
+                EvalOut::Infeasible(policy_execution) => {
+                    self.stats.policy_execution.absorb(policy_execution);
                     // Infeasible domain: provably empty, closed.
                     self.stats.closed += 1;
                     self.ledger.leaf(depth);
                     continue;
                 }
-                EvalOut::Deadline => {
+                EvalOut::Deadline(policy_execution) => {
+                    self.stats.policy_execution.absorb(policy_execution);
                     // #deadline-poll (D2): clean early exit, no verdict.
                     stop = "wallclock_intra_expansion".into();
                     break;
                 }
-                EvalOut::Node(b_eval, st) => (b_eval, *st),
+                EvalOut::Node(b_eval, st) => {
+                    self.stats.policy_execution.absorb(st.policy_execution);
+                    (b_eval, *st)
+                }
             };
             if !b_eval.is_finite() {
                 return Ok(MarginRowOutcome::Unknown {
@@ -1558,8 +3173,10 @@ impl<'a> MarginRowBab<'a> {
                 continue;
             }
             // ---------- candidates ----------
-            let (trunk_cands, head_cands) = self.select_candidates(&st, &entry);
+            let (trunk_cands, head_cands) = self.select_candidates(&mut st, &entry);
             if head_cands.is_empty() && trunk_cands.is_empty() {
+                self.stats.epoch_execution.absorb(st.epoch_execution);
+                self.stats.width_execution.absorb(st.width_execution);
                 stop = "no_candidates".into();
                 break;
             }
@@ -1569,31 +3186,35 @@ impl<'a> MarginRowBab<'a> {
                     Some(ch) => ch,
                     None => {
                         // #deadline-poll (D2): clean early exit, no verdict.
+                        self.stats.epoch_execution.absorb(st.epoch_execution);
+                        self.stats.width_execution.absorb(st.width_execution);
                         stop = "wallclock_intra_expansion".into();
                         break;
                     }
                 }
             };
+            let epoch_selection = st.epoch_selection;
+            st.epoch_execution
+                .observe_scored_selection(self.cfg.epoch_frame_route, epoch_selection);
+            self.stats.epoch_execution.absorb(st.epoch_execution);
             if ch
                 .iter()
                 .any(|(left, right)| !(left.is_finite() && right.is_finite()))
             {
+                self.stats.width_execution.absorb(st.width_execution);
                 return Ok(MarginRowOutcome::Unknown {
                     reason: "non-finite child score".into(),
                     stats: Some(self.stats.clone()),
                 });
             }
-            // Pick: max by (min child, sum child); later index wins ties
-            // (np.lexsort parity).
-            let mut pick = 0usize;
-            let mut best = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-            for (i, pair) in ch.iter().enumerate() {
-                let key = (pair.0.min(pair.1), pair.0 + pair.1);
-                if key.0 > best.0 || (key.0 == best.0 && key.1 >= best.1) {
-                    best = key;
-                    pick = i;
-                }
-            }
+            st.width_execution
+                .observe_successful_score(self.cfg.epoch_frame_route, st.width_selection);
+            self.stats.width_execution.absorb(st.width_execution);
+            // #branch-reduceop: shared pick rule (see `pick_candidate`). This is
+            // the SERIAL site; the scored cifar100 lane runs the parallel ones.
+            let reduce_max = super::branch_reduce_max();
+            let (pick, differs) = pick_candidate(&ch, reduce_max);
+            note_reduceop(reduce_max, "serial", ch.len(), pick, differs);
             let n_t = trunk_cands.len();
             let chb = ch[pick];
             // ---------- push children ----------
@@ -1676,6 +3297,9 @@ impl<'a> MarginRowBab<'a> {
                         pc: st.pc.clone(),
                         // #margin-row-col-retire: monotone inheritance.
                         retired: st.retired.clone(),
+                        // #margin-row-domain-alpha: warm start (see
+                        // `DomainEntry::alpha`).
+                        alpha: st.alpha.clone(),
                     });
                     seq += 1;
                 }
@@ -1684,6 +3308,14 @@ impl<'a> MarginRowBab<'a> {
         }
         self.stats.stop = stop.clone();
         self.stats.elapsed_secs = t0.elapsed().as_secs_f64();
+        // R9: the armed policy always leaves a receipt, so a run that observed
+        // nothing is distinguishable from a run where the policy never loaded.
+        self.closure.finish(
+            self.stats.expansions,
+            self.stats.domains_created,
+            self.stats.closed,
+            &stop,
+        );
         let mut verified = matches!(stop.as_str(), "verified_bestfirst" | "queue_empty");
         if verified && self.cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
             stop = "wallclock_before_verdict".into();
@@ -1713,13 +3345,10 @@ impl<'a> MarginRowBab<'a> {
     /// per-point sign cover, so the instance closes iff every leaf closes; a
     /// SAT point survives in some leaf under both orders. The lane still only
     /// ever returns `Unsat` or `Unknown`.
-    /// See [`adaptive_width_enabled`]. Called once per batch from the serial
-    /// section; a no-op unless armed.
+    /// Called once per batch from the serial section. Both the configured and
+    /// exact lower-authority ratchets advance from the same frontier fact, so
+    /// selector counterfactuals never reopen process-global state.
     fn adapt_width(&mut self, open: usize) {
-        if !adaptive_width_enabled() {
-            return;
-        }
-        let (base_h, base_t) = (self.cfg.k_head, self.cfg.k_trunk);
         let esc: usize = if open >= 256 {
             32
         } else if open >= 32 {
@@ -1727,15 +3356,123 @@ impl<'a> MarginRowBab<'a> {
         } else {
             0
         };
-        let (nh, nt) = (base_h.max(esc), base_t.max(esc));
-        if (nh, nt) != (base_h, base_t) {
+        if esc == 0 {
+            return;
+        }
+
+        let ordinary_route = ordinary_width_selectors_enabled(
+            self.cfg.epoch_policy.tier0_exact,
+            self.cfg.retained.is_some(),
+        );
+        let (old_h, old_t) = (self.cfg.effective_k_head, self.cfg.effective_k_trunk);
+        let (old_contextual_h, old_contextual_t) = (
+            self.cfg.effective_contextual_k_head,
+            self.cfg.effective_contextual_k_trunk,
+        );
+        if self.cfg.adaptive {
+            self.cfg.effective_k_head = self.cfg.effective_k_head.max(esc);
+            self.cfg.effective_k_trunk = self.cfg.effective_k_trunk.max(esc);
+        }
+        if self.cfg.contextual_adaptive {
+            self.cfg.effective_contextual_k_head = self.cfg.effective_contextual_k_head.max(esc);
+            self.cfg.effective_contextual_k_trunk = self.cfg.effective_contextual_k_trunk.max(esc);
+        }
+        let escalated = (self.cfg.effective_k_head, self.cfg.effective_k_trunk) != (old_h, old_t);
+        self.stats.width_execution.observe_adaptive_threshold(
+            ordinary_route,
+            (old_h, old_t),
+            (self.cfg.effective_k_head, self.cfg.effective_k_trunk),
+            (old_contextual_h, old_contextual_t),
+            (
+                self.cfg.effective_contextual_k_head,
+                self.cfg.effective_contextual_k_trunk,
+            ),
+        );
+        if escalated {
             eprintln!(
-                "[k-adapt] frontier open={open} -> k_head {base_h}->{nh} k_trunk {base_t}->{nt}                  at exp {}",
+                "[k-adapt] frontier open={open} -> k_head {old_h}->{} k_trunk {old_t}->{} at exp {}",
+                self.cfg.effective_k_head,
+                self.cfg.effective_k_trunk,
                 self.stats.expansions
             );
-            self.cfg.k_head = nh;
-            self.cfg.k_trunk = nt;
         }
+    }
+
+    /// #closure-adaptive: one observation of THIS tree's child-closure
+    /// fraction, and the escalation it implies.
+    ///
+    /// Called from the SERIAL section of either tree loop (never from a rayon
+    /// worker), so a parallel frontier batch always runs at one tier for its
+    /// whole batch and the deterministic merge is untouched. The policy writes
+    /// nothing but an integer tier; it has no path to a published bound.
+    fn closure_step(&mut self, open: usize, elapsed: f64, root_pack: &Arc<YPack>) {
+        let remaining = self
+            .cfg
+            .deadline
+            .map(|dl| dl.saturating_duration_since(Instant::now()).as_secs_f64());
+        let decision = self.closure.observe(
+            self.stats.expansions,
+            self.stats.domains_created,
+            self.stats.closed,
+            open,
+            elapsed,
+            remaining,
+        );
+        match decision {
+            super::closure::Decision::Escalate(t) | super::closure::Decision::Rollback(t) => {
+                self.set_epoch_tier(t);
+                self.retier_packs(t, root_pack);
+            }
+            super::closure::Decision::Idle | super::closure::Decision::Hold => {}
+        }
+    }
+
+    /// #closure-adaptive top tier: the epoch rebuild is carried in `BabConfig`
+    /// rather than behind a process-global gate, so the tier is applied here.
+    /// The configured cadence remains immutable in `epoch_policy`; this method
+    /// owns only the closure controller's operational cadence. Consequently a
+    /// rollback can never disarm an explicit scored `NY_EPOCH_DEPTH`, including
+    /// the formerly ambiguous case where it equals the adaptive depth.
+    fn set_epoch_tier(&mut self, tier: usize) {
+        let before = self.cfg.epoch_trigger_depth;
+        let after = closure_epoch_trigger(self.cfg.epoch_policy.depth, before, tier);
+        if after == before {
+            return;
+        }
+        self.cfg.epoch_trigger_depth = after;
+        if after > 0 {
+            eprintln!(
+                "[closure] tier={tier} epoch rebuilds ARMED at trunk depth >= {after} \
+                 (max {} attempts)",
+                self.cfg.epoch_attempt_cap
+            );
+        } else {
+            eprintln!("[closure] tier={tier} epoch rebuilds disarmed");
+        }
+    }
+
+    /// Drop y-packs built under a different tier.
+    ///
+    /// NOT a soundness requirement — a pack built at a lower tier is merely
+    /// LOOSER, and the certified pass rescores every domain that uses it. It is
+    /// an ENGAGEMENT requirement: without this the domains that triggered the
+    /// escalation are exactly the ones that would keep hitting pre-escalation
+    /// packs, and the lever would read as inert for reasons that have nothing
+    /// to do with whether it works.
+    ///
+    /// The empty-trunk root pack is tier-invariant (no splits ⇒ no halfspaces ⇒
+    /// every clip site returns early), so it is RE-SEEDED from the root
+    /// evaluation rather than rebuilt — which also keeps `build_pack(.., None,
+    /// ..)` the single producer of the root pack.
+    fn retier_packs(&mut self, tier: usize, root_pack: &Arc<YPack>) {
+        let dropped = self.lru.entries.len();
+        self.lru.entries.clear();
+        self.lru.put(Vec::new(), root_pack.clone());
+        eprintln!(
+            "[closure] tier={tier} ({}) y-pack cache retiered: {dropped} entries dropped, \
+             root pack re-seeded",
+            super::closure::tier_name(tier),
+        );
     }
 
     fn tree_loop_parallel(&mut self, root_bound: f64, re: &RootEval) -> Result<MarginRowOutcome> {
@@ -1795,6 +3532,9 @@ impl<'a> MarginRowBab<'a> {
                 }
             }
             self.adapt_width(heap.len());
+            // #closure-adaptive: same observation as the serial lane, in the
+            // serial section so the whole batch runs at one tier.
+            self.closure_step(heap.len(), t0.elapsed().as_secs_f64(), &re.pack);
             // Pop up to `width` worst-open domains into the batch. Open entries
             // are never closed (the push rule below never enqueues a closed
             // bound); the closed guard is defensive and, if it ever fires,
@@ -1836,6 +3576,13 @@ impl<'a> MarginRowBab<'a> {
             if batch.is_empty() {
                 break;
             }
+            // At least one domain survived the defensive closed/epoch gates,
+            // so this planned frontier batch reached executable tree work.
+            // Exclude entries already discharged by those gates; retain the
+            // selected batch plus the still-open, uninspected heap.
+            self.stats
+                .frontier_execution
+                .observe(batch.len() + heap.len());
             // Prebuild each domain's y-pack SERIALLY: this reads/populates the
             // shared LRU (no cross-thread cache sync) and dedups identical
             // trunk-sets within the batch. The builds are internally rayon-
@@ -1872,7 +3619,7 @@ impl<'a> MarginRowBab<'a> {
             // path rebuilds. Runs BEFORE the CPU parallel prebuild so the two
             // never do the same work twice.
             self.gpu_batch_prefill(&batch);
-            if parallel_prebuild_enabled() && batch.len() > 1 {
+            if self.cfg.parallel_prebuild && batch.len() > 1 {
                 let mut missing: Vec<Vec<TrunkSplit>> = Vec::new();
                 for e in &batch {
                     if self.lru.get(&e.trunk).is_none()
@@ -1882,6 +3629,16 @@ impl<'a> MarginRowBab<'a> {
                     }
                 }
                 if !missing.is_empty() {
+                    self.stats.policy_execution.parallel_prebuild_batches = self
+                        .stats
+                        .policy_execution
+                        .parallel_prebuild_batches
+                        .saturating_add(1);
+                    self.stats.policy_execution.parallel_prebuild_domains = self
+                        .stats
+                        .policy_execution
+                        .parallel_prebuild_domains
+                        .saturating_add(missing.len());
                     // Attribute the prebuild to YRefresh. Building the packs
                     // here bypasses `rows_for`, so without this the phase reads
                     // "0.000s n=0" and the work becomes invisible rather than
@@ -1948,12 +3705,16 @@ impl<'a> MarginRowBab<'a> {
             // Deterministic serial merge in pop order.
             for (step, entry) in steps.into_iter().zip(&batch) {
                 let depth = entry.trunk.len() + entry.heads.len();
-                match step? {
-                    ExpandStep::Infeasible | ExpandStep::ClosedAtEval => {
+                let step = step?;
+                self.stats.policy_execution.absorb(step.policy_execution());
+                self.stats.epoch_execution.absorb(step.epoch_execution());
+                self.stats.width_execution.absorb(step.width_execution());
+                match step {
+                    ExpandStep::Infeasible(_) | ExpandStep::ClosedAtEval(_) => {
                         self.stats.closed += 1;
                         self.ledger.leaf(depth);
                     }
-                    ExpandStep::DeadlineHit => {
+                    ExpandStep::DeadlineHit(_) => {
                         // #deadline-poll (D2): clean early exit, no verdict.
                         // The domain is neither closed nor counted; results
                         // merged before this one stand, the rest are dropped
@@ -1962,11 +3723,11 @@ impl<'a> MarginRowBab<'a> {
                         stop = "wallclock_intra_expansion".into();
                         break 'outer;
                     }
-                    ExpandStep::NoCandidates => {
+                    ExpandStep::NoCandidates(_) => {
                         stop = "no_candidates".into();
                         break 'outer;
                     }
-                    ExpandStep::NonFiniteBound => {
+                    ExpandStep::NonFiniteBound(_) => {
                         return Ok(MarginRowOutcome::Unknown {
                             reason: "non-finite domain or child bound".into(),
                             stats: Some(self.stats.clone()),
@@ -1978,6 +3739,7 @@ impl<'a> MarginRowBab<'a> {
                         pushes,
                         closed_children,
                         created_children,
+                        execution: _,
                     } => {
                         self.stats.mono_raw_dips += dips;
                         self.stats.mono_worst = self.stats.mono_worst.min(worst_dip);
@@ -1999,6 +3761,7 @@ impl<'a> MarginRowBab<'a> {
                                 beta_step: c.beta_step,
                                 pc: c.pc,
                                 retired: c.retired,
+                                alpha: c.alpha,
                             });
                             seq += 1;
                         }
@@ -2009,6 +3772,14 @@ impl<'a> MarginRowBab<'a> {
         }
         self.stats.stop = stop.clone();
         self.stats.elapsed_secs = t0.elapsed().as_secs_f64();
+        // R9: the armed policy always leaves a receipt, so a run that observed
+        // nothing is distinguishable from a run where the policy never loaded.
+        self.closure.finish(
+            self.stats.expansions,
+            self.stats.domains_created,
+            self.stats.closed,
+            &stop,
+        );
         let mut verified = matches!(stop.as_str(), "verified_bestfirst" | "queue_empty");
         if verified && self.cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
             stop = "wallclock_before_verdict".into();
@@ -2092,10 +3863,14 @@ impl<'a> MarginRowBab<'a> {
         let mut out = Vec::with_capacity(preps.len());
         for (i, (prep, entry)) in preps.into_iter().zip(batch).enumerate() {
             match prep {
-                PreparedExpand::Done(step) => out.push(step),
+                PreparedExpand::Done(step) => out.push(*step),
                 PreparedExpand::Ready(ready) => match scores[i].take() {
                     Some(score) => out.push(self.finish_prepared_expand(entry, &ready, &score)),
-                    None if score_deadline => out.push(ExpandStep::DeadlineHit),
+                    None if score_deadline => {
+                        out.push(ExpandStep::DeadlineHit(
+                            DomainExecutionEvidence::from_state(&ready.st),
+                        ));
+                    }
                     None => {
                         return Err(NyError::InvalidSpec(
                             "margin_row: missing domain-stack candidate score".into(),
@@ -2109,21 +3884,35 @@ impl<'a> MarginRowBab<'a> {
 
     fn prepare_expand(&self, pack: &Arc<YPack>, entry: &DomainEntry) -> Result<PreparedExpand> {
         let mode = self.eng.root.mode;
-        let (b_eval, st) = match self.eval_with_pack(pack, entry)? {
-            EvalOut::Infeasible => return Ok(PreparedExpand::Done(ExpandStep::Infeasible)),
-            EvalOut::Deadline => return Ok(PreparedExpand::Done(ExpandStep::DeadlineHit)),
+        let (b_eval, mut st) = match self.eval_with_pack(pack, entry)? {
+            EvalOut::Infeasible(policy_execution) => {
+                return Ok(PreparedExpand::Done(Box::new(ExpandStep::Infeasible(
+                    DomainExecutionEvidence::before_selection(policy_execution, &self.cfg),
+                ))))
+            }
+            EvalOut::Deadline(policy_execution) => {
+                return Ok(PreparedExpand::Done(Box::new(ExpandStep::DeadlineHit(
+                    DomainExecutionEvidence::before_selection(policy_execution, &self.cfg),
+                ))))
+            }
             EvalOut::Node(b_eval, st) => (b_eval, *st),
         };
         if !(b_eval.is_finite() && entry.bound.is_finite()) {
-            return Ok(PreparedExpand::Done(ExpandStep::NonFiniteBound));
+            return Ok(PreparedExpand::Done(Box::new(ExpandStep::NonFiniteBound(
+                DomainExecutionEvidence::from_state(&st),
+            ))));
         }
         let b = b_eval.max(entry.bound);
         if closed(mode, b) {
-            return Ok(PreparedExpand::Done(ExpandStep::ClosedAtEval));
+            return Ok(PreparedExpand::Done(Box::new(ExpandStep::ClosedAtEval(
+                DomainExecutionEvidence::from_state(&st),
+            ))));
         }
-        let (trunk_cands, head_cands) = self.select_candidates(&st, entry);
+        let (trunk_cands, head_cands) = self.select_candidates(&mut st, entry);
         if head_cands.is_empty() && trunk_cands.is_empty() {
-            return Ok(PreparedExpand::Done(ExpandStep::NoCandidates));
+            return Ok(PreparedExpand::Done(Box::new(ExpandStep::NoCandidates(
+                DomainExecutionEvidence::from_state(&st),
+            ))));
         }
         Ok(PreparedExpand::Ready(Box::new(ReadyExpand {
             b,
@@ -2139,23 +3928,26 @@ impl<'a> MarginRowBab<'a> {
         ready: &ReadyExpand,
         ch: &[(f64, f64)],
     ) -> ExpandStep {
+        let mut execution = DomainExecutionEvidence::from_state(&ready.st);
+        execution
+            .epoch
+            .observe_scored_selection(self.cfg.epoch_frame_route, ready.st.epoch_selection);
         if ch.len() != ready.trunk_cands.len() + ready.head_cands.len()
             || ch
                 .iter()
                 .any(|(left, right)| !(left.is_finite() && right.is_finite()))
         {
-            return ExpandStep::NonFiniteBound;
+            return ExpandStep::NonFiniteBound(execution);
         }
-        // Pick: max by (min child, sum child); later index wins ties.
-        let mut pick = 0usize;
-        let mut best = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for (i, pair) in ch.iter().enumerate() {
-            let key = (pair.0.min(pair.1), pair.0 + pair.1);
-            if key.0 > best.0 || (key.0 == best.0 && key.1 >= best.1) {
-                best = key;
-                pick = i;
-            }
-        }
+        execution
+            .width
+            .observe_successful_score(self.cfg.epoch_frame_route, ready.st.width_selection);
+        // #branch-reduceop: shared pick rule (see `pick_candidate`). THIS is a
+        // scored-lane site — the concurrent cifar100 lane runs the parallel
+        // expansion paths, not the serial loop.
+        let reduce_max = super::branch_reduce_max();
+        let (pick, differs) = pick_candidate(ch, reduce_max);
+        note_reduceop(reduce_max, "parallel", ch.len(), pick, differs);
         let n_t = ready.trunk_cands.len();
         let chb = ch[pick];
         let mut pushes = Vec::new();
@@ -2166,7 +3958,7 @@ impl<'a> MarginRowBab<'a> {
         for (d_i, dr) in [(0usize, 1i8), (1usize, -1i8)] {
             let raw = if d_i == 0 { chb.0 } else { chb.1 };
             if !raw.is_finite() {
-                return ExpandStep::NonFiniteBound;
+                return ExpandStep::NonFiniteBound(execution);
             }
             if raw < ready.b - 1e-9 {
                 dips += 1;
@@ -2234,6 +4026,9 @@ impl<'a> MarginRowBab<'a> {
                     pc: ready.st.pc.clone(),
                     // #margin-row-col-retire: monotone inheritance.
                     retired: ready.st.retired.clone(),
+                    // #margin-row-domain-alpha: warm start (see
+                    // `DomainEntry::alpha`).
+                    alpha: ready.st.alpha.clone(),
                 });
             }
         }
@@ -2243,6 +4038,7 @@ impl<'a> MarginRowBab<'a> {
             pushes,
             closed_children,
             created_children,
+            execution,
         }
     }
 
@@ -2250,45 +4046,66 @@ impl<'a> MarginRowBab<'a> {
     /// Mirrors the serial expansion body exactly; see [`Self::tree_loop`].
     fn expand_one(&self, pack: &Arc<YPack>, entry: &DomainEntry) -> Result<ExpandStep> {
         let mode = self.eng.root.mode;
-        let (b_eval, st) = match self.eval_with_pack(pack, entry)? {
-            EvalOut::Infeasible => return Ok(ExpandStep::Infeasible),
-            EvalOut::Deadline => return Ok(ExpandStep::DeadlineHit),
+        let (b_eval, mut st) = match self.eval_with_pack(pack, entry)? {
+            EvalOut::Infeasible(policy_execution) => {
+                return Ok(ExpandStep::Infeasible(
+                    DomainExecutionEvidence::before_selection(policy_execution, &self.cfg),
+                ))
+            }
+            EvalOut::Deadline(policy_execution) => {
+                return Ok(ExpandStep::DeadlineHit(
+                    DomainExecutionEvidence::before_selection(policy_execution, &self.cfg),
+                ))
+            }
             EvalOut::Node(b_eval, st) => (b_eval, *st),
         };
         if !(b_eval.is_finite() && entry.bound.is_finite()) {
-            return Ok(ExpandStep::NonFiniteBound);
+            return Ok(ExpandStep::NonFiniteBound(
+                DomainExecutionEvidence::from_state(&st),
+            ));
         }
         let b = b_eval.max(entry.bound);
         if closed(mode, b) {
-            return Ok(ExpandStep::ClosedAtEval);
+            return Ok(ExpandStep::ClosedAtEval(
+                DomainExecutionEvidence::from_state(&st),
+            ));
         }
-        let (trunk_cands, head_cands) = self.select_candidates(&st, entry);
+        let (trunk_cands, head_cands) = self.select_candidates(&mut st, entry);
         if head_cands.is_empty() && trunk_cands.is_empty() {
-            return Ok(ExpandStep::NoCandidates);
+            return Ok(ExpandStep::NoCandidates(
+                DomainExecutionEvidence::from_state(&st),
+            ));
         }
         let ch = {
             let _t = super::prof::Timer::start(super::prof::Phase::ScoreCands);
             match self.score_candidates(&st, &trunk_cands, &head_cands)? {
                 Some(ch) => ch,
-                None => return Ok(ExpandStep::DeadlineHit),
+                None => {
+                    return Ok(ExpandStep::DeadlineHit(
+                        DomainExecutionEvidence::from_state(&st),
+                    ))
+                }
             }
         };
+        let epoch_selection = st.epoch_selection;
+        st.epoch_execution
+            .observe_scored_selection(self.cfg.epoch_frame_route, epoch_selection);
         if ch
             .iter()
             .any(|(left, right)| !(left.is_finite() && right.is_finite()))
         {
-            return Ok(ExpandStep::NonFiniteBound);
+            return Ok(ExpandStep::NonFiniteBound(
+                DomainExecutionEvidence::from_state(&st),
+            ));
         }
-        // Pick: max by (min child, sum child); later index wins ties.
-        let mut pick = 0usize;
-        let mut best = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for (i, pair) in ch.iter().enumerate() {
-            let key = (pair.0.min(pair.1), pair.0 + pair.1);
-            if key.0 > best.0 || (key.0 == best.0 && key.1 >= best.1) {
-                best = key;
-                pick = i;
-            }
-        }
+        st.width_execution
+            .observe_successful_score(self.cfg.epoch_frame_route, st.width_selection);
+        // #branch-reduceop: shared pick rule (see `pick_candidate`). THIS is a
+        // scored-lane site — the concurrent cifar100 lane runs the parallel
+        // expansion paths, not the serial loop.
+        let reduce_max = super::branch_reduce_max();
+        let (pick, differs) = pick_candidate(&ch, reduce_max);
+        note_reduceop(reduce_max, "parallel", ch.len(), pick, differs);
         let n_t = trunk_cands.len();
         let chb = ch[pick];
         let mut pushes = Vec::new();
@@ -2299,7 +4116,9 @@ impl<'a> MarginRowBab<'a> {
         for (d_i, dr) in [(0usize, 1i8), (1usize, -1i8)] {
             let raw = if d_i == 0 { chb.0 } else { chb.1 };
             if !raw.is_finite() {
-                return Ok(ExpandStep::NonFiniteBound);
+                return Ok(ExpandStep::NonFiniteBound(
+                    DomainExecutionEvidence::from_state(&st),
+                ));
             }
             if raw < b - 1e-9 {
                 dips += 1;
@@ -2367,6 +4186,9 @@ impl<'a> MarginRowBab<'a> {
                     pc: st.pc.clone(),
                     // #margin-row-col-retire: monotone inheritance.
                     retired: st.retired.clone(),
+                    // #margin-row-domain-alpha: warm start (see
+                    // `DomainEntry::alpha`).
+                    alpha: st.alpha.clone(),
                 });
             }
         }
@@ -2376,6 +4198,7 @@ impl<'a> MarginRowBab<'a> {
             pushes,
             closed_children,
             created_children,
+            execution: DomainExecutionEvidence::from_state(&st),
         })
     }
 
@@ -2434,10 +4257,23 @@ impl<'a> MarginRowBab<'a> {
                 epochs_attempted: 0,
                 epochs_closed: 0,
                 ledger_ok: None,
+                frontier_execution: FrontierExecutionEvidence::joint(1, 1),
+                policy_execution: PolicyExecutionEvidence::from_config(&BabConfig::default()),
+                epoch_execution: EpochExecutionEvidence::default(),
+                width_execution: WidthExecutionEvidence::default(),
+                root_precision_execution: Default::default(),
+                backward_interm_execution: Default::default(),
+                root_alpha_execution: Default::default(),
             },
             epoch_failures: 0,
             ledger: Ledger::default(),
             nested_ledgers_ok: true,
+            lane_cache: super::gpu_backward::cache::PlanCache::default(),
+            // #closure-adaptive: this determinism harness predates the ladder
+            // and must keep measuring the SHIPPED path, so the observer is off
+            // and the tier stays at `TIER_BASE` — byte-identical to the
+            // pre-policy driver rather than a hand-set tier.
+            closure: super::closure::ClosureMonitor::new(false),
         };
         bab.lru.put(Vec::new(), re.pack.clone());
         let mut entry = DomainEntry {
@@ -2452,6 +4288,7 @@ impl<'a> MarginRowBab<'a> {
             beta_step: super::beta::lambda(),
             pc: Vec::new(),
             retired: Vec::new(),
+            alpha: Vec::new(),
         };
         let mut out = Vec::new();
         for _ in 0..steps {
@@ -2495,6 +4332,7 @@ impl<'a> MarginRowBab<'a> {
                         beta_step: c.beta_step,
                         pc: c.pc,
                         retired: c.retired,
+                        alpha: c.alpha,
                     };
                 }
                 _ => break,
@@ -2568,8 +4406,17 @@ impl<'a> MarginRowBab<'a> {
         }
         super::prof::bump(super::prof::Counter::LruMiss, missing.len() as u64);
         for (trunk, (al, au)) in missing.into_iter().zip(rows) {
-            let pack = Arc::new(pack_from_rows(&self.eng, al, au));
-            self.lru.put(trunk, pack);
+            let mut pack = pack_from_rows(&self.eng, al, au);
+            // #clip-and-verify / #closure-adaptive: the CPU producer
+            // (`build_pack`) applies the split-derived y-box tightening at this
+            // point, so the batched prefill must too. Otherwise a PREFILLED
+            // pack differs from the one a cache MISS would have rebuilt, which
+            // breaks the LRU's stated contract ("a hit returns exactly what a
+            // miss would have rebuilt") and silently disarms tier 3 for every
+            // domain the prefill reached. Sound either way — the tightening is
+            // shrink-only — but only correct one way.
+            clip_tighten_pack(&self.eng, &trunk, &mut pack);
+            self.lru.put(trunk, Arc::new(pack));
         }
     }
 
@@ -2612,11 +4459,14 @@ impl<'a> MarginRowBab<'a> {
     /// bound here is a deterministic function of `(pack, entry)`, so a domain's
     /// result is BIT-IDENTICAL whether evaluated serially or in a worker.
     fn eval_with_pack(&self, pack: &Arc<YPack>, entry: &DomainEntry) -> Result<EvalOut> {
+        let mut policy_execution = PolicyExecutionEvidence::from_config(&self.cfg);
+        let epoch_execution = EpochExecutionEvidence::from_config(&self.cfg);
+        let width_execution = WidthExecutionEvidence::from_config(&self.cfg);
         // #deadline-poll (D2): guard the domain-gate rebuild + the main
         // certified pass about to be spent.
         if self.deadline_hit() {
             poll_note("eval_node");
-            return Ok(EvalOut::Deadline);
+            return Ok(EvalOut::Deadline(policy_execution));
         }
         let mode = self.eng.root.mode;
         let _t = super::prof::Timer::start(super::prof::Phase::EvalNode);
@@ -2626,7 +4476,7 @@ impl<'a> MarginRowBab<'a> {
             // domain's region empty. Discharged without paying the ~600 ms
             // backward pass — the exact "child that never closes" converted
             // into an instant close.
-            return Ok(EvalOut::Infeasible);
+            return Ok(EvalOut::Infeasible(policy_execution));
         }
         let pack = pack.clone();
         let mut ybox = YBox {
@@ -2635,11 +4485,11 @@ impl<'a> MarginRowBab<'a> {
         };
         ybox.clamp(&entry.heads);
         if ybox.is_empty() {
-            return Ok(EvalOut::Infeasible);
+            return Ok(EvalOut::Infeasible(policy_execution));
         }
         ybox.intersect(&entry.ly, &entry.uy);
         if ybox.is_empty() {
-            return Ok(EvalOut::Infeasible);
+            return Ok(EvalOut::Infeasible(policy_execution));
         }
         let gates = head_gates(&ybox, mode);
         // #margin-row-col-retire: narrow the margin batch to the SURVIVING
@@ -2668,6 +4518,9 @@ impl<'a> MarginRowBab<'a> {
                 if let Ok(sub) = self.mb.subset(&keep) {
                     mb_local = Some(sub);
                     survivors = Some(keep);
+                    policy_execution.inherited_retirement_evals = policy_execution
+                        .inherited_retirement_evals
+                        .saturating_add(1);
                 }
             }
         }
@@ -2701,7 +4554,7 @@ impl<'a> MarginRowBab<'a> {
         // split starts at 0); out-of-range columns dropped defensively. Empty
         // unless NY_MARGIN_ROW_BETA_PERCOL=1 — the shared-vector lane is then
         // bit-identical (no pc terms are ever installed).
-        let percol = beta_armed && super::beta::percol();
+        let percol = beta_armed && self.cfg.beta_per_column;
         // #margin-row-col-retire: entry `pc` columns are stored ROOT-frame
         // (stable as the survivor set shrinks down the tree); the ascent below
         // runs entirely in the LOCAL frame — the seed/pass columns the engine
@@ -2756,6 +4609,49 @@ impl<'a> MarginRowBab<'a> {
             }
         }
         let mut dom = dom;
+        // #margin-row-domain-alpha WARM START (`NY_MARGIN_ROW_DOMAIN_ALPHA=1` /
+        // `margin_row.domain_alpha`, default OFF): apply the ancestor's
+        // ACCEPTED alpha to this domain's gates BEFORE the main pass, so a
+        // child starts from the slope its parent paid for instead of resetting
+        // to the frozen root value. Free (`dom/base` pass-cost ratio measures
+        // 0.98-1.12 at every width) and sound on any region — lower-line
+        // validity is box-independent. `movable` reads the gates
+        // `domain_gates` already produced, INCLUDING clip's rebuilt
+        // `(alpha, s, c)`, which is what makes the clip x alpha pair compound.
+        //
+        // Disarmed: `alpha_slots` stays empty, no gate is written, and every
+        // pass below is bit-identical to the pre-domain-alpha lane.
+        let alpha_policy = self.cfg.domain_alpha_policy.normalized();
+        let alpha_armed = alpha_policy.enabled;
+        let mut alpha_slots: Vec<super::domain_alpha::Slot> = Vec::new();
+        let mut alpha_cur: Vec<f64> = Vec::new();
+        let mut alpha_warm = 0usize;
+        if alpha_armed {
+            policy_execution.domain_alpha_gate_evals =
+                policy_execution.domain_alpha_gate_evals.saturating_add(1);
+            alpha_slots = super::domain_alpha::movable(self.eng.root, &dom, &entry.trunk);
+            if alpha_slots.is_empty() {
+                super::domain_alpha::refuse("no-movable-neuron");
+            } else {
+                policy_execution.domain_alpha_movable_evals = policy_execution
+                    .domain_alpha_movable_evals
+                    .saturating_add(1);
+                policy_execution.domain_alpha_movable_slots = policy_execution
+                    .domain_alpha_movable_slots
+                    .saturating_add(alpha_slots.len());
+                alpha_cur = super::domain_alpha::read_alphas(self.eng.root, &dom, &alpha_slots);
+                alpha_warm = super::domain_alpha::apply_inherited(
+                    self.eng.root,
+                    &mut dom,
+                    &alpha_slots,
+                    &mut alpha_cur,
+                    &entry.alpha,
+                );
+                policy_execution.domain_alpha_warm_applied = policy_execution
+                    .domain_alpha_warm_applied
+                    .saturating_add(alpha_warm);
+            }
+        }
         if beta_armed {
             super::beta::set_terms(&mut dom, self.eng.root, &entry.trunk, &betas);
         }
@@ -2816,24 +4712,47 @@ impl<'a> MarginRowBab<'a> {
             };
         let collect = Collect {
             unst_abs: true,
-            rows: if self.cfg.tier0_exact > 0 {
+            rows: if self.cfg.epoch_policy.tier0_exact > 0 {
                 self.cfg.retained.as_deref()
             } else {
                 None
             },
-            // Gradient capture for the beta proposal only; nothing
-            // verdict-bearing reads it.
-            unst_rows: beta_armed,
+            // Gradient capture for the beta and per-domain-alpha proposals
+            // only; nothing verdict-bearing reads it. `unst_rows` is a
+            // read-only row copy taken BEFORE the domain-stack branch, so a
+            // captured pass's bound is bit-identical to an uncaptured one — it
+            // costs memory and a memcpy, and it refuses the dark GPU seam.
+            unst_rows: beta_armed || alpha_armed,
         };
-        let mut pass = self.eng.run_collect(
+        // B5 (#margin-row-gpu-eft, SITE_EVAL): the ~600 ms main pass — 43.4%
+        // of the lane — routes through the certified GPU lane's own seam.
+        // Dark and fail-closed: with the lane disarmed (or on ANY refusal —
+        // beta-carrying dom, tier-0/unst_rows collection, Busy device, cap
+        // overflow) this is exactly the established `run_collect` call,
+        // bit-for-bit. The seed is the MARGIN seed, which carries certified
+        // error, so the lane needs the y-box magnitudes to concretize both
+        // discrepancies into the bias-error lane (the `seed_penalty`
+        // contract, same as the root pass at bab.rs:910-919).
+        let eval_y_abs: Vec<f64> = ybox
+            .ly
+            .iter()
+            .zip(&ybox.uy)
+            .map(|(l, u)| l.abs().max(u.abs()))
+            .collect();
+        let lane_ctx = super::gpu_backward::LaneCtx {
+            y_abs: Some(&eval_y_abs),
+            deadline: self.cfg.deadline,
+            plan_cache: Some(&self.lane_cache),
+        };
+        let mut pass = self.eng.run_collect_seamed(
             seed_main_pc
                 .as_ref()
                 .or(seed_main.as_ref())
                 .unwrap_or(&ms.seed),
             Some(&dom),
             super::engine::LaneDir::Lower,
-            None,
             collect,
+            &lane_ctx,
         )?;
         let per_j = per_class_direct(&self.eng, &pass, &ms, 0..nf);
         let m2v = compose_viay(
@@ -2913,7 +4832,9 @@ impl<'a> MarginRowBab<'a> {
                         .total_cmp(&comp(&per_best, y))
                         .then(x.cmp(&y))
                 });
-                active.truncate(super::beta::beta_cols());
+                let candidate_count = active.len();
+                let configured_columns = self.cfg.beta_columns.clamp(1, 32);
+                active.truncate(configured_columns);
                 let cols0 = active.len();
                 for &c in &active {
                     if !pc.iter().any(|s| s.col == c) {
@@ -2929,12 +4850,30 @@ impl<'a> MarginRowBab<'a> {
                 let mut acc_events = 0usize;
                 let mut closed_cols = 0usize;
                 let n_t = entry.trunk.len();
+                let mut execution_observed = false;
                 'ascent: for _ in 0..super::beta::iters() {
                     if self.cfg.deadline.is_some_and(|dl| Instant::now() > dl) {
                         break;
                     }
                     if active.is_empty() {
                         break;
+                    }
+                    if !execution_observed {
+                        // Credit only after the first non-deadline iteration
+                        // actually consumes the configured per-column set. A
+                        // node that merely reached this block as its deadline
+                        // expired is not an executed parameter experiment.
+                        policy_execution.beta_per_column_evals =
+                            policy_execution.beta_per_column_evals.saturating_add(1);
+                        policy_execution.beta_columns_max_candidates = policy_execution
+                            .beta_columns_max_candidates
+                            .max(candidate_count);
+                        if candidate_count.min(configured_columns) != candidate_count.min(8) {
+                            policy_execution.beta_columns_binding_evals = policy_execution
+                                .beta_columns_binding_evals
+                                .saturating_add(1);
+                        }
+                        execution_observed = true;
                     }
                     // Per-column candidates. The walk is per column by
                     // construction: x* and the frozen-sign line selections
@@ -3320,6 +5259,309 @@ impl<'a> MarginRowBab<'a> {
                 );
             }
         }
+        // ---- #margin-row-domain-alpha ascent ----
+        //
+        // Re-optimize this domain's lower-line slopes against ITS OWN gates.
+        // Same shape as the β ascent directly above, and deliberately so: the
+        // direction comes from `alpha_opt`'s frozen-sign supergradient
+        // (`g = vp * U`, evaluated on the DOMAIN's effective alpha), every
+        // proposal is re-scored by the UNCHANGED certified pass, and only a
+        // measured improvement of the same certified composite the verdict uses
+        // is kept. Runs AFTER β so it starts from the β-tightened bound and
+        // composes with it; the accepted alpha then rides `st.dom` into
+        // `score_candidates` and `st.alpha` into the children.
+        //
+        // SOUNDNESS is entirely in `domain_alpha`: `[0, 1]` clamp and the
+        // `ms = max(alpha, s)` re-derivation at the single write site, exact
+        // lines excluded by admission, certified pass as the only scorer. A bad
+        // proposal costs one pass and nothing else. ON REJECTION THE GATES ARE
+        // RESTORED to the last accepted vector, so the `dom` stored below always
+        // describes the bound that was actually published.
+        //
+        // THE SCHEDULE decides WHICH domains pay. Default (`min_depth 0`,
+        // `stride 1`, `gap 0` = unlimited) admits every domain, i.e. exactly the
+        // arm the 2x2 measured; a non-default schedule declines domains whose
+        // passes are predicted not to pay for themselves, and a declined domain
+        // publishes the bound the disarmed lane would publish — from its
+        // inheritance, which is free — so declining is tightness-only and never
+        // a soundness event.
+        //
+        // The `&&` chain SHORT-CIRCUITS deliberately: a disarmed lane never
+        // consults the schedule (`schedule_admits_with` is pure and takes its
+        // three knobs from the SAME frozen `alpha_policy` as iters/eta, so the
+        // knobs' values are resolved at entry like the rest of the family but
+        // can only influence an ARMED ascent) — which is what their
+        // `Requirement::Armed` edges assert — and the disarmed path is
+        // byte-identical, not merely equivalent.
+        let alpha_depth = entry.trunk.len() + entry.heads.len();
+        let alpha_active = alpha_armed && !alpha_slots.is_empty() && !closed(mode, b);
+        let alpha_scheduled = alpha_active
+            && super::domain_alpha::schedule_admits_with(
+                alpha_depth,
+                b,
+                alpha_policy.min_depth,
+                alpha_policy.stride,
+                alpha_policy.gap,
+            );
+        if alpha_active && !alpha_scheduled {
+            super::domain_alpha::note_skipped();
+        }
+        if alpha_scheduled {
+            let b0 = b;
+            let mut eta_a = alpha_policy.eta;
+            let mut eta_baseline = super::DomainAlphaRuntimePolicy::default().eta;
+            let mut steps = 0usize;
+            let mut accepts = 0usize;
+            let mut cap_boundary_reachable = true;
+            let outer_frame = self.cfg.epoch_frame_route == EpochFrameRoute::Outer;
+            let mut last_trial_finite = false;
+            let mut iters_counterfactual = false;
+            let mut eta_counterfactual_scored = false;
+            let mut eta_trace_live = alpha_policy.eta.to_bits()
+                != super::DomainAlphaRuntimePolicy::default().eta.to_bits();
+            let mut grad = {
+                let t = Instant::now();
+                let g = super::alpha_opt::supergradient(
+                    self.eng.net,
+                    self.eng.root,
+                    &super::domain_alpha::effective_alpha(self.eng.root, &dom),
+                    &pass,
+                    worst_col,
+                );
+                super::domain_alpha::charge_grad(t.elapsed().as_micros() as u64);
+                g
+            };
+            if grad.is_none() {
+                cap_boundary_reachable = false;
+                super::domain_alpha::refuse("no-gradient-capture");
+            }
+            for trial_index in 0..alpha_policy.iters {
+                if self.deadline_hit() {
+                    cap_boundary_reachable = false;
+                    break;
+                }
+                let Some(g) = grad.as_ref() else {
+                    cap_boundary_reachable = false;
+                    break;
+                };
+                let baseline_cand = eta_trace_live.then(|| {
+                    super::domain_alpha::propose(&alpha_slots, &alpha_cur, g, eta_baseline)
+                });
+                let Some(cand) = super::domain_alpha::propose(&alpha_slots, &alpha_cur, g, eta_a)
+                else {
+                    cap_boundary_reachable = false;
+                    super::domain_alpha::refuse("degenerate-direction");
+                    break;
+                };
+                let eta_proposal_differs = baseline_cand
+                    .as_ref()
+                    .is_some_and(|baseline| baseline.as_ref() != Some(&cand));
+                super::domain_alpha::write_alphas(self.eng.root, &mut dom, &alpha_slots, &cand);
+                if steps == 0 {
+                    policy_execution.domain_alpha_ascent_calls =
+                        policy_execution.domain_alpha_ascent_calls.saturating_add(1);
+                    if outer_frame {
+                        policy_execution.domain_alpha_outer_ascent_calls = policy_execution
+                            .domain_alpha_outer_ascent_calls
+                            .saturating_add(1);
+                    }
+                }
+                steps += 1;
+                policy_execution.domain_alpha_trials_started = policy_execution
+                    .domain_alpha_trials_started
+                    .saturating_add(1);
+                // Same seed family and collect shape as the main pass. NOTE the
+                // seed is the one the MAIN pass used, i.e. it carries the
+                // INHERITED head β rather than any the β ascent just accepted —
+                // still a valid Lagrangian (`β >= 0`), so the trial bound is a
+                // valid bound of this domain; at worst it is scored slightly
+                // loose, and acceptance is `> b` regardless.
+                let t_trial = Instant::now();
+                let trial = self.eng.run_collect(
+                    seed_main_pc
+                        .as_ref()
+                        .or(seed_main.as_ref())
+                        .unwrap_or(&ms.seed),
+                    Some(&dom),
+                    super::engine::LaneDir::Lower,
+                    None,
+                    collect,
+                );
+                super::domain_alpha::charge_trial(t_trial.elapsed().as_micros() as u64);
+                let Ok(mut trial) = trial else {
+                    cap_boundary_reachable = false;
+                    policy_execution.domain_alpha_trial_pass_failures = policy_execution
+                        .domain_alpha_trial_pass_failures
+                        .saturating_add(1);
+                    super::domain_alpha::refuse("trial-pass-failed");
+                    super::domain_alpha::write_alphas(
+                        self.eng.root,
+                        &mut dom,
+                        &alpha_slots,
+                        &alpha_cur,
+                    );
+                    break;
+                };
+                policy_execution.domain_alpha_trial_passes_completed = policy_execution
+                    .domain_alpha_trial_passes_completed
+                    .saturating_add(1);
+                let per_t = per_class_direct(&self.eng, &trial, &ms, 0..nf);
+                let mut bt = f64::INFINITY;
+                let mut wc_t = 0usize;
+                for r0 in 0..nf {
+                    let pj = per_t[r0].max(ms.m1[r0]).max(m2v[r0]);
+                    if !pj.is_finite() {
+                        bt = f64::NAN;
+                        break;
+                    }
+                    if pj < bt {
+                        wc_t = r0;
+                    }
+                    bt = bt.min(pj);
+                }
+                last_trial_finite = bt.is_finite();
+                if last_trial_finite {
+                    policy_execution.domain_alpha_finite_trial_scores = policy_execution
+                        .domain_alpha_finite_trial_scores
+                        .saturating_add(1);
+                    if outer_frame {
+                        policy_execution.domain_alpha_outer_finite_trial_scores = policy_execution
+                            .domain_alpha_outer_finite_trial_scores
+                            .saturating_add(1);
+                    }
+                    if trial_index >= super::DomainAlphaRuntimePolicy::default().iters {
+                        iters_counterfactual = true;
+                    }
+                    if eta_proposal_differs {
+                        eta_counterfactual_scored = true;
+                    }
+                }
+                if eta_proposal_differs {
+                    // Once the proposal vector diverges, a shadow schedule can
+                    // no longer follow the actual accepted/rejected states.
+                    eta_trace_live = false;
+                }
+                if bt.is_finite() && bt > b {
+                    b = bt;
+                    alpha_cur = cand;
+                    accepts += 1;
+                    policy_execution.domain_alpha_trials_accepted = policy_execution
+                        .domain_alpha_trials_accepted
+                        .saturating_add(1);
+                    // #margin-row-col-retire: each `per_t[c]` scored under an
+                    // accepted (valid) relaxation is a valid column bound.
+                    if let Some(tracked) = per_track.as_mut() {
+                        for (tv, &nv) in tracked.iter_mut().zip(&per_t) {
+                            if nv.is_finite() && nv > *tv {
+                                *tv = nv;
+                            }
+                        }
+                    }
+                    std::mem::swap(&mut pass, &mut trial);
+                    if closed(mode, b) {
+                        cap_boundary_reachable = false;
+                        break;
+                    }
+                    // Live gradient: x* and the frozen-sign selections go stale
+                    // precisely when the step was material, so refresh both the
+                    // worst column and the direction from the ACCEPTED pass.
+                    worst_col = wc_t;
+                    eta_a = (eta_a * 1.5).min(super::domain_alpha::ETA_MAX);
+                    eta_baseline = (eta_baseline * 1.5).min(super::domain_alpha::ETA_MAX);
+                    // NOTE: an earlier draft trimmed this refresh on the LAST
+                    // trial as "nothing reads `grad` again". That is no longer
+                    // true: the low-iters counterfactual probe after the loop
+                    // consults `grad` to decide whether one more trial was
+                    // possible, so the refresh must run on every accept.
+                    let t = Instant::now();
+                    grad = super::alpha_opt::supergradient(
+                        self.eng.net,
+                        self.eng.root,
+                        &super::domain_alpha::effective_alpha(self.eng.root, &dom),
+                        &pass,
+                        worst_col,
+                    );
+                    super::domain_alpha::charge_grad(t.elapsed().as_micros() as u64);
+                    if grad.is_none() {
+                        cap_boundary_reachable = false;
+                        super::domain_alpha::refuse("dir-refresh");
+                    }
+                } else {
+                    // Restore the last ACCEPTED alpha before the next proposal:
+                    // the stored `dom` must describe the published bound.
+                    super::domain_alpha::write_alphas(
+                        self.eng.root,
+                        &mut dom,
+                        &alpha_slots,
+                        &alpha_cur,
+                    );
+                    eta_a *= 0.5;
+                    eta_baseline *= 0.5;
+                    if eta_a < super::domain_alpha::ETA_MIN {
+                        cap_boundary_reachable = false;
+                        break;
+                    }
+                }
+            }
+            if alpha_policy.iters < super::DomainAlphaRuntimePolicy::default().iters
+                && cap_boundary_reachable
+                && last_trial_finite
+                && !self.deadline_hit()
+                && grad.as_ref().is_some_and(|g| {
+                    super::domain_alpha::propose(&alpha_slots, &alpha_cur, g, eta_a).is_some()
+                })
+            {
+                iters_counterfactual = true;
+            }
+            if iters_counterfactual {
+                policy_execution.domain_alpha_iters_counterfactual_domains = policy_execution
+                    .domain_alpha_iters_counterfactual_domains
+                    .saturating_add(1);
+                if outer_frame {
+                    policy_execution.domain_alpha_outer_iters_counterfactual_domains =
+                        policy_execution
+                            .domain_alpha_outer_iters_counterfactual_domains
+                            .saturating_add(1);
+                }
+            }
+            if eta_counterfactual_scored {
+                policy_execution.domain_alpha_eta_counterfactual_scored_domains = policy_execution
+                    .domain_alpha_eta_counterfactual_scored_domains
+                    .saturating_add(1);
+                if outer_frame {
+                    policy_execution.domain_alpha_outer_eta_counterfactual_scored_domains =
+                        policy_execution
+                            .domain_alpha_outer_eta_counterfactual_scored_domains
+                            .saturating_add(1);
+                }
+            }
+            super::domain_alpha::report(
+                alpha_depth,
+                alpha_slots.len(),
+                alpha_warm,
+                steps,
+                accepts,
+                b0,
+                b,
+                eta_a,
+            );
+        }
+        // #margin-row-domain-alpha: what the children inherit — every movable
+        // slot whose accepted alpha differs from the ROOT's, capped by
+        // `domain_alpha::CARRY_CAP`. Built from THIS domain's slot list, so an
+        // inherited entry naming a neuron that has since been pinned is dropped
+        // rather than carried forward stale. Empty (and the entry's list passes
+        // through) when the gate is off.
+        let alpha_out = if alpha_armed && !alpha_slots.is_empty() {
+            super::domain_alpha::carry(self.eng.root, &alpha_slots, &alpha_cur)
+        } else {
+            entry.alpha.clone()
+        };
+        if alpha_armed && !alpha_slots.is_empty() {
+            policy_execution.domain_alpha_carried_entries = policy_execution
+                .domain_alpha_carried_entries
+                .saturating_add(alpha_out.len());
+        }
         // #margin-row-beta-percol: strip the per-column terms before the dom
         // is stored — every downstream pass reusing `st.dom` (candidate
         // scoring, the stacked canary) runs on a DIFFERENT column layout
@@ -3356,6 +5598,8 @@ impl<'a> MarginRowBab<'a> {
                 }
             }
             if newly > 0 {
+                policy_execution.newly_retired_columns =
+                    policy_execution.newly_retired_columns.saturating_add(newly);
                 retired_out.sort_unstable();
                 col_retire_report(
                     entry.trunk.len() + entry.heads.len(),
@@ -3384,6 +5628,12 @@ impl<'a> MarginRowBab<'a> {
                 beta_step,
                 pc,
                 retired: retired_out,
+                policy_execution,
+                epoch_execution,
+                width_execution,
+                epoch_selection: EpochSelectionObservation::default(),
+                width_selection: WidthSelectionObservation::default(),
+                alpha: alpha_out,
                 mb_local,
                 coll,
                 coll_rows,
@@ -3445,18 +5695,27 @@ impl<'a> MarginRowBab<'a> {
     }
 
     /// Exact single-gate variant pre-rank of unstable head neurons.
-    fn head_prerank(&self, st: &NodeState, heads: &[HeadFix]) -> Vec<usize> {
+    fn head_prerank(&self, st: &NodeState, heads: &[HeadFix]) -> (Vec<usize>, usize, bool) {
         let mut scored = self.head_variant_scores(st, heads);
         scored.sort_by(|a, b| {
             b.0.total_cmp(&a.0)
                 .then_with(|| b.1.total_cmp(&a.1))
                 .then_with(|| b.2.cmp(&a.2))
         });
-        scored
-            .into_iter()
-            .take(self.cfg.k_head)
-            .map(|(_, _, i)| i)
-            .collect()
+        let ranked: Vec<usize> = scored.into_iter().map(|(_, _, i)| i).collect();
+        let selected: Vec<usize> = ranked
+            .iter()
+            .take(self.cfg.effective_k_head)
+            .copied()
+            .collect();
+        let contextual: Vec<usize> = ranked
+            .iter()
+            .take(self.cfg.effective_contextual_k_head)
+            .copied()
+            .collect();
+        let available = ranked.len();
+        let counterfactual = selected != contextual;
+        (selected, available, counterfactual)
     }
 
     /// Tier-2 epoch attempt (#epoch-bab, design doc §2.3): when the popped
@@ -3479,19 +5738,210 @@ impl<'a> MarginRowBab<'a> {
     /// valid under the epoch. The nested lane runs the SAME certified
     /// Outward machinery, so a nested `Unsat` is a certified cover of the
     /// subtree by closed leaves.
-    fn try_epoch(&mut self, entry: &DomainEntry) -> bool {
-        if self.cfg.epoch_depth == 0 || entry.trunk.len() < self.cfg.epoch_depth {
+    /// #epoch-monotone: intersect the PARENT frame's intermediate intervals
+    /// into a freshly rebuilt epoch frame, and re-derive the affected gates.
+    ///
+    /// # Why this is sound
+    ///
+    /// The epoch is built over the SAME input box (`root.lo`/`root.hi`) with the
+    /// domain's splits additionally baked in, so the epoch's feasible region is
+    /// a SUBSET of the parent's. Every parent interval `[l, u]` is therefore a
+    /// valid enclosure of that pre-activation over the epoch region too, and
+    /// intersecting two valid enclosures is shrink-only — the same argument the
+    /// #backward-interm pass already runs on (`.max(l)` / `.min(u)`). Nothing
+    /// here can widen an interval, so the epoch can lose a proof but never
+    /// manufacture one.
+    ///
+    /// The gates must be re-derived from the intersected box or they would
+    /// describe a wider triangle than the interval claims: that direction is
+    /// merely loose, not unsound, but it throws away the entire point. They are
+    /// re-derived through the certified root path (`gates_from_box` then
+    /// `repair_upper_lines` in outward mode) — the same functions the root
+    /// itself used.
+    ///
+    /// # What it deliberately does NOT touch
+    ///
+    /// * **Split neurons.** `build_retaining` baked an EXACT fixed line at each
+    ///   one; re-deriving a relaxation over them would delete the mechanism.
+    /// * **`unst`.** A neuron that became stable under the intersected box stays
+    ///   in the list. Leaving it is conservative (splitting a stable neuron is
+    ///   sound — one child is simply empty) and, more importantly, `clip_rows`
+    ///   is indexed by POSITION IN `unst`, so re-deriving the list here would
+    ///   silently re-point every retained halfspace row at a different neuron.
+    ///   That is the frame error `clip::frame_ok` exists to catch, and it must
+    ///   not be introduced on purpose.
+    ///
+    /// Returns `false` — caller fails open to normal expansion — on any frame
+    /// mismatch, or if the intersection CROSSES an interval. A crossing does
+    /// certify the epoch region empty, but turning that into a closure is a new
+    /// verdict path and this function is not allowed to open one.
+    fn inherit_parent_intervals(
+        &self,
+        eroot: &mut RootGates,
+        splits: &[(usize, usize, i8)],
+    ) -> bool {
+        let parent = self.eng.root;
+        if eroot.layers.len() != parent.layers.len() {
+            eprintln!(
+                "[epoch-monotone] REFUSED: layer count {} vs parent {}",
+                eroot.layers.len(),
+                parent.layers.len()
+            );
             return false;
         }
-        if self.epoch_failures >= self.cfg.epoch_max_attempts {
+        let mut tightened = 0usize;
+        let mut regated = 0usize;
+        for (li, elayer) in eroot.layers.iter_mut().enumerate() {
+            let player = &parent.layers[li];
+            if elayer.n != player.n || elayer.l.len() != player.l.len() {
+                eprintln!(
+                    "[epoch-monotone] REFUSED: layer {li} width {} vs parent {}",
+                    elayer.n, player.n
+                );
+                return false;
+            }
+            let mut touched: Vec<usize> = Vec::new();
+            for i in 0..elayer.l.len() {
+                let (pl, pu) = (player.l[i], player.u[i]);
+                if !(pl.is_finite() && pu.is_finite()) {
+                    continue;
+                }
+                let nl = elayer.l[i].max(pl);
+                let nu = elayer.u[i].min(pu);
+                if nl > nu {
+                    eprintln!(
+                        "[epoch-monotone] REFUSED: layer {li} neuron {i} crossed \
+                         ({nl:.6e} > {nu:.6e}); the region is certified empty but this \
+                         path may not open a verdict"
+                    );
+                    return false;
+                }
+                if nl > elayer.l[i] || nu < elayer.u[i] {
+                    elayer.l[i] = nl;
+                    elayer.u[i] = nu;
+                    tightened += 1;
+                    // The split neurons keep their baked exact lines.
+                    if !splits.iter().any(|&(l2, i2, _)| l2 == li && i2 == i) {
+                        touched.push(i);
+                    }
+                }
+            }
+            if touched.is_empty() {
+                continue;
+            }
+            let (alpha2, mut s2, mut c2) = super::root::gates_from_box(&elayer.l, &elayer.u);
+            if eroot.mode.outward() {
+                super::root::repair_upper_lines(&elayer.l, &elayer.u, &mut s2, &mut c2);
+            }
+            for &i in &touched {
+                elayer.alpha[i] = alpha2[i];
+                elayer.s[i] = s2[i];
+                elayer.c[i] = c2[i];
+                // `ms = max(alpha, s)` is the certified error-carry contraction
+                // factor; whoever writes `alpha` MUST re-derive it or the
+                // carried error is UNDER-scaled, which is a false-UNSAT risk.
+                elayer.ms[i] = alpha2[i].max(s2[i]);
+                regated += 1;
+            }
+        }
+        // R9: without this line an epoch arm cannot tell "inherited nothing"
+        // from "never ran".
+        eprintln!(
+            "[epoch-monotone] inherited parent intervals: tightened={tightened} \
+             regated={regated} (split neurons keep their baked exact lines)"
+        );
+        true
+    }
+
+    fn record_epoch_failure(&mut self) {
+        self.epoch_failures = self.epoch_failures.saturating_add(1);
+        self.stats.epoch_execution.attempt_failures = self
+            .stats
+            .epoch_execution
+            .attempt_failures
+            .saturating_add(1);
+    }
+
+    fn try_epoch(&mut self, entry: &DomainEntry) -> bool {
+        self.stats.epoch_execution.tree_entries =
+            self.stats.epoch_execution.tree_entries.saturating_add(1);
+        if self.cfg.epoch_trigger_depth == 0 || entry.trunk.len() < self.cfg.epoch_trigger_depth {
+            return false;
+        }
+        if self.cfg.epoch_policy.parent_topk > 0 && self.cfg.epoch_parent_generations_left == 0 {
+            self.stats.epoch_execution.generation_refusals = self
+                .stats
+                .epoch_execution
+                .generation_refusals
+                .saturating_add(1);
+            return false;
+        }
+        let actual_admit = self.epoch_failures < self.cfg.epoch_attempt_cap;
+        let contextual_admit = self.epoch_failures < 2;
+        self.stats.epoch_execution.attempt_cap_decisions = self
+            .stats
+            .epoch_execution
+            .attempt_cap_decisions
+            .saturating_add(1);
+        if actual_admit != contextual_admit {
+            self.stats
+                .epoch_execution
+                .attempt_cap_counterfactual_differences = self
+                .stats
+                .epoch_execution
+                .attempt_cap_counterfactual_differences
+                .saturating_add(1);
+        }
+        if !actual_admit {
+            self.stats.epoch_execution.attempt_cap_refusals = self
+                .stats
+                .epoch_execution
+                .attempt_cap_refusals
+                .saturating_add(1);
             return false;
         }
         if let Some(dl) = self.cfg.deadline {
             let rem = dl.saturating_duration_since(Instant::now()).as_secs_f64();
-            if rem < 3.0 * self.cfg.root_build_secs.max(0.05) {
+            // The full build needs root-build-sized headroom. The incremental
+            // arm pays only selected prefix rows; its own deadline checks make
+            // a late attempt fail open, so retain a small fixed floor instead
+            // of the resnet-large guard that otherwise makes the arm inert.
+            let need = if self.cfg.epoch_policy.parent_topk > 0 {
+                0.5
+            } else {
+                3.0 * self.cfg.root_build_secs.max(0.05)
+            };
+            if rem < need {
+                self.stats.epoch_execution.deadline_refusals = self
+                    .stats
+                    .epoch_execution
+                    .deadline_refusals
+                    .saturating_add(1);
                 return false;
             }
         }
+        let configured_depth_attempt = self.cfg.epoch_policy.depth > 0
+            && self.cfg.epoch_trigger_depth == self.cfg.epoch_policy.depth;
+        let configured_depth_binding =
+            configured_depth_attempt && entry.trunk.len() == self.cfg.epoch_policy.depth;
+        if configured_depth_attempt {
+            self.stats.epoch_execution.configured_depth_admissions = self
+                .stats
+                .epoch_execution
+                .configured_depth_admissions
+                .saturating_add(1);
+        } else {
+            self.stats.epoch_execution.adaptive_depth_admissions = self
+                .stats
+                .epoch_execution
+                .adaptive_depth_admissions
+                .saturating_add(1);
+        }
+        self.stats.epoch_execution.attempts_started = self
+            .stats
+            .epoch_execution
+            .attempts_started
+            .saturating_add(1);
         self.stats.epochs_attempted += 1;
         super::prof::bump(super::prof::Counter::EpochAttempt, 1);
         let _t = super::prof::Timer::start(super::prof::Phase::EpochBuild);
@@ -3504,30 +5954,188 @@ impl<'a> MarginRowBab<'a> {
             .collect();
         let net = self.eng.net;
         let root = self.eng.root;
-        let built = RootGates::build_retaining(
-            net,
-            &root.lo,
-            &root.hi,
-            root.mode,
-            self.cfg.deadline,
-            self.cfg.retain_cfg.as_ref(),
-            &abs,
-        );
-        let Ok((eroot, eret)) = built else {
-            // Rebuild failed (deadline / numeric): normal expansion instead.
-            self.epoch_failures += 1;
-            return false;
+        let incremental = self.cfg.epoch_policy.parent_topk > 0;
+        match (self.cfg.epoch_frame_route, incremental) {
+            (EpochFrameRoute::Outer, false) => {
+                self.stats.epoch_execution.outer_full_attempts = self
+                    .stats
+                    .epoch_execution
+                    .outer_full_attempts
+                    .saturating_add(1);
+            }
+            (EpochFrameRoute::Outer, true) => {
+                self.stats.epoch_execution.outer_incremental_attempts = self
+                    .stats
+                    .epoch_execution
+                    .outer_incremental_attempts
+                    .saturating_add(1);
+            }
+            (EpochFrameRoute::NestedFull, false) | (EpochFrameRoute::NestedIncremental, false) => {
+                self.stats.epoch_execution.nested_full_attempts = self
+                    .stats
+                    .epoch_execution
+                    .nested_full_attempts
+                    .saturating_add(1);
+            }
+            (EpochFrameRoute::NestedFull, true) | (EpochFrameRoute::NestedIncremental, true) => {
+                self.stats.epoch_execution.nested_incremental_attempts = self
+                    .stats
+                    .epoch_execution
+                    .nested_incremental_attempts
+                    .saturating_add(1);
+            }
+        }
+        let (mut eroot, eret): (RootGates, Option<RetainedRows>) = if incremental {
+            self.stats.epoch_execution.parent_refreshes_started = self
+                .stats
+                .epoch_execution
+                .parent_refreshes_started
+                .saturating_add(1);
+            let refreshed = super::backward_interm::refresh_parent_frame(
+                net,
+                root,
+                &abs,
+                self.cfg.epoch_policy.parent_topk,
+                self.cfg.epoch_policy.parent_topk.min(64),
+                self.cfg.deadline,
+            );
+            let (eroot, refresh) = match refreshed {
+                Ok(pair) => pair,
+                Err(err) => {
+                    // Any malformed frame, numerical refusal, or deadline
+                    // leaves the established domain expansion in charge.
+                    eprintln!("[epoch-parent] REFUSED refresh: {err}");
+                    self.stats.epoch_execution.parent_refresh_refusals = self
+                        .stats
+                        .epoch_execution
+                        .parent_refresh_refusals
+                        .saturating_add(1);
+                    self.record_epoch_failure();
+                    return false;
+                }
+            };
+            self.stats.epoch_execution.parent_refreshes_completed = self
+                .stats
+                .epoch_execution
+                .parent_refreshes_completed
+                .saturating_add(1);
+            self.stats.epoch_execution.parent_refresh_columns = self
+                .stats
+                .epoch_execution
+                .parent_refresh_columns
+                .saturating_add(refresh.columns);
+            self.stats.epoch_execution.parent_refresh_tightened = self
+                .stats
+                .epoch_execution
+                .parent_refresh_tightened
+                .saturating_add(refresh.tightened);
+            self.stats.epoch_execution.parent_refresh_stabilized = self
+                .stats
+                .epoch_execution
+                .parent_refresh_stabilized
+                .saturating_add(refresh.stabilized);
+            if refresh.tightened == 0 {
+                eprintln!("[epoch-parent] REFUSED nested run: zero downstream intervals tightened");
+                self.stats.epoch_execution.parent_refresh_refusals = self
+                    .stats
+                    .epoch_execution
+                    .parent_refresh_refusals
+                    .saturating_add(1);
+                self.record_epoch_failure();
+                return false;
+            }
+            self.stats.epoch_execution.parent_refreshes_accepted = self
+                .stats
+                .epoch_execution
+                .parent_refreshes_accepted
+                .saturating_add(1);
+            let speedup = self.cfg.root_build_secs / refresh.elapsed_secs.max(1e-9);
+            eprintln!(
+                "[epoch-parent] accepted frame: refresh_secs={:.3} \
+                 reference_root_secs={:.3} observed_ratio={:.2}x generations_left={}",
+                refresh.elapsed_secs,
+                self.cfg.root_build_secs,
+                speedup,
+                self.cfg.epoch_parent_generations_left
+            );
+            // Parent Tier-0 rows are indexed in the parent's unstable frame;
+            // the refreshed frame deliberately changes that index space.
+            (eroot, None)
+        } else {
+            let built = RootGates::build_retaining_with_policy(
+                net,
+                &root.lo,
+                &root.hi,
+                root.mode,
+                self.cfg.deadline,
+                self.cfg.retain_cfg.as_ref(),
+                &abs,
+                self.cfg.root_precision_policy,
+                super::BackwardIntermRuntimePolicy::default(),
+            );
+            let Ok(pair) = built else {
+                // Rebuild failed (deadline / numeric): normal expansion instead.
+                self.stats.epoch_execution.full_rebuild_refusals = self
+                    .stats
+                    .epoch_execution
+                    .full_rebuild_refusals
+                    .saturating_add(1);
+                self.record_epoch_failure();
+                return false;
+            };
+            pair
         };
-        // Nested runs do NOT epoch again (`epoch_depth: 0`): re-linearization
-        // is ITERATIVE through the outer loop — if the nested subtree stalls
-        // and returns Unknown, the outer tree keeps expanding under the old
-        // gates and its deeper domains re-trigger a fresh epoch with their
-        // fuller split sets. Recursion depth is therefore exactly one, which
-        // both bounds the stack and keeps the failed-attempt accounting in
-        // one place.
+        // #epoch-monotone. MEASURED 2026-08-22 on cifar100 idx_4169 at the
+        // official budget: the rebuild's root bound came out -0.389998 against
+        // the parent tree's -0.371373 — WORSE, on a domain with four neurons
+        // FIXED, which is a strict subset of the parent region and can only
+        // have a better true bound. The cause is visible in the log ordering:
+        // `build_retaining` is the ROOT BUILD, and the #backward-interm phase
+        // that tightened 584 intermediate columns for 7.11 s is applied
+        // separately at lane setup and never re-run for the nested tree. So the
+        // rebuild was trading 584 tightened columns for 4 fixed neurons and
+        // losing. That is the whole reason this mechanism was built, measured
+        // once, and left dark.
+        //
+        // The fix costs nothing and makes the rebuild MONOTONE BY CONSTRUCTION.
+        if !incremental && !self.inherit_parent_intervals(&mut eroot, &abs) {
+            // Intersection found a crossed interval, or the frames did not
+            // line up. Fail-open to normal expansion: this path may never
+            // manufacture a closure.
+            self.stats.epoch_execution.full_rebuild_refusals = self
+                .stats
+                .epoch_execution
+                .full_rebuild_refusals
+                .saturating_add(1);
+            self.record_epoch_failure();
+            return false;
+        }
+        if !incremental {
+            self.stats.epoch_execution.full_rebuilds_completed = self
+                .stats
+                .epoch_execution
+                .full_rebuilds_completed
+                .saturating_add(1);
+        }
+        // Full-tableau epochs retain the historical one-level nesting. The
+        // incremental parent-frame arm may recur after `epoch_trigger_depth`
+        // NEW trunk
+        // splits: every nested root has baked the prior constraints already,
+        // so recursion makes strict domain-depth progress and refreshes the
+        // gating path at the cadence measured necessary for idx_1298.
+        let (nested_epoch_depth, nested_epoch_attempts, nested_epoch_generations) =
+            self.cfg.nested_epoch_limits(incremental);
         let ncfg = BabConfig {
             k_head: self.cfg.k_head,
+            contextual_k_head: self.cfg.contextual_k_head,
             k_trunk: self.cfg.k_trunk,
+            contextual_k_trunk: self.cfg.contextual_k_trunk,
+            effective_k_head: self.cfg.effective_k_head,
+            effective_contextual_k_head: self.cfg.effective_contextual_k_head,
+            effective_k_trunk: self.cfg.effective_k_trunk,
+            effective_contextual_k_trunk: self.cfg.effective_contextual_k_trunk,
+            adaptive: self.cfg.adaptive,
+            contextual_adaptive: self.cfg.contextual_adaptive,
             max_expansions: self
                 .cfg
                 .max_expansions
@@ -3535,12 +6143,19 @@ impl<'a> MarginRowBab<'a> {
             deadline: self.cfg.deadline,
             lru_cap: self.cfg.lru_cap,
             frontier: 1,
+            frontier_contextual: 1,
             domain_stack: false,
-            tier0_exact: self.cfg.tier0_exact,
-            tier0_universe: self.cfg.tier0_universe,
+            domain_alpha_policy: self.cfg.domain_alpha_policy,
+            epoch_policy: self.cfg.epoch_policy,
+            epoch_frame_route: if incremental {
+                EpochFrameRoute::NestedIncremental
+            } else {
+                EpochFrameRoute::NestedFull
+            },
             retained: eret.map(Arc::new),
-            epoch_depth: 0,
-            epoch_max_attempts: 0,
+            epoch_trigger_depth: nested_epoch_depth,
+            epoch_attempt_cap: nested_epoch_attempts,
+            epoch_parent_generations_left: nested_epoch_generations,
             root_build_secs: self.cfg.root_build_secs,
             retain_cfg: self.cfg.retain_cfg,
             initial_heads: entry.heads.clone(),
@@ -3549,10 +6164,22 @@ impl<'a> MarginRowBab<'a> {
             // fail-set on the epoch gates; the outer retirement set is NOT
             // inherited (root frames differ), only the gate carries over.
             col_retire: self.cfg.col_retire,
+            beta_per_column: self.cfg.beta_per_column,
+            beta_columns: self.cfg.beta_columns,
+            parallel_prebuild: self.cfg.parallel_prebuild,
+            root_precision_policy: self.cfg.root_precision_policy,
+            root_precision_execution: self.cfg.root_precision_execution,
+            backward_interm_execution: self.cfg.backward_interm_execution,
+            root_alpha_execution: self.cfg.root_alpha_execution,
         };
         let adv = self.stats.tree_classes.clone();
-        let dbg = std::env::var("NY_EPOCH_DEBUG").is_ok();
+        // Entry-frozen presence semantics: `NY_EPOCH_DEBUG=0` and an empty
+        // UTF-8 value arm the trace; a non-UTF-8 value remains dark. Nested
+        // runs inherit this bit and never reopen process-global state.
+        let dbg = self.cfg.epoch_policy.debug_trace;
         if dbg {
+            self.stats.epoch_execution.debug_emissions =
+                self.stats.epoch_execution.debug_emissions.saturating_add(1);
             eprintln!(
                 "[epoch] attempt at depth {} (trunk {} heads {}): outer bound {:+.5}",
                 entry.trunk.len() + entry.heads.len(),
@@ -3562,6 +6189,8 @@ impl<'a> MarginRowBab<'a> {
             );
         }
         let t_epoch = Instant::now();
+        self.stats.epoch_execution.nested_started =
+            self.stats.epoch_execution.nested_started.saturating_add(1);
         match MarginRowBab::run_inner(net, &eroot, self.mb.t, &adv, ncfg) {
             Ok(MarginRowOutcome::Unsat(n)) => {
                 super::prof::bump(super::prof::Counter::EpochClosed, 1);
@@ -3575,6 +6204,26 @@ impl<'a> MarginRowBab<'a> {
                     );
                 }
                 self.nested_ledgers_ok &= matches!(n.ledger_ok, Some(true));
+                self.stats.epoch_execution.nested_runs_with_stats = self
+                    .stats
+                    .epoch_execution
+                    .nested_runs_with_stats
+                    .saturating_add(1);
+                if configured_depth_binding {
+                    self.stats
+                        .epoch_execution
+                        .configured_depth_nested_with_stats = self
+                        .stats
+                        .epoch_execution
+                        .configured_depth_nested_with_stats
+                        .saturating_add(1);
+                }
+                self.stats.epoch_execution.nested_unsat =
+                    self.stats.epoch_execution.nested_unsat.saturating_add(1);
+                self.stats.epoch_execution.attempts_closed =
+                    self.stats.epoch_execution.attempts_closed.saturating_add(1);
+                self.stats.epoch_execution.closures =
+                    self.stats.epoch_execution.closures.saturating_add(1);
                 self.stats.epochs_closed += 1;
                 self.stats.epochs_attempted += n.epochs_attempted;
                 self.stats.epochs_closed += n.epochs_closed;
@@ -3583,6 +6232,9 @@ impl<'a> MarginRowBab<'a> {
                 self.stats.closed += n.closed;
                 self.stats.mono_raw_dips += n.mono_raw_dips;
                 self.stats.mono_worst = self.stats.mono_worst.min(n.mono_worst);
+                self.stats.policy_execution.absorb(n.policy_execution);
+                self.stats.epoch_execution.absorb(n.epoch_execution);
+                self.stats.width_execution.absorb(n.width_execution);
                 self.stats.max_depth = self
                     .stats
                     .max_depth
@@ -3590,7 +6242,9 @@ impl<'a> MarginRowBab<'a> {
                 true
             }
             Ok(MarginRowOutcome::Unknown { stats, .. }) => {
-                self.epoch_failures += 1;
+                self.stats.epoch_execution.nested_unknown =
+                    self.stats.epoch_execution.nested_unknown.saturating_add(1);
+                self.record_epoch_failure();
                 if dbg {
                     if let Some(n) = &stats {
                         eprintln!(
@@ -3606,6 +6260,20 @@ impl<'a> MarginRowBab<'a> {
                     }
                 }
                 if let Some(n) = stats {
+                    self.stats.epoch_execution.nested_runs_with_stats = self
+                        .stats
+                        .epoch_execution
+                        .nested_runs_with_stats
+                        .saturating_add(1);
+                    if configured_depth_binding {
+                        self.stats
+                            .epoch_execution
+                            .configured_depth_nested_with_stats = self
+                            .stats
+                            .epoch_execution
+                            .configured_depth_nested_with_stats
+                            .saturating_add(1);
+                    }
                     self.stats.epochs_attempted += n.epochs_attempted;
                     self.stats.epochs_closed += n.epochs_closed;
                     self.stats.expansions += n.expansions;
@@ -3613,11 +6281,16 @@ impl<'a> MarginRowBab<'a> {
                     self.stats.closed += n.closed;
                     self.stats.mono_raw_dips += n.mono_raw_dips;
                     self.stats.mono_worst = self.stats.mono_worst.min(n.mono_worst);
+                    self.stats.policy_execution.absorb(n.policy_execution);
+                    self.stats.epoch_execution.absorb(n.epoch_execution);
+                    self.stats.width_execution.absorb(n.width_execution);
                 }
                 false
             }
             Err(_) => {
-                self.epoch_failures += 1;
+                self.stats.epoch_execution.nested_errors =
+                    self.stats.epoch_execution.nested_errors.saturating_add(1);
+                self.record_epoch_failure();
                 false
             }
         }
@@ -3627,20 +6300,38 @@ impl<'a> MarginRowBab<'a> {
     /// or Tier-0 rank-1 ranking when configured (#epoch-bab).
     fn select_candidates(
         &self,
-        st: &NodeState,
+        st: &mut NodeState,
         entry: &DomainEntry,
     ) -> (Vec<(usize, usize)>, Vec<usize>) {
-        if self.cfg.tier0_exact > 0 && self.cfg.retained.is_some() {
-            return self.tier0_candidates(st, entry);
+        if !ordinary_width_selectors_enabled(
+            self.cfg.epoch_policy.tier0_exact,
+            self.cfg.retained.is_some(),
+        ) {
+            let (trunks, heads, observation) = self.tier0_candidates(st, entry);
+            st.epoch_selection = observation;
+            st.epoch_execution
+                .observe_selection(self.cfg.epoch_frame_route, observation);
+            return (trunks, heads);
         }
-        let head_cands = {
+        let (head_cands, head_available, head_counterfactual) = {
             let _t = super::prof::Timer::start(super::prof::Phase::HeadPrerank);
             self.head_prerank(st, &entry.heads)
         };
-        let trunk_cands = {
+        let (trunk_cands, trunk_available, trunk_counterfactual) = {
             let _t = super::prof::Timer::start(super::prof::Phase::TrunkShortlist);
             self.trunk_shortlist(st, &entry.trunk)
         };
+        let observation = WidthSelectionObservation {
+            head_available,
+            head_selected: head_cands.len(),
+            head_counterfactual,
+            trunk_available,
+            trunk_selected: trunk_cands.len(),
+            trunk_counterfactual,
+        };
+        st.width_selection = observation;
+        st.width_execution
+            .observe_selection(self.cfg.epoch_frame_route, observation);
         (trunk_cands, head_cands)
     }
 
@@ -3653,9 +6344,13 @@ impl<'a> MarginRowBab<'a> {
         &self,
         st: &NodeState,
         entry: &DomainEntry,
-    ) -> (Vec<(usize, usize)>, Vec<usize>) {
+    ) -> (Vec<(usize, usize)>, Vec<usize>, EpochSelectionObservation) {
         let _t = super::prof::Timer::start(super::prof::Phase::Tier0Rank);
         let ret = self.cfg.retained.as_deref().expect("checked by caller");
+        let mut observation = EpochSelectionObservation {
+            tier0: true,
+            ..EpochSelectionObservation::default()
+        };
         // Pool entries: (min child, child sum, is_head, a, b) where
         // (a, b) = (layer, unst position) for trunks and (neuron, 0) heads.
         // Head and trunk scores are BOTH anchored on the parent's direct
@@ -3722,7 +6417,16 @@ impl<'a> MarginRowBab<'a> {
                 .filter(|&(m, _)| m.is_finite() && m > 0.0)
                 .collect();
             dyn_scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-            dyn_scored.truncate(self.cfg.tier0_universe);
+            let available = dyn_scored.len();
+            let selected = available.min(self.cfg.epoch_policy.tier0_universe);
+            let contextual = available.min(64);
+            observation.universe_counterfactual |= selected != contextual;
+            let retained = lr.idx.len();
+            let configured_retained = lr.eligible.min(self.cfg.epoch_policy.retain_per_layer);
+            let contextual_retained = lr.eligible.min(128);
+            observation.retain_counterfactual |=
+                available > 0 && retained == configured_retained && retained != contextual_retained;
+            dyn_scored.truncate(self.cfg.epoch_policy.tier0_universe);
             let r = vmat.ncols();
             let vs = vmat.as_slice().expect("standard layout");
             for &(_, ri) in &dyn_scored {
@@ -3741,7 +6445,8 @@ impl<'a> MarginRowBab<'a> {
                 .then_with(|| b.3.cmp(&a.3))
                 .then_with(|| b.4.cmp(&a.4))
         });
-        let k = self.cfg.tier0_exact.max(1);
+        let k = self.cfg.epoch_policy.tier0_exact.max(1);
+        observation.exact_binding = pool.len() > k;
         // Per-kind floor: keep at least one head and one trunk candidate in
         // the exact set when both kinds exist (guards residual scale bias
         // between the two rankers).
@@ -3770,14 +6475,20 @@ impl<'a> MarginRowBab<'a> {
                 trunks.push((a, b));
             }
         }
-        (trunks, heads)
+        (trunks, heads, observation)
     }
 
     /// Trunk shortlist by |margin-row coef| x intercept from the seeded pass.
-    fn trunk_shortlist(&self, st: &NodeState, trunk: &[TrunkSplit]) -> Vec<(usize, usize)> {
+    fn trunk_shortlist(
+        &self,
+        st: &NodeState,
+        trunk: &[TrunkSplit],
+    ) -> (Vec<(usize, usize)>, usize, bool) {
         let used: std::collections::BTreeSet<(usize, usize)> =
             trunk.iter().map(|&(li, pos, _)| (li, pos)).collect();
         let mut natives: Vec<(f64, usize, usize)> = Vec::new();
+        let mut contextual_natives: Vec<(f64, usize, usize)> = Vec::new();
+        let mut available = 0usize;
         for (&li, coefs) in &st.coll {
             let rec = &self.eng.root.layers[li];
             let mut sc: Vec<(f64, usize)> = coefs
@@ -3788,22 +6499,46 @@ impl<'a> MarginRowBab<'a> {
             // np.argsort(stable)[::-1] parity: descending score, ties by
             // descending position.
             sc.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-            for &(v, pos) in sc.iter().take(self.cfg.k_trunk + 4) {
+            available = available.saturating_add(
+                sc.iter()
+                    .filter(|&&(v, pos)| v.is_finite() && v > 0.0 && !used.contains(&(li, pos)))
+                    .count(),
+            );
+            for &(v, pos) in sc.iter().take(self.cfg.effective_k_trunk.saturating_add(4)) {
                 if v.is_finite() && v > 0.0 && !used.contains(&(li, pos)) {
                     natives.push((v, li, pos));
                 }
             }
+            for &(v, pos) in sc
+                .iter()
+                .take(self.cfg.effective_contextual_k_trunk.saturating_add(4))
+            {
+                if v.is_finite() && v > 0.0 && !used.contains(&(li, pos)) {
+                    contextual_natives.push((v, li, pos));
+                }
+            }
         }
-        natives.sort_by(|a, b| {
-            b.0.total_cmp(&a.0)
-                .then_with(|| b.1.cmp(&a.1))
-                .then_with(|| b.2.cmp(&a.2))
-        });
-        natives
+        let sort = |values: &mut Vec<(f64, usize, usize)>| {
+            values.sort_by(|a, b| {
+                b.0.total_cmp(&a.0)
+                    .then_with(|| b.1.cmp(&a.1))
+                    .then_with(|| b.2.cmp(&a.2))
+            })
+        };
+        sort(&mut natives);
+        sort(&mut contextual_natives);
+        let selected: Vec<(usize, usize)> = natives
             .into_iter()
-            .take(self.cfg.k_trunk)
+            .take(self.cfg.effective_k_trunk)
             .map(|(_, li, pos)| (li, pos))
-            .collect()
+            .collect();
+        let contextual: Vec<(usize, usize)> = contextual_natives
+            .into_iter()
+            .take(self.cfg.effective_contextual_k_trunk)
+            .map(|(_, li, pos)| (li, pos))
+            .collect();
+        let counterfactual = selected != contextual;
+        (selected, available, counterfactual)
     }
 
     /// Build one domain's candidate columns without running the backward
@@ -4190,12 +6925,33 @@ impl<'a> MarginRowBab<'a> {
                 }
             }
         }
-        let pass = self.eng.run(
+        // B4 (#margin-row-gpu-eft, SITE_SCORE): the ~554 ms batched-children
+        // scoring pass — 40.0% of the lane — routes through the certified
+        // lane's exception seam. VERDICT-BEARING: the values below become
+        // child bounds (`cb = raw.max(b)`, :1612) that close children at pop
+        // (:1555) without re-proving, which is why the exception table is
+        // fully certified (FIX A1) rather than heuristic. Dark and
+        // fail-closed: any refusal is exactly the established `run` call,
+        // bit-for-bit. The per-block seeds are margin seeds built against
+        // THIS node's y-box, so the lane takes that box's magnitudes.
+        let score_y_abs: Vec<f64> = st
+            .ybox
+            .ly
+            .iter()
+            .zip(&st.ybox.uy)
+            .map(|(l, u)| l.abs().max(u.abs()))
+            .collect();
+        let lane_ctx = super::gpu_backward::LaneCtx {
+            y_abs: Some(&score_y_abs),
+            deadline: self.cfg.deadline,
+            plan_cache: Some(&self.lane_cache),
+        };
+        let pass = self.eng.run_exc_seamed(
             &Seed { s: seed, e: seed_e },
             Some(&st.dom),
             super::engine::LaneDir::Lower,
-            Some(&exc),
-            false,
+            &exc,
+            &lane_ctx,
         )?;
         let low = self.eng.concretize_lower(&pass);
         let mut out = Vec::with_capacity(n_t + n_h);
@@ -4241,8 +6997,98 @@ impl<'a> MarginRowBab<'a> {
 }
 
 #[cfg(test)]
+mod reduceop_tests {
+    use super::pick_candidate;
+
+    /// TEETH: the two reductions must actually be able to disagree, or the
+    /// lever is decorative and every A/B on it is unfalsifiable. Candidate 0
+    /// is balanced, candidate 1 is lopsided: `min` prefers 0 (worse child
+    /// -0.10 beats -0.50), `max` prefers 1 (better child +0.40 beats -0.05).
+    #[test]
+    fn the_two_reductions_can_disagree_and_the_flag_reports_it() {
+        let ch = [(-0.10_f64, -0.05_f64), (-0.50_f64, 0.40_f64)];
+        let (pick_min, differs_min) = pick_candidate(&ch, false);
+        let (pick_max, differs_max) = pick_candidate(&ch, true);
+        assert_eq!(pick_min, 0, "min must rank by the WORSE child");
+        assert_eq!(pick_max, 1, "max must rank by the BETTER child");
+        assert!(differs_min && differs_max, "differs must be true both ways");
+    }
+
+    /// And they must AGREE when one candidate dominates on both children —
+    /// that is the case where a `differs=0` telemetry line is a REAL null
+    /// about the row rather than evidence of an inert lever.
+    #[test]
+    fn a_dominating_candidate_makes_both_reductions_agree() {
+        let ch = [(-0.90_f64, -0.80_f64), (-0.10_f64, 0.20_f64)];
+        for use_max in [false, true] {
+            let (pick, differs) = pick_candidate(&ch, use_max);
+            assert_eq!(pick, 1);
+            assert!(!differs, "dominated candidate sets must not report differs");
+        }
+    }
+
+    /// Ties resolve to the LATER index in both modes (np.lexsort parity), the
+    /// behaviour every pick site had before they were unified.
+    #[test]
+    fn ties_resolve_to_the_later_index_in_both_modes() {
+        let ch = [(-0.20_f64, -0.10_f64), (-0.20_f64, -0.10_f64)];
+        for use_max in [false, true] {
+            assert_eq!(pick_candidate(&ch, use_max).0, 1);
+        }
+    }
+}
+
+#[cfg(test)]
 mod ledger_tests {
-    use super::{closed, require_finite, Ledger, RoundMode};
+    use super::{closed, require_finite, BabConfig, Ledger, RoundMode};
+
+    #[test]
+    fn incremental_epoch_generation_budget_never_resets_in_nested_drivers() {
+        let mut cfg = BabConfig {
+            epoch_policy: super::super::EpochRuntimePolicy {
+                depth: 3,
+                parent_topk: 16,
+                ..super::super::EpochRuntimePolicy::default()
+            },
+            epoch_trigger_depth: 3,
+            epoch_attempt_cap: 2,
+            epoch_parent_generations_left: 4,
+            ..BabConfig::default()
+        };
+        for want_left in [3usize, 2, 1, 0] {
+            let (depth, attempts, left) = cfg.nested_epoch_limits(true);
+            assert_eq!(left, want_left);
+            if want_left == 0 {
+                assert_eq!((depth, attempts), (0, 0));
+            } else {
+                assert_eq!((depth, attempts), (3, 2));
+            }
+            cfg.epoch_trigger_depth = depth;
+            cfg.epoch_attempt_cap = attempts;
+            cfg.epoch_parent_generations_left = left;
+        }
+        assert_eq!(cfg.nested_epoch_limits(true), (0, 0, 0));
+        assert_eq!(
+            BabConfig {
+                epoch_trigger_depth: 3,
+                epoch_attempt_cap: 2,
+                epoch_parent_generations_left: usize::MAX,
+                ..BabConfig::default()
+            }
+            .nested_epoch_limits(true),
+            (3, 2, 3),
+            "an oversized public config is clamped to the hard four-frame cap before nesting"
+        );
+        assert_eq!(
+            BabConfig {
+                epoch_parent_generations_left: usize::MAX,
+                ..BabConfig::default()
+            }
+            .nested_epoch_limits(false),
+            (0, 0, 0),
+            "the historical full epoch must stay one nesting level"
+        );
+    }
 
     #[test]
     fn joint_nonfinite_bounds_fail_before_max_min_can_mask_them() {
@@ -4417,7 +7263,7 @@ mod col_retire_tests {
     /// competitor: its margin goes negative in the box), class 3 is a third
     /// distinct pattern.
     #[allow(clippy::cast_precision_loss)]
-    fn spec4() -> TwinSpec {
+    pub(super) fn spec4() -> TwinSpec {
         let wh: Vec<f64> = (0..(N_Y * N_IN))
             .map(|i| ((i * 7) % 11) as f64 / 11.0 - 0.5)
             .collect();
@@ -4449,14 +7295,14 @@ mod col_retire_tests {
         }
     }
 
-    fn build(net: &TwinNet) -> (Vec<f64>, Vec<f64>, RootGates) {
+    pub(super) fn build(net: &TwinNet) -> (Vec<f64>, Vec<f64>, RootGates) {
         let lo = vec![-0.4; N_IN];
         let hi = vec![0.4; N_IN];
         let root = RootGates::build(net, &lo, &hi, RoundMode::Outward, None).expect("root");
         (lo, hi, root)
     }
 
-    fn driver<'a>(
+    pub(super) fn driver<'a>(
         net: &'a TwinNet,
         root: &'a RootGates,
         adv: &[usize],
@@ -4465,14 +7311,18 @@ mod col_retire_tests {
         let eng = BackwardEngine::new(net, root);
         let re = root_eval(&eng, net, 0, adv).expect("root_eval");
         let root_bound = re.dj.iter().copied().fold(f64::INFINITY, f64::min);
+        let cfg = BabConfig {
+            lru_cap: 8,
+            col_retire,
+            ..BabConfig::default()
+        };
+        let policy_execution = PolicyExecutionEvidence::from_config(&cfg);
+        let epoch_execution = EpochExecutionEvidence::from_config(&cfg);
+        let width_execution = WidthExecutionEvidence::from_config(&cfg);
         let mut bab = MarginRowBab {
             eng: BackwardEngine::new(net, root),
             mb: MarginBatch::new(net, 0, adv).expect("mb"),
-            cfg: BabConfig {
-                lru_cap: 8,
-                col_retire,
-                ..BabConfig::default()
-            },
+            cfg,
             lru: Lru {
                 cap: 8,
                 entries: Vec::new(),
@@ -4493,10 +7343,19 @@ mod col_retire_tests {
                 epochs_attempted: 0,
                 epochs_closed: 0,
                 ledger_ok: None,
+                frontier_execution: FrontierExecutionEvidence::joint(1, 1),
+                policy_execution,
+                epoch_execution,
+                width_execution,
+                root_precision_execution: Default::default(),
+                backward_interm_execution: Default::default(),
+                root_alpha_execution: Default::default(),
             },
             epoch_failures: 0,
             ledger: Ledger::default(),
             nested_ledgers_ok: true,
+            lane_cache: crate::margin_row::gpu_backward::cache::PlanCache::default(),
+            closure: crate::margin_row::closure::ClosureMonitor::new(false),
         };
         let pack = re.pack;
         bab.lru.put(Vec::new(), pack.clone());
@@ -4516,7 +7375,65 @@ mod col_retire_tests {
             beta_step: crate::margin_row::beta::lambda(),
             pc: Vec::new(),
             retired,
+            alpha: Vec::new(),
         }
+    }
+
+    #[test]
+    fn frozen_domain_alpha_policy_drives_eval_and_closes_its_evidence_algebra() {
+        let spec = spec4();
+        let net = TwinNet::compile(&spec).expect("compiles");
+        let (_lo, _hi, root) = build(&net);
+        let adv = [1usize, 2, 3];
+        let (mut bab, pack, root_bound) = driver(&net, &root, &adv, false);
+        bab.cfg.domain_alpha_policy = super::super::DomainAlphaRuntimePolicy {
+            enabled: true,
+            iters: 4,
+            eta: 0.5,
+            min_depth: 0,
+            stride: 1,
+            gap: f64::INFINITY,
+        };
+        let entry = root_entry_over(&pack, root_bound, Vec::new());
+        let EvalOut::Node(_, state) = bab.eval_with_pack(&pack, &entry).expect("eval") else {
+            panic!("root domain must evaluate")
+        };
+        let evidence = state.policy_execution;
+        assert!(evidence.domain_alpha_enabled);
+        assert_eq!(evidence.domain_alpha_iters, 4);
+        assert_eq!(evidence.domain_alpha_eta_bits, 0.5f64.to_bits());
+        assert_eq!(evidence.domain_alpha_gate_evals, 1);
+        assert_eq!(evidence.domain_alpha_movable_evals, 1);
+        assert!(evidence.domain_alpha_movable_slots > 0);
+        assert!(evidence.domain_alpha_ascent_calls <= evidence.domain_alpha_movable_evals);
+        assert_eq!(
+            evidence.domain_alpha_trials_started,
+            evidence.domain_alpha_trial_passes_completed
+                + evidence.domain_alpha_trial_pass_failures
+        );
+        assert!(
+            evidence.domain_alpha_finite_trial_scores
+                <= evidence.domain_alpha_trial_passes_completed
+        );
+        assert!(evidence.domain_alpha_trials_accepted <= evidence.domain_alpha_finite_trial_scores);
+        assert_eq!(
+            evidence.domain_alpha_outer_ascent_calls,
+            evidence.domain_alpha_ascent_calls
+        );
+        assert_eq!(
+            evidence.domain_alpha_outer_finite_trial_scores,
+            evidence.domain_alpha_finite_trial_scores
+        );
+        assert_eq!(evidence.domain_alpha_iters_counterfactual_domains, 1);
+        assert_eq!(evidence.domain_alpha_eta_counterfactual_scored_domains, 1);
+        assert_eq!(
+            evidence.domain_alpha_outer_iters_counterfactual_domains,
+            evidence.domain_alpha_iters_counterfactual_domains
+        );
+        assert_eq!(
+            evidence.domain_alpha_outer_eta_counterfactual_scored_domains,
+            evidence.domain_alpha_eta_counterfactual_scored_domains
+        );
     }
 
     #[test]
@@ -4661,6 +7578,19 @@ mod col_retire_tests {
             st.retired.len() < adv.len(),
             "a pushed frontier needs >= 1 survivor"
         );
+        assert!(
+            st.policy_execution.column_retire,
+            "the evaluation evidence lost the armed retirement policy"
+        );
+        assert_eq!(
+            st.policy_execution.newly_retired_columns,
+            st.retired.len(),
+            "the empty root retirement set must account for every new certificate"
+        );
+        assert_eq!(
+            st.policy_execution.inherited_retirement_evals, 0,
+            "the root has no inherited retirement to narrow"
+        );
 
         // Sampled soundness of every retired column over the region.
         let mbf = MarginBatch::new(&net, 0, &adv).expect("mb");
@@ -4695,50 +7625,70 @@ mod col_retire_tests {
         }
 
         // Inheritance + narrowed descendant eval.
-        if !closed(mode, b.max(entry.bound)) {
-            if let ExpandStep::Expanded { pushes, .. } =
-                bab.expand_one(&pack, &entry).expect("expand")
+        assert!(
+            !closed(mode, b.max(entry.bound)),
+            "the fixture root must stay open to exercise child inheritance"
+        );
+        let ExpandStep::Expanded { pushes, .. } = bab.expand_one(&pack, &entry).expect("expand")
+        else {
+            panic!("the fixture root must expand")
+        };
+        assert!(!pushes.is_empty(), "open root must push children");
+        let mut narrowed_children = 0usize;
+        for child in &pushes {
+            for c in &st.retired {
+                assert!(
+                    child.retired.contains(c),
+                    "child lost inherited retirement {c}"
+                );
+            }
+            let child_pack = bab.rows_for(&child.trunk).expect("child pack");
+            let centry = DomainEntry {
+                bound: child.bound,
+                seq: 1,
+                trunk: child.trunk.clone(),
+                heads: child.heads.clone(),
+                ly: child.ly.clone(),
+                uy: child.uy.clone(),
+                betas: child.betas.clone(),
+                head_betas: child.head_betas.clone(),
+                beta_step: child.beta_step,
+                pc: child.pc.clone(),
+                retired: child.retired.clone(),
+                alpha: child.alpha.clone(),
+            };
+            if let EvalOut::Node(_, st2) = bab
+                .eval_with_pack(&child_pack, &centry)
+                .expect("child eval")
             {
-                assert!(!pushes.is_empty(), "open root must push children");
-                for child in &pushes {
-                    for c in &st.retired {
-                        assert!(
-                            child.retired.contains(c),
-                            "child lost inherited retirement {c}"
-                        );
-                    }
-                    let child_pack = bab.rows_for(&child.trunk).expect("child pack");
-                    let centry = DomainEntry {
-                        bound: child.bound,
-                        seq: 1,
-                        trunk: child.trunk.clone(),
-                        heads: child.heads.clone(),
-                        ly: child.ly.clone(),
-                        uy: child.uy.clone(),
-                        betas: child.betas.clone(),
-                        head_betas: child.head_betas.clone(),
-                        beta_step: child.beta_step,
-                        pc: child.pc.clone(),
-                        retired: child.retired.clone(),
-                    };
-                    if let EvalOut::Node(_, st2) = bab
-                        .eval_with_pack(&child_pack, &centry)
-                        .expect("child eval")
-                    {
-                        // Engagement observable: the child's pass is narrowed
-                        // to the survivors.
-                        assert_eq!(
-                            st2.ms.seed.s.ncols(),
-                            adv.len() - centry.retired.len(),
-                            "child eval did not narrow to the survivors"
-                        );
-                        for c in &centry.retired {
-                            assert!(st2.retired.contains(c), "child dropped {c}");
-                        }
-                    }
+                narrowed_children += 1;
+                // Engagement observable: the child's pass is narrowed to the
+                // survivors and its per-eval evidence accounts for that work.
+                assert_eq!(
+                    st2.ms.seed.s.ncols(),
+                    adv.len() - centry.retired.len(),
+                    "child eval did not narrow to the survivors"
+                );
+                assert!(st2.policy_execution.column_retire);
+                assert_eq!(
+                    st2.policy_execution.inherited_retirement_evals, 1,
+                    "one narrowed child evaluation must count once"
+                );
+                for c in &centry.retired {
+                    assert!(st2.retired.contains(c), "child dropped {c}");
                 }
+                assert!(st2.retired.len() >= centry.retired.len());
+                assert_eq!(
+                    st2.policy_execution.newly_retired_columns,
+                    st2.retired.len() - centry.retired.len(),
+                    "child retirement certificates were not counted exactly"
+                );
             }
         }
+        assert!(
+            narrowed_children > 0,
+            "the fixture never produced a feasible narrowed child"
+        );
     }
 
     /// Gate OFF: an inherited set is INERT — full width, passthrough — so the
@@ -4757,5 +7707,119 @@ mod col_retire_tests {
         assert_eq!(st.ms.seed.s.ncols(), adv.len(), "gate off must stay full");
         assert!(st.mb_local.is_none(), "gate off must not build a subset");
         assert_eq!(st.retired, vec![0u16], "gate off must pass through");
+        assert!(!st.policy_execution.column_retire);
+        assert_eq!(st.policy_execution.inherited_retirement_evals, 0);
+        assert_eq!(st.policy_execution.newly_retired_columns, 0);
+    }
+}
+
+/// #closure-adaptive TEETH.
+///
+/// The policy's contract is that it selects INPUTS to the certified pass and
+/// never produces a bound. The one place that contract could be broken without
+/// anybody noticing is the y-pack cache: a pack is a certified enclosure, it is
+/// keyed by trunk-set alone, and a tier change alters what `build_pack` would
+/// produce for that same key. If a pack could survive a tier change, the lane
+/// would evaluate a domain against numbers no pass scored under the tier in
+/// force. These tests fail if that becomes possible.
+#[cfg(test)]
+mod closure_adaptive_tests {
+    use super::col_retire_tests::{build, driver, spec4};
+    use super::*;
+    use crate::margin_row::closure::{
+        tier, ClosureMonitor, Decision, TIER_BASE, TIER_BETA, TIER_TOP,
+    };
+    use crate::margin_row::net::TwinNet;
+
+    /// A y-pack whose lower bounds are `+1e9` above anything the lane could
+    /// certify: if this ever reaches an evaluation, an unscored bound was
+    /// published.
+    ///
+    /// Built by REBUILDING the pack and mutating it rather than by cloning one.
+    /// `YPack` deliberately has no `Clone`: it carries the two pass matrices and
+    /// their row dots, and a derive would let a hot path clone them by accident
+    /// — a throughput regression that is very hard to find again.
+    fn poisoned_pack(bab: &MarginRowBab<'_>, trunk: &[TrunkSplit]) -> YPack {
+        let dom = (!trunk.is_empty()).then(|| domain_gates(bab.eng.root, trunk));
+        let mut p = build_pack(&bab.eng, dom.as_ref(), trunk).expect("pack");
+        for v in &mut p.ly0 {
+            *v += 1e9;
+        }
+        p
+    }
+
+    #[test]
+    fn a_pack_the_certified_pass_did_not_score_cannot_survive_a_tier_change() {
+        let net = TwinNet::compile(&spec4()).expect("compiles");
+        let (_lo, _hi, root) = build(&net);
+        let (mut bab, root_pack, _rb) = driver(&net, &root, &[1, 2, 3], false);
+
+        // A domain that carries a split, so its pack is tier-DEPENDENT (a
+        // split-free pack is tier-invariant and is the one we re-seed).
+        let key: Vec<TrunkSplit> = vec![(0, 0, 1)];
+        let honest = bab.rows_for(&key).expect("pack");
+        let honest_ly = honest.ly0.clone();
+
+        // THE HAZARD IS REAL: the cache is load-bearing, so a wrong pack in it
+        // is a wrong bound out of it. (If this assert ever fails the rest of
+        // the test proves nothing, so it is asserted rather than assumed.)
+        let bad = poisoned_pack(&bab, &key);
+        bab.lru.put(key.clone(), Arc::new(bad));
+        let served = bab.rows_for(&key).expect("pack");
+        assert!(
+            served.ly0[0] > honest_ly[0] + 1e8,
+            "the LRU must actually serve what was put in it, or this test is vacuous"
+        );
+
+        // THE TEETH: a tier change must retire it.
+        bab.retier_packs(TIER_TOP, &root_pack);
+        let after = bab.rows_for(&key).expect("pack");
+        for (i, (a, b)) in after.ly0.iter().zip(&honest_ly).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "row {i}: a tier change left a pack the certified pass did not score \
+                 (got {a}, certified {b})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reseeded_root_pack_is_bit_identical_to_the_certified_root_pack() {
+        let net = TwinNet::compile(&spec4()).expect("compiles");
+        let (_lo, _hi, root) = build(&net);
+        let (mut bab, root_pack, _rb) = driver(&net, &root, &[1, 2, 3], false);
+
+        // `retier_packs` is the ONE site that inserts a pack without rebuilding
+        // it. Poison the root slot first so a no-op re-seed cannot pass.
+        let bad = poisoned_pack(&bab, &[]);
+        bab.lru.put(Vec::new(), Arc::new(bad));
+        bab.retier_packs(TIER_BETA, &root_pack);
+        let after = bab.rows_for(&[]).expect("root pack");
+        for (i, (a, b)) in after.ly0.iter().zip(&root_pack.ly0).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "root pack ly0 row {i} moved");
+        }
+        for (i, (a, b)) in after.uy0.iter().zip(&root_pack.uy0).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "root pack uy0 row {i} moved");
+        }
+    }
+
+    /// The observer takes counters and clocks and NOTHING else — no bound, no
+    /// pack, no gates. That is what makes "the policy cannot publish a bound" a
+    /// structural claim rather than a review promise, and this pins it
+    /// behaviourally: identical counters, identical decision, whatever the
+    /// tree's bounds happen to be.
+    #[test]
+    fn the_decision_is_a_function_of_the_counters_alone() {
+        let mut a = ClosureMonitor::with_params(8, 8, 0.40, TIER_BETA);
+        let mut b = ClosureMonitor::with_params(8, 8, 0.40, TIER_BETA);
+        crate::margin_row::closure::reset();
+        let da = a.observe(8, 16, 0, 16, 0.8, Some(500.0));
+        crate::margin_row::closure::reset();
+        let db = b.observe(8, 16, 0, 16, 0.8, Some(500.0));
+        assert_eq!(da, db);
+        assert_eq!(da, Decision::Escalate(TIER_BETA));
+        crate::margin_row::closure::reset();
+        assert_eq!(tier(), TIER_BASE);
     }
 }

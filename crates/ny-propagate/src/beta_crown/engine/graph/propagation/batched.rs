@@ -58,6 +58,29 @@ pub(crate) mod interm_refine;
 pub(crate) mod intermediate_sweep;
 #[allow(dead_code)] // Observation-only CPU differential oracle; no production caller.
 pub(crate) mod multi_depth_oracle;
+
+/// Test-only re-export of the batched backward's Linear-node dispatch probe.
+///
+/// `mod backward_core` is private to this module, but the input-split parity
+/// tests live under `graph/input_split/tests/` and need this observable: the
+/// `GemmEngine::gemm_f32` call counter they used to read went dead when
+/// `9f06e35b2` moved `dispatch_node_backward`'s `Layer::Linear` arm onto
+/// `propagate_linear_pollable_cpu` (see `backward_core.rs`), and a counter that
+/// can only ever read 0 is not an instrument.
+#[cfg(test)]
+pub(crate) use backward_core::linear_dispatches_on_thread;
+
+/// Test-only re-export of the SoA batched-backward engagement probe.
+///
+/// The domain-batched backward has TWO legs: the `#lsnc-batched-bwd` SoA lane
+/// (`batched_bwd::try_backward_soa`, taken when no deadline is set — i.e. in
+/// every test) and the reference per-node loop below it (which is what
+/// `linear_dispatches_on_thread` counts). A test that asks "did the batched
+/// lane fire?" must accept EITHER leg; counting only the reference loop reads 0
+/// whenever the SoA lane accepts, which is exactly the shape that made the old
+/// `gemm_f32` counter useless.
+#[cfg(test)]
+pub(crate) use batched_bwd::engaged_on_thread as soa_backward_engaged_on_thread;
 mod spec_adapters;
 /// Re-export of the spec-gate test mutex so gate-forcing parity tests OUTSIDE
 /// this module (e.g. `input_split::f64_tail::tests`, alpha-tail) serialize
@@ -184,6 +207,8 @@ pub(crate) mod gather_score;
 mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_deadline_parity;
 #[cfg(test)]
 mod tests_nan_safety;
 #[cfg(test)]
@@ -566,6 +591,9 @@ pub(in crate::beta_crown::engine::graph) struct ResnetDomainPrep {
     /// not the network input box. `None` for every legacy caller (walk reached
     /// NETWORK_INPUT): byte-identical semantics.
     pub stop_node: Option<String>,
+    /// Number of BatchNorm nodes represented by the certified diagonal-Conv
+    /// extraction in this accepted suffix. Zero for every legacy/skeleton path.
+    pub bn_layers_extracted: usize,
 }
 
 // Hydra-CROWN's active-set trajectory bank keeps only the rows that can close a
@@ -958,15 +986,22 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
                 alpha_bridge.as_ref(),
             )
         });
-    let (segments, relu_names, frontier_abs, node_abs, stop_node) = match folded {
-        // Skeleton path: only reachable with both flags false, where the legacy
-        // walk is proven to reach NETWORK_INPUT or refuse — stop_node ≡ None.
-        Some((segments, relu_names, frontier_abs, node_abs)) => {
-            (segments, relu_names, frontier_abs, node_abs, None)
-        }
-        None => {
-            let Some((segments, relu_names, frontier_abs, node_abs, stop_node)) =
-                crate::network::extract_gpu_segments_with_relu_names_ext(
+    let (segments, relu_names, frontier_abs, node_abs, stop_node, bn_layers_extracted) =
+        match folded {
+            // Skeleton path: only reachable with both flags false, where the legacy
+            // walk is proven to reach NETWORK_INPUT or refuse — stop_node ≡ None.
+            Some((segments, relu_names, frontier_abs, node_abs)) => {
+                (segments, relu_names, frontier_abs, node_abs, None, 0)
+            }
+            None => {
+                let Some((
+                    segments,
+                    relu_names,
+                    frontier_abs,
+                    node_abs,
+                    stop_node,
+                    bn_layers_extracted,
+                )) = crate::network::extract_gpu_segments_with_relu_names_ext(
                     graph,
                     constrained_input,
                     start_node,
@@ -977,18 +1012,25 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
                     allow_bn,
                     stop_at_bounded,
                 )
-            else {
-                // #clip-gather-probe L3: forward the extraction's own exit label so
-                // the flat `prep_extract_segments` bucket names a single expression.
-                return note_prep_refusal(crate::network::extract_segments_last_refusal());
-            };
-            debug_assert!(
-                stop_at_bounded || stop_node.is_none(),
-                "frozen_stop=false can never stop"
-            );
-            (segments, relu_names, frontier_abs, node_abs, stop_node)
-        }
-    };
+                else {
+                    // #clip-gather-probe L3: forward the extraction's own exit label so
+                    // the flat `prep_extract_segments` bucket names a single expression.
+                    return note_prep_refusal(crate::network::extract_segments_last_refusal());
+                };
+                debug_assert!(
+                    stop_at_bounded || stop_node.is_none(),
+                    "frozen_stop=false can never stop"
+                );
+                (
+                    segments,
+                    relu_names,
+                    frontier_abs,
+                    node_abs,
+                    stop_node,
+                    bn_layers_extracted,
+                )
+            }
+        };
     let mut beta_signed: Vec<Vec<f32>> = Vec::with_capacity(relu_names.len());
     for name in &relu_names {
         let Some(relu_bounds) = bounds_cache.get(name) else {
@@ -1054,6 +1096,7 @@ pub(in crate::beta_crown::engine::graph) fn prep_resnet_domain_with<V: Borrow<Bo
         in_lo,
         in_hi,
         stop_node,
+        bn_layers_extracted,
     })
 }
 

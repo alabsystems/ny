@@ -22,6 +22,12 @@ mod axis;
 mod bound;
 mod bound_tightener;
 mod counterexample;
+/// #cost-observer: invariant I1's missing PRODUCER. `#phase-window` requires a
+/// cost "predicted on this host, from a measured rate, not a constant", but the
+/// only two producers in the tree need an analytic MAC model. This measures a
+/// repeated seam's OWN per-call cost as the run proceeds and derives the
+/// allowance from that measurement plus the live remaining wall.
+pub mod cost_observer;
 mod custom_op;
 /// Double-double (two-f64) compensated arithmetic + certified error envelope
 /// (`#dd-zonotope`).
@@ -44,6 +50,10 @@ pub mod instance_budget;
 pub mod joint_alpha_grad;
 mod layer_output;
 mod layer_type;
+/// Injected device-executor seam for the margin-row certified GPU backward
+/// (#margin-row-gpu-eft): trait here, implementation in ny-gpu
+/// (`MarginRowLaneDevice`), registration in ny-propagate `margin_row`.
+pub mod margin_row_lane_gpu;
 mod nan_math;
 mod output_constraint;
 /// #phase-scheduler: the marginal-value loop that composes I1/I2/I3 — spend the
@@ -61,9 +71,6 @@ mod reshape_copy_axis;
 pub mod resident_cut_fold;
 /// Arithmetic-only, call-local resident Cut-CROWN shadow transport.
 pub mod resident_cut_shadow;
-/// #span-profile: hierarchical self/total wall-time accounting across rayon
-/// workers (`NY_SPAN_PROFILE=1`). Diagnostics only; inert when unset.
-pub mod span_profile;
 
 mod soundness;
 mod verification_result;
@@ -426,6 +433,11 @@ pub use gemm::{
 pub use layer_output::LayerOutput;
 /// Enum of all supported neural network layer types.
 pub use layer_type::LayerType;
+/// Margin-row certified GPU backward: injected device-executor seam.
+pub use margin_row_lane_gpu::{
+    LaneArenaBuffer, LaneBinding, LaneProgramSpec, LaneProgramTiming, LaneResidentId,
+    LaneStepBinding, LaneStepSpec, LaneTransactionSpec, MarginRowLaneGpu,
+};
 /// NaN-propagating max for fold-based upper bound computation (#2577).
 pub use nan_math::nan_propagating_max;
 /// NaN-propagating max for f64 fold-based computation (#2616).

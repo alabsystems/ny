@@ -1001,8 +1001,28 @@ impl GraphNetwork {
             // pre-repair inversion or distinguish a completed conditioned fold
             // from a fallback. Keeping OFF/ON on the same CPU route also avoids
             // a hardware-path confound in treatment evidence.
-            let gpu_suffix_bounds = if intermediate.is_none() && invprop_state.is_none() {
-                self.try_alpha_backward_gpu_suffix(
+            //
+            // #gpu-suffix-frontier (SOUNDNESS, false proof fixed here). This
+            // shortcut returns a CONCRETIZED suffix result as the walk's final
+            // answer, so it is only valid when this node carries ALL remaining
+            // output dependence. `extract_gpu_suffix_layers` checks arity only
+            // along the chain it offloads; it never looked at the accumulator
+            // frontier. On a DAG where a suffix-eligible node is reached while
+            // a SIBLING branch is still pending (e.g. Concat(Slice(x), Relu(Gemm(x)))),
+            // the walk was abandoned mid-flight: the sibling's rows kept zero
+            // coefficients and zero bias and concretized to +/-(fp residue),
+            // published as `mode: Sound` — a false SAFE verdict 31 orders of
+            // magnitude tighter than the true range.
+            //
+            // The witness is unforgeable (private field, issued only by the
+            // accumulator), so this precondition is now carried by the type
+            // system rather than by reviewer discipline.
+            let sole_carrier = node_crown_bounds.sole_carrier_witness(input_accumulated);
+            let gpu_suffix_bounds = match (
+                &sole_carrier,
+                intermediate.is_none() && invprop_state.is_none(),
+            ) {
+                (Some(witness), true) => self.try_alpha_backward_gpu_suffix(
                     input,
                     &node_lb,
                     node_name,
@@ -1010,9 +1030,9 @@ impl GraphNetwork {
                     alpha_state,
                     effective_engine,
                     deadline,
-                )?
-            } else {
-                None
+                    witness,
+                )?,
+                _ => None,
             };
             if let Some(concrete_bounds) = gpu_suffix_bounds {
                 // #margin-subset-alpha: the GPU suffix concretized the k-row

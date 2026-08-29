@@ -75,10 +75,44 @@ command: >-
   --official external_tools/vnncomp2025_results
   --measured reports/measured --ext-measured reports/measured-ext --extended
   --results-txt external_tools/vnncomp2025_results/SCORING-ZERO-TOL/results.txt
+# STALE — DO NOT QUOTE THESE THREE AS CURRENT (banner added 2026-08-27).
+# `measured_on`/`measured_at_sha` below are deliberately NOT bumped: this is a
+# targeted correction of one entry, not a rerun, and restamping provenance
+# without one is the exact false-provenance failure this file exists to stop.
+#
+#   extended_9    CORRECTED 499.6 -> 482.8. Derivable in-tree without the
+#                 official checkout: the totals decomposed exactly
+#                 (1406.8 + 499.6 = 1906.4), vit_2023.csv is the ONLY file
+#                 changed under reports/measured-ext/ since dcda62ded, and its
+#                 contribution went 16.8 -> 0.0. Carries ~+/-0.1 of accumulated
+#                 rounding, being a subtraction of printed 1-dp figures.
+#   regular_16    STALE, UNVERIFIED, and drifting UPWARD — bank conversions
+#                 landed after this file was written. NOT re-derivable here.
+#   full_field_25 STALE by construction: 1406.8 + 482.8 = 1889.6, not 1906.4.
+#                 Inconsistent until regular_16 is re-measured.
+#
+# A true refresh needs external_tools/vnncomp2025_results at pin ea89fbc2518b,
+# which is gitignored (.gitignore:75) and ABSENT from this box. Nothing in-tree
+# cross-checks these numbers against the bank — the consumer
+# (crates/ny-cli/src/preset/model_load_smoke_tests.rs:156) asserts only
+# 0.0 <= banked_normalized <= 100.0, which 16.8 satisfied for all 16 days it
+# was false. That missing cross-check is why this drifted silently.
 totals:
-  regular_16: 1406.8
-  extended_9: 499.6
-  full_field_25: 1906.4
+  # RE-DERIVED IN-TREE 2026-08-28, denominator-free. The earlier "not
+  # re-derivable here" note was WRONG: each total is just the sum of its
+  # members' `banked_normalized`, which live in this file, so no
+  # external_tools/vnncomp2025_results checkout is needed to CHECK them.
+  # (Denominators are only needed to recompute a member from the bank.)
+  # Summed over the scorer's OWN lists (ny_retroactive_scorecard.py REGULAR:61,
+  # EXTENDED:98), de-duplicated: this file carries 31 roots for 25 scored
+  # benchmarks because cifar100/safenlp appear under alternate years, so a
+  # naive sum over roots over-counts by 136.0. Verified no duplicate pair
+  # disagrees. Tolerance is +/-0.2: members are stored to 1 dp, so a 16-term
+  # sum accumulates rounding.
+  regular_16: 1406.8        # derived 1406.7  (delta -0.1, rounding)
+  extended_9: 482.8         # derived  482.9  (delta +0.1, rounding)
+  full_field_25: 1889.6     # CORRECTED from 1906.4: stale by exactly the 16.8
+                            # vit_2023 retraction. 1406.8 + 482.8 = 1889.6.
 
 # ROOTS
 # -----
@@ -186,7 +220,21 @@ roots:
   - root: benchmarks/vnncomp2025/benchmarks/vit_2023
     benchmark: vit_2023
     track: extended
-    banked_normalized: 16.8
+    # RE-DERIVED 2026-08-27 from reports/measured-ext/vit_2023.csv: 200 rows,
+    # 136 timeout + 64 unknown, ZERO sat and ZERO unsat. raw = 0, so
+    # normalized = 0.0 under BOTH branches of ny_retroactive_scorecard.py:1806
+    # (win_raw>0 -> max(0, 0) = 0; win_raw=0 -> denom 0 -> else-branch 0.0),
+    # which is why this one value needs no official-results checkout to state.
+    # The previous 16.8 was CORRECT when written: at this file's own commit
+    # dcda62ded (2026-08-11) the bank held 21 unsat, and 100*210/1250 = 16.8
+    # exactly. d63a62511 (2026-08-25) retracted those 21 proofs the N-ary
+    # Concat defect minted, rewriting them unsat -> timeout at a stated
+    # -210 raw. No verdict INVERTED; ny_bad is untouched.
+    # The entry stays recorded rather than being deleted: banked_normalized is
+    # what makes the guard say "this deletes N banked points", so removing it
+    # would price a future vit model-load refusal as UNRECORDED. The stake
+    # stops being zero the moment the category is recovered.
+    banked_normalized: 0.0
   - root: benchmarks/vnncomp2025/benchmarks/yolo_2023
     benchmark: yolo_2023
     track: extended

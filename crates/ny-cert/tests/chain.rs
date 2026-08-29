@@ -79,7 +79,7 @@ fn real_crown_block_then_weakening_composes() {
     if let Ok(dir) = std::env::var("NY_CERT_OUT_DIR") {
         std::fs::write(
             format!("{dir}/ny_chain.json"),
-            serde_json::to_string_pretty(&json).unwrap(),
+            ny_cert::json::to_string_pretty(&json),
         )
         .unwrap();
     }

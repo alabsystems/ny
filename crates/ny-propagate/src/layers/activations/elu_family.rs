@@ -13,7 +13,7 @@
 //! Ref: alpha-beta-CROWN auto_LiRPA/operators/nonlinear.py (ELU/SELU/CELU relaxation)
 
 use ny_core::{nan_propagating_max_f64, nan_propagating_min_f64};
-use ny_tensor::{next_down_f32, next_up_f32};
+use ny_tensor::{cast_f64_to_f32_down, cast_f64_to_f32_up, next_down_f32, next_up_f32};
 
 use super::LinearRelaxation;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
@@ -71,17 +71,51 @@ pub(crate) fn elu_family_linear_relaxation(
     }
     if l.is_infinite() {
         // l = -inf, u finite: f(-inf) -> saturation, f(u) = fu.
-        let fu = if u >= 0.0 {
-            positive_slope_f32 * u
+        //
+        // DIRECTED ROUNDING, both directions, from ONE f64 witness. `fu` is
+        // published as a certified constant in BOTH directions at once — it is
+        // the lower intercept via `min(saturation, fu)` and the upper intercept
+        // via `max(fu, 0)` — so a single round-to-NEAREST f32 is unsound on
+        // whichever side it happens to land, and no choice of a single f32 can
+        // be sound for both.
+        //
+        // It landed on the upper side for SELU, whose `positive_slope` is
+        // lambda != 1. `f32(LAMBDA * u)` and the exact real product
+        // `f64::from(LAMBDA) * f64::from(u)` (EXACT: 24 + 24 = 48 <= 53 mantissa
+        // bits, so the f64 multiply has no error at all) disagree for about half
+        // of all u > 0, and when the f32 rounds DOWN the published upper
+        // certifies `SELU(x) <= v` for a v that `SELU(u)` itself exceeds — a
+        // false proof at the interval's own endpoint. Exactly, on the current
+        // constants:
+        //     u = 0.3 -> 0.3152103126049042  vs 0.31521031916977194 (-6.565e-09)
+        //     u = 3.0 -> 3.1521029472351074  vs 3.152103066444397   (-1.192e-07)
+        //     u = 100 -> 105.07009887695312  vs 105.07010221481323  (-3.338e-06)
+        // and 25188 of 60000 random u in (-40, 200) violate, worst -7.629e-06.
+        // u = 2.0 is one of the EXACT cases (lambda * 2 is an exponent shift),
+        // which is exactly why `test_selu_relaxation_left_infinite_soundness`
+        // stayed green over this for its whole life.
+        //
+        // This is the UPPER twin of the lower-intercept defect 64f39e061 fixed
+        // on these same three lines, and it is latent for the same reason: every
+        // consumer's CROWN entry still applies `non_finite_domain_guard`, so no
+        // infinite endpoint reaches here in production today. Widening a
+        // published bound is unconditionally sound — it only ever loosens, and
+        // by at most one f32 ULP.
+        //
+        // ELU and CELU are numerically unaffected: `positive_slope == 1.0`, so
+        // the product is exact and both directed casts return it unchanged.
+        let fu64 = if u >= 0.0 {
+            params.positive_slope * f64::from(u)
         } else {
-            (params.eval_negative)(u as f64, params) as f32
+            (params.eval_negative)(f64::from(u), params)
         };
         // NaN-propagating: if fu is NaN, propagate instead of absorbing via IEEE min/max. (#2714)
+        // Both directed casts are NaN-preserving, so that path is unchanged.
         return LinearRelaxation::new(
             0.0,
-            nan_propagating_min(params.saturation, fu),
+            nan_propagating_min(params.saturation, cast_f64_to_f32_down(fu64)),
             0.0,
-            nan_propagating_max(fu, 0.0),
+            nan_propagating_max(cast_f64_to_f32_up(fu64), 0.0),
         );
     }
     if u.is_infinite() {

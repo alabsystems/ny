@@ -10,27 +10,32 @@
 
 SCRIPT_DIR=$(dirname "$(realpath "$0")")
 
-# Competition runs must not inherit AY's developer-only lane overrides, NY's
-# dark reserve-allocation ceiling, the query capture sink, the legacy WGPU
-# authority diagnostic request, or mimalloc runtime tuning. WGPU production
-# authority is also compile-time quarantined in the binary; scrubbing the old
-# self-arm spelling here is defense in depth for scored and future binaries.
-# Keep newly pinned AY experiments explicit here: several are presence-gated,
-# so even a caller's "0" can arm them.
-# The allocator accepts an open-ended MIMALLOC_* namespace, so sanitize every
-# currently exported member rather than maintaining a stale list. Local A/B and
-# capture workflows use vnncomp_scripts/run_instance.sh (or invoke ny directly),
-# both of which deliberately preserve these variables.
-unset AY_MILP_SMT AY_MILP_GUB_CLIQUE AY_MILP_STAB_ORBIT \
-    AY_MILP_COVER_MINIMAL AY_MILP_NODE_PROP \
-    AY_MILP_IMPLIED_COL_BOUNDS AY_MILP_ADOPT_FT_MAX_ROWS \
-    AY_MILP_NO_SHAPE_CPR \
-    AY_DISABLE_PHASE_EPOCH_SKIP \
-    AY_SAT_L0_UNSAT_TRACE \
-    AY_DUMP_QUERY_DIR NY_MARGIN_ROW_RESERVE_MAX_FRAC \
-    NY_GPU_AUTHORITY_SELFARM
-while IFS= read -r mimalloc_env; do
-    unset "$mimalloc_env"
-done < <(compgen -e -- MIMALLOC_)
+# The organizer-facing entrypoint is environment-closed for solver policy.
+# Search/evaluation children already remove every NY_* override; scored runs
+# must do the same or a caller's shell can silently replace the measured preset.
+# Keep the two wrapper control-plane values long enough for the delegated helper
+# to locate/authenticate the binary. The helper removes them before starting ny.
+scored_ny_bin_present=${NY_BIN+x}
+scored_ny_bin=${NY_BIN-}
+scored_expect_build_id_present=${NY_EXPECT_BUILD_ID+x}
+scored_expect_build_id=${NY_EXPECT_BUILD_ID-}
+
+# AY experiments include presence-gated switches, while NY_* contains both the
+# typed registry and the still-legacy parameter frontier. Namespace scrubbing is
+# deliberately future-proof: adding a knob cannot reopen scored ambient authority.
+for solver_env_prefix in AY_ NY_ MIMALLOC_; do
+    while IFS= read -r solver_env; do
+        unset "$solver_env"
+    done < <(compgen -e -- "$solver_env_prefix")
+done
+unset RAYON_NUM_THREADS RAYON_RS_NUM_CPUS
+
+if [ -n "$scored_ny_bin_present" ]; then
+    export NY_BIN="$scored_ny_bin"
+fi
+if [ -n "$scored_expect_build_id_present" ]; then
+    export NY_EXPECT_BUILD_ID="$scored_expect_build_id"
+fi
+export VNNCOMP_SCORED_ENV_CLOSED=1
 
 exec "${SCRIPT_DIR}/vnncomp_scripts/run_instance.sh" "$@"

@@ -403,6 +403,7 @@ impl PackedGraphDomainAlphaState {
     pub(crate) fn unpack(&self, expected_queue_identity: u64) -> Result<GraphDomainAlphaState> {
         self.validate(expected_queue_identity)?;
         Ok(GraphDomainAlphaState {
+            split_refresh: false,
             neurons: self.lower.unpack(),
             upper_neurons: self.upper.unpack(),
         })

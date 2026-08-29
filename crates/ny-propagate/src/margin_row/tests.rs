@@ -12,14 +12,15 @@ use rand::{RngExt, SeedableRng};
 
 use super::bab::{
     absorb_class_stats, classwise_conjunction_complete, classwise_root_cache_isolated_for_test,
-    classwise_schedule, BabConfig, BabStats, ClassBabStats, MarginRowBab, MarginRowOutcome,
+    classwise_runtime_policy_for_test, classwise_schedule, BabConfig, BabStats, ClassBabStats,
+    FrontierExecutionEvidence, MarginRowBab, MarginRowOutcome, PolicyExecutionEvidence,
 };
 use super::bounds::{
     compose_viay, head_gates, head_variant, margin_seed, per_class_direct, row_dots, variant_state,
     MarginBatch, YBox,
 };
 use super::engine::{
-    domain_gates, BackwardEngine, Exc, Exceptions, LaneDir, RowDomainGateBlock,
+    domain_gates, BackwardEngine, DomainGates, Exc, Exceptions, LaneDir, RowDomainGateBlock,
     Seed as DomainStackSeed,
 };
 use super::net::TwinNet;
@@ -220,6 +221,92 @@ fn y_rows_bracket_sampled_y() {
 }
 
 #[test]
+fn root_precision_receipt_binds_real_dispatch_and_logical_store_sites() {
+    let mut rng = StdRng::seed_from_u64(0xF32_E71D);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let build = |mode, root_f32, tableau_f32| {
+        RootGates::build_prec_store(&net, &lo, &hi, mode, None, root_f32, tableau_f32)
+            .expect("root")
+    };
+
+    let assert_common = |root: &RootGates, root_f32, tableau_f32| {
+        assert_eq!(
+            root.root_precision_policy,
+            super::RootPrecisionRuntimePolicy {
+                root_f32,
+                tableau_f32,
+            }
+        );
+        let evidence = root.root_precision_execution;
+        assert_eq!(evidence.configured_root_f32, root_f32);
+        assert_eq!(evidence.configured_tableau_f32, tableau_f32);
+        assert!(!evidence.policy_mismatch);
+        evidence
+    };
+
+    // The completed tiny root has two conv compute sites and four logical
+    // tableau stores: two Conv, one Add, and the nonterminal ReLU. Flatten
+    // aliases storage and the terminal ReLU only concretizes the final box.
+    let off = assert_common(&build(RoundMode::Outward, false, false), false, false);
+    assert_eq!(
+        (
+            off.eligible_conv_ops,
+            off.root_f32_conv_ops,
+            off.root_f64_conv_ops,
+        ),
+        (2, 0, 2)
+    );
+    assert_eq!(
+        (
+            off.eligible_store_ops,
+            off.tableau_f32_store_ops,
+            off.tableau_f64_store_ops,
+        ),
+        (4, 0, 4)
+    );
+    assert!(!off.tableau_refused);
+
+    let compute = assert_common(&build(RoundMode::Outward, true, false), true, false);
+    assert_eq!(
+        (compute.root_f32_conv_ops, compute.root_f64_conv_ops),
+        (2, 0)
+    );
+    assert_eq!(
+        (compute.tableau_f32_store_ops, compute.tableau_f64_store_ops,),
+        (0, 4)
+    );
+    assert!(!compute.tableau_refused);
+
+    let both = assert_common(&build(RoundMode::Outward, true, true), true, true);
+    assert_eq!((both.root_f32_conv_ops, both.root_f64_conv_ops), (2, 0));
+    assert_eq!(
+        (both.tableau_f32_store_ops, both.tableau_f64_store_ops),
+        (4, 0)
+    );
+    assert!(!both.tableau_refused);
+
+    let refused = assert_common(&build(RoundMode::Outward, false, true), false, true);
+    assert_eq!(
+        (refused.root_f32_conv_ops, refused.root_f64_conv_ops),
+        (0, 2)
+    );
+    assert_eq!(
+        (refused.tableau_f32_store_ops, refused.tableau_f64_store_ops,),
+        (0, 4)
+    );
+    assert!(refused.tableau_refused);
+
+    let parity = assert_common(&build(RoundMode::Parity, true, true), true, true);
+    assert!(!parity.outward_eligible);
+    assert_eq!(parity.eligible_conv_ops, 0);
+    assert_eq!(parity.eligible_store_ops, 0);
+    assert!(parity.tableau_refused);
+}
+
+#[test]
 fn root_margin_bounds_enclose_sampled_margins_and_modes_agree() {
     let mut rng = StdRng::seed_from_u64(13);
     let spec = tiny_spec(&mut rng, 0.6);
@@ -229,8 +316,12 @@ fn root_margin_bounds_enclose_sampled_margins_and_modes_agree() {
     let t = 0usize;
     let adv = vec![1usize, 2, 3];
     let mut bounds_by_mode = Vec::new();
+    let mut outward_f32 = false;
     for mode in [RoundMode::Parity, RoundMode::Outward] {
         let root = RootGates::build(&net, &lo, &hi, mode, None).expect("root");
+        if mode.outward() {
+            outward_f32 = root.root_precision_execution.root_f32_conv_ops > 0;
+        }
         let eng = BackwardEngine::new(&net, &root);
         let (al, au) = eng.y_rows(None).expect("y_rows");
         let ybox = YBox::from_rows(&eng, &al, &au);
@@ -275,14 +366,13 @@ fn root_margin_bounds_enclose_sampled_margins_and_modes_agree() {
     //       by the bound magnitude when that kernel is active. Measured with
     //       BLAS+f32 both on: drift 2.6e-4 on a -27.4 margin, i.e. ~9e-6
     //       relative, and in the SAFE direction.
-    let f32_root = std::env::var("NY_MARGIN_ROW_ROOT_F32").is_ok();
     for (p, o) in bounds_by_mode[0].iter().zip(&bounds_by_mode[1]) {
         assert!(
             o <= &(p + 1e-9),
             "outward {o} is ABOVE parity {p} — the certified bound must be the \
              conservative one"
         );
-        let budget = if f32_root {
+        let budget = if outward_f32 {
             1e-6 + 1e-4 * (1.0 + p.abs())
         } else {
             1e-6
@@ -513,22 +603,37 @@ fn classwise_aggregation_requires_every_scheduled_certificate() {
         epochs_attempted: 0,
         epochs_closed: 0,
         ledger_ok: Some(true),
+        frontier_execution: FrontierExecutionEvidence::classwise(),
+        policy_execution: PolicyExecutionEvidence::default(),
+        epoch_execution: Default::default(),
+        width_execution: Default::default(),
+        root_precision_execution: Default::default(),
+        backward_interm_execution: Default::default(),
+        root_alpha_execution: Default::default(),
     };
-    let record = |class, verified, expansions, domains_created, max_depth| ClassBabStats {
-        class,
-        root_bound: if class == 2 { -0.2 } else { -0.1 },
-        verified,
-        expansions,
-        domains_created,
-        closed: domains_created / 2,
-        max_depth,
-        mono_raw_dips: 1,
-        mono_worst: -0.01,
-        stop: if verified { "queue_empty" } else { "wallclock" }.into(),
-        elapsed_secs: 0.1,
-        epochs_attempted: 0,
-        epochs_closed: 0,
-        ledger_ok: verified.then_some(true),
+    let record = |class, verified, expansions, domains_created, max_depth| {
+        let mut frontier_execution = FrontierExecutionEvidence::classwise();
+        frontier_execution.observe(max_depth + 1);
+        ClassBabStats {
+            class,
+            root_bound: if class == 2 { -0.2 } else { -0.1 },
+            verified,
+            expansions,
+            domains_created,
+            closed: domains_created / 2,
+            max_depth,
+            mono_raw_dips: 1,
+            mono_worst: -0.01,
+            stop: if verified { "queue_empty" } else { "wallclock" }.into(),
+            elapsed_secs: 0.1,
+            epochs_attempted: 0,
+            epochs_closed: 0,
+            ledger_ok: verified.then_some(true),
+            frontier_execution,
+            policy_execution: PolicyExecutionEvidence::default(),
+            epoch_execution: Default::default(),
+            width_execution: Default::default(),
+        }
     };
     absorb_class_stats(&mut aggregate, record(2, true, 3, 7, 2));
     assert!(!classwise_conjunction_complete(
@@ -548,6 +653,10 @@ fn classwise_aggregation_requires_every_scheduled_certificate() {
         ),
         (7, 16, 5)
     );
+    assert_eq!(aggregate.frontier_execution.steps, 2);
+    assert_eq!(aggregate.frontier_execution.counterfactual_differences, 0);
+    assert_eq!(aggregate.frontier_execution.max_open, 6);
+    assert_eq!(aggregate.frontier_execution.max_batch, 1);
     let mut failed = aggregate.class_runs.clone();
     failed[1].verified = false;
     assert!(!classwise_conjunction_complete(
@@ -563,6 +672,38 @@ fn classwise_aggregation_requires_every_scheduled_certificate() {
 }
 
 #[test]
+fn frontier_execution_evidence_records_only_counterfactual_tree_decisions() {
+    let mut serial = FrontierExecutionEvidence::joint(1, 8);
+    serial.observe(1);
+    assert_eq!(serial.counterfactual_differences, 0);
+    serial.observe(8);
+    assert_eq!(
+        (
+            serial.configured,
+            serial.contextual,
+            serial.steps,
+            serial.counterfactual_differences,
+            serial.max_open,
+            serial.max_batch,
+        ),
+        (1, 8, 2, 1, 8, 1),
+    );
+
+    let mut wider_than_context = FrontierExecutionEvidence::joint(16, 8);
+    wider_than_context.observe(8);
+    assert_eq!(wider_than_context.counterfactual_differences, 0);
+    wider_than_context.observe(9);
+    assert_eq!(wider_than_context.counterfactual_differences, 1);
+    assert_eq!(wider_than_context.max_batch, 9);
+
+    let mut classwise = FrontierExecutionEvidence::classwise();
+    classwise.observe(32);
+    assert_eq!(classwise.steps, 1);
+    assert_eq!(classwise.counterfactual_differences, 0);
+    assert_eq!(classwise.max_batch, 1);
+}
+
+#[test]
 fn classwise_root_pack_is_shared_but_class_caches_are_isolated() {
     let mut rng = StdRng::seed_from_u64(30);
     let spec = tiny_spec(&mut rng, 0.35);
@@ -574,6 +715,12 @@ fn classwise_root_pack_is_shared_but_class_caches_are_isolated() {
     let eng = BackwardEngine::new(&net, &root);
     let re = super::bab::root_eval(&eng, &net, t, &adv).unwrap();
     assert!(classwise_root_cache_isolated_for_test(&re));
+}
+
+#[test]
+fn classwise_policy_floors_the_cache_and_suppresses_parallel_frontiers() {
+    assert_eq!(classwise_runtime_policy_for_test(0, 16, 12), (1, 1, 1));
+    assert_eq!(classwise_runtime_policy_for_test(64, 8, 24), (64, 1, 1));
 }
 
 #[test]
@@ -602,6 +749,10 @@ fn classwise_and_joint_both_certify_a_robust_box() {
         stats.root_closed_classes + stats.tree_classes.len(),
         adv.len()
     );
+    assert_eq!(stats.frontier_execution.route.stable_token(), "classwise");
+    assert_eq!(stats.frontier_execution.configured, 1);
+    assert_eq!(stats.frontier_execution.contextual, 1);
+    assert_eq!(stats.frontier_execution.counterfactual_differences, 0);
 }
 
 #[test]
@@ -638,6 +789,8 @@ fn classwise_one_class_identity_deadline_and_global_cap() {
     assert!(cs.expansions <= cfg.max_expansions);
     assert_eq!(cs.class_runs.len(), 1);
     assert!(!cs.class_runs[0].verified);
+    assert_eq!(cs.frontier_execution.route.stable_token(), "classwise");
+    assert_eq!(cs.frontier_execution.counterfactual_differences, 0);
 
     let expired = BabConfig {
         deadline: Some(
@@ -657,6 +810,10 @@ fn classwise_one_class_identity_deadline_and_global_cap() {
         MarginRowBab::run_classwise(&net, &parity, t, &adv, BabConfig::default()),
         MarginRowOutcome::Unknown { .. }
     ));
+    assert!(matches!(
+        MarginRowBab::run(&net, &parity, t, &adv, BabConfig::default()),
+        MarginRowOutcome::Unknown { stats: None, .. }
+    ));
 
     let all_adv: Vec<_> = (0..4).filter(|class| *class != runner_up).collect();
     let zero = BabConfig {
@@ -670,6 +827,8 @@ fn classwise_one_class_identity_deadline_and_global_cap() {
         panic!("zero budget must fail closed")
     };
     assert_eq!(zs.expansions, 0);
+    assert_eq!(zs.frontier_execution.steps, 0);
+    assert_eq!(zs.frontier_execution.counterfactual_differences, 0);
     assert_eq!(zs.class_runs.len(), 1);
     assert_eq!(zs.class_runs[0].stop, "global_max_expansions_before_class");
 }
@@ -1876,6 +2035,10 @@ fn parallel_frontier_matches_serial_and_moat_holds() {
         srb, prb,
         "root_bound not bit-identical (serial vs frontier)"
     );
+    let default_policy = outcome_stats(&par).policy_execution;
+    assert!(!default_policy.parallel_prebuild);
+    assert_eq!(default_policy.parallel_prebuild_batches, 0);
+    assert_eq!(default_policy.parallel_prebuild_domains, 0);
 
     // MOAT: falsified orientation must NEVER be UNSAT under the parallel lane.
     // Bounded so it terminates (it can never close a leaf containing the SAT
@@ -1883,6 +2046,8 @@ fn parallel_frontier_matches_serial_and_moat_holds() {
     let moat_cfg = BabConfig {
         lru_cap: 64,
         frontier: 8,
+        frontier_contextual: 1,
+        parallel_prebuild: true,
         max_expansions: 400,
         ..BabConfig::default()
     };
@@ -1892,6 +2057,25 @@ fn parallel_frontier_matches_serial_and_moat_holds() {
         !matches!(moat, MarginRowOutcome::Unsat(_)),
         "MOAT VIOLATION: parallel lane certified a falsified instance UNSAT"
     );
+    let moat_evidence = outcome_stats(&moat).frontier_execution;
+    assert!(moat_evidence.steps > 0, "frontier never reached tree work");
+    assert!(
+        moat_evidence.counterfactual_differences > 0,
+        "branching fixture never distinguished width 8 from contextual serial: \
+         {moat_evidence:?}"
+    );
+    assert!(moat_evidence.max_open >= 2);
+    assert!(moat_evidence.max_batch >= 2 && moat_evidence.max_batch <= 8);
+    let moat_policy = outcome_stats(&moat).policy_execution;
+    assert!(moat_policy.parallel_prebuild);
+    assert!(
+        moat_policy.parallel_prebuild_batches > 0,
+        "branching fixture never executed a parallel prebuild: {moat_policy:?}"
+    );
+    assert!(
+        moat_policy.parallel_prebuild_domains >= 2 * moat_policy.parallel_prebuild_batches,
+        "the fixture must meet the optimizer's multi-domain engagement boundary: {moat_policy:?}"
+    );
 
     // DETERMINISM: two parallel runs on the branching (falsified) instance,
     // same budget, must produce identical stats — no float race, no order
@@ -1899,12 +2083,29 @@ fn parallel_frontier_matches_serial_and_moat_holds() {
     let det_cfg = || BabConfig {
         lru_cap: 64,
         frontier: 8,
+        parallel_prebuild: true,
         max_expansions: 300,
         ..BabConfig::default()
     };
-    let a = verdict_bits(&MarginRowBab::run(&net, &root, worst, &adv_f, det_cfg()));
-    let b = verdict_bits(&MarginRowBab::run(&net, &root, worst, &adv_f, det_cfg()));
+    let a_out = MarginRowBab::run(&net, &root, worst, &adv_f, det_cfg());
+    let b_out = MarginRowBab::run(&net, &root, worst, &adv_f, det_cfg());
+    let a = verdict_bits(&a_out);
+    let b = verdict_bits(&b_out);
     assert_eq!(a, b, "parallel frontier is non-deterministic across runs");
+    let a_policy = outcome_stats(&a_out).policy_execution;
+    let b_policy = outcome_stats(&b_out).policy_execution;
+    assert_eq!(
+        a_policy, b_policy,
+        "parallel prebuild execution evidence is non-deterministic across runs"
+    );
+    assert!(
+        a_policy.parallel_prebuild_batches > 0,
+        "determinism fixture never executed a parallel prebuild: {a_policy:?}"
+    );
+    assert!(
+        a_policy.parallel_prebuild_domains >= 2 * a_policy.parallel_prebuild_batches,
+        "determinism fixture did not meet the multi-domain engagement boundary: {a_policy:?}"
+    );
 }
 
 /// SCORE-CANDIDATE STACK DIFFERENTIAL: same frontier width, same pop order,
@@ -4966,8 +5167,10 @@ fn epoch_tier0_lane_closes_and_moat_holds() {
             .expect("root");
     let retained = std::sync::Arc::new(ret.expect("retention requested"));
     let mk_cfg = || BabConfig {
-        tier0_exact: 4,
-        tier0_universe: 64,
+        epoch_policy: super::EpochRuntimePolicy {
+            tier0_exact: 4,
+            ..super::EpochRuntimePolicy::default()
+        },
         retained: Some(retained.clone()),
         ..BabConfig::default()
     };
@@ -4998,6 +5201,193 @@ fn epoch_tier0_lane_closes_and_moat_holds() {
 
 // ===================== EPOCH-BAB PHASE B TESTS (#epoch-bab Tier 2) ==========
 // Epoch re-linearization: baked-split tableau rebuilds + the nested lane.
+
+/// The default-off parent-frame epoch is a shrink-only certified refresh on
+/// exactly the split halfspace it claims, and batching does not move a bit.
+///
+/// This is the load-bearing oracle for the cheap idx_1298 path: it exercises a
+/// residual trunk, exact split baking, downstream prefix re-bounding, gate
+/// regeneration, unstable-index rebuilding, and final margin scoring. Sampled
+/// preactivations and margins on the matching halfspace must remain enclosed.
+#[test]
+fn epoch_parent_frame_refresh_is_sound_shrink_only_and_chunk_invariant() {
+    let mut rng = StdRng::seed_from_u64(60_1298);
+    let spec = tiny_spec(&mut rng, 0.65);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    assert_eq!(
+        BabConfig::default().epoch_policy.parent_topk,
+        0,
+        "incremental epochs must remain dark by default"
+    );
+    assert!(root.layers.len() >= 2 && !root.layers[0].unst.is_empty());
+
+    let x = sample_box(&mut rng, &root, 1200);
+    let sel_all: std::collections::BTreeMap<usize, Vec<usize>> = root
+        .layers
+        .iter()
+        .map(|layer| (layer.op, (0..layer.n).collect()))
+        .collect();
+    let (y, pre) = net.forward_points(&x, &sel_all).expect("forward");
+    let first_pre = &pre[&root.layers[0].op];
+
+    // Prefer a balanced first-layer split, ensuring the sampled soundness
+    // oracle has substantial coverage on both sides.
+    let (idx, _) = root.layers[0]
+        .unst
+        .iter()
+        .copied()
+        .map(|idx| {
+            let positive = (0..x.ncols())
+                .filter(|&column| first_pre[[idx, column]] >= 0.0)
+                .count();
+            (idx, positive.min(x.ncols() - positive))
+        })
+        .max_by_key(|(_, balance)| *balance)
+        .expect("unstable split");
+
+    let mut any_tightened = false;
+    for dir in [1i8, -1] {
+        let split = [(0usize, idx, dir)];
+        let (child1, stats1) =
+            super::backward_interm::refresh_parent_frame(&net, &root, &split, usize::MAX, 1, None)
+                .expect("columnwise refresh");
+        let (child17, stats17) =
+            super::backward_interm::refresh_parent_frame(&net, &root, &split, usize::MAX, 17, None)
+                .expect("chunked refresh");
+        assert_eq!(stats1.baked, 1);
+        assert!(stats1.columns > 0 && stats1.layers > 0);
+        assert_eq!(stats1.columns, stats17.columns);
+        assert_eq!(stats1.tightened, stats17.tightened);
+        any_tightened |= stats1.tightened > 0;
+
+        for (li, ((parent, a), b)) in root
+            .layers
+            .iter()
+            .zip(&child1.layers)
+            .zip(&child17.layers)
+            .enumerate()
+        {
+            for j in 0..parent.n {
+                assert!(
+                    a.l[j] >= parent.l[j] && a.u[j] <= parent.u[j],
+                    "refresh widened layer {li} neuron {j}"
+                );
+                for (name, av, bv) in [
+                    ("l", a.l[j], b.l[j]),
+                    ("u", a.u[j], b.u[j]),
+                    ("alpha", a.alpha[j], b.alpha[j]),
+                    ("s", a.s[j], b.s[j]),
+                    ("c", a.c[j], b.c[j]),
+                    ("ms", a.ms[j], b.ms[j]),
+                ] {
+                    assert_eq!(
+                        av.to_bits(),
+                        bv.to_bits(),
+                        "chunking moved {name} at layer {li} neuron {j}"
+                    );
+                }
+            }
+            assert_eq!(a.unst, b.unst, "chunking moved unstable frame at {li}");
+        }
+        let fixed = &child1.layers[0];
+        assert!(!fixed.unst.contains(&idx));
+        if dir > 0 {
+            assert!(fixed.l[idx] >= 0.0);
+            assert_eq!(
+                (fixed.alpha[idx], fixed.s[idx], fixed.c[idx], fixed.ms[idx]),
+                (1.0, 1.0, 0.0, 1.0)
+            );
+        } else {
+            assert!(fixed.u[idx] <= 0.0);
+            assert_eq!(
+                (fixed.alpha[idx], fixed.s[idx], fixed.c[idx], fixed.ms[idx]),
+                (0.0, 0.0, 0.0, 0.0)
+            );
+        }
+
+        let t = 0usize;
+        let adv = [1usize, 2, 3];
+        let margins = margins_at(&net, &y, t, &adv);
+        let bounds = domain_class_bounds(&net, &child1, t, &adv, &[], &[]);
+        let mut on_side = 0usize;
+        for column in 0..x.ncols() {
+            let zsplit = first_pre[[idx, column]];
+            if (dir > 0 && zsplit < 0.0) || (dir < 0 && zsplit > 0.0) {
+                continue;
+            }
+            on_side += 1;
+            for (li, layer) in child1.layers.iter().enumerate() {
+                let exact = &pre[&layer.op];
+                for j in 0..layer.n {
+                    let value = exact[[j, column]];
+                    assert!(
+                        layer.l[j] <= value + 1e-9 && value <= layer.u[j] + 1e-9,
+                        "parent-refresh box violation dir={dir} layer={li} neuron={j}: \
+                         {value} outside [{},{}]",
+                        layer.l[j],
+                        layer.u[j]
+                    );
+                }
+            }
+            for (class, margin) in margins.iter().enumerate() {
+                assert!(
+                    bounds[class] <= margin[column] + 1e-9,
+                    "parent-refresh margin violation dir={dir} class={class}: \
+                     bound {} > exact {}",
+                    bounds[class],
+                    margin[column]
+                );
+            }
+        }
+        assert!(on_side > 100, "degenerate sampled split side: {on_side}");
+    }
+    assert!(
+        any_tightened,
+        "parent-frame prefix refresh did not tighten either child on the fixture"
+    );
+}
+
+/// Refusal cases cannot accidentally turn the parity oracle, an empty request,
+/// or an invalid/duplicated split into a refreshed verdict frame.
+#[test]
+fn epoch_parent_frame_refresh_refuses_non_authoritative_inputs() {
+    let mut rng = StdRng::seed_from_u64(61_1298);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let outward = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let parity = RootGates::build(&net, &lo, &hi, RoundMode::Parity, None).expect("parity");
+    let idx = outward.layers[0].unst[0];
+    let split = [(0usize, idx, 1i8)];
+    assert!(
+        super::backward_interm::refresh_parent_frame(&net, &parity, &split, 8, 8, None).is_err()
+    );
+    assert!(
+        super::backward_interm::refresh_parent_frame(&net, &outward, &split, 0, 8, None).is_err()
+    );
+    assert!(super::backward_interm::refresh_parent_frame(
+        &net,
+        &outward,
+        &[(0, idx, 1), (0, idx, 1)],
+        8,
+        8,
+        None,
+    )
+    .is_err());
+    assert!(super::backward_interm::refresh_parent_frame(
+        &net,
+        &outward,
+        &[(0, idx, 0)],
+        8,
+        8,
+        None,
+    )
+    .is_err());
+}
 
 /// Epoch gates (splits baked into the forward tableau) are pointwise sound
 /// on their halfspaces: for every sampled point whose exact pre-activation
@@ -5179,8 +5569,13 @@ fn epoch_nested_lane_closes_and_moat_holds() {
             .expect("root");
     let mk_cfg = || BabConfig {
         k_head: 0,
-        epoch_depth: 1,
-        epoch_max_attempts: 8,
+        epoch_policy: super::EpochRuntimePolicy {
+            depth: 1,
+            max_attempts: 8,
+            ..super::EpochRuntimePolicy::default()
+        },
+        epoch_trigger_depth: 1,
+        epoch_attempt_cap: 8,
         retain_cfg: Some(retain),
         ..BabConfig::default()
     };
@@ -6750,7 +7145,7 @@ fn fractional_alpha_backward_pass_sound_vs_samples() {
     let ms = margin_seed(&mb, &gates, &ybox, RoundMode::Outward);
     // Fractional alpha on every unstable neuron; `ms` re-derived per the root
     // formula. Stable neurons keep their exact lines.
-    let mut dg = super::engine::DomainGates::default();
+    let mut dg = DomainGates::default();
     for (li, layer) in root.layers.iter().enumerate() {
         if layer.unst.is_empty() {
             continue;
@@ -6839,8 +7234,18 @@ fn alpha_opt_monotone_accept_and_ms_invariant() {
             )
         })
         .collect();
-    let report =
-        super::alpha_opt::optimize_root_alpha(&net, &mut root, 0, &[1, 2, 3], None, 6, 60.0);
+    let report = super::alpha_opt::optimize_root_alpha(
+        &net,
+        &mut root,
+        0,
+        &[1, 2, 3],
+        None,
+        super::alpha_opt::AlphaOptCfg {
+            iters: 6,
+            secs: 60.0,
+            ..super::alpha_opt::AlphaOptCfg::default()
+        },
+    );
     for (li, layer) in root.layers.iter().enumerate() {
         let (a0, s0, c0, ms0, l0, u0, unst0) = &snap[li];
         assert_eq!(&layer.s, s0, "s moved at layer {li}");
@@ -6945,6 +7350,463 @@ fn domain_gates_split_overrides_stay_exact_under_fractional_alpha() {
                 assert_eq!(gv.alpha[j], root.layers[li].alpha[j]);
                 assert_eq!(gv.ms[j], root.layers[li].ms[j]);
             }
+        }
+    }
+}
+
+// ===================== #rebake: joint forward re-bake =======================
+
+/// Exact `x - y` as a double-double (both inputs plain f64).
+fn dd_sub_f64(x: f64, y: f64) -> Dd {
+    let (h, l) = two_sum(x, -y);
+    Dd { hi: h, lo: l }
+}
+
+/// `x * y` for a double-double `x` and plain f64 `y` (error ~1e-32 relative).
+fn dd_mul_f64(x: Dd, y: f64) -> Dd {
+    let (p, e) = two_prod(x.hi, y);
+    let e = e + x.lo * y;
+    let (h, l) = two_sum(p, e);
+    Dd { hi: h, lo: l }
+}
+
+/// #rebake obligation 1, the ONE re-derived constant: `apply_gates`' outward
+/// widening under a FRACTIONAL lower slope must satisfy, per coefficient and
+/// in real arithmetic over the stored inputs,
+///
+///   `M' - D' <= (m - d)*alpha`  and  `M' + D' >= (m + d)*s (+ c on bias)`,
+///
+/// across regimes the binary-era derivation never faced — in particular
+/// `alpha >> s` (the `gates_from_box` coupling `alpha=1 => s>=1/2` is gone
+/// once the optimizer owns alpha), inverted pairs (`U < L`), and bias-column
+/// cancellation. Reference is double-double (~1e-32); the derivation proves a
+/// surplus >= 5u*W, so ANY exceedance is a real bug, not tolerance noise.
+///
+/// Also pinned here: (a) binary-alpha rows still take the HISTORICAL line
+/// bit-for-bit (disarmed builds cannot move), and (b) the historical line
+/// genuinely FAILS the obligation somewhere in the fractional grid — the
+/// discriminating half: this test would have caught shipping the old constant.
+#[test]
+fn fractional_alpha_apply_gates_widening_covers_the_extra_rounding() {
+    use super::rounding::{next_up, UNIT};
+    let ms_grid = [0.0, 1e-3, -1e-3, 0.7, -0.7, 3.0, -3.0, 1e8, -1e8, 1e-300];
+    let d_grid = [0.0, 1e-12, 1e-3, 0.5, 2.0];
+    let a_frac = [1e-6, 0.1, 0.37, 0.75, 0.999];
+    let s_grid = [0.0, 1e-9, 1e-3, 0.5, 0.999, 1.0];
+    let c_grid = [0.0, 1e-9, 0.4, 5.0];
+    let n_in = 1usize;
+    let naug = n_in + 1;
+    let blk = naug.div_ceil(64);
+    let xabs_ext = vec![1.0f64; naug];
+    let mut old_formula_violations = 0usize;
+    let mut checked = 0usize;
+    for &m in &ms_grid {
+        for &d in &d_grid {
+            for &sv in &s_grid {
+                for &cv in &c_grid {
+                    // Same (m, d) on the regular and the bias column; the bias
+                    // column additionally absorbs `c` (the cancellation case
+                    // is m + d < 0 with s, c > 0).
+                    let mm_in = Array2::from_shape_vec((1, naug), vec![m, m]).expect("shape");
+                    let dd_in = Array2::from_shape_vec((1, naug), vec![d, d]).expect("shape");
+                    for &a in &a_frac {
+                        let (mo, do_, _) = super::root::apply_gates(
+                            &mm_in,
+                            &dd_in,
+                            &[a],
+                            &[sv],
+                            &[cv],
+                            n_in,
+                            RoundMode::Outward,
+                            None,
+                            blk,
+                            &xabs_ext,
+                        );
+                        for i in 0..naug {
+                            // Exact targets from the STORED inputs.
+                            let l_exact = dd_mul_f64(dd_sub_f64(m, d), a);
+                            let mut u_exact = dd_mul_f64(
+                                {
+                                    let (h, l) = two_sum(m, d);
+                                    Dd { hi: h, lo: l }
+                                },
+                                sv,
+                            );
+                            if i == n_in {
+                                u_exact = dd_add(u_exact, Dd::from(cv));
+                            }
+                            // (†) in exact arithmetic: A_l = mo - do <= L and
+                            // A_u = mo + do >= U.
+                            let a_l = dd_sub_f64(mo[[0, i]], do_[[0, i]]);
+                            let a_u = dd_add(Dd::from(mo[[0, i]]), Dd::from(do_[[0, i]]));
+                            let low_ok = dd_add(
+                                l_exact,
+                                Dd {
+                                    hi: -a_l.hi,
+                                    lo: -a_l.lo,
+                                },
+                            );
+                            let upp_ok = dd_add(
+                                a_u,
+                                Dd {
+                                    hi: -u_exact.hi,
+                                    lo: -u_exact.lo,
+                                },
+                            );
+                            assert!(
+                                low_ok.val() >= 0.0,
+                                "lower row overstates the exact product: m={m} d={d} \
+alpha={a} s={sv} c={cv} col={i}: A_l={} > L={}",
+                                a_l.val(),
+                                l_exact.val()
+                            );
+                            assert!(
+                                upp_ok.val() >= 0.0,
+                                "upper row understates the exact product: m={m} d={d} \
+alpha={a} s={sv} c={cv} col={i}: A_u={} < U={}",
+                                a_u.val(),
+                                u_exact.val()
+                            );
+                            checked += 1;
+                            // Discriminating half: would the HISTORICAL widening
+                            // have covered this point? Count its violations.
+                            let lo_c = (m - d) * a;
+                            let up0 = (m + d) * sv;
+                            let up_c = if i == n_in { up0 + cv } else { up0 };
+                            #[allow(clippy::manual_midpoint)]
+                            let mmv = (lo_c + up_c) * 0.5;
+                            let ddv = (up_c - lo_c) * 0.5;
+                            let drow_old =
+                                next_up((ddv + 6.0 * UNIT * (mmv.abs() + ddv)) * (1.0 + 1e-15));
+                            let a_l_old = dd_sub_f64(mmv, drow_old);
+                            if dd_add(
+                                l_exact,
+                                Dd {
+                                    hi: -a_l_old.hi,
+                                    lo: -a_l_old.lo,
+                                },
+                            )
+                            .val()
+                                < 0.0
+                            {
+                                old_formula_violations += 1;
+                            }
+                        }
+                    }
+                    // Binary alpha keeps the HISTORICAL formula bit-for-bit
+                    // (this is the disarmed-bit-identity half at the site).
+                    for a in [0.0, 1.0] {
+                        let (mo, do_, _) = super::root::apply_gates(
+                            &mm_in,
+                            &dd_in,
+                            &[a],
+                            &[sv],
+                            &[cv],
+                            n_in,
+                            RoundMode::Outward,
+                            None,
+                            blk,
+                            &xabs_ext,
+                        );
+                        for i in 0..naug {
+                            let lo_c = (m - d) * a;
+                            let up0 = (m + d) * sv;
+                            let up_c = if i == n_in { up0 + cv } else { up0 };
+                            #[allow(clippy::manual_midpoint)]
+                            let mmv = (lo_c + up_c) * 0.5;
+                            let ddv = (up_c - lo_c) * 0.5;
+                            let drow_old =
+                                next_up((ddv + 6.0 * UNIT * (mmv.abs() + ddv)) * (1.0 + 1e-15));
+                            assert_eq!(
+                                mo[[0, i]].to_bits(),
+                                mmv.to_bits(),
+                                "binary-alpha M' moved: m={m} d={d} a={a} s={sv} c={cv} col={i}"
+                            );
+                            assert_eq!(
+                                do_[[0, i]].to_bits(),
+                                drow_old.to_bits(),
+                                "binary-alpha D' moved: m={m} d={d} a={a} s={sv} c={cv} col={i}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000, "grid unexpectedly small: {checked}");
+    // The obligation was REAL: the historical constant fails somewhere in the
+    // fractional grid (alpha >> s breaks its |lo_c| <= 2(|mm|+dd) premise).
+    // If this ever reads 0 the grid stopped exercising the regime and the
+    // test above is vacuous for the new branch — fix the grid, not the assert.
+    assert!(
+        old_formula_violations > 0,
+        "the historical widening covered every fractional grid point — the \
+grid no longer exercises the regime the re-derivation exists for"
+    );
+}
+
+/// #rebake disarmed/binary bit-identity at the BUILD level: rebaking with the
+/// build's own (binary, heuristic) alpha as the seed reproduces the plain
+/// build bit-for-bit — the seed plumbing and the `apply_gates` branch are
+/// provably inert until the optimizer actually moves an alpha.
+#[test]
+fn rebake_binary_seed_build_is_bit_identical() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.3; 72];
+    let hi = vec![0.5; 72];
+    let base = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let seed: Vec<Vec<f64>> = base.layers.iter().map(|l| l.alpha.clone()).collect();
+    let (rebaked, ret) = RootGates::build_rebaked(
+        &net,
+        &lo,
+        &hi,
+        RoundMode::Outward,
+        None,
+        None,
+        &seed,
+        None,
+        base.root_precision_policy,
+    )
+    .expect("rebaked");
+    assert!(ret.is_none());
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&base.mid), bits(&rebaked.mid));
+    assert_eq!(bits(&base.rad), bits(&rebaked.rad));
+    assert_eq!(base.layers.len(), rebaked.layers.len());
+    for (a, b) in base.layers.iter().zip(&rebaked.layers) {
+        assert_eq!(a.op, b.op);
+        assert_eq!(bits(&a.l), bits(&b.l), "l moved at op {}", a.op);
+        assert_eq!(bits(&a.u), bits(&b.u), "u moved at op {}", a.op);
+        assert_eq!(bits(&a.alpha), bits(&b.alpha), "alpha moved at op {}", a.op);
+        assert_eq!(bits(&a.s), bits(&b.s), "s moved at op {}", a.op);
+        assert_eq!(bits(&a.c), bits(&b.c), "c moved at op {}", a.op);
+        assert_eq!(bits(&a.ms), bits(&b.ms), "ms moved at op {}", a.op);
+        assert_eq!(a.unst, b.unst, "unst moved at op {}", a.op);
+    }
+}
+
+/// #rebake obligation 1 end-to-end: a tableau REBUILT with fractional alpha
+/// baked through `apply_gates` must still enclose exact pre-activations at
+/// sampled box points, and the certified margins from that root must sit
+/// under sampled true margins. The seed deliberately includes alpha values
+/// far above the layer's `s` (the regime the re-derived widening exists for).
+#[test]
+fn rebaked_root_boxes_enclose_sampled_preacts_under_fractional_alpha() {
+    let mut rng = StdRng::seed_from_u64(7);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.3; 72];
+    let hi = vec![0.5; 72];
+    let base = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let seed: Vec<Vec<f64>> = base
+        .layers
+        .iter()
+        .map(|l| {
+            let mut a = l.alpha.clone();
+            for (k, &j) in l.unst.iter().enumerate() {
+                a[j] = [0.05, 0.37, 0.63, 0.99][k % 4];
+            }
+            a
+        })
+        .collect();
+    let (root, _) = RootGates::build_rebaked(
+        &net,
+        &lo,
+        &hi,
+        RoundMode::Outward,
+        None,
+        None,
+        &seed,
+        None,
+        base.root_precision_policy,
+    )
+    .expect("rebaked");
+    // Engagement: the bake must actually carry fractional alpha.
+    assert!(
+        root.layers
+            .iter()
+            .any(|l| l.alpha.iter().any(|a| *a != 0.0 && *a != 1.0)),
+        "fixture produced no fractional alpha (no unstable neurons?)"
+    );
+    for lg in &root.layers {
+        for j in 0..lg.n {
+            assert_eq!(
+                lg.ms[j],
+                lg.alpha[j].max(lg.s[j]),
+                "ms invariant broken at op {} neuron {j}",
+                lg.op
+            );
+            assert!(
+                (0.0..=1.0).contains(&lg.alpha[j]),
+                "alpha out of range at op {} neuron {j}",
+                lg.op
+            );
+        }
+    }
+    let x = sample_box(&mut rng, &root, 64);
+    let sel: std::collections::BTreeMap<usize, Vec<usize>> = root
+        .layers
+        .iter()
+        .map(|lg| (lg.op, (0..lg.n).collect()))
+        .collect();
+    let (_, pre) = net.forward_points(&x, &sel).expect("forward");
+    for lg in &root.layers {
+        let p = &pre[&lg.op];
+        for j in 0..lg.n {
+            for b in 0..x.ncols() {
+                let v = p[[j, b]];
+                assert!(
+                    v >= lg.l[j] - 1e-9 && v <= lg.u[j] + 1e-9,
+                    "rebaked layer op {} neuron {j}: {v} outside [{}, {}]",
+                    lg.op,
+                    lg.l[j],
+                    lg.u[j]
+                );
+            }
+        }
+    }
+    // End-to-end: certified per-class root bounds from the rebaked build stay
+    // under sampled true margins.
+    let (t, adv) = (0usize, vec![1usize, 2, 3]);
+    let bound_ok = super::rebake::certified_root_bound(&net, &root, t, &adv).expect("root_eval");
+    let eng = BackwardEngine::new(&net, &root);
+    let re = super::bab::root_eval(&eng, &net, t, &adv).expect("root_eval");
+    let (y, _) = net
+        .forward_points(&x, &std::collections::BTreeMap::new())
+        .expect("forward");
+    let margins = margins_at(&net, &y, t, &adv);
+    for (k, row) in margins.iter().enumerate() {
+        for &mv in row {
+            assert!(
+                re.dj[k] <= mv + 1e-9,
+                "UNSOUND rebaked root: class {} certified {} > sampled margin {}",
+                adv[k],
+                re.dj[k],
+                mv
+            );
+        }
+    }
+    assert!((bound_ok - re.dj.iter().copied().fold(f64::INFINITY, f64::min)).abs() <= 1e-12);
+}
+
+/// #rebake driver contract: round-level MONOTONE ACCEPT on the certified
+/// `root_eval` bound (never worse than the entry build; bit-identical root
+/// when nothing is accepted), and the final root's certified bounds stay
+/// sound against sampled margins. Also the disarmed entry: with the frozen
+/// policy gate off, `maybe_rebake_root` must not touch the root at all.
+#[test]
+fn rebake_round_monotone_acceptance_and_disarmed_identity() {
+    let mut rng = StdRng::seed_from_u64(53);
+    let spec = tiny_spec(&mut rng, 0.65);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.5; 72];
+    let hi = vec![0.5; 72];
+    let mut root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let (t, adv) = (0usize, vec![1usize, 2, 3]);
+    let bits_of = |r: &RootGates| -> Vec<Vec<u64>> {
+        r.layers
+            .iter()
+            .flat_map(|l| {
+                [&l.l, &l.u, &l.alpha, &l.s, &l.c, &l.ms]
+                    .into_iter()
+                    .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+            })
+            .collect()
+    };
+    // Disarmed entry: frozen policy gate off => no-op.
+    let snap0 = bits_of(&root);
+    let mut retained = None;
+    assert!(super::rebake::maybe_rebake_root(
+        &net,
+        &mut root,
+        &mut retained,
+        None,
+        t,
+        &adv,
+        None,
+        0.01,
+        super::RootAlphaRuntimePolicy::default(),
+        super::BackwardIntermRuntimePolicy::default(),
+    )
+    .is_none());
+    assert_eq!(
+        snap0,
+        bits_of(&root),
+        "disarmed maybe_rebake_root moved the root"
+    );
+    assert!(retained.is_none());
+    // Armed loop, called below the gate.
+    let entry_bound = super::rebake::certified_root_bound(&net, &root, t, &adv).expect("baseline");
+    let snap1 = bits_of(&root);
+    let rebake_policy = super::RootAlphaRuntimePolicy {
+        rebake_enabled: true,
+        rebake_rounds: 3,
+        rebake_secs: 60.0,
+        ..super::RootAlphaRuntimePolicy::default()
+    };
+    let report = super::rebake::rebake_root(
+        &net,
+        &mut root,
+        &mut retained,
+        None,
+        t,
+        &adv,
+        None,
+        0.01,
+        rebake_policy,
+        None,
+    )
+    .expect("tiny net with unstable neurons must not refuse");
+    assert!(
+        (report.baseline - entry_bound).abs() <= 1e-12,
+        "baseline {} != independent root_eval {}",
+        report.baseline,
+        entry_bound
+    );
+    assert!(
+        report.best >= report.baseline,
+        "round-monotone accept violated: best {} < baseline {}",
+        report.best,
+        report.baseline
+    );
+    assert!(report.rounds_accepted <= report.rounds_run);
+    let final_bound = super::rebake::certified_root_bound(&net, &root, t, &adv).expect("final");
+    assert!(
+        (final_bound - report.best).abs() <= 1e-12,
+        "published root ({final_bound}) disagrees with the accepted round ({})",
+        report.best
+    );
+    if report.rounds_accepted == 0 {
+        assert_eq!(
+            snap1,
+            bits_of(&root),
+            "no round accepted, yet the root moved"
+        );
+    } else {
+        assert!(
+            report.best > report.baseline,
+            "accepted rounds without a strict improvement"
+        );
+    }
+    // Soundness of whatever build the loop left behind.
+    let eng = BackwardEngine::new(&net, &root);
+    let re = super::bab::root_eval(&eng, &net, t, &adv).expect("root_eval");
+    let x = sample_box(&mut rng, &root, 128);
+    let (y, _) = net
+        .forward_points(&x, &std::collections::BTreeMap::new())
+        .expect("forward");
+    let margins = margins_at(&net, &y, t, &adv);
+    for (k, row) in margins.iter().enumerate() {
+        for &mv in row {
+            assert!(
+                re.dj[k] <= mv + 1e-9,
+                "UNSOUND rebaked root: class {} certified {} > sampled margin {}",
+                adv[k],
+                re.dj[k],
+                mv
+            );
         }
     }
 }
@@ -7367,7 +8229,7 @@ fn beta_percol_seed_shift_isolates_columns() {
 fn beta_percol_term_filters_and_grouping() {
     let (_net, root) = beta_fixture(0xB37A_0006);
     let trunk = [(1usize, 0usize, -1i8), (2usize, 0usize, 1i8)];
-    let mut dom = super::engine::DomainGates::default();
+    let mut dom = DomainGates::default();
     // Column 0 prices only the layer-2 split (layer-1 beta is 0); column 3
     // prices only the layer-1 split.
     let c0 = [0.0f64, 2.0];
@@ -7404,18 +8266,66 @@ fn backward_interm_shrink_only_sound_and_chunk_invariant() {
             .0
     };
     let off = build(None);
+    // `chunk_secs: 0.0` pins the FIXED grain, which is what the chunk-invariance
+    // assertion below is about; the sizer's own invariance is covered by
+    // `backward_interm_pass_sizer_is_bit_identical_to_the_fixed_grain`.
     let cfg = |chunk: usize| super::backward_interm::BiCfg {
         secs: 60.0,
         chunk,
         topk: 512,
+        chunk_secs: 0.0,
     };
     let on1 = build(Some(cfg(1)));
     let on8 = build(Some(cfg(8)));
+    let on256 = build(Some(cfg(256)));
+    let top1 = build(Some(super::backward_interm::BiCfg {
+        secs: 60.0,
+        chunk: 8,
+        topk: 1,
+        chunk_secs: 0.0,
+    }));
     let zero = build(Some(super::backward_interm::BiCfg {
         secs: 0.0,
         chunk: 4,
         topk: 512,
+        chunk_secs: 0.0,
     }));
+    let off_exec = off.backward_interm_execution;
+    assert!(!off_exec.enabled);
+    assert!(off_exec.eligible_layers > 0);
+    assert!(off_exec.suppressed_setup_layers > 0);
+    assert_eq!(off_exec.layers_started, 0);
+    assert_eq!(off_exec.chunks_completed, 0);
+    assert_eq!(off_exec.columns_completed, 0);
+    assert_eq!(off_exec.outcome(), "disabled");
+    let on_exec = on1.backward_interm_execution;
+    assert!(on_exec.enabled);
+    assert_eq!(on_exec.configured_chunk, 1);
+    assert!(on_exec.layers_started > 0);
+    assert!(on_exec.chunks_completed > 0);
+    assert!(on_exec.columns_completed > 0);
+    assert!(on_exec.chunk_counterfactual_chunks > 0);
+    assert!(!on_exec.policy_mismatch);
+    assert_eq!(on_exec.outcome(), "completed");
+    let fixed_width_exec = on8.backward_interm_execution;
+    assert!(fixed_width_exec.fixed_width_chunks > 0);
+    assert!(fixed_width_exec.chunk_ceiling_binding_chunks > 0);
+    let default_chunk_exec = on256.backward_interm_execution;
+    assert_eq!(default_chunk_exec.configured_chunk, 256);
+    assert_eq!(default_chunk_exec.chunk_counterfactual_chunks, 0);
+    assert_eq!(default_chunk_exec.chunk_ceiling_binding_chunks, 0);
+    assert!(default_chunk_exec.fixed_width_chunks > 0);
+    let top1_exec = top1.backward_interm_execution;
+    assert!(top1_exec.topk_binding_layers > 0);
+    assert_eq!(top1_exec.configured_topk, 1);
+    let zero_exec = zero.backward_interm_execution;
+    assert!(zero_exec.enabled);
+    assert!(zero_exec.eligible_layers > 0);
+    assert_eq!(zero_exec.layers_started, 0);
+    assert_eq!(zero_exec.columns_completed, 0);
+    assert!(zero_exec.budget_exhausted);
+    assert!(!zero_exec.deadline_capped);
+    assert_eq!(zero_exec.outcome(), "exhausted");
     assert_eq!(off.layers.len(), on1.layers.len());
     // Shrink-only against the forward-only build.
     let mut moved = 0usize;
@@ -7462,6 +8372,69 @@ fn backward_interm_shrink_only_sound_and_chunk_invariant() {
                     l.l[j],
                     l.u[j]
                 );
+            }
+        }
+    }
+}
+
+/// #bi-adaptive-chunk: sizing a pass from a MEASURED rate instead of a fixed
+/// grain changes only the partition of the selected columns, and a partition is
+/// not a mathematical object here — each column is its own independent prefix
+/// pass committing its own shrink-only intersection. So with a budget large
+/// enough that neither arm truncates, the two published roots must be
+/// BIT-IDENTICAL. This is the regression gate for the whole mechanism: if the
+/// sizer ever changed a bound it would be doing something it has no licence to
+/// do, and the seconds it saves would be bought with a different proof.
+#[test]
+fn backward_interm_pass_sizer_is_bit_identical_to_the_fixed_grain() {
+    let mut rng = StdRng::seed_from_u64(0xB1_0001);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.4; 72];
+    let hi = vec![0.4; 72];
+    let build = |chunk_secs: f64| {
+        RootGates::build_retaining_bi(
+            &net,
+            &lo,
+            &hi,
+            RoundMode::Outward,
+            None,
+            Some(super::backward_interm::BiCfg {
+                secs: 600.0,
+                chunk: 8,
+                topk: 512,
+                chunk_secs,
+            }),
+        )
+        .expect("build")
+        .0
+    };
+    let fixed = build(0.0);
+    // A target far larger than any pass on this toy net costs, so the sizer is
+    // ceiling-bound and must reproduce the grain exactly; and a target far
+    // smaller, so it is rate-bound and runs single-column passes.
+    let ceiling_sized = build(600.0);
+    let rate_sized = build(1e-9);
+    assert_eq!(fixed.backward_interm_execution.configured_chunk_secs, 0.0);
+    assert_eq!(
+        ceiling_sized
+            .backward_interm_execution
+            .configured_chunk_secs,
+        600.0
+    );
+    assert_eq!(
+        rate_sized.backward_interm_execution.configured_chunk_secs,
+        1e-9
+    );
+    assert!(rate_sized.backward_interm_execution.adaptive_width_changes > 0);
+    for sized in [ceiling_sized, rate_sized] {
+        assert_eq!(fixed.layers.len(), sized.layers.len());
+        for (a, b) in fixed.layers.iter().zip(&sized.layers) {
+            for j in 0..a.n {
+                assert_eq!(a.l[j].to_bits(), b.l[j].to_bits(), "pass sizing moved l");
+                assert_eq!(a.u[j].to_bits(), b.u[j].to_bits(), "pass sizing moved u");
+                assert_eq!(a.s[j].to_bits(), b.s[j].to_bits(), "pass sizing moved s");
+                assert_eq!(a.c[j].to_bits(), b.c[j].to_bits(), "pass sizing moved c");
             }
         }
     }
@@ -7571,5 +8544,2048 @@ fn clip_slack_calibration_must_use_forward_bounds() {
     assert_eq!(
         wrong.sl_up[0], 0.0,
         "tightened calibration must clamp (the trap)"
+    );
+}
+
+// ======================= #tableau-f32 STORAGE-LANE TESTS =====================
+//
+// THE PINNED CONTAINMENT RULE (docs/TABLEAU_F32_2026-08-20.md, must-fix MF2).
+// Baseline: the f64 path at HEAD (`build_prec` with `use_f32 = false` for the
+// end-to-end boxes; the literal HEAD site expressions for the per-site rule).
+// Per-coefficient obligation at every f64->f32 store site, on the SAME inputs:
+//
+//     m32 - d32 <= m64 - d64   AND   m32 + d32 >= m64 + d64
+//
+// (equivalently `d32 - d64 >= |m32 - m64|`): the f32-stored sandwich interval
+// CONTAINS the f64-path interval. Checked by the per-site ORACLE below over a
+// grid including subnormals — not by a per-run assertion. The end-to-end zoo
+// test then checks the composed boxes against the f64 baseline.
+
+/// f32-representable CENTER-role grid values (signed, incl. f32 subnormals and
+/// the 2^-25 teeth case), widened exactly to f64 so both lanes see identical
+/// inputs.
+fn tf32_grid_m() -> Vec<f64> {
+    let mags: [f32; 10] = [
+        0.0,
+        f32::from_bits(1), // min subnormal (1.4e-45)
+        1.0e-40,           // subnormal
+        f32::MIN_POSITIVE, // 1.17549435e-38
+        2.0f32.powi(-25),  // the uncharged-formula killer
+        1.0e-20,
+        0.5,
+        1.0 + f32::EPSILON, // 1 + 2^-23
+        3.303_03,
+        1.0e8,
+    ];
+    let mut v: Vec<f64> = Vec::new();
+    for m in mags {
+        v.push(f64::from(m));
+        if m != 0.0 {
+            v.push(-f64::from(m));
+        }
+    }
+    v
+}
+
+/// f32-representable RADIUS-role grid values (nonneg).
+fn tf32_grid_d() -> Vec<f64> {
+    [
+        0.0f32,
+        f32::from_bits(1),
+        1.0e-40,
+        f32::MIN_POSITIVE,
+        1.0e-16,
+        2.5e-7,
+        0.25,
+        7.0e5,
+    ]
+    .into_iter()
+    .map(f64::from)
+    .collect()
+}
+
+/// Per-site containment check: the f32-stored (m, d) pair must contain the
+/// f64-path pair per coefficient. EXACT — no tolerance: the charges must
+/// cover every store perturbation outright.
+#[allow(clippy::too_many_arguments)]
+fn tf32_assert_contains(
+    site: &str,
+    m64: &Array2<f64>,
+    d64: &Array2<f64>,
+    m32: &Array2<f32>,
+    d32: &Array2<f32>,
+    checks: &mut usize,
+) {
+    for ((idx, &mv64), &dv64) in m64.indexed_iter().zip(d64.iter()) {
+        let mv32 = f64::from(m32[idx]);
+        let dv32 = f64::from(d32[idx]);
+        assert!(
+            mv32 - dv32 <= mv64 - dv64 && mv32 + dv32 >= mv64 + dv64,
+            "{site} @ {idx:?}: f32-stored sandwich [{:e}, {:e}] does NOT contain \
+             f64 sandwich [{:e}, {:e}] (m64={mv64:e} d64={dv64:e} m32={mv32:e} \
+             d32={dv32:e}) — a store charge under-covers (false-tightening risk)",
+            mv32 - dv32,
+            mv32 + dv32,
+            mv64 - dv64,
+            mv64 + dv64,
+        );
+        *checks += 1;
+    }
+}
+
+/// MF2 per-site oracle, two obligations per store site on identical inputs
+/// (f32-representable grid incl. subnormals), NO tolerance:
+/// (1) per-coefficient sandwich containment against the f64 path at HEAD
+///     (`d32 - d64 >= |m32 - m64|`, via the same-site D fold), and
+/// (2) the site's fused g_err storage-dust charge dominates the exact
+///     deviation functional: `gstore[j] >= sum_i (|m32-m64| + |d32-d64|) *
+///     xabs_ext_i` — the sign-independent account `concretize_box` consumes,
+///     which is what makes the storage lane endpoint-sound on MIXED-SIGN
+///     input boxes (tinyimagenet's are mixed-sign).
+/// Plus: the UNcharged Add formula demonstrably VIOLATES containment (the
+/// test has teeth), and the din up-store is elementwise monotone.
+#[test]
+fn tableau_f32_store_per_site_containment_oracle() {
+    use super::root::{add_op, chaffine_op, conv_bias_fold, par_zip2_radius_masked};
+    let gm = tf32_grid_m();
+    let gd = tf32_grid_d();
+    let mut checks = 0usize;
+
+    // Exact deviation functional of one row: sum_i (|dM| + |dD|) * x_i.
+    let dev_functional = |m64: &Array2<f64>,
+                          d64: &Array2<f64>,
+                          m32: &Array2<f32>,
+                          d32: &Array2<f32>,
+                          row: usize,
+                          xabs_ext: &[f64]|
+     -> f64 {
+        let mut acc = 0.0f64;
+        for i in 0..m64.ncols() {
+            acc += ((f64::from(m32[[row, i]]) - m64[[row, i]]).abs()
+                + (f64::from(d32[[row, i]]) - d64[[row, i]]).abs())
+                * xabs_ext[i];
+        }
+        acc
+    };
+    let assert_gstore = |site: &str,
+                         m64: &Array2<f64>,
+                         d64: &Array2<f64>,
+                         m32: &Array2<f32>,
+                         d32: &Array2<f32>,
+                         gstore: &[f64],
+                         xabs_ext: &[f64],
+                         checks: &mut usize| {
+        for row in 0..m64.nrows() {
+            let need = dev_functional(m64, d64, m32, d32, row, xabs_ext);
+            assert!(
+                gstore[row] >= need,
+                "{site} row {row}: g_err storage charge {:.6e} < exact deviation \
+                 functional {:.6e} — endpoint soundness on mixed-sign boxes broken",
+                gstore[row],
+                need
+            );
+            *checks += 1;
+        }
+    };
+
+    // ---- Site: residual Add (fused center+radius store + g_err charge) -----
+    {
+        let mut ma = Vec::new();
+        let mut mb = Vec::new();
+        let mut da = Vec::new();
+        let mut db = Vec::new();
+        for &a in &gm {
+            for &b in &gm {
+                for &x in &gd {
+                    for &y in &gd {
+                        ma.push(a);
+                        mb.push(b);
+                        da.push(x);
+                        db.push(y);
+                    }
+                }
+            }
+        }
+        let n = ma.len();
+        // Mixed-magnitude xabs weights, cycled.
+        let xabs_ext: Vec<f64> = (0..n).map(|i| [0.0, 1e-6, 1.0, 37.5][i % 4]).collect();
+        let to2 = |v: &[f64]| Array2::from_shape_vec((1, n), v.to_vec()).expect("shape");
+        let to2f = |v: &[f64]| {
+            #[allow(clippy::cast_possible_truncation)]
+            Array2::from_shape_vec((1, n), v.iter().map(|&x| x as f32).collect::<Vec<f32>>())
+                .expect("shape")
+        };
+        let (mo64, do64, _) = add_op::<f64>(
+            to2(&ma),
+            &to2(&mb),
+            to2(&da),
+            &to2(&db),
+            &[],
+            1,
+            RoundMode::Outward,
+            &xabs_ext,
+        );
+        let (mo32, do32, gs32) = add_op::<f32>(
+            to2f(&ma),
+            &to2f(&mb),
+            to2f(&da),
+            &to2f(&db),
+            &[],
+            1,
+            RoundMode::Outward,
+            &xabs_ext,
+        );
+        tf32_assert_contains("add_op", &mo64, &do64, &mo32, &do32, &mut checks);
+        assert_gstore(
+            "add_op",
+            &mo64,
+            &do64,
+            &mo32,
+            &do32,
+            &gs32,
+            &xabs_ext,
+            &mut checks,
+        );
+
+        // TEETH: the UNcharged formula (HEAD's f64 widening with a bare f32
+        // nearest store, no `f32_store_slack`) must VIOLATE containment on
+        // ma = 1, mb = 2^-25, da = db = 0: the sum 1 + 2^-25 stores to 1.0f32
+        // (delta 2^-25 ~ 3e-8) while the uncharged D is only ~2e-16.
+        let (sum, dsum) = (1.0f64 + f64::from(2.0f32.powi(-25)), 0.0f64);
+        let m64v = sum;
+        let d64v = super::rounding::next_up(
+            (dsum + 2.0 * super::rounding::UNIT * sum.abs()) * (1.0 + 1e-15),
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let m32v = f64::from(sum as f32);
+        let d32_uncharged = f64::from(ny_core::f64_to_f32_up(d64v));
+        assert!(
+            m32v + d32_uncharged < m64v + d64v,
+            "teeth case no longer violates containment WITHOUT the charge — the \
+             oracle lost its discriminating power"
+        );
+    }
+
+    // ---- Site: ChannelAffine (folded BN), coefficients + bias column -------
+    {
+        let scales = [-3.0f64, -1.0, -1e-3, 0.0, 1e-3, 1.0, 2.5, 1e10];
+        let shifts = [-1.0f64, 0.0, 1e-8, 2.0];
+        let mut scale = Vec::new();
+        let mut shift = Vec::new();
+        let mut shift_err = Vec::new();
+        for (i, &sc) in scales.iter().enumerate() {
+            for &sh in &shifts {
+                scale.push(sc);
+                shift.push(sh);
+                shift_err.push(if i % 2 == 0 { 0.0 } else { 1e-9 });
+            }
+        }
+        let rows = scale.len();
+        let mut cols_m = Vec::new();
+        let mut cols_d = Vec::new();
+        for &m in &gm {
+            for &d in &gd {
+                cols_m.push(m);
+                cols_d.push(d);
+            }
+        }
+        let n_in = cols_m.len();
+        let naug = n_in + 1;
+        let xabs_ext: Vec<f64> = (0..n_in)
+            .map(|i| [0.0, 1e-6, 1.0, 37.5][i % 4])
+            .chain(std::iter::once(1.0))
+            .collect();
+        let mut m64 = Array2::<f64>::zeros((rows, naug));
+        let mut d64 = Array2::<f64>::zeros((rows, naug));
+        for r in 0..rows {
+            for i in 0..n_in {
+                m64[[r, i]] = cols_m[i];
+                d64[[r, i]] = cols_d[i];
+            }
+            m64[[r, n_in]] = gm[r % gm.len()];
+            d64[[r, n_in]] = gd[r % gd.len()];
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let mut m32 = m64.mapv(|v| v as f32);
+        #[allow(clippy::cast_possible_truncation)]
+        let mut d32 = d64.mapv(|v| v as f32);
+        let blk = naug.div_ceil(64);
+        let _ = chaffine_op::<f64>(
+            &mut m64,
+            &mut d64,
+            &scale,
+            &shift,
+            1e-15,
+            &shift_err,
+            n_in,
+            RoundMode::Outward,
+            None,
+            blk,
+            &xabs_ext,
+        );
+        let gs32 = chaffine_op::<f32>(
+            &mut m32,
+            &mut d32,
+            &scale,
+            &shift,
+            1e-15,
+            &shift_err,
+            n_in,
+            RoundMode::Outward,
+            None,
+            blk,
+            &xabs_ext,
+        );
+        tf32_assert_contains("chaffine_op", &m64, &d64, &m32, &d32, &mut checks);
+        assert_gstore(
+            "chaffine_op",
+            &m64,
+            &d64,
+            &m32,
+            &d32,
+            &gs32,
+            &xabs_ext,
+            &mut checks,
+        );
+    }
+
+    // ---- Site: conv bias fold (bias column only, g_err weight 1.0) ---------
+    {
+        let biases = [-2.0f64, -1e-9, 0.0, 3.5e-8, 1.0, 4.0e7];
+        let mut mo = Vec::new();
+        let mut do_ = Vec::new();
+        let mut bias = Vec::new();
+        let mut bias_err = Vec::new();
+        for &b in &biases {
+            for &m in &gm {
+                for &d in &gd {
+                    mo.push(m);
+                    do_.push(d);
+                    bias.push(b);
+                    bias_err.push(if bias.len() % 3 == 0 { 1e-12 } else { 0.0 });
+                }
+            }
+        }
+        let n_out = mo.len();
+        // naug = 2: col 0 is untouched payload, col 1 is the bias column.
+        let mk = |bias_col: &[f64]| {
+            let mut a = Array2::<f64>::zeros((n_out, 2));
+            for (j, &v) in bias_col.iter().enumerate() {
+                a[[j, 1]] = v;
+            }
+            a
+        };
+        let mut mo64 = mk(&mo);
+        let mut do64 = mk(&do_);
+        #[allow(clippy::cast_possible_truncation)]
+        let mut mo32 = mo64.mapv(|v| v as f32);
+        #[allow(clippy::cast_possible_truncation)]
+        let mut do32 = do64.mapv(|v| v as f32);
+        let mut g64 = vec![0.0f64; n_out];
+        let mut g32 = vec![0.0f64; n_out];
+        conv_bias_fold::<f64>(
+            &mut mo64,
+            &mut do64,
+            &bias,
+            &bias_err,
+            1,
+            1,
+            RoundMode::Outward,
+            &mut g64,
+        );
+        conv_bias_fold::<f32>(
+            &mut mo32,
+            &mut do32,
+            &bias,
+            &bias_err,
+            1,
+            1,
+            RoundMode::Outward,
+            &mut g32,
+        );
+        assert!(g64.iter().all(|&v| v == 0.0), "f64 lane must not charge");
+        tf32_assert_contains("conv_bias_fold", &mo64, &do64, &mo32, &do32, &mut checks);
+        // Bias column dev functional with weight 1.0 (payload col 0 exact).
+        for j in 0..n_out {
+            let need = (f64::from(mo32[[j, 1]]) - mo64[[j, 1]]).abs()
+                + (f64::from(do32[[j, 1]]) - do64[[j, 1]]).abs();
+            assert!(
+                g32[j] >= need,
+                "conv_bias_fold row {j}: g_err charge {:.3e} < deviation {need:.3e}",
+                g32[j]
+            );
+            checks += 1;
+        }
+    }
+
+    // ---- Site: apply_gates (binary AND fractional alpha, bias column) ------
+    {
+        let gates: &[(f64, f64, f64)] = &[
+            (0.0, 0.0, 0.0),        // inactive
+            (1.0, 1.0, 0.0),        // active
+            (1.0, 0.5, 0.7),        // binary unstable
+            (0.0, 0.5, 0.7),        // binary unstable, alpha 0
+            (0.3, 0.5, 0.7),        // fractional (#rebake regime)
+            (0.999_999, 1e-6, 0.2), // fractional near-degenerate
+        ];
+        let alpha: Vec<f64> = gates.iter().map(|g| g.0).collect();
+        let s: Vec<f64> = gates.iter().map(|g| g.1).collect();
+        let c: Vec<f64> = gates.iter().map(|g| g.2).collect();
+        let rows = gates.len();
+        let mut cols_m = Vec::new();
+        let mut cols_d = Vec::new();
+        for &m in &gm {
+            for &d in &gd {
+                cols_m.push(m);
+                cols_d.push(d);
+            }
+        }
+        let n_in = cols_m.len();
+        let naug = n_in + 1;
+        let xabs_ext: Vec<f64> = (0..n_in)
+            .map(|i| [0.0, 1e-6, 1.0, 37.5][i % 4])
+            .chain(std::iter::once(1.0))
+            .collect();
+        let mut m64 = Array2::<f64>::zeros((rows, naug));
+        let mut d64 = Array2::<f64>::zeros((rows, naug));
+        for r in 0..rows {
+            for i in 0..n_in {
+                m64[[r, i]] = cols_m[i];
+                d64[[r, i]] = cols_d[i];
+            }
+            m64[[r, n_in]] = gm[(r + 3) % gm.len()];
+            d64[[r, n_in]] = gd[(r + 2) % gd.len()];
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let m32 = m64.mapv(|v| v as f32);
+        #[allow(clippy::cast_possible_truncation)]
+        let d32 = d64.mapv(|v| v as f32);
+        let blk = naug.div_ceil(64);
+        let (o64m, o64d, _) = super::root::apply_gates::<f64>(
+            &m64,
+            &d64,
+            &alpha,
+            &s,
+            &c,
+            n_in,
+            RoundMode::Outward,
+            None,
+            blk,
+            &xabs_ext,
+        );
+        let (o32m, o32d, gs32) = super::root::apply_gates::<f32>(
+            &m32,
+            &d32,
+            &alpha,
+            &s,
+            &c,
+            n_in,
+            RoundMode::Outward,
+            None,
+            blk,
+            &xabs_ext,
+        );
+        tf32_assert_contains("apply_gates", &o64m, &o64d, &o32m, &o32d, &mut checks);
+        assert_gstore(
+            "apply_gates",
+            &o64m,
+            &o64d,
+            &o32m,
+            &o32d,
+            &gs32,
+            &xabs_ext,
+            &mut checks,
+        );
+    }
+
+    // ---- Site: din prep (radius-role up-store monotonicity, design 7.4) ----
+    {
+        let g = super::rounding::next_up(super::rounding::gamma_n(66) + 1e-15);
+        let mut am = Vec::new();
+        let mut ad = Vec::new();
+        for &m in &gm {
+            for &d in &gd {
+                am.push(m);
+                ad.push(d);
+            }
+        }
+        let n = am.len();
+        let a64 = Array2::from_shape_vec((1, n), am.clone()).expect("shape");
+        let b64 = Array2::from_shape_vec((1, n), ad.clone()).expect("shape");
+        #[allow(clippy::cast_possible_truncation)]
+        let a32 = a64.mapv(|v| v as f32);
+        #[allow(clippy::cast_possible_truncation)]
+        let b32 = b64.mapv(|v| v as f32);
+        let mut din64 = Array2::<f64>::zeros((1, n));
+        let mut din32 = Array2::<f32>::zeros((1, n));
+        par_zip2_radius_masked::<f64>(&mut din64, &a64, &b64, &[], 1, |m, d| d + g * (m.abs() + d));
+        par_zip2_radius_masked::<f32>(&mut din32, &a32, &b32, &[], 1, |m, d| d + g * (m.abs() + d));
+        for i in 0..n {
+            assert!(
+                f64::from(din32[[0, i]]) >= din64[[0, i]],
+                "din up-store NOT monotone at {i}: {} < {}",
+                f64::from(din32[[0, i]]),
+                din64[[0, i]]
+            );
+            checks += 1;
+        }
+    }
+
+    eprintln!("[tableau-f32] per-site containment oracle: {checks} exact checks, 0 breaches");
+    assert!(checks > 20_000, "grid unexpectedly small ({checks})");
+}
+
+/// End-to-end #tableau-f32 gate over the net zoo:
+/// (1) HARD: every f32-STORED box contains the f64-path box (the MF2 baseline:
+///     `build_prec(use_f32 = false)` at HEAD), per layer/neuron;
+/// (2) HARD off-arm bit-identity: with the storage flag OFF the generic walk's
+///     published gates are BITWISE the f32-compute lane's (and with
+///     `use_f32 = false` the refused store request is BITWISE the f64 lane's —
+///     the refusal path is loud but inert).
+#[test]
+fn tableau_f32_store_boxes_contain_f64_and_off_arm_is_bitwise() {
+    let n_out = 6usize;
+    let mut seed: u64 = 0x7AB1_EAF3;
+    let radii = [1.0f64, 1.0e-3];
+    let mut box_checks = 0usize;
+    for trial in 0..8usize {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        for &rad in &radii {
+            let (spec, n_in): (TwinSpec, usize) = match trial % 4 {
+                0 => {
+                    let (cin, h, w, cw) = (3usize, 2usize, 2usize, 10usize);
+                    (
+                        conv_bn_spec(cin, h, w, cw, 20.0, 1e-13, 1e-4, 16, n_out, seed),
+                        cin * h * w,
+                    )
+                }
+                1 => {
+                    let (cin, h, w, cw, nb) = (2usize, 2usize, 2usize, 8usize, 16usize);
+                    (
+                        residual_add_spec(cin, h, w, cw, nb, 2.0 / cw as f64, 16, n_out, seed),
+                        cin * h * w,
+                    )
+                }
+                2 => {
+                    let (n_in, depth) = (8usize, 40usize);
+                    (no_conv_chain_spec(n_in, depth, 20, n_out, seed), n_in)
+                }
+                _ => {
+                    let (cin, h, w, cw, n_y) = (2usize, 2usize, 2usize, 8usize, 256usize);
+                    (
+                        large_head_spec(cin, h, w, cw, n_y, n_out, seed),
+                        cin * h * w,
+                    )
+                }
+            };
+            let lo = vec![-rad; n_in];
+            let hi = vec![rad; n_in];
+            let net = match TwinNet::compile(&spec) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let b = |use_f32: bool, store: bool| {
+                RootGates::build_prec_store(
+                    &net,
+                    &lo,
+                    &hi,
+                    RoundMode::Outward,
+                    None,
+                    use_f32,
+                    store,
+                )
+                .ok()
+            };
+            let (Some(r64), Some(r32), Some(rst)) =
+                (b(false, false), b(true, false), b(true, true))
+            else {
+                continue;
+            };
+            // (2a) store OFF == the f32-compute lane, bitwise.
+            let r32_prec = RootGates::build_prec(&net, &lo, &hi, RoundMode::Outward, None, true)
+                .expect("f32 lane");
+            for (a, c) in r32.layers.iter().zip(&r32_prec.layers) {
+                for (x, y) in
+                    a.l.iter()
+                        .chain(&a.u)
+                        .chain(&a.alpha)
+                        .chain(&a.s)
+                        .chain(&a.c)
+                        .chain(&a.ms)
+                        .zip(
+                            c.l.iter()
+                                .chain(&c.u)
+                                .chain(&c.alpha)
+                                .chain(&c.s)
+                                .chain(&c.c)
+                                .chain(&c.ms),
+                        )
+                {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "store-OFF arm drifted from the f32-compute lane (trial {trial})"
+                    );
+                }
+            }
+            // (2b) store requested WITHOUT the compute lane == the f64 lane,
+            // bitwise (refused loudly, then inert).
+            let refused = b(false, true).expect("refused build");
+            for (a, c) in refused.layers.iter().zip(&r64.layers) {
+                for (x, y) in a.l.iter().chain(&a.u).zip(c.l.iter().chain(&c.u)) {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "REFUSED store arm drifted from the f64 lane (trial {trial})"
+                    );
+                }
+            }
+            // (1) containment of the composed boxes vs the f64 path at HEAD.
+            assert_eq!(rst.layers.len(), r64.layers.len());
+            for (lgs, lg64) in rst.layers.iter().zip(&r64.layers) {
+                for j in 0..lg64.n {
+                    if !(lgs.l[j].is_finite()
+                        && lgs.u[j].is_finite()
+                        && lg64.l[j].is_finite()
+                        && lg64.u[j].is_finite())
+                    {
+                        continue;
+                    }
+                    // Same directed-rounding allowance as the shipped f32 gate.
+                    let eps = 8.0 * f64::EPSILON * (lg64.l[j].abs().max(lg64.u[j].abs()) + 1.0);
+                    assert!(
+                        lgs.l[j] <= lg64.l[j] + eps && lgs.u[j] >= lg64.u[j] - eps,
+                        "trial {trial} rad {rad} j={j}: f32-STORED box [{}, {}] fails to \
+                         contain f64 box [{}, {}]",
+                        lgs.l[j],
+                        lgs.u[j],
+                        lg64.l[j],
+                        lg64.u[j]
+                    );
+                    box_checks += 1;
+                }
+            }
+        }
+    }
+    eprintln!("[tableau-f32] zoo containment: {box_checks} box checks, 0 breaches");
+    assert!(box_checks > 500, "zoo unexpectedly small ({box_checks})");
+}
+
+/// Class (a) refactor gate: the native f32-store conv publishes BITWISE the
+/// value the shipped widened path publishes (same shared core, dense and
+/// mask-blocked), protecting the shipped `root_f32` lane through the
+/// cast/core split.
+#[test]
+fn conv_f32_native_store_is_bitwise_the_widened_path() {
+    use super::net::{conv_apply_forward_prec_masked, conv_forward_f32_native, TwinOp};
+    let mut rng = StdRng::seed_from_u64(0xC0DE_F32D);
+    let spec = conv_bn_spec(3, 3, 3, 12, 4.0, 1e-13, 1e-4, 16, 6, 0xFEED);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let naug = 40usize;
+    let mut tested = 0usize;
+    for (k, op) in net.ops.iter().enumerate() {
+        let TwinOp::Conv(c) = op else { continue };
+        let n_src = net.tsize[c.input];
+        let n_out = net.tsize[k + 1];
+        let src64 = Array2::from_shape_fn((n_src, naug), |_| rng.random_range(-2.0..2.0f64));
+        #[allow(clippy::cast_possible_truncation)]
+        let src32 = src64.mapv(|v| v as f32);
+        for abs_w in [false, true] {
+            // Dense.
+            let mut dst64 = Array2::<f64>::zeros((n_out, naug));
+            conv_apply_forward_prec_masked(c, &src64, &mut dst64, abs_w, true, None);
+            let mut dst32 = Array2::<f32>::zeros((n_out, naug));
+            conv_forward_f32_native(c, &src32, &mut dst32, abs_w, None);
+            for (a, b) in dst64.iter().zip(dst32.iter()) {
+                assert_eq!(
+                    a.to_bits(),
+                    f64::from(*b).to_bits(),
+                    "native f32 store drifted from the widened path (op {k}, dense)"
+                );
+            }
+            // Mask-blocked (all-live masks: exercises the mask blocking with
+            // the support invariant trivially satisfied).
+            let src_mask = vec![u64::MAX; n_src];
+            let out_mask = vec![u64::MAX; n_out];
+            let mask = Some((src_mask.as_slice(), out_mask.as_slice(), 64usize));
+            let mut dst64m = Array2::<f64>::zeros((n_out, naug));
+            conv_apply_forward_prec_masked(c, &src64, &mut dst64m, abs_w, true, mask);
+            let mut dst32m = Array2::<f32>::zeros((n_out, naug));
+            conv_forward_f32_native(c, &src32, &mut dst32m, abs_w, mask);
+            for (a, b) in dst64m.iter().zip(dst32m.iter()) {
+                assert_eq!(
+                    a.to_bits(),
+                    f64::from(*b).to_bits(),
+                    "native f32 store drifted from the widened path (op {k}, masked)"
+                );
+            }
+            tested += 1;
+        }
+    }
+    assert!(tested >= 4, "too few conv ops exercised ({tested})");
+}
+
+/// #tableau-f32 interface gates for the ranker/clip consumers:
+/// (1) `retain_clip_rows` over f32-stored rows == over their EXACT f64
+///     widenings, bitwise (retention happens once; rows STAY f64);
+/// (2) Tier-0 retained rows built from the f32-stored tableau still sandwich
+///     sampled pre-activations (the epoch property, store arm).
+#[test]
+fn tableau_f32_store_retention_interfaces_hold() {
+    // (1) clip rows: f32 input rows == widened f64 input rows, bitwise.
+    let m32 = Array2::from_shape_vec((2, 3), vec![1.5f32, -2.25, 0.5, 3.0e-7, -1.0e-40, 2.0])
+        .expect("shape");
+    let d32 = Array2::from_shape_vec((2, 3), vec![0.25f32, 0.125, 0.0625, 1.0e-8, 4.0e-41, 0.5])
+        .expect("shape");
+    let m64 = m32.mapv(f64::from);
+    let d64 = d32.mapv(f64::from);
+    let mid = [0.1f64, -0.2];
+    let rad = [0.5f64, 0.4];
+    let (l_cal, u_cal) = ([-5.0f64, -9.0], [5.0f64, 9.0]);
+    let a = super::root::retain_clip_rows(&m32, &d32, &[0, 1], &mid, &rad, &l_cal, &u_cal);
+    let b = super::root::retain_clip_rows(&m64, &d64, &[0, 1], &mid, &rad, &l_cal, &u_cal);
+    assert_eq!(a.m, b.m);
+    assert_eq!(a.d, b.d);
+    assert_eq!(a.bm, b.bm);
+    assert_eq!(a.bd, b.bd);
+    assert_eq!(a.sl_lo, b.sl_lo);
+    assert_eq!(a.sl_up, b.sl_up);
+
+    // (2) retained rows sandwich sampled pre-activations on the STORE arm.
+    let mut rng = StdRng::seed_from_u64(51);
+    let spec = tiny_spec(&mut rng, 0.6);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.3; 72];
+    let hi = vec![0.5; 72];
+    let cfg = super::root::RetainCfg {
+        per_layer: 1_000_000,
+        budget_bytes: 1 << 30,
+    };
+    let (root, ret) = RootGates::build_retaining_prec_store(
+        &net,
+        &lo,
+        &hi,
+        RoundMode::Outward,
+        None,
+        Some(&cfg),
+        true,
+        true,
+    )
+    .expect("store-arm root");
+    let ret = ret.expect("retention requested");
+    assert_eq!(ret.layers.len(), root.layers.len());
+    let n_ret: usize = ret.layers.iter().map(|l| l.idx.len()).sum();
+    assert!(n_ret > 0, "no rows retained on a net with unstable neurons");
+    let x = sample_box(&mut rng, &root, 64);
+    let sel: std::collections::BTreeMap<usize, Vec<usize>> = root
+        .layers
+        .iter()
+        .zip(&ret.layers)
+        .map(|(lg, lr)| (lg.op, lr.idx.clone()))
+        .collect();
+    let (_, pre) = net.forward_points(&x, &sel).expect("forward");
+    for (lg, lr) in root.layers.iter().zip(&ret.layers) {
+        let p = &pre[&lg.op];
+        let naug = lr.naug;
+        for (ri, &pos) in lr.unst_pos.iter().enumerate() {
+            assert_eq!(lg.unst[pos], lr.idx[ri], "unst_pos <-> idx mismatch");
+            let al = &lr.a_l[ri * naug..(ri + 1) * naug];
+            let au = &lr.a_u[ri * naug..(ri + 1) * naug];
+            for b in 0..x.ncols() {
+                let (mut vl, mut vu, mut mag) = (
+                    f64::from(al[naug - 1]),
+                    f64::from(au[naug - 1]),
+                    f64::from(al[naug - 1]).abs() + f64::from(au[naug - 1]).abs(),
+                );
+                for k in 0..naug - 1 {
+                    vl += f64::from(al[k]) * x[[k, b]];
+                    vu += f64::from(au[k]) * x[[k, b]];
+                    mag += (f64::from(al[k]).abs() + f64::from(au[k]).abs()) * x[[k, b]].abs();
+                }
+                // f32 cast slack + the storage lane's own f32 grid: 2x the
+                // f64-lane allowance.
+                let tol = 1e-9 + mag * 2.4e-7;
+                let z = p[[ri, b]];
+                assert!(
+                    vl - tol <= z && z <= vu + tol,
+                    "store arm op {} neuron {}: z={z} outside f32 sandwich [{vl}, {vu}] \
+                     (tol {tol:.3e})",
+                    lg.op,
+                    lr.idx[ri]
+                );
+            }
+        }
+    }
+}
+
+/// Synthetic-net floor-time smoke (#tableau-f32): build the same walk with
+/// storage OFF vs ON (both on the f32 compute lane) and report the RELATIVE
+/// build-time cut. Nothing wall-clock is asserted — the printed ratio is the
+/// observable; correctness (containment vs the f64 path) IS asserted.
+#[test]
+fn tableau_f32_store_floor_smoke() {
+    let spec = conv_bn_spec(3, 12, 12, 24, 2.0, 1e-13, 1e-4, 16, 6, 0x50FA_F32D);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let n_in = 3 * 12 * 12;
+    let lo = vec![-0.05; n_in];
+    let hi = vec![0.05; n_in];
+    let time_build = |store: bool| {
+        // Min of 3 builds: the walk is deterministic; min removes scheduler noise.
+        let mut best = f64::INFINITY;
+        let mut root = None;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let r =
+                RootGates::build_prec_store(&net, &lo, &hi, RoundMode::Outward, None, true, store)
+                    .expect("build");
+            best = best.min(t0.elapsed().as_secs_f64());
+            root = Some(r);
+        }
+        (best, root.expect("built"))
+    };
+    let (t_off, r_off) = time_build(false);
+    let (t_on, r_on) = time_build(true);
+    let r64 = RootGates::build_prec(&net, &lo, &hi, RoundMode::Outward, None, false).expect("f64");
+    for (lgs, lg64) in r_on.layers.iter().zip(&r64.layers) {
+        for j in 0..lg64.n {
+            let eps = 8.0 * f64::EPSILON * (lg64.l[j].abs().max(lg64.u[j].abs()) + 1.0);
+            assert!(
+                lgs.l[j] <= lg64.l[j] + eps && lgs.u[j] >= lg64.u[j] - eps,
+                "smoke: store box fails containment at {j}"
+            );
+        }
+    }
+    assert_eq!(r_on.layers.len(), r_off.layers.len());
+    eprintln!(
+        "[tableau-f32-smoke] off={t_off:.3}s on={t_on:.3}s ratio={:.2} (relative only; \
+         the real observable is the tiny A/B's [backward-interm] done secs= line)",
+        t_on / t_off.max(1e-12)
+    );
+}
+
+/// Release-grade floor projection (#tableau-f32): a wider synthetic conv net
+/// whose tableau lanes leave cache, so the storage-width cut is visible.
+/// This is compiled only for release test builds; run it explicitly with:
+/// `cargo test --release -p ny-propagate tableau_f32_store_floor_smoke_big -- --nocapture`
+#[cfg(not(debug_assertions))]
+#[test]
+fn tableau_f32_store_floor_smoke_big() {
+    let spec = conv_bn_spec(3, 24, 24, 32, 2.0, 1e-13, 1e-4, 16, 6, 0x5160_F32D);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let n_in = 3 * 24 * 24;
+    let lo = vec![-0.05; n_in];
+    let hi = vec![0.05; n_in];
+    let time_build = |store: bool| {
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let _ =
+                RootGates::build_prec_store(&net, &lo, &hi, RoundMode::Outward, None, true, store)
+                    .expect("build");
+            best = best.min(t0.elapsed().as_secs_f64());
+        }
+        best
+    };
+    let t_off = time_build(false);
+    let t_on = time_build(true);
+    eprintln!(
+        "[tableau-f32-smoke-big] n_in={n_in} off={t_off:.3}s on={t_on:.3}s ratio={:.2}",
+        t_on / t_off.max(1e-12)
+    );
+}
+
+/// #tableau-f32 charge-magnitude REGRESSION PIN (2026-08-20 ship-gate FAIL,
+/// re-entry (a)): the live sites charge the EXACT per-site deviation
+/// `(|dM| + |dD|) * xabs_ext` — not the retired worst-case formula
+/// (`rounding::f32_store_gerr_term`, kept only as this pin's yardstick) —
+/// and the conv `store_dust` arm budgets the din/do_ up-store dust against
+/// the D-LANE-ONLY functional `Bd`, not the full `|M|+D` envelope `B`.
+/// This pin measures both tightenings and FAILS if a charge regresses toward
+/// the retired magnitudes; every measured factor is printed for the ledger.
+/// (The grids deliberately mix `d >> m` rows, which UNDERSTATE the production
+/// win — tableau coefficients run `|M| >> D` through the early layers.)
+#[test]
+fn tableau_f32_store_dust_charge_regression_pin() {
+    use super::net::TwinOp;
+    use super::root::{add_op, apply_gates, chaffine_op, conv_f32_gerr};
+    use super::rounding::{f32_store_gerr_term, gamma_n_f32, next_up, UNIT_F32};
+
+    // Retired worst-case row charge, reconstructed from the stored outputs
+    // (bitwise the retired site code for add_op/apply_gates; a LOWER bound
+    // for chaffine_op, whose retired code charged the bias column twice —
+    // an understated factor is a conservative pin).
+    let old_row = |m32: &Array2<f32>, d32: &Array2<f32>, row: usize, x: &[f64]| -> f64 {
+        let mut acc = 0.0f64;
+        for i in 0..m32.ncols() {
+            acc += f32_store_gerr_term(f64::from(m32[[row, i]]), f64::from(d32[[row, i]])) * x[i];
+        }
+        next_up(acc)
+    };
+
+    // f32-representable grids (identical inputs on both lanes).
+    let gm: Vec<f64> = [
+        0.0f32, 0.5, -0.5, 3.303_03, -3.303_03, 1.0e-6, -1.0e-6, 1.0e8, -1.0e8,
+    ]
+    .into_iter()
+    .map(f64::from)
+    .collect();
+    let gd: Vec<f64> = [0.0f32, 2.5e-7, 0.25, 7.0e5]
+        .into_iter()
+        .map(f64::from)
+        .collect();
+
+    // ---- Site: residual Add ------------------------------------------------
+    {
+        let mut ma = Vec::new();
+        let mut mb = Vec::new();
+        let mut da = Vec::new();
+        let mut db = Vec::new();
+        for &a in &gm {
+            for &b in &gm {
+                for &x in &gd {
+                    for &y in &gd {
+                        ma.push(a);
+                        mb.push(b);
+                        da.push(x);
+                        db.push(y);
+                    }
+                }
+            }
+        }
+        let n = ma.len();
+        let xabs_ext: Vec<f64> = (0..n).map(|i| [0.5, 1e-6, 1.0, 37.5][i % 4]).collect();
+        let to2f = |v: &[f64]| {
+            #[allow(clippy::cast_possible_truncation)]
+            Array2::from_shape_vec((1, n), v.iter().map(|&x| x as f32).collect::<Vec<f32>>())
+                .expect("shape")
+        };
+        let (mo32, do32, gs32) = add_op::<f32>(
+            to2f(&ma),
+            &to2f(&mb),
+            to2f(&da),
+            &to2f(&db),
+            &[],
+            1,
+            RoundMode::Outward,
+            &xabs_ext,
+        );
+        let new_total: f64 = gs32.iter().sum();
+        let old_total: f64 = (0..mo32.nrows())
+            .map(|r| old_row(&mo32, &do32, r, &xabs_ext))
+            .sum();
+        let factor = old_total / new_total;
+        eprintln!("[tableau-f32 pin] add_op charge factor old/new = {factor:.3}");
+        assert!(
+            factor >= 1.3,
+            "add_op exact dust charge regressed toward the retired worst-case \
+             formula (old/new {factor:.3} < 1.3)"
+        );
+    }
+
+    // ---- Site: ChannelAffine -----------------------------------------------
+    {
+        let scales = [-3.0f64, -1.0, -1e-3, 0.0, 1e-3, 1.0, 2.5, 1e10];
+        let shifts = [-1.0f64, 0.0, 1e-8, 2.0];
+        let mut scale = Vec::new();
+        let mut shift = Vec::new();
+        let mut shift_err = Vec::new();
+        for (i, &sc) in scales.iter().enumerate() {
+            for &sh in &shifts {
+                scale.push(sc);
+                shift.push(sh);
+                shift_err.push(if i % 2 == 0 { 0.0 } else { 1e-9 });
+            }
+        }
+        let rows = scale.len();
+        let mut cols_m = Vec::new();
+        let mut cols_d = Vec::new();
+        for &m in &gm {
+            for &d in &gd {
+                cols_m.push(m);
+                cols_d.push(d);
+            }
+        }
+        let n_in = cols_m.len();
+        let naug = n_in + 1;
+        let xabs_ext: Vec<f64> = (0..n_in)
+            .map(|i| [0.5, 1e-6, 1.0, 37.5][i % 4])
+            .chain(std::iter::once(1.0))
+            .collect();
+        let mut m64 = Array2::<f64>::zeros((rows, naug));
+        let mut d64 = Array2::<f64>::zeros((rows, naug));
+        for r in 0..rows {
+            for i in 0..n_in {
+                m64[[r, i]] = cols_m[i];
+                d64[[r, i]] = cols_d[i];
+            }
+            m64[[r, n_in]] = gm[r % gm.len()];
+            d64[[r, n_in]] = gd[r % gd.len()];
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let mut m32 = m64.mapv(|v| v as f32);
+        #[allow(clippy::cast_possible_truncation)]
+        let mut d32 = d64.mapv(|v| v as f32);
+        let blk = naug.div_ceil(64);
+        let gs32 = chaffine_op::<f32>(
+            &mut m32,
+            &mut d32,
+            &scale,
+            &shift,
+            1e-15,
+            &shift_err,
+            n_in,
+            RoundMode::Outward,
+            None,
+            blk,
+            &xabs_ext,
+        );
+        let new_total: f64 = gs32.iter().sum();
+        let old_total: f64 = (0..rows).map(|r| old_row(&m32, &d32, r, &xabs_ext)).sum();
+        let factor = old_total / new_total;
+        eprintln!("[tableau-f32 pin] chaffine_op charge factor old/new = {factor:.3}");
+        assert!(
+            factor >= 1.3,
+            "chaffine_op exact dust charge regressed toward the retired \
+             worst-case formula (old/new {factor:.3} < 1.3)"
+        );
+    }
+
+    // ---- Site: apply_gates (binary + fractional alpha) ---------------------
+    {
+        let gates: &[(f64, f64, f64)] = &[
+            (0.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (1.0, 0.5, 0.7),
+            (0.0, 0.5, 0.7),
+            (0.3, 0.5, 0.7),
+            (0.999_999, 1e-6, 0.2),
+        ];
+        let alpha: Vec<f64> = gates.iter().map(|g| g.0).collect();
+        let s: Vec<f64> = gates.iter().map(|g| g.1).collect();
+        let c: Vec<f64> = gates.iter().map(|g| g.2).collect();
+        let rows = gates.len();
+        let mut cols_m = Vec::new();
+        let mut cols_d = Vec::new();
+        for &m in &gm {
+            for &d in &gd {
+                cols_m.push(m);
+                cols_d.push(d);
+            }
+        }
+        let n_in = cols_m.len();
+        let naug = n_in + 1;
+        let xabs_ext: Vec<f64> = (0..n_in)
+            .map(|i| [0.5, 1e-6, 1.0, 37.5][i % 4])
+            .chain(std::iter::once(1.0))
+            .collect();
+        let mut m64 = Array2::<f64>::zeros((rows, naug));
+        let mut d64 = Array2::<f64>::zeros((rows, naug));
+        for r in 0..rows {
+            for i in 0..n_in {
+                m64[[r, i]] = cols_m[i];
+                d64[[r, i]] = cols_d[i];
+            }
+            m64[[r, n_in]] = gm[(r + 3) % gm.len()];
+            d64[[r, n_in]] = gd[(r + 2) % gd.len()];
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let m32 = m64.mapv(|v| v as f32);
+        #[allow(clippy::cast_possible_truncation)]
+        let d32 = d64.mapv(|v| v as f32);
+        let blk = naug.div_ceil(64);
+        let (o32m, o32d, gs32) = apply_gates::<f32>(
+            &m32,
+            &d32,
+            &alpha,
+            &s,
+            &c,
+            n_in,
+            RoundMode::Outward,
+            None,
+            blk,
+            &xabs_ext,
+        );
+        let new_total: f64 = gs32.iter().sum();
+        let old_total: f64 = (0..rows).map(|r| old_row(&o32m, &o32d, r, &xabs_ext)).sum();
+        let factor = old_total / new_total;
+        eprintln!("[tableau-f32 pin] apply_gates charge factor old/new = {factor:.3}");
+        assert!(
+            factor >= 1.3,
+            "apply_gates exact dust charge regressed toward the retired \
+             worst-case formula (old/new {factor:.3} < 1.3)"
+        );
+    }
+
+    // ---- Conv store-dust arm (production regime: D orders below |M|) -------
+    {
+        let mut rng = StdRng::seed_from_u64(0xD057);
+        let spec = conv_bn_spec(3, 3, 3, 12, 4.0, 1e-13, 1e-4, 16, 6, 0xFEED);
+        let net = TwinNet::compile(&spec).expect("compile");
+        let c = net
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                TwinOp::Conv(c) => Some(c),
+                _ => None,
+            })
+            .expect("conv op");
+        let n_src = net.tsize[c.input];
+        let naug = 40usize;
+        let n_in = naug - 1;
+        let mi64 = Array2::from_shape_fn((n_src, naug), |_| rng.random_range(-2.0..2.0f64));
+        #[allow(clippy::cast_possible_truncation)]
+        let mi32 = mi64.mapv(|v| v as f32);
+        // Early-layer regime: the D lane runs ~gamma-scale below the centers.
+        #[allow(clippy::cast_possible_truncation)]
+        let din32 = mi32.mapv(|v| (f64::from(v).abs() * 1e-13) as f32);
+        let xabs: Vec<f64> = (0..n_in).map(|i| [0.5, 1.0, 2.0, 37.5][i % 4]).collect();
+        let s_xabs = next_up(xabs.iter().sum::<f64>() + 1.0);
+        let zeros = vec![0.0f64; n_src];
+        let blk = naug.div_ceil(64);
+        let with_dust = conv_f32_gerr::<f32>(
+            c, &mi32, &din32, &zeros, &xabs, s_xabs, n_in, None, blk, true,
+        );
+        let compute_only = conv_f32_gerr::<f32>(
+            c, &mi32, &din32, &zeros, &xabs, s_xabs, n_in, None, blk, false,
+        );
+        let new_dust: f64 = with_dust
+            .iter()
+            .zip(&compute_only)
+            .map(|(a, b)| a - b)
+            .sum();
+        assert!(new_dust > 0.0, "store-dust arm charged nothing");
+        // The retired arm charged (gf32 + 8*UNIT_F32) * B — an increment of
+        // (8*UNIT_F32 / gf32) of the compute charge itself.
+        let gf32 = next_up(gamma_n_f32(c.k_fwd + 8));
+        let old_dust: f64 = compute_only
+            .iter()
+            .map(|v| v * (8.0 * UNIT_F32 / gf32))
+            .sum();
+        let factor = old_dust / new_dust;
+        eprintln!("[tableau-f32 pin] conv store-dust charge factor old/new = {factor:.3e}");
+        assert!(
+            factor >= 1.0e6,
+            "conv store-dust charge no longer tracks the D-lane-only functional \
+             (old/new {factor:.3e} < 1e6 in the |M| >> D regime)"
+        );
+    }
+}
+
+/// End-to-end SOUNDNESS backstop under the STORE ARM (#tableau-f32): the
+/// composed `dj` from an f32-STORED build must lower-bound the true margin
+/// (double-double reference) at gradient-guided corners + interior samples —
+/// the same obligation the shipped enclosure-oracle suite pins for the f64 and
+/// f32-compute lanes. Any overshoot is a literal false-UNSAT generator.
+#[test]
+fn tableau_f32_store_dj_encloses_true_margin() {
+    let n_out = 6usize;
+    let adv: Vec<usize> = (1..n_out).collect();
+    let mut seed: u64 = 0xE9C1_05ED;
+    let mut checks = 0usize;
+    let mut viol = 0usize;
+    let mut worst = f64::NEG_INFINITY;
+    for trial in 0..6usize {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let (spec, n_in): (TwinSpec, usize) = match trial % 3 {
+            0 => {
+                let (cin, h, w, cw) = (3usize, 2usize, 2usize, 10usize);
+                (
+                    conv_bn_spec(cin, h, w, cw, 20.0, 1e-13, 1e-4, 16, n_out, seed),
+                    cin * h * w,
+                )
+            }
+            1 => {
+                let (cin, h, w, cw, nb) = (2usize, 2usize, 2usize, 8usize, 8usize);
+                (
+                    residual_add_spec(cin, h, w, cw, nb, 2.0 / cw as f64, 16, n_out, seed),
+                    cin * h * w,
+                )
+            }
+            _ => {
+                let (n_in, depth) = (8usize, 20usize);
+                (no_conv_chain_spec(n_in, depth, 20, n_out, seed), n_in)
+            }
+        };
+        // MIXED-SIGN box on purpose: the regime where the g_err storage-dust
+        // account (not the D fold) carries the endpoint soundness.
+        let lo = vec![-1.0; n_in];
+        let hi = vec![1.0; n_in];
+        let Ok(net) = TwinNet::compile(&spec) else {
+            continue;
+        };
+        let Ok(root) =
+            RootGates::build_prec_store(&net, &lo, &hi, RoundMode::Outward, None, true, true)
+        else {
+            continue;
+        };
+        let eng = BackwardEngine::new(&net, &root);
+        let Ok(re) = super::bab::root_eval(&eng, &net, 0, &adv) else {
+            continue;
+        };
+        let pts = encl_points(&net, &lo, &hi, 0, &adv, 256, 16, seed);
+        for x in &pts {
+            let m = dd_margins(&spec, x, 0, &adv);
+            for k in 0..adv.len() {
+                if re.dj[k].is_finite() {
+                    checks += 1;
+                    let over = re.dj[k] - m[k];
+                    worst = worst.max(over);
+                    if over > 1e-12 {
+                        viol += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[tableau-f32] store-arm dj enclosure: checks={checks} viol={viol} worst_over={worst:.3e}"
+    );
+    assert!(
+        checks > 3_000,
+        "enclosure sample unexpectedly small ({checks})"
+    );
+    assert_eq!(
+        viol, 0,
+        "STORE-ARM ENCLOSURE: {viol}/{checks} dj exceed the true margin \
+         (worst {worst:.3e}) — the storage-dust account under-charges (false UNSAT)"
+    );
+}
+
+/// #gate-gerr-max (A1) TEETH PIN: the forward gate charge contracts by
+/// `max(alpha, s)`, and that constant is both SOUND and ATTAINED.
+///
+/// Two obligations per case, measured against `apply_gates` itself (the real
+/// transform) on a layer whose slopes DIFFER, so `max` and the historical `sum`
+/// are distinguishable:
+///
+/// (1) SOUND — the exact deviation functional the gate actually produces,
+///     `sum_i (|dM'| + |dD'|) * xabs_i`, is dominated by
+///     [`gate_gerr_out`]'s charge. This is the obligation `concretize_box`
+///     consumes; under-charging it is a false-UNSAT generator.
+/// (2) STRICTLY TIGHTER — that charge is strictly below the historical
+///     `(alpha + s)` one, by exactly `1 + min/max`. Restoring the old constant
+///     inside `gate_gerr_out` fails this assertion.
+///
+/// Plus TIGHTNESS: with `dD = 0` the bound is an EQUALITY, so `max` is the best
+/// uniform constant available — anything smaller is unsound, which is why this
+/// pin also guards against over-shaving in the other direction.
+///
+/// `RoundMode::Parity` on purpose: it stores `mm`/`dd` unwidened, so what is
+/// measured is the gate TRANSFORM, not the outward enclosure widening (a
+/// separate account — see `apply_gates`' header).
+#[test]
+fn gate_gerr_charge_contracts_by_max_alpha_s_not_the_sum() {
+    use super::root::{apply_gates, gate_gerr_out};
+    use super::rounding::next_up;
+
+    let n_in = 4usize;
+    let naug = n_in + 1;
+    let blk = naug.div_ceil(64);
+    // Bias column carries weight 1.0 in the g_err convention.
+    let xabs_ext: Vec<f64> = vec![1.0, 0.25, 4.0, 0.5, 1.0];
+    // Dyadic values: every reference/perturbed pair below is EXACT in f64, so
+    // the realized (dM, dD) are exactly the ones written here.
+    let m_ref = [0.75f64, -1.5, 0.125, 2.0, 0.5];
+    let d_ref = [0.25f64, 0.5, 0.0625, 0.25, 0.125];
+    let dm_full = [
+        1.0f64 / 1024.0,
+        -1.0 / 2048.0,
+        1.0 / 4096.0,
+        -1.0 / 512.0,
+        0.0,
+    ];
+    let dd_full = [
+        1.0f64 / 2048.0,
+        1.0 / 1024.0,
+        -1.0 / 8192.0,
+        1.0 / 4096.0,
+        0.0,
+    ];
+
+    // (alpha, s, c): a heuristic-reachable binary row (alpha = 1 forces
+    // s >= 1/2 through `gates_from_box`), a #rebake fractional row, and the
+    // task's constructed (1, 0.4) worst case.
+    let cases: &[(f64, f64, f64)] = &[(1.0, 0.6, 0.3), (0.7, 0.3, 0.11), (1.0, 0.4, 0.0)];
+    let mut compared = 0usize;
+
+    for &zero_dd in &[false, true] {
+        let dm = dm_full;
+        let dd = if zero_dd { [0.0f64; 5] } else { dd_full };
+        // The functional the INPUT error represents, in the sum convention.
+        let gerr_in: f64 = (0..naug)
+            .map(|i| (dm[i].abs() + dd[i].abs()) * xabs_ext[i])
+            .sum();
+        for &(alpha, s, c) in cases {
+            let mk = |pert: bool| {
+                let mv: Vec<f64> = (0..naug)
+                    .map(|i| if pert { m_ref[i] + dm[i] } else { m_ref[i] })
+                    .collect();
+                let dv: Vec<f64> = (0..naug)
+                    .map(|i| if pert { d_ref[i] + dd[i] } else { d_ref[i] })
+                    .collect();
+                (
+                    Array2::from_shape_vec((1, naug), mv).expect("shape"),
+                    Array2::from_shape_vec((1, naug), dv).expect("shape"),
+                )
+            };
+            let (mr, dr) = mk(false);
+            let (mp, dp) = mk(true);
+            // The realized perturbation must be EXACTLY (dm, dd) — otherwise the
+            // comparison below measures the wrong thing.
+            for i in 0..naug {
+                assert_eq!(mp[[0, i]] - mr[[0, i]], dm[i], "dM not exact at {i}");
+                assert_eq!(dp[[0, i]] - dr[[0, i]], dd[i], "dD not exact at {i}");
+            }
+            let g = |m: &Array2<f64>, d: &Array2<f64>| {
+                apply_gates::<f64>(
+                    m,
+                    d,
+                    &[alpha],
+                    &[s],
+                    &[c],
+                    n_in,
+                    RoundMode::Parity,
+                    None,
+                    blk,
+                    &xabs_ext,
+                )
+            };
+            let (mo_r, do_r, _) = g(&mr, &dr);
+            let (mo_p, do_p, _) = g(&mp, &dp);
+            let measured: f64 = (0..naug)
+                .map(|i| {
+                    ((mo_p[[0, i]] - mo_r[[0, i]]).abs() + (do_p[[0, i]] - do_r[[0, i]]).abs())
+                        * xabs_ext[i]
+                })
+                .sum();
+
+            let new_charge = gate_gerr_out(alpha, s, gerr_in);
+            let old_charge = next_up((alpha + s) * gerr_in);
+            let ms = alpha.max(s);
+            // The gate evaluates in f64, so allow its own ~few-ulp rounding of
+            // ROW MAGNITUDES (that leak is the `concretize_box` depth envelope's
+            // job, not this account's).
+            let tol = 1.0 + 1.0e-9;
+
+            eprintln!(
+                "[gate-gerr-max] alpha={alpha} s={s} c={c} dD={} | measured={measured:.12e} \
+                 new(max)={new_charge:.12e} old(sum)={old_charge:.12e} \
+                 old/new={:.6}",
+                if zero_dd { "0" } else { "nz" },
+                old_charge / new_charge
+            );
+
+            // (1) SOUND.
+            assert!(
+                measured <= new_charge * tol,
+                "gate charge UNDER-covers: measured {measured:.6e} > max(alpha,s) charge \
+                 {new_charge:.6e} (alpha={alpha} s={s}) — false-UNSAT generator"
+            );
+            // (2) STRICTLY TIGHTER than the historical (alpha + s) constant.
+            assert!(
+                new_charge < old_charge,
+                "gate charge is NOT tighter than the historical (alpha+s) one \
+                 (new {new_charge:.6e} vs old {old_charge:.6e}, alpha={alpha} s={s})"
+            );
+            let ratio = old_charge / new_charge;
+            let want = (alpha + s) / ms;
+            assert!(
+                (ratio - want).abs() <= 1.0e-12 * want,
+                "over-charge factor {ratio} != (alpha+s)/max(alpha,s) = {want}"
+            );
+            // TIGHTNESS: with dD = 0 the derivation is an EQUALITY.
+            if zero_dd {
+                assert!(
+                    measured >= new_charge / tol,
+                    "max(alpha,s) is not ATTAINED (measured {measured:.6e} << charge \
+                     {new_charge:.6e}) — the pin has lost its grip on the constant"
+                );
+            }
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 6, "teeth pin did not run every case");
+}
+
+/// #gate-gerr-max (A1) NO-CHANGE PIN: neurons with `alpha = 0` (and every other
+/// row where a slope is zero) see the charge BIT-IDENTICALLY — the over-charge
+/// factor `(alpha + s)/max(alpha, s)` is exactly 1.0 there.
+///
+/// This is the honesty guard on any aggregate claim: ny's rule
+/// (`gates_from_box`, `alpha = [u >= -l]`) sets `alpha = 0` on every unstable
+/// neuron with `u < -l`, and those rows are unchanged by A1, so a measured
+/// aggregate win can only come from the `alpha = 1` population. Stable-inactive
+/// rows and negative baked splits (`(0, 0)`) are likewise untouched.
+#[test]
+fn gate_gerr_charge_is_bit_identical_where_either_slope_is_zero() {
+    use super::root::{gate_gerr_out, gates_from_box};
+    use super::rounding::next_up;
+
+    // ny's rule, quoted from the source of truth rather than assumed.
+    let l = [-2.0f64, -1.0, -0.25, 0.5, -3.0];
+    let u = [1.0f64, 2.0, 1.0, 2.0, 0.0];
+    let (alpha, s, _c) = gates_from_box(&l, &u);
+    assert_eq!(alpha[0], 0.0, "u < -l must give alpha = 0 (ny's rule)");
+    assert_eq!(alpha[4], 0.0, "stable-inactive must give alpha = 0");
+    assert_eq!(alpha[1], 1.0, "u >= -l must give alpha = 1");
+
+    let gs: &[f64] = &[
+        0.0,
+        f64::MIN_POSITIVE,
+        1.0e-300,
+        3.7e-17,
+        1.0,
+        6.25e3,
+        1.0e300,
+    ];
+    let dusts: &[f64] = &[0.0, 1.0e-30, 2.5e-9];
+    let mut pinned = 0usize;
+    for j in 0..alpha.len() {
+        if alpha[j] != 0.0 && s[j] != 0.0 {
+            continue;
+        }
+        let (a, sv) = (alpha[j], s[j]);
+        assert_eq!(
+            (a + sv).to_bits(),
+            a.max(sv).to_bits(),
+            "a zero slope must make sum and max the SAME f64 (alpha={a} s={sv})"
+        );
+        for &g in gs {
+            let new = gate_gerr_out(a, sv, g);
+            let old = next_up((a + sv) * g);
+            assert_eq!(
+                new.to_bits(),
+                old.to_bits(),
+                "alpha={a} s={sv} g={g:e}: A1 moved a zero-slope row \
+                 ({new:e} vs {old:e}) — it must be a NO-OP there"
+            );
+            // The #tableau-f32 storage composition must be a no-op too.
+            for &dust in dusts {
+                assert_eq!(
+                    next_up(new + dust).to_bits(),
+                    next_up(old + dust).to_bits(),
+                    "alpha={a} s={sv} g={g:e} dust={dust:e}: storage-lane \
+                     composition moved on a zero-slope row"
+                );
+            }
+            pinned += 1;
+        }
+    }
+    assert!(pinned >= 14, "zero-slope pin covered too little ({pinned})");
+    // Positive control: the SAME comparison on an alpha = 1 row does move.
+    assert!(
+        gate_gerr_out(1.0, 0.6, 1.0) < next_up((1.0 + 0.6) * 1.0),
+        "positive control failed — the pin above would pass vacuously"
+    );
+}
+
+/// #gate-gerr-max (A1) AGGREGATE REPORT — the honest measurement.
+///
+/// Prints, over the zoo nets the f32 gates already use, (a) the gate CENSUS
+/// (which populations can save at all) and the per-layer aggregate charge
+/// multiplier `sum_j (alpha+s) / sum_j max(alpha,s)`, and (b) the END-TO-END
+/// observable: the mean/max published box-width EXCESS of the two f32 lanes
+/// over the f64 lane, which is what the g_err charge buys or costs. Re-running
+/// this test on a build with the old constant is the before/after measurement;
+/// the census half is lane-invariant (it is read off the f64 build) and is
+/// there to keep any headline number attributable.
+///
+/// It is also a pin: the f32 lanes must still CONTAIN the f64 boxes (a
+/// nonnegative excess under the shipped directed-rounding allowance), and both
+/// the saving and the non-saving populations must be non-empty, or the report
+/// means nothing.
+#[test]
+fn gate_gerr_aggregate_charge_excess_report() {
+    let n_out = 6usize;
+    let mut seed: u64 = 0x7AB1_EAF3;
+    let (mut n_active, mut n_a1_unstable, mut n_a0, mut n_inactive) =
+        (0usize, 0usize, 0usize, 0usize);
+    let (mut sum_old, mut sum_new) = (0.0f64, 0.0f64);
+    let (mut exc_cmp_sum, mut exc_cmp_max, mut exc_cmp_n) = (0.0f64, 0.0f64, 0usize);
+    let (mut exc_st_sum, mut exc_st_max, mut exc_st_n) = (0.0f64, 0.0f64, 0usize);
+    // (trunk relu layers, neurons, f32-compute excess sum, f32-store excess sum)
+    let kinds = ["conv_bn", "residual_add", "no_conv_chain", "large_head"];
+    let mut by_kind = [(0usize, 0usize, 0.0f64, 0.0f64); 4];
+    for trial in 0..8usize {
+        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let (spec, n_in): (TwinSpec, usize) = match trial % 4 {
+            0 => {
+                let (cin, h, w, cw) = (3usize, 2usize, 2usize, 10usize);
+                (
+                    conv_bn_spec(cin, h, w, cw, 20.0, 1e-13, 1e-4, 16, n_out, seed),
+                    cin * h * w,
+                )
+            }
+            1 => {
+                let (cin, h, w, cw, nb) = (2usize, 2usize, 2usize, 8usize, 16usize);
+                (
+                    residual_add_spec(cin, h, w, cw, nb, 2.0 / cw as f64, 16, n_out, seed),
+                    cin * h * w,
+                )
+            }
+            2 => {
+                let (n_in, depth) = (8usize, 40usize);
+                (no_conv_chain_spec(n_in, depth, 20, n_out, seed), n_in)
+            }
+            _ => {
+                let (cin, h, w, cw, n_y) = (2usize, 2usize, 2usize, 8usize, 256usize);
+                (
+                    large_head_spec(cin, h, w, cw, n_y, n_out, seed),
+                    cin * h * w,
+                )
+            }
+        };
+        let lo = vec![-1.0; n_in];
+        let hi = vec![1.0; n_in];
+        let Ok(net) = TwinNet::compile(&spec) else {
+            continue;
+        };
+        let b = |use_f32: bool, store: bool| {
+            RootGates::build_prec_store(&net, &lo, &hi, RoundMode::Outward, None, use_f32, store)
+                .ok()
+        };
+        let (Some(r64), Some(rcmp), Some(rst)) = (b(false, false), b(true, false), b(true, true))
+        else {
+            continue;
+        };
+        for lg in &r64.layers {
+            for j in 0..lg.n {
+                let (a, sv) = (lg.alpha[j], lg.s[j]);
+                sum_old += a + sv;
+                sum_new += a.max(sv);
+                if a == 1.0 && sv == 1.0 {
+                    n_active += 1;
+                } else if a == 1.0 {
+                    n_a1_unstable += 1;
+                } else if sv == 0.0 {
+                    n_inactive += 1;
+                } else {
+                    n_a0 += 1;
+                }
+            }
+        }
+        let tally = |r: &RootGates, sum: &mut f64, mx: &mut f64, cnt: &mut usize| -> f64 {
+            let mut local = 0.0f64;
+            for (lgf, lg64) in r.layers.iter().zip(&r64.layers) {
+                for j in 0..lg64.n {
+                    if !(lgf.l[j].is_finite()
+                        && lgf.u[j].is_finite()
+                        && lg64.l[j].is_finite()
+                        && lg64.u[j].is_finite())
+                    {
+                        continue;
+                    }
+                    let eps = 8.0 * f64::EPSILON * (lg64.l[j].abs().max(lg64.u[j].abs()) + 1.0);
+                    let excess = (lgf.u[j] - lgf.l[j]) - (lg64.u[j] - lg64.l[j]);
+                    assert!(
+                        excess >= -2.0 * eps,
+                        "trial {trial} j={j}: an f32 lane box is NARROWER than the f64 box \
+                         (excess {excess:.3e}) — containment broken"
+                    );
+                    local += excess.max(0.0);
+                    *sum += excess.max(0.0);
+                    *mx = mx.max(excess);
+                    *cnt += 1;
+                }
+            }
+            local
+        };
+        let n_before = exc_cmp_n;
+        let l_cmp = tally(&rcmp, &mut exc_cmp_sum, &mut exc_cmp_max, &mut exc_cmp_n);
+        let l_st = tally(&rst, &mut exc_st_sum, &mut exc_st_max, &mut exc_st_n);
+        // Per-net-kind attribution: the charge COMPOUNDS with trunk depth, so a
+        // pooled headline number is only interpretable next to the depth that
+        // produced it.
+        let k = &mut by_kind[trial % 4];
+        k.0 = r64.layers.len();
+        k.1 += exc_cmp_n - n_before;
+        k.2 += l_cmp;
+        k.3 += l_st;
+    }
+    let n_tot = n_active + n_a1_unstable + n_a0 + n_inactive;
+    assert!(
+        n_tot > 0 && exc_cmp_n > 0 && exc_st_n > 0,
+        "zoo produced nothing"
+    );
+    eprintln!(
+        "[gate-gerr-max] CENSUS neurons={n_tot} stable_active={n_active} \
+         alpha1_unstable={n_a1_unstable} alpha0_unstable={n_a0} inactive={n_inactive} \
+         layer_charge_ratio(old_sum/new_sum)={:.4}",
+        sum_old / sum_new
+    );
+    eprintln!(
+        "[gate-gerr-max] EXCESS f32compute n={exc_cmp_n} mean={:.6e} max={exc_cmp_max:.6e} | \
+         f32store n={exc_st_n} mean={:.6e} max={exc_st_max:.6e}",
+        exc_cmp_sum / exc_cmp_n as f64,
+        exc_st_sum / exc_st_n as f64
+    );
+    for (name, k) in kinds.iter().zip(&by_kind) {
+        if k.1 == 0 {
+            continue;
+        }
+        eprintln!(
+            "[gate-gerr-max] EXCESS[{name}] relu_layers={} n={} mean_f32compute={:.6e} \
+             mean_f32store={:.6e}",
+            k.0,
+            k.1,
+            k.2 / k.1 as f64,
+            k.3 / k.1 as f64
+        );
+    }
+    assert!(
+        n_active + n_a1_unstable > 0,
+        "no alpha = 1 neurons — nothing in this zoo can save, report is vacuous"
+    );
+    assert!(
+        n_a0 + n_inactive > 0,
+        "no zero-slope neurons — the no-change population is missing from the report"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #margin-row-domain-alpha
+// ---------------------------------------------------------------------------
+
+/// THE TEETH TEST. A DELIBERATELY TERRIBLE per-domain alpha must still produce
+/// an ENCLOSING bound.
+///
+/// This is the module's whole soundness claim in executable form: `alpha*y <=
+/// relu(y)` holds pointwise on all of R for ANY `alpha in [0, 1]`, so a bad
+/// optimizer costs tightness and CANNOT manufacture a proof — provided the
+/// write site clamps to `[0, 1]` and re-derives the error-contraction constant
+/// `ms = max(alpha, s)`. The perverse vectors below include the two extremes,
+/// the midpoint, the exact INVERSION of the heuristic value (the worst thing a
+/// broken gradient could converge to), and out-of-range garbage that only the
+/// clamp saves. Both lanes are checked: alpha enters the Upper lane too, and an
+/// under-scaled `ms` would surface here as a certified lower bound EXCEEDING a
+/// sampled value — the false-UNSAT direction.
+#[test]
+fn domain_alpha_bounds_stay_sound_for_any_alpha() {
+    let (net, root) = beta_fixture(0xDA1F_0001);
+    let eng = BackwardEngine::new(&net, &root);
+    let mut rng = StdRng::seed_from_u64(4242);
+    let x = sample_box(&mut rng, &root, 600);
+    let mut checked = 0usize;
+    for &(li, pos) in &[(1usize, 0usize), (2usize, 0usize)] {
+        let rec = &root.layers[li];
+        assert!(!rec.unst.is_empty(), "fixture: layer {li} has no unstable");
+        let neuron = rec.unst[pos];
+        let relu_op = rec.op;
+        let mut pre_sel = std::collections::BTreeMap::new();
+        pre_sel.insert(relu_op, vec![neuron]);
+        let (y, pre) = net.forward_points(&x, &pre_sel).expect("forward");
+        let z = &pre[&relu_op];
+        for &sign in &[1i8, -1i8] {
+            let split = (li, pos, sign);
+            let base_dom = domain_gates(&root, &[split]);
+            let slots = super::domain_alpha::movable(&root, &base_dom, &[split]);
+            assert!(
+                !slots.is_empty(),
+                "fixture: no movable neuron at li={li} sign={sign}"
+            );
+            let heuristic = super::domain_alpha::read_alphas(&root, &base_dom, &slots);
+            let perverse: Vec<Vec<f64>> = vec![
+                vec![0.0; slots.len()],
+                vec![1.0; slots.len()],
+                vec![0.5; slots.len()],
+                heuristic.iter().map(|a| 1.0 - a).collect(),
+                // Out of range in BOTH directions: only the clamp saves these.
+                vec![-3.0; slots.len()],
+                vec![7.0; slots.len()],
+            ];
+            for (k, vals) in perverse.iter().enumerate() {
+                let mut dom = domain_gates(&root, &[split]);
+                super::domain_alpha::write_alphas(&root, &mut dom, &slots, vals);
+                // The write site's two obligations, checked directly.
+                for (lj, gv) in &dom.layers {
+                    for j in 0..gv.alpha.len() {
+                        assert!(
+                            (0.0..=1.0).contains(&gv.alpha[j]),
+                            "alpha out of [0,1] at {lj}/{j} (case {k})"
+                        );
+                        assert_eq!(
+                            gv.ms[j],
+                            gv.alpha[j].max(gv.s[j]),
+                            "ms invariant broken at {lj}/{j} (case {k})"
+                        );
+                    }
+                }
+                let seed = eng.identity_seed();
+                let plo = eng
+                    .run(&seed, Some(&dom), LaneDir::Lower, None, false)
+                    .expect("lower pass");
+                let lows = eng.concretize_lower(&plo);
+                let pup = eng
+                    .run(&seed, Some(&dom), LaneDir::Upper, None, false)
+                    .expect("upper pass");
+                let ups = eng.concretize_upper(&pup);
+                let mut kept = 0usize;
+                for bcol in 0..x.ncols() {
+                    let zb = z[[0, bcol]];
+                    if (sign > 0 && zb < 0.0) || (sign < 0 && zb > 0.0) {
+                        continue; // outside this split's region
+                    }
+                    kept += 1;
+                    for i in 0..y.nrows() {
+                        let yv = y[[i, bcol]];
+                        assert!(
+                            lows[i] <= yv + 1e-7,
+                            "li={li} sign={sign} case={k} row {i}: certified lower {} \
+EXCEEDS sampled y {yv} (false-UNSAT direction)",
+                            lows[i]
+                        );
+                        assert!(
+                            ups[i] >= yv - 1e-7,
+                            "li={li} sign={sign} case={k} row {i}: certified upper {} \
+BELOW sampled y {yv}",
+                            ups[i]
+                        );
+                    }
+                }
+                assert!(kept > 20, "vacuous region filter: kept={kept}");
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked >= 24, "vacuous sweep: checked={checked}");
+}
+
+/// Admission: only genuine relaxation TRIANGLES (`0 < s < 1`) are movable, and
+/// a split-pinned position is excluded on top of that. Every exact line —
+/// stable-active, stable-inactive, split-baked — must be untouchable, because
+/// loosening one costs the child exactly the tightness the split bought.
+#[test]
+fn domain_alpha_movable_admits_only_relaxed_unpinned_neurons() {
+    let (_net, root) = beta_fixture(0xDA1F_0002);
+    let split = (1usize, 0usize, 1i8);
+    let pinned_idx = root.layers[1].unst[0];
+    let dom = domain_gates(&root, &[split]);
+    let slots = super::domain_alpha::movable(&root, &dom, &[split]);
+    assert!(!slots.is_empty(), "fixture: nothing movable");
+    assert!(
+        !slots.iter().any(|s| s.li == 1 && s.idx == pinned_idx),
+        "the split-pinned neuron is movable"
+    );
+    for s in &slots {
+        let sv = dom
+            .layers
+            .get(&s.li)
+            .map_or(root.layers[s.li].s[s.idx], |g| g.s[s.idx]);
+        assert!(
+            sv > 0.0 && sv < 1.0,
+            "admitted an exact line at {}/{} (s={sv})",
+            s.li,
+            s.idx
+        );
+        assert!(
+            root.layers[s.li].unst.contains(&s.idx),
+            "admitted a neuron outside `unst` at {}/{} — no gradient row exists",
+            s.li,
+            s.idx
+        );
+    }
+    // The unpinned domain admits strictly more: the pin is the only difference.
+    let bare = super::domain_alpha::movable(&root, &DomainGates::default(), &[]);
+    assert_eq!(
+        bare.len(),
+        slots.len() + 1,
+        "the pin should remove exactly one slot"
+    );
+}
+
+/// THE SCHEDULE IS THE COST KNOB, so it is pinned as a pure rule rather than
+/// only observed through a 100 s run. The shipped defaults (`min_depth 0`,
+/// `stride 1`, `gap` unlimited) must admit EVERYTHING — otherwise arming the
+/// mechanism would silently measure a different arm than the one the 2x2
+/// measured.
+#[test]
+fn domain_alpha_schedule_defaults_admit_every_domain() {
+    let admits = super::domain_alpha::schedule_admits_with;
+    let unlimited = f64::INFINITY;
+    for depth in 0..24usize {
+        for b in [-9.0, -0.2, -1e-9, 0.0, 0.5] {
+            assert!(
+                admits(depth, b, 0, 1, unlimited),
+                "default schedule declined depth={depth} b={b}"
+            );
+        }
+    }
+    // A non-finite bound is only consulted when a WINDOW is set; with no
+    // window the pre-schedule behaviour stands exactly.
+    assert!(admits(3, f64::NAN, 0, 1, unlimited));
+    assert!(!admits(3, f64::NAN, 0, 1, 0.05));
+
+    // Depth floor: strictly shallower is declined, the floor itself pays.
+    assert!(!admits(2, -0.1, 3, 1, unlimited));
+    assert!(admits(3, -0.1, 3, 1, unlimited));
+    assert!(admits(30, -0.1, 3, 1, unlimited));
+
+    // Stride: `depth % k == 0` pays, and depth 0 (the root domain) always does.
+    assert!(admits(0, -0.1, 0, 3, unlimited));
+    assert!(!admits(1, -0.1, 0, 3, unlimited));
+    assert!(!admits(2, -0.1, 0, 3, unlimited));
+    assert!(admits(3, -0.1, 0, 3, unlimited));
+    // A zero stride cannot divide by zero: it reads as 1.
+    assert!(admits(7, -0.1, 0, 0, unlimited));
+
+    // Closure window: `b >= -gap` pays. The boundary is INCLUSIVE, and an
+    // already-closed domain is trivially inside it (the caller's `closed`
+    // guard is what actually keeps it out).
+    assert!(admits(5, -0.05, 0, 1, 0.05));
+    assert!(!admits(5, -0.050_001, 0, 1, 0.05));
+    assert!(admits(5, 0.3, 0, 1, 0.05));
+
+    // The three compose as a conjunction: failing any one declines.
+    assert!(admits(4, -0.01, 2, 2, 0.05));
+    assert!(!admits(4, -0.5, 2, 2, 0.05), "window");
+    assert!(!admits(5, -0.01, 2, 2, 0.05), "stride");
+    assert!(!admits(1, -0.01, 2, 1, 0.05), "floor");
+}
+
+/// The proposal is PROJECTED into `[0, 1]` and NORMALIZED so the largest-`|g|`
+/// slot moves by exactly `eta`. A degenerate direction refuses rather than
+/// proposing a no-op the caller would pay a certified pass to score.
+#[test]
+fn domain_alpha_propose_is_projected_and_normalized() {
+    let slots = [
+        super::domain_alpha::Slot { li: 0, idx: 0 },
+        super::domain_alpha::Slot { li: 0, idx: 1 },
+        super::domain_alpha::Slot { li: 0, idx: 2 },
+    ];
+    let cur = [0.5, 0.5, 0.02];
+    // g: max |g| is 2.0 at slot 1, so slot 1 moves by exactly eta.
+    let g = vec![vec![1.0, -2.0, -1.0]];
+    let out = super::domain_alpha::propose(&slots, &cur, &g, 0.25).expect("proposal");
+    assert!((out[0] - (0.5 + 0.25 * 0.5)).abs() < 1e-12, "{out:?}");
+    assert!((out[1] - (0.5 - 0.25)).abs() < 1e-12, "{out:?}");
+    // Projection: 0.02 - 0.125 would be negative; it clamps at the floor.
+    assert_eq!(out[2], 0.0, "{out:?}");
+    // A saturated iterate that cannot move refuses rather than burning a pass.
+    assert!(
+        super::domain_alpha::propose(&slots, &[1.0, 1.0, 1.0], &[vec![1.0, 2.0, 1.0]], 0.25)
+            .is_none(),
+        "an all-saturated ascent must refuse"
+    );
+    // Degenerate directions refuse.
+    assert!(super::domain_alpha::propose(&slots, &cur, &[vec![0.0; 3]], 0.25).is_none());
+    assert!(super::domain_alpha::propose(&slots, &cur, &g, 0.0).is_none());
+    assert!(super::domain_alpha::propose(&slots, &cur, &g, f64::NAN).is_none());
+    assert!(
+        super::domain_alpha::propose(&slots, &cur[..2], &g, 0.25).is_none(),
+        "length mismatch must refuse"
+    );
+}
+
+/// Inheritance round-trips, and an entry naming a neuron the CHILD has since
+/// split is DROPPED rather than written over its exact line.
+#[test]
+fn domain_alpha_carry_warm_starts_children_but_never_over_an_exact_line() {
+    let (_net, root) = beta_fixture(0xDA1F_0003);
+    let parent_split = (1usize, 0usize, 1i8);
+    let mut parent = domain_gates(&root, &[parent_split]);
+    let slots = super::domain_alpha::movable(&root, &parent, &[parent_split]);
+    assert!(slots.len() > 2, "fixture: too few movable slots");
+    // A "parent accepted" vector: every slot moved off the root's heuristic.
+    let accepted: Vec<f64> = super::domain_alpha::read_alphas(&root, &parent, &slots)
+        .iter()
+        .map(|a| if *a > 0.5 { 0.375 } else { 0.625 })
+        .collect();
+    super::domain_alpha::write_alphas(&root, &mut parent, &slots, &accepted);
+    let carried = super::domain_alpha::carry(&root, &slots, &accepted);
+    assert_eq!(
+        carried.len(),
+        slots.len(),
+        "every moved slot must be carried"
+    );
+    assert!(
+        carried
+            .windows(2)
+            .all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)),
+        "carry must be sorted by (layer, neuron) for the binary search"
+    );
+
+    // The child splits one MORE neuron: the one the parent moved at slots[1].
+    let child_pos = root.layers[slots[1].li]
+        .unst
+        .iter()
+        .position(|&j| j == slots[1].idx)
+        .expect("slot is an unstable neuron");
+    let child_split = (slots[1].li, child_pos, -1i8);
+    let child_trunk = [parent_split, child_split];
+    let mut child = domain_gates(&root, &child_trunk);
+    let child_slots = super::domain_alpha::movable(&root, &child, &child_trunk);
+    let mut child_cur = super::domain_alpha::read_alphas(&root, &child, &child_slots);
+    let applied = super::domain_alpha::apply_inherited(
+        &root,
+        &mut child,
+        &child_slots,
+        &mut child_cur,
+        &carried,
+    );
+    assert_eq!(
+        applied,
+        carried.len() - 1,
+        "exactly the freshly-split neuron's entry must be dropped"
+    );
+    // The fresh split's exact line survived the warm start untouched.
+    let gv = child.layers.get(&child_split.0).expect("split layer");
+    assert_eq!(
+        gv.alpha[slots[1].idx], 0.0,
+        "inactive split alpha overwritten"
+    );
+    assert_eq!(gv.s[slots[1].idx], 0.0, "inactive split chord overwritten");
+    assert_eq!(gv.ms[slots[1].idx], 0.0, "inactive split ms overwritten");
+    // Every other carried value arrived, with `ms` re-established.
+    for (k, sl) in child_slots.iter().enumerate() {
+        let g = child.layers.get(&sl.li).expect("materialized layer");
+        assert_eq!(g.alpha[sl.idx], child_cur[k], "warm start not applied");
+        assert_eq!(
+            g.ms[sl.idx],
+            g.alpha[sl.idx].max(g.s[sl.idx]),
+            "ms invariant broken by the warm start at {}/{}",
+            sl.li,
+            sl.idx
+        );
+    }
+}
+
+/// The carry is CAPPED, and the cap keeps the LARGEST deltas — the truncation
+/// argument in `domain_alpha::CARRY_CAP`. A dropped entry is a tightness event,
+/// never a soundness one, so this pins the selection rule rather than the size.
+#[test]
+fn domain_alpha_carry_is_capped_at_the_largest_deltas() {
+    let (_net, root) = beta_fixture(0xDA1F_0004);
+    let dom = DomainGates::default();
+    let slots = super::domain_alpha::movable(&root, &dom, &[]);
+    assert!(slots.len() > 4, "fixture: too few movable slots");
+    let base = super::domain_alpha::read_alphas(&root, &dom, &slots);
+    // Unchanged alphas are not carried at all.
+    assert!(super::domain_alpha::carry(&root, &slots, &base).is_empty());
+    // Give slot 0 the largest delta and slot 1 the second largest, everything
+    // else a hair; then check a cap of that size would keep the right ones.
+    let mut cur = base.clone();
+    for (k, a) in cur.iter_mut().enumerate() {
+        let delta = match k {
+            0 => 0.9,
+            1 => 0.4,
+            _ => 1e-3,
+        };
+        *a = (*a + delta).clamp(0.0, 1.0);
+        if *a == base[k] {
+            *a = (base[k] - delta).clamp(0.0, 1.0);
+        }
+    }
+    let carried = super::domain_alpha::carry(&root, &slots, &cur);
+    assert!(
+        carried.len() <= super::domain_alpha::CARRY_CAP,
+        "carry exceeded the cap"
+    );
+    let by_delta = |li: usize, idx: usize| -> f64 {
+        (carried
+            .iter()
+            .find(|&&(l, i, _)| l as usize == li && i as usize == idx)
+            .map(|&(_, _, a)| a)
+            .expect("slot carried")
+            - root.layers[li].alpha[idx])
+            .abs()
+    };
+    assert!(
+        by_delta(slots[0].li, slots[0].idx) > by_delta(slots[2].li, slots[2].idx),
+        "the ranking the cap selects on is inverted"
+    );
+}
+
+/// DEFAULT OFF, and the whole block is gated on it. `enabled()` latches once
+/// per process, so this also pins that no other test in this binary arms it.
+#[test]
+fn domain_alpha_is_dark_by_default() {
+    assert!(
+        !super::domain_alpha::enabled(),
+        "per-domain alpha must ship dark: an armed default would change every \
+         published margin-row bound without an A/B"
+    );
+}
+
+/// THE STALE-ALPHA PROBE DOES NOT TRANSFER TO THIS LANE, and this pins why.
+///
+/// `9e695ba92` measured, in the MULTI-OBJECTIVE joint lane
+/// (`beta_crown/state/alpha/graph_runtime.rs`, `NY_MO_ALPHA_HEURISTIC`), that
+/// simply RE-DERIVING the current-box heuristic `alpha = [u > -l]` beat the
+/// stored ancestor-optimized alpha by +0.34 at depth 16 — "staleness costs more
+/// than optimization gains". The obvious port is a zero-pass fifth arm here.
+///
+/// IT WOULD MEASURE EXACTLY ZERO, by construction, and the reason is a property
+/// of THIS lane rather than an opinion:
+///
+/// * `engine::domain_gates` = `domain_gates_split_only` + `clip_tighten_gates`,
+///   and NOTHING ELSE writes a per-domain trunk alpha. The first clones the
+///   root's vectors and bakes exact lines at the SPLIT positions only; the
+///   second is the only per-domain `(l, u)` mover — and it ALREADY calls
+///   `root::gates_from_box` + `repair_upper_lines` on the tightened box
+///   (`engine.rs`), which IS the probe's intervention. The Tier-2 epoch
+///   refresh (`bab.rs`) does the same on its refreshed box.
+/// * So for every neuron this domain has not split, `(l, u)` is BIT-IDENTICAL
+///   to the root's, and the root's own alpha came from `gates_from_box` on
+///   exactly those `(l, u)`. "Fresh" and "stored" are the same number.
+///
+/// A stale alpha therefore exists in this lane only where something moved the
+/// root alpha OFF the heuristic — `#alpha-opt` or `#rebake`, both default OFF —
+/// and in that case resetting to the binary heuristic DISCARDS the optimization
+/// rather than refreshing it. What is genuinely missing here is the other half:
+/// nothing ever OPTIMIZES alpha against the domain. That is
+/// `#margin-row-domain-alpha`, and it is why this lane needs the optimizer arm
+/// and not the free one.
+#[test]
+fn fresh_current_box_heuristic_is_a_noop_in_this_lane() {
+    let mut rng = StdRng::seed_from_u64(0xDA1F_0005);
+    let spec = tiny_spec(&mut rng, 0.65);
+    let net = TwinNet::compile(&spec).expect("compile");
+    let lo = vec![-0.5; 72];
+    let hi = vec![0.5; 72];
+    let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+    let splits = [(0usize, 0usize, 1i8), (1usize, 0usize, -1i8)];
+    let dom = domain_gates(&root, &splits);
+    let pinned: Vec<(usize, usize)> = splits
+        .iter()
+        .map(|&(li, pos, _)| (li, root.layers[li].unst[pos]))
+        .collect();
+    let mut compared = 0usize;
+    let mut compared_unstable = 0usize;
+    for (li, layer) in root.layers.iter().enumerate() {
+        // The domain carries the ROOT's intermediate box verbatim: the only
+        // per-domain mover is clip, which is disarmed here (the shipped state)
+        // and which re-derives these very gates when it is not.
+        let (fresh_alpha, mut fresh_s, mut fresh_c) =
+            super::root::gates_from_box(&layer.l, &layer.u);
+        if root.mode.outward() {
+            super::root::repair_upper_lines(&layer.l, &layer.u, &mut fresh_s, &mut fresh_c);
+        }
+        let gv = dom.layers.get(&li);
+        let unst: std::collections::BTreeSet<usize> = layer.unst.iter().copied().collect();
+        for j in 0..layer.n {
+            if pinned.contains(&(li, j)) {
+                continue; // exact split line, deliberately not the heuristic
+            }
+            let cur = gv.map_or(layer.alpha[j], |g| g.alpha[j]);
+            assert_eq!(
+                cur.to_bits(),
+                fresh_alpha[j].to_bits(),
+                "the current-box heuristic DIFFERS from the stored gate at {li}/{j} \
+({cur} vs {}) — the stale-alpha port would no longer be a no-op here and this \
+test's reasoning must be re-derived",
+                fresh_alpha[j]
+            );
+            compared += 1;
+            if unst.contains(&j) {
+                compared_unstable += 1;
+            }
+        }
+    }
+    // UNSTABLE neurons are the only ones with a heuristic CHOICE to get wrong
+    // (`alpha = [u >= -l]`); a sweep that only saw stable neurons would prove
+    // nothing.
+    assert!(
+        compared > 20 && compared_unstable > 4,
+        "vacuous comparison: compared={compared} unstable={compared_unstable}"
     );
 }

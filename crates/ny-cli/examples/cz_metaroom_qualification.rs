@@ -89,9 +89,46 @@ fn run_named(name: &str) -> anyhow::Result<()> {
         }
         _ => anyhow::bail!(
             "unknown selector {name:?}; expected trunk, projected-trunk, seal-tail, \
-             full-tail, cuda-dual, box-advantage, box-cz-hybrid, hybrid-tail, or ay-lp-tail"
+             full-tail, cuda-dual, box-advantage, box-cz-hybrid, hybrid-tail, ay-lp-tail, \
+             or wired BUDGET_SECS"
         ),
     }
+    Ok(())
+}
+
+/// Research replay of the EXACT wired #cz-hybrid production pipeline
+/// (single-traversal inline Box/CZ hybrid trunk + M17/M20/retry/AY tail
+/// cascade) at a caller-chosen budget. This is the same code path
+/// `commands::cz_metaroom_wired` runs in a scored `ny vnncomp` instance; only
+/// the preset gate and RESULTS_FILE publication are absent.
+fn run_wired(budget_secs: u64) -> anyhow::Result<()> {
+    use cz_metaroom_unwired::qualification as probe;
+
+    require_assets()?;
+    anyhow::ensure!(
+        (1..=3_600).contains(&budget_secs),
+        "wired budget must be 1..=3600 seconds, got {budget_secs}"
+    );
+    let root = benchmark_root();
+    let assets = probe::MetaroomAssets {
+        onnx: root.join("onnx/6cnn_ry_39_6_no_custom_OP.onnx"),
+        vnnlib: root.join("vnnlib/spec_idx_119_eps_0.00000436.vnnlib"),
+    };
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(budget_secs);
+    let report = probe::run_wired_metaroom_cz_hybrid(&assets, deadline)
+        .ok_or_else(|| anyhow::anyhow!("assets vanished between the check and the run"))?;
+    eprintln!(
+        "wired replay: proved_unsat={}, strictly_positive={}/{}, unresolved={:?}, \
+         trunk_elapsed={:?}, tail_elapsed={:?}, total_elapsed={:?}, budget={budget_secs}s",
+        report.proved_unsat,
+        report.certificates.len() - report.unresolved.len(),
+        report.certificates.len(),
+        report.unresolved,
+        report.trunk_elapsed,
+        report.tail_elapsed,
+        started.elapsed(),
+    );
     Ok(())
 }
 
@@ -100,6 +137,14 @@ fn main() -> anyhow::Result<()> {
     let selector = args
         .next()
         .ok_or_else(|| anyhow::anyhow!("missing Metaroom qualification selector"))?;
+    if selector == "wired" {
+        let budget = args
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("wired requires BUDGET_SECS"))?
+            .parse::<u64>()?;
+        anyhow::ensure!(args.next().is_none(), "expected exactly wired BUDGET_SECS");
+        return run_wired(budget);
+    }
     anyhow::ensure!(args.next().is_none(), "expected exactly one selector");
     run_named(&selector)
 }

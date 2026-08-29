@@ -718,6 +718,14 @@ pub(super) fn write_implication_sidecar(
                 pc.clause, pc.neg_disjunct
             )
         })?;
+        // BRIDGE: ny-cert's bounded `Json` carries no serde impls by design;
+        // re-parse its canonical rendering for this serde_json payload.
+        let json: serde_json::Value = serde_json::from_str(&json.to_string()).map_err(|e| {
+            format!(
+                "pair (clause {}, neg-disjunct {}) JSON bridge: {e}",
+                pc.clause, pc.neg_disjunct
+            )
+        })?;
         entries.push(serde_json::json!({
             "clause": pc.clause,
             "neg_disjunct": pc.neg_disjunct,
@@ -1316,6 +1324,7 @@ mod real_benchmark_e2e {
             Path::new(onnx_field),
             &vnnlib,
             10,
+            None,
         )
         .expect("relational BaB run must not error");
         eprintln!("relational BaB smoke verdict: {verdict:?}");

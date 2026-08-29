@@ -128,25 +128,26 @@ impl LayerNormLayer {
         })
     }
 
-    /// Create a LayerNorm layer with forward mode enabled (tighter but approximate bounds).
-    ///
-    /// Returns an error if eps is non-finite or below the supported minimum.
-    pub fn new_forward_mode(ny: Array1<f32>, beta: Array1<f32>, eps: f32) -> Result<Self> {
-        Ok(Self {
-            ny,
-            beta,
-            eps: validate_norm_eps(eps, "LayerNorm")?,
-            forward_mode: true,
-            crown_mode: LayerNormCrownMode::default(),
-            mode: LayerNormMode::Standard,
-        })
-    }
-
     /// Enable or disable forward mode.
     ///
     /// Forward mode uses mean/std computed from the center (midpoint) of input bounds
     /// instead of computing uncertain bounds. This dramatically reduces bound explosion
     /// but may not be perfectly sound for large perturbations.
+    ///
+    /// # Prefer the network-level switch
+    ///
+    /// Production enables forward mode through
+    /// `Network::set_layernorm_forward_mode` / `GraphNetwork::set_layernorm_forward_mode`,
+    /// which applies it across every norm family at once and returns the number
+    /// of layers changed — the count the CLI prints in its "trades strict
+    /// soundness for tighter bounds" warning. Setting the mode one layer at a
+    /// time skips that warning (the label does not escape:
+    /// `soundness_provenance_for_network` reads the `forward_mode` field itself,
+    /// so `HeuristicUsed::LayerNormForwardMode` is still reported either way).
+    /// This builder is used only by tests today. A `new_forward_mode`
+    /// constructor that had no caller at all was removed rather than left
+    /// standing as a second, unaccounted way to switch on a mode whose own doc
+    /// declares a soundness caveat.
     pub fn with_forward_mode(mut self, enabled: bool) -> Self {
         self.forward_mode = enabled;
         self

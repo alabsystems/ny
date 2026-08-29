@@ -4,6 +4,26 @@
 #
 # safenlp_2024 VNN-COMP 2025 benchmark config
 #
+# *** THIS FILE IS SHADOWED AND NEVER LOADS (#preset-shadowing, 2026-08-24). ***
+# The preset resolver searches `vnncomp*` directories NEWEST YEAR FIRST
+# (crates/ny-cli/src/commands/vnncomp.rs `vnncomp_dirs_newest_first`), and
+# configs/vnncomp26/safenlp_2024.yaml exists with the same category name — so
+# EVERY run of category `safenlp_2024`, including the scored path, loads the
+# vnncomp26 file. Verified: `ny vnncomp plan safenlp_2024 ...` prints
+# `Loading preset: configs/vnncomp26/safenlp_2024.yaml`. Edits here are DEAD;
+# an A/B arm patched only in this file measures as an exact placebo (this
+# happened: 12 rows x 2 identical arms, bit-identical walls). Tune the
+# vnncomp26 file instead, or delete this one.
+#
+# MEASURED 2026-08-24 while here (`general.complete_verifier: mip` in the
+# LOADED vnncomp26 file, pinned 4250d245 mip,cuda binary, official 20s):
+# the MIP-only route ENGAGES (sequential FC net -> run_mip_only; the
+# [deadline-preserve] sequential-CROWN loop disappears, ay in-process solves
+# run) and converts 0 of 12 open ruarobot/medical rows — every ay solve hits
+# its deadline. The binding constraint is ay solve capability at this budget,
+# not routing; matches docs/SAFENLP_AY_ARC_2026-08-20.md. Do not re-arm
+# `complete_verifier: mip` as a routing fix.
+#
 # Benchmark characteristics:
 # - SafeNLP: NLP safety verification instances
 # - 1080 instances

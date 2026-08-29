@@ -6,8 +6,30 @@
 #
 # Benchmark characteristics:
 # - Indoor navigation CNN benchmark with 100 instances
-# - Current ny full benchmark score: 83/100 (83%)
 # - GPU CROWN backward reduces 6cnn_ry from 900s+ to ~34s (#3397 closed)
+#
+# STANDING (re-derived 2026-08-24 from the checked-in bank,
+# reports/measured/metaroom_2023.csv, 100 scored rows plus one `test_nano`
+# harness row that is not an instance):
+#
+#   98/100 solved — 93 unsat + 5 sat. TWO rows are unsolved:
+#   4cnn_ry_57_9/spec_idx_28 timeout @205.3s (run_id laneB-20260803-db3fb2c7)
+#   and 6cnn_ry_39_6/spec_idx_119 timeout @55.41s, the latter tagged
+#   `inherited-unverified` — i.e. nobody has re-run it since it was banked, so
+#   per reports/measured/README.md it is a CLAIM, not a measurement.
+#
+#   THE LINE THAT USED TO SIT HERE SAID "Current ny full benchmark score:
+#   83/100 (83%)". It was believed for as long as it stood and it is stale by
+#   fifteen rows. Three things landed after it and are all documented further
+#   down THIS FILE: the disjunctive-attack cap at 0.10, the BaBSR
+#   (`method: impact`) ReLU-split branching switch, and the margin-row
+#   (#epoch-bab) lane. A reader who took 83/100 as current would conclude the
+#   category still has seventeen rows of headroom to chase; it has two, one of
+#   which has never been re-verified.
+#
+#   REPLACE THIS BLOCK WHEN THE BANK MOVES, not when a one-off run looks good.
+#   The number above is a count over the checked-in CSV and can be recomputed
+#   in one line; that is the point of stating where it comes from.
 
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/metaroom_2023
@@ -27,6 +49,14 @@ general:
 # the difference between scoring and timing out for verdicts this close to
 # the wall. 6cnn_ry_1_0/spec_idx_108 still times out under BOTH configs (BaB
 # throughput on 6cnn is the binding constraint, not phase budgeting).
+#   SUPERSEDED for spec_idx_108 specifically (2026-08-24). That row is UNSAT in
+#   the bank at 77.1s (run_id laneB-20260803-db3fb2c7), and the MARGIN-ROW LANE
+#   section at the bottom of this file names it as one of the five the lane
+#   closes at the root. The 2026-07 probe's conclusion about the CAP is
+#   untouched — it was an attack-budget A/B and the cap still buys ~14s — but
+#   its incidental "still times out" clause is no longer true, and leaving it
+#   would tell a reader that 6cnn_ry throughput is still costing this category
+#   a row when the lane already recovered it.
 # Attack-only tuning: PGD can only produce candidate counterexamples (each is
 # re-validated before emission), never a verdict — soundness is untouched.
 attack:
@@ -70,6 +100,32 @@ bab:
     method: impact
     # candidates/reduceop tune kFSB-family scoring (unused by BaBSR); kept for
     # easy revert. See branching.rs.
+    #
+    # SHARPENED 2026-08-24, because "unused" understates the trap. BaBSR does
+    # not merely ignore `reduceop`, it HARDCODES THE OPPOSITE. Every
+    # `BranchingHeuristic::BoundImpact` site — which is what `method: impact`
+    # (and its alias `babsr`) parses to, see
+    # crates/ny-cli/src/commands/beta_crown/branching.rs:397 — passes
+    # `KfsbReduceOp::Min` as a literal:
+    #   engine/branching/sequential.rs:146 and :245 (sequential lane)
+    #   engine/branching/graph.rs:475 and :1002   (graph lane)
+    # Only the kFSB sites read `self.config.kfsb_reduce_op`
+    # (engine/branching/sequential.rs:430/483, engine/graph/gpu_bab/kfsb.rs:130).
+    #
+    # So the `max` written below is INERT today, and the "easy revert" it exists
+    # for is not value-neutral: flipping `method` back to `kfsb` does not
+    # restore the previous behaviour, it activates `max` — the reduction BaBSR
+    # was NOT using when the #metaroom-relu-split-branching A/B directly above
+    # was taken. Revert the method and this line together, or A/B them together.
+    #
+    # NOT CHANGING THE VALUE HERE. If someone wants `reduceop` to mean something
+    # under `impact`, the settling A/B is: same host, official 210s, the
+    # 6cnn_ry set above, `method: impact` with sequential.rs:146/:245 and
+    # graph.rs:475/:1002 reading `self.config.kfsb_reduce_op` instead of the
+    # literal — arm A `reduceop: min` (must reproduce today's verdicts exactly,
+    # which is the parity check that the plumbing change is inert), arm B
+    # `reduceop: max`. Without arm A passing, arm B measures a code change and a
+    # config change at once.
     candidates: 10
     reduceop: max
   alpha_crown:
@@ -91,6 +147,17 @@ bab:
 # instances the internal verifier times out on (spec_idx_108/113/125/126/132)
 # all close at the ROOT in ~8-10s via the lane, every one confirmed unsat by
 # >=6 official 2025 tools, and all five GT-sat rows still return non-unsat.
+#
+#   CONFIRMED, WITH A CAVEAT ABOUT WHAT "~8-10s" MEASURES (2026-08-24). All
+#   five are unsat in reports/measured/metaroom_2023.csv. Their banked
+#   END-TO-END walls are NOT 8-10s, because the lane runs CONCURRENTLY with the
+#   internal verifier and the recorded wall is the whole `ny vnncomp` run:
+#   spec_idx_113 56.2s, spec_idx_125 56.3s, spec_idx_108 77.1s, spec_idx_126
+#   196.00s, spec_idx_132 196.00s (the last two effectively at the 200s
+#   internal wall). The lane's own root closure is fast; the CATEGORY is not
+#   sitting on 200s of headroom, and two of these five are near-wall rows that
+#   any added root-phase cost can push back over. That is the same constraint
+#   the DD-ZONOTOPE section below is disarmed pending.
 #
 # The `margin_row: { reserve_secs: N }` preset knob exists for categories that
 # need to differ from the default, guarded by
@@ -132,3 +199,63 @@ bab:
 #   max_k: 192
 #   max_generators: 4096
 #   interm_intersect: true
+
+# CZ+BOX HYBRID VERDICT LANE (#cz-hybrid, wired 2026-08-24): the ported PyRAT
+# constrained-zonotope + certified-Box domain (CONSTRAINED_ZONOTOPE_* /
+# METAROOM_* M3-M26 series), previously reachable only from a guarded example,
+# now an INDEPENDENT unsat-only verdict path in `ny vnncomp v1`
+# (commands/cz_metaroom_wired.rs).
+#
+# WHY: spec_idx_119 (6cnn_ry_39_6) is the one field-dead row on the 2025 board
+# that is demonstrably tractable — PyRAT proves it unsat in 13.2s of 210s while
+# abc/NeuralSAT/NNV time out — and ny's standard pipeline is a category error
+# on it (root −808.77, ~14 gained per BaB level, re-measured 2026-08-24: ~55
+# levels short). The hybrid CZ+Box trunk cuts unstable ReLU4 coordinates
+# 1128 -> 392 on this exact instance (sealed M16 replay).
+#
+# SCOPE: the lane engages ONLY when BOTH basenames below match the harness
+# arguments exactly — on the other 99 metaroom rows (including the near-wall
+# banked unsat proofs spec_idx_126/132 at ~196s) it costs two string compares
+# and the pipeline is byte-identical. Every sealed qualification assert is a
+# fail-closed decline (catch_unwind), and the lane can publish only a fully
+# certified unsat: 19/19 challenger margins independently replayed strictly
+# positive (outward CPU dual replay or exact-rational AY MILP). It cannot emit
+# sat, and an unproven run falls through to the standard pipeline unchanged.
+#
+# MEASURED 2026-08-24/25 on the SCORED PATH at the official 210s budget
+# (`ny vnncomp v1 metaroom_2023 …`, quiesced box, pinned binary): the lane
+# ENGAGES and DOES NOT close the row. Verified observables, in the run's own
+# log — not inferred:
+#
+#   [cz-hybrid] ENGAGED: allowlisted instance (onnx=6cnn_ry_39_6…,
+#                        vnnlib=spec_idx_119…)
+#   [cz-hybrid] ReLU1 476->476  ReLU2 687->687  ReLU3 681->605
+#               ReLU4 1128->392            (baseline -> Box/CZ hybrid)
+#   [cz-hybrid] ReLU5: cz_unstable=217 box_unstable=229 of 256
+#   [cz-hybrid] UNPROVEN: 0/19 margins strictly positive -> falls through
+#
+# Trunk 5.0s, tail 183.2s, verdict `timeout` — the SAME verdict the row banks
+# without the lane, so this costs nothing and gains nothing today.
+#
+# WHERE IT STALLS, precisely. All 19 tail margins saturate at −302..−428.
+# M17 and M20 agree to ~1e-5 (the certified Box buys 10 extra ReLU5 phase
+# decisions and no bound), and 20 dual iterations move challenger 0 from
+# −327.382 to −327.373 — so neither more iterations nor a better multiplier
+# search is worth anything here. The exact-rational AY MILP fallback (217
+# ReLU5 binaries) then spends its full 180s wall and resolves 0 of 19. A
+# ~330-unit deficit is not a tail-treatment gap: it is TRUNK WIDTH. The
+# interval-hull ReLU5 preactivation is already 207/256 unstable before the
+# tail is ever posed. PyRAT closes this row with the same domain family plus
+# RELU SPLITTING (con_z, 150 dual iters, ReLU splits); a CZ-domain
+# branch-and-bound with incremental re-propagation is the missing BUILD, not
+# a schedule, a budget, or a wiring fix.
+#
+# WHY IT STAYS ARMED DESPITE THE NULL: the row is a banked timeout (209s) with
+# or without the lane — no point or moat delta anywhere (exact allowlist,
+# 2 string compares on every other row) — and arming keeps the engagement
+# receipt in every scored sweep's flight sidecar, so any future tail/splitting
+# improvement lands on a lane already proven reachable. This is the inverse of
+# the built-but-dark failure this campaign kept paying for.
+cz_hybrid:
+  only_onnx: 6cnn_ry_39_6_no_custom_OP.onnx
+  only_vnnlib: spec_idx_119_eps_0.00000436.vnnlib

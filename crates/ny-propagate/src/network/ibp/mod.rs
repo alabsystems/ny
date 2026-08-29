@@ -112,15 +112,17 @@ pub(crate) trait NetworkIbpExt {
         deadline: Option<Instant>,
     ) -> Result<CrownIbpBoundsResult>;
 
-    /// Like
-    /// [`Self::collect_crown_ibp_bounds_with_engine_deadline_and_status_impl`],
-    /// with an explicit per-node time-budget policy.
-    fn collect_crown_ibp_bounds_with_engine_deadline_budget_and_status_impl(
+    /// Frozen-authority variant with explicit per-node, provenance, and
+    /// Patches-bias policies.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_crown_ibp_bounds_with_engine_deadline_budget_and_flat_bias_policy_and_status_impl(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
         per_node_time_budget: &crate::types::CrownIbpPerNodeTimeBudget,
+        honest_provenance_enabled: bool,
+        patches_deadline_flat_bias_enabled: bool,
     ) -> Result<CrownIbpBoundsResult>;
 
     /// Run CROWN-IBP with pre-computed IBP bounds (#3397).
@@ -139,19 +141,17 @@ pub(crate) trait NetworkIbpExt {
         deadline: Option<Instant>,
     ) -> Result<CrownIbpBoundsResult>;
 
-    /// Like [`Self::collect_crown_ibp_bounds_with_precomputed_ibp_impl`], with
-    /// an explicit per-node time-budget policy (#4413, #cgan-bn11-budget).
-    ///
-    /// Used by the graph collector's sequential fast path and by the native
-    /// sequential verifier so a preset floor/cap survives delegation. The
-    /// default-budget wrappers preserve the default policy.
-    fn collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_impl(
+    /// Frozen-authority precomputed-IBP variant with explicit per-node,
+    /// provenance, and Patches-bias policies.
+    fn collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_and_flat_bias_policy_impl(
         &self,
         input: &BoundedTensor,
         precomputed_ibp: Vec<BoundedTensor>,
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
         per_node_time_budget: &crate::types::CrownIbpPerNodeTimeBudget,
+        honest_provenance_enabled: bool,
+        patches_deadline_flat_bias_enabled: bool,
     ) -> Result<CrownIbpBoundsResult>;
 
     /// Core CROWN-IBP collection that accepts optional pre-computed IBP (#3397).
@@ -283,14 +283,25 @@ impl NetworkIbpExt for Network {
     }
 
     #[inline]
-    fn collect_crown_ibp_bounds_with_engine_deadline_budget_and_status_impl(
+    fn collect_crown_ibp_bounds_with_engine_deadline_budget_and_flat_bias_policy_and_status_impl(
         &self,
         input: &BoundedTensor,
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
         per_node_time_budget: &crate::types::CrownIbpPerNodeTimeBudget,
+        honest_provenance_enabled: bool,
+        patches_deadline_flat_bias_enabled: bool,
     ) -> Result<CrownIbpBoundsResult> {
-        crown_ibp::collect_core(self, input, None, engine, deadline, per_node_time_budget)
+        crown_ibp::collect_core(
+            self,
+            input,
+            None,
+            engine,
+            deadline,
+            per_node_time_budget,
+            honest_provenance_enabled,
+            Some(patches_deadline_flat_bias_enabled),
+        )
     }
 
     #[inline]
@@ -305,13 +316,15 @@ impl NetworkIbpExt for Network {
     }
 
     #[inline]
-    fn collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_impl(
+    fn collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_and_flat_bias_policy_impl(
         &self,
         input: &BoundedTensor,
         precomputed_ibp: Vec<BoundedTensor>,
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
         per_node_time_budget: &crate::types::CrownIbpPerNodeTimeBudget,
+        honest_provenance_enabled: bool,
+        patches_deadline_flat_bias_enabled: bool,
     ) -> Result<CrownIbpBoundsResult> {
         crown_ibp::collect_core(
             self,
@@ -320,6 +333,8 @@ impl NetworkIbpExt for Network {
             engine,
             deadline,
             per_node_time_budget,
+            honest_provenance_enabled,
+            Some(patches_deadline_flat_bias_enabled),
         )
     }
 
@@ -338,6 +353,8 @@ impl NetworkIbpExt for Network {
             engine,
             deadline,
             &crate::types::CrownIbpPerNodeTimeBudget::default(),
+            crate::network::honest_provenance_enabled(),
+            None,
         )
     }
 

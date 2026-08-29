@@ -21,7 +21,7 @@ use std::os::unix::fs::FileExt;
 #[cfg(target_os = "linux")]
 use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
@@ -74,8 +74,9 @@ impl DenseMaterializationEstimate {
 /// machine.
 const ADAPTIVE_DENSE_BUDGET_SHARE_DIVISOR: u64 = 2;
 
-/// Share of LIVE cgroup/RLIMIT headroom one advertised Dense coefficient-pair
-/// estimate may claim.
+/// Share of LIVE process headroom -- cgroup/RLIMIT, or since #mem-governor the
+/// self-governing `MemAvailable`/`VmRSS` term -- that one advertised Dense
+/// coefficient-pair estimate may claim.
 ///
 /// This is deliberately stricter than the host-wide heuristic above.  The
 /// 7-D Patches -> Dense conversion can hold eight same-sized matrices while
@@ -91,6 +92,87 @@ const PROCESS_ENVELOPE_DENSE_BUDGET_SHARE_DIVISOR: u64 = 8;
 /// `NY_DENSE_BUDGET_MB` is not subject to it -- an operator stating a number is
 /// making an assertion about their machine.
 const MAX_ADAPTIVE_DENSE_BUDGET_MB: usize = 12 * 1024;
+
+/// System memory withheld from `MemAvailable` before NY will call the remainder
+/// "headroom" (#mem-governor).
+///
+/// # Why this exists at all
+///
+/// `process_memory_headroom_bytes` used to observe ONLY kernel-enforced
+/// envelopes -- cgroup `memory.max` and `RLIMIT_AS` -- and to report `None` when
+/// neither exists. `vnncomp_scripts/run_instance.sh` installs NEITHER: its only
+/// `export` is `OMP_NUM_THREADS=1`, and it sets no `ulimit`, no cgroup and no
+/// RLIMIT. So in COMPETITION the clamp that the whole Dense-admission stack
+/// consults was inert by construction, every gate saw the full
+/// `MAX_ADAPTIVE_DENSE_BUDGET_MB` ceiling for the entire run, and nothing at all
+/// bounded total RSS. Measured 2026-08-26 on this 121 GiB host: one cgan row
+/// reached anon-rss 118 GB and took a GLOBAL OOM kill (`task=ny_pin_base`).
+/// A crashed run scores zero and can take the rest of the benchmark with it.
+///
+/// # Why a reserve rather than a fraction of RAM
+///
+/// `MemAvailable` already accounts for reclaimable page cache, so it is the
+/// kernel's own estimate of what a new allocation can obtain without swapping or
+/// reclaiming pressure. What it does NOT leave is room for the kernel itself and
+/// for the allocator overshoot between one admission and the next, which is why
+/// a flat reserve is subtracted before the figure is treated as headroom.
+///
+/// 4 GiB is chosen so the term is INERT on a healthy host and binding only under
+/// real pressure: on this 121.7 GiB box a quiescent `MemAvailable` of 114.5 GiB
+/// leaves 110.5 GiB, and 110.5 / `PROCESS_ENVELOPE_DENSE_BUDGET_SHARE_DIVISOR`
+/// = 13.8 GiB, still above the 12 GiB adaptive ceiling. The clamp therefore
+/// changes nothing until `MemAvailable` falls below 100 GiB here -- i.e. until
+/// something really is eating the machine.
+///
+/// # Where it is NOT inert, measured rather than assumed
+///
+/// "Inert" is exact for the Dense budget and for
+/// `runtime_host_budget_bytes`/`post_c_survivor`, whose other terms are already
+/// far tighter. It is NOT exact for `narrowest_conv_crown_mem_cap`
+/// (`conv2d/ops_transpose_gemm.rs`), which applies `PROCESS_ENVELOPE_SHARE_DIVISOR`
+/// = 16 to any process envelope while charging an observed host only
+/// `MIN_ENVELOPE_SHARE_DIVISOR` = 4. On this host that turns a previously
+/// absent term into 110.5 GiB / 16 = 6.9 GiB, just under the 7.6 GiB RAM-adaptive
+/// policy cap that used to bind, so the conv per-buffer cap tightens by ~9%.
+/// That is the intended reading of its own comment -- the /16 exists because a
+/// hard process peak deserves it, and a global OOM is exactly as hard as a
+/// cgroup one -- but it is a real behavioural delta on conv benchmarks, not a
+/// no-op, and it is the term to look at first if a conv row regresses.
+#[cfg(target_os = "linux")]
+const SYSTEM_MEMORY_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Share of physical RAM above which NY's OWN resident set forces the cheap
+/// representation outright, whatever `MemAvailable` still claims
+/// (#mem-governor-backstop).
+///
+/// The `MemAvailable` term above decays as the process grows, but it decays
+/// TOO LATE in one specific and observed shape: `MemAvailable` counts
+/// reclaimable page cache, so a process holding 100 GiB of anonymous memory on a
+/// box with 20 GiB of cache still reads ~20 GiB "available" and keeps admitting
+/// multi-GiB materializations right up to the kill. This backstop contributes
+/// ZERO headroom -- refuse everything, take the patches/IBP path -- once NY's
+/// own `VmRSS` crosses three quarters of `MemTotal`.
+///
+/// Three quarters, not a half: the largest legitimate `ny` resident set on
+/// record is 14.17 GiB on a 24 GiB host (yolo_2023, 2026-07-31), which is 59% of
+/// RAM. A one-half ceiling would have fired against that run; three quarters
+/// (18 GiB there) clears it, and still stops the 118 GB cgan shape at ~91 GiB on
+/// this host, with 30 GiB of the machine left.
+#[cfg(target_os = "linux")]
+const SELF_RSS_CEILING_NUMERATOR: u64 = 3;
+/// Denominator of [`SELF_RSS_CEILING_NUMERATOR`].
+#[cfg(target_os = "linux")]
+const SELF_RSS_CEILING_DENOMINATOR: u64 = 4;
+
+/// Minimum spacing between `#mem-governor` trace lines (#mem-governor).
+///
+/// Dense admission is a hot loop -- `backward_step.rs` alone reaches it four
+/// times in one function, and a SafeNLP proof was measured at 13,500 probes --
+/// so the governor must not print per call. One line every five seconds is
+/// enough to show the headroom TRAJECTORY across a 1200 s cgan budget (~240
+/// lines) while costing nothing.
+#[cfg(target_os = "linux")]
+const MEMORY_GOVERNOR_LOG_INTERVAL_MS: u64 = 5_000;
 
 /// Reclaimable-now figure below which the host is reported as critically low
 /// (#dense-budget-valve, withdrawn as a clamp 2026-08-01 -- DIAGNOSTIC ONLY).
@@ -160,10 +242,13 @@ fn clamp_dense_budget_to_process_envelope(
 /// Three bounds still apply, in this order:
 ///   * the FLOOR is the historical 2 GiB default, so no host can regress;
 ///   * the SHARE is half of an already-conservative observation;
-///   * `process_memory_headroom_bytes` (cgroup / RLIMIT) is KERNEL-ENFORCED and
-///     clamps the result to one eighth of live headroom -- exceeding it is a
-///     real OOM, not a policy choice.  The public entry point reapplies that
-///     clamp to explicit operator budgets as well.
+///   * `process_memory_headroom_bytes` clamps the result to one eighth of live
+///     headroom -- exceeding it is a real OOM, not a policy choice. Its cgroup
+///     and RLIMIT terms are KERNEL-ENFORCED; since #mem-governor it also
+///     carries a self-governing `MemAvailable`/`VmRSS` term, for the
+///     competition configuration in which neither kernel limit exists. The
+///     public entry point reapplies that clamp to explicit operator budgets as
+///     well.
 ///
 /// With neither an observable host-memory value nor a process-envelope value,
 /// this returns exactly the historical default.
@@ -386,6 +471,228 @@ mod adaptive_budget_tests {
     }
 }
 
+/// #mem-governor: the self-governing memory term that competition actually
+/// relies on, because `run_instance.sh` installs no cgroup and no RLIMIT.
+///
+/// These assert END-TO-END SHAPES, not just arithmetic. The withdrawn
+/// `#dense-budget-valve` was "verified in unit tests and never end to end" and
+/// its trigger turned out to fire against the very run it protected, so each
+/// case below is a host state that was actually observed, named, and dated.
+#[cfg(all(test, target_os = "linux"))]
+mod memory_governor_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// This GB10 host, `/proc/meminfo` 2026-08-26: 127_600_748 kB.
+    const HOST_TOTAL: u64 = 127_600_748 * 1024;
+    /// Same reading, quiescent: 120_036_632 kB.
+    const HOST_AVAILABLE_QUIESCENT: u64 = 120_036_632 * 1024;
+
+    fn dense_budget_under(headroom: Option<u64>) -> usize {
+        // The adaptive path on this host: `MemAvailable / 2` clamped into
+        // [2 GiB, 12 GiB], then the envelope share.
+        adaptive_cpu_crown_dense_budget_from(Some(HOST_AVAILABLE_QUIESCENT), headroom, None)
+    }
+
+    /// The governor must change NOTHING on a healthy machine. If it did, every
+    /// banked verdict on this box would be in question and the proof cost would
+    /// be paid on rows that were never at risk.
+    #[test]
+    fn governor_is_inert_on_a_quiescent_host() {
+        // Production cgan peak, measured 2026-08-26: 6.3 GB resident.
+        let headroom = system_memory_headroom_from(
+            Some(HOST_AVAILABLE_QUIESCENT),
+            Some(HOST_TOTAL),
+            Some(6_300_000_000),
+        );
+        let headroom = headroom.expect("procfs observations present");
+        assert!(
+            headroom / PROCESS_ENVELOPE_DENSE_BUDGET_SHARE_DIVISOR
+                >= MAX_ADAPTIVE_DENSE_BUDGET_MB as u64 * 1024 * 1024,
+            "quiescent headroom share {} must stay above the 12 GiB adaptive ceiling",
+            headroom / PROCESS_ENVELOPE_DENSE_BUDGET_SHARE_DIVISOR
+        );
+        assert_eq!(
+            dense_budget_under(Some(headroom)),
+            MAX_ADAPTIVE_DENSE_BUDGET_MB * 1024 * 1024,
+            "the governor must not move the dense budget on a healthy host"
+        );
+    }
+
+    /// The shape that took the global OOM: `ny_pin_base` at anon-rss 118 GB on
+    /// this 121 GiB host, 2026-08-26. By then `MemAvailable` is nearly gone, so
+    /// the availability term alone already refuses everything.
+    #[test]
+    fn governor_binds_at_the_measured_oom_shape() {
+        let headroom =
+            system_memory_headroom_from(Some(2 * GIB), Some(HOST_TOTAL), Some(118_000_000_000));
+        assert_eq!(
+            headroom,
+            Some(0),
+            "with 2 GiB available and 118 GB resident there is no headroom to hand out"
+        );
+        assert_eq!(
+            dense_budget_under(headroom),
+            0,
+            "a zero envelope must beat the 2 GiB floor -- taking 2 GiB here is the OOM"
+        );
+    }
+
+    /// The case the availability term CANNOT see, and the reason the backstop
+    /// exists: `MemAvailable` counts reclaimable page cache, so a process
+    /// holding most of the machine can still read tens of GiB "available" and
+    /// keep admitting multi-GiB materializations right up to the kill.
+    #[test]
+    fn self_rss_backstop_fires_while_mem_available_still_looks_healthy() {
+        let available = 20 * GIB;
+        let resident = 100 * GIB;
+        assert!(
+            available > SYSTEM_MEMORY_RESERVE_BYTES,
+            "precondition: the availability term is NOT what binds here"
+        );
+        assert_eq!(
+            system_memory_headroom_from(Some(available), Some(HOST_TOTAL), None),
+            Some(available - SYSTEM_MEMORY_RESERVE_BYTES),
+            "without a VmRSS reading this host looks fine, which is the defect"
+        );
+        assert_eq!(
+            system_memory_headroom_from(Some(available), Some(HOST_TOTAL), Some(resident)),
+            Some(0),
+            "the backstop must force the cheap path once NY owns 3/4 of RAM"
+        );
+        assert_eq!(
+            memory_governor_source(MemoryGovernorReport {
+                cgroup: None,
+                address_space: None,
+                system: Some(0),
+                headroom: Some(0),
+                available: Some(available),
+                total: Some(HOST_TOTAL),
+                self_rss: Some(resident),
+            }),
+            "self-rss-backstop",
+            "the observable must name the term that is actually holding the line"
+        );
+    }
+
+    /// The largest legitimate `ny` resident set on record: 14.17 GiB on a
+    /// 24 GiB host (yolo_2023, 2026-07-31), 59% of RAM. A one-half ceiling
+    /// would have fired against it; three quarters must not.
+    #[test]
+    fn self_rss_backstop_clears_the_largest_legitimate_run() {
+        let total = 24 * GIB;
+        let resident = 15_214_921_646; // 14.17 GiB, 59% of a 24 GiB host
+        assert_eq!(
+            system_memory_headroom_from(Some(8 * GIB), Some(total), Some(resident)),
+            Some(8 * GIB - SYSTEM_MEMORY_RESERVE_BYTES),
+            "the backstop must not contribute a bound below its ceiling"
+        );
+    }
+
+    /// LIVE, not one-shot: headroom must fall monotonically as the process
+    /// grows and the host drains. A governor that samples once is a ceiling.
+    #[test]
+    fn governor_headroom_decays_as_the_process_grows() {
+        let mut previous = u64::MAX;
+        for step in 0..12_u64 {
+            let resident = step * 10 * GIB;
+            let available = HOST_AVAILABLE_QUIESCENT.saturating_sub(resident);
+            let headroom =
+                system_memory_headroom_from(Some(available), Some(HOST_TOTAL), Some(resident))
+                    .expect("observations present");
+            assert!(
+                headroom <= previous,
+                "headroom rose from {previous} to {headroom} at resident={resident}"
+            );
+            previous = headroom;
+        }
+        assert_eq!(previous, 0, "the trajectory must reach zero, not a floor");
+    }
+
+    /// Missing observations must contribute NO bound, exactly as an unreadable
+    /// cgroup does. A `None` here must never be read as zero.
+    #[test]
+    fn absent_observations_contribute_no_bound() {
+        assert_eq!(system_memory_headroom_from(None, None, None), None);
+        assert_eq!(
+            system_memory_headroom_from(None, Some(HOST_TOTAL), Some(1)),
+            None,
+            "a resident set below the ceiling with no availability reading bounds nothing"
+        );
+    }
+
+    /// The governor is a peer term in a `min`. It must be able to tighten a
+    /// kernel envelope and must never loosen one -- a looser envelope is the
+    /// only way this could ever admit something it previously refused.
+    #[test]
+    fn governor_narrows_but_never_widens_a_kernel_envelope() {
+        let system = system_memory_headroom_from(Some(6 * GIB), Some(HOST_TOTAL), None);
+        assert_eq!(system, Some(2 * GIB));
+        assert_eq!(
+            narrowest_headroom(&[Some(64 * 1024 * 1024), None, system]),
+            Some(64 * 1024 * 1024),
+            "a tighter cgroup must still win"
+        );
+        assert_eq!(
+            narrowest_headroom(&[Some(100 * GIB), None, system]),
+            Some(2 * GIB),
+            "and the governor must win when it is the tighter one"
+        );
+        for headroom in [Some(0), Some(GIB), Some(100 * GIB), None] {
+            let with_governor = narrowest_headroom(&[headroom, None, system]);
+            let without = narrowest_headroom(&[headroom, None, None]);
+            let widened = match (with_governor, without) {
+                (Some(new), Some(old)) => new > old,
+                (Some(_), None) => false,
+                (None, Some(_)) => true,
+                (None, None) => false,
+            };
+            assert!(
+                !widened,
+                "adding the governor widened {without:?} to {with_governor:?}"
+            );
+        }
+    }
+
+    /// The behavioural change this whole task exists for: with no cgroup and no
+    /// RLIMIT -- the competition configuration -- the probe used to report
+    /// `None`, so the clamp every Dense gate consults was inert. It must now
+    /// report a live bound on any Linux host.
+    #[test]
+    fn linux_headroom_is_no_longer_none_without_a_kernel_limit() {
+        assert!(
+            process_memory_headroom_bytes().is_some(),
+            "the self-governing term must supply a bound when no kernel limit does"
+        );
+    }
+
+    #[test]
+    fn parses_vm_rss_and_mem_total() {
+        let status = "Name:\tny\nVmSize:\t 8388608 kB\nVmRSS:\t 4194304 kB\nThreads:\t20\n";
+        assert_eq!(parse_vm_rss_bytes(status), Some(4_194_304 * 1024));
+        assert_eq!(parse_vm_size_bytes(status), Some(8_388_608 * 1024));
+        assert_eq!(parse_vm_rss_bytes("VmSize:\t 8388608 kB\n"), None);
+        assert_eq!(parse_vm_rss_bytes("VmRSS:\t notanumber kB\n"), None);
+        assert_eq!(
+            parse_vm_rss_bytes("VmRSS:\t 4194304 pages\n"),
+            None,
+            "a unit change must read as no observation, not as kiB"
+        );
+
+        let meminfo = "MemTotal:       127600748 kB\nMemFree:        103307692 kB\n\
+                       MemAvailable:   120036632 kB\n";
+        assert_eq!(
+            parse_meminfo_field_bytes(meminfo, "MemTotal:"),
+            Some(HOST_TOTAL)
+        );
+        assert_eq!(
+            parse_meminfo_available_kib(meminfo),
+            Some(HOST_AVAILABLE_QUIESCENT)
+        );
+        assert_eq!(parse_meminfo_field_bytes(meminfo, "MemAbsent:"), None);
+    }
+}
+
 #[cfg(all(test, not(target_os = "linux")))]
 mod vm_stat_parse_tests {
     use super::*;
@@ -473,13 +780,42 @@ fn observed_host_memory_bytes() -> Option<u64> {
 /// than as zero -- a zero would silently clamp the budget to the floor.
 #[cfg(target_os = "linux")]
 fn parse_meminfo_available_kib(contents: &str) -> Option<u64> {
+    parse_meminfo_field_bytes(contents, "MemAvailable:")
+}
+
+/// Parse a named `/proc/meminfo` field, reported in kiB, into bytes.
+///
+/// Returns `None` when the field is absent or unparseable, which callers treat
+/// as "no observation" rather than as zero -- a zero would silently clamp the
+/// budget to nothing on a host whose procfs format merely changed.
+#[cfg(target_os = "linux")]
+fn parse_meminfo_field_bytes(contents: &str, field: &str) -> Option<u64> {
     contents
         .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .find_map(|line| line.strip_prefix(field))
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|value| value.parse::<u64>().ok())
         .and_then(|kib| kib.checked_mul(1024))
         .filter(|bytes| *bytes > 0)
+}
+
+/// Parse `VmRSS:` (reported in kiB) out of `/proc/self/status` contents.
+///
+/// RESIDENT set, not `VmSize`: the OOM killer charges resident anonymous pages,
+/// and NY routinely reserves address space it never touches. Returns `None`
+/// when absent or unparseable so an unreadable field contributes no bound
+/// instead of a fabricated one.
+#[cfg(target_os = "linux")]
+fn parse_vm_rss_bytes(contents: &str) -> Option<u64> {
+    let rest = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?;
+    let mut fields = rest.split_whitespace();
+    let kib: u64 = fields.next()?.parse().ok()?;
+    if fields.next()? != "kB" {
+        return None;
+    }
+    kib.checked_mul(1024)
 }
 
 /// Total physical memory, where the platform exposes it cheaply.
@@ -616,23 +952,43 @@ pub(crate) fn explicit_cpu_crown_dense_budget_bytes() -> Option<usize> {
     Some(parsed.saturating_mul(1024 * 1024))
 }
 
-/// Remaining memory in the narrowest kernel-enforced process/container
-/// envelope that NY can observe without adding a new configuration claim.
+/// Remaining memory in the narrowest live envelope NY can observe without
+/// adding a new configuration claim.
 ///
-/// Linux exposes the two envelopes used by NY's guarded runners:
+/// Linux exposes the two KERNEL-ENFORCED envelopes used by NY's guarded
+/// runners:
 ///
 /// - cgroup v2 `memory.max` (or v1 `memory.limit_in_bytes`), including tighter
 ///   ancestor limits and the corresponding hierarchical current usage;
 /// - the process soft `RLIMIT_AS`, installed by `ny-safe-gpu-run` via
 ///   `ulimit -v`, less the process's current `VmSize`.
 ///
+/// ...and, since #mem-governor, a third SELF-GOVERNING term for the case those
+/// two do not cover, which is the case competition actually runs in:
+///
+/// - [`system_memory_headroom_from`], derived from `/proc/meminfo`
+///   `MemAvailable` and this process's own `/proc/self/status` `VmRSS`.
+///
+/// The third term is a peer of the other two rather than a fallback used only
+/// when they are absent. A global OOM kill is exactly as fatal as a cgroup one,
+/// so a run that is inside its cgroup but outside what the machine can supply
+/// must still degrade. It is deliberately sized to be INERT on a quiescent host
+/// (see [`SYSTEM_MEMORY_RESERVE_BYTES`]).
+///
 /// The minimum remaining headroom is returned. An unreadable, malformed, or
 /// unlimited source contributes no bound; callers must retain their own
-/// conservative fallback. Every resolved cgroup limit/usage pair and both
-/// RLIMIT inputs are read at every allocation gate through cached open handles.
-/// Only path discovery and handle opening use a short, invalidating snapshot,
-/// so dynamic envelope semantics stay live without turning
-/// `openat`/`statx`/`close` into the dominant workload.
+/// conservative fallback. Every resolved cgroup limit/usage pair, both RLIMIT
+/// inputs, and both self-governing inputs are read at every allocation gate
+/// through cached open handles. Only path discovery and handle opening use a
+/// short, invalidating snapshot, so dynamic envelope semantics stay live
+/// without turning `openat`/`statx`/`close` into the dominant workload.
+///
+/// This narrows; it never widens. See [`system_memory_headroom_from`] for why
+/// that makes the governor incapable of tightening any bound.
+///
+/// [`ProcessMemoryEnvelope`] is deliberately NOT affected: that API's contract
+/// is strictly about limits the kernel will enforce, and callers use it to fail
+/// CLOSED on ambiguity. A host-derived observation has no place in it.
 pub fn process_memory_headroom_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -1003,14 +1359,211 @@ fn process_memory_headroom_from_snapshot(snapshot: &LinuxMemoryProbeSnapshot) ->
     let address_limit = snapshot.limits.as_ref().and_then(|file| {
         file.parse::<PROC_MEMORY_FILE_BYTES, _>(parse_address_space_soft_limit_bytes)
     });
-    let address_used = snapshot
+    // ONE read of `/proc/self/status` for both fields. `VmSize` and `VmRSS`
+    // live in the same generated file and that generation walks the mm, so a
+    // second `read_at` would double the per-admission cost of the probe rather
+    // than add a field to it.
+    let (address_used, self_rss) = snapshot
         .status
         .as_ref()
-        .and_then(|file| file.parse::<PROC_MEMORY_FILE_BYTES, _>(parse_vm_size_bytes));
+        .and_then(|file| {
+            file.parse::<PROC_MEMORY_FILE_BYTES, _>(|contents| {
+                Some((parse_vm_size_bytes(contents), parse_vm_rss_bytes(contents)))
+            })
+        })
+        .unwrap_or((None, None));
     let address_space = address_limit
         .zip(address_used)
         .map(|(limit, used)| limit.saturating_sub(used));
-    narrowest_headroom(&[cgroup, address_space])
+    let (available, total) = system_memory_reading_from_snapshot(snapshot);
+    let system = system_memory_headroom_from(available, total, self_rss);
+    let headroom = narrowest_headroom(&[cgroup, address_space, system]);
+    report_memory_governor(MemoryGovernorReport {
+        cgroup,
+        address_space,
+        system,
+        headroom,
+        available,
+        total,
+        self_rss,
+    });
+    headroom
+}
+
+/// `MemAvailable` and `MemTotal`, from a single read of `/proc/meminfo`.
+#[cfg(target_os = "linux")]
+fn system_memory_reading_from_snapshot(
+    snapshot: &LinuxMemoryProbeSnapshot,
+) -> (Option<u64>, Option<u64>) {
+    snapshot
+        .meminfo
+        .as_ref()
+        .and_then(|file| {
+            file.parse::<PROC_MEMORY_FILE_BYTES, _>(|contents| {
+                Some((
+                    parse_meminfo_available_kib(contents),
+                    parse_meminfo_field_bytes(contents, "MemTotal:"),
+                ))
+            })
+        })
+        .unwrap_or((None, None))
+}
+
+/// The self-governing memory term: what NY may still take when NO kernel
+/// envelope exists to say (#mem-governor).
+///
+/// Pure, so the policy is regression-testable without a host in any particular
+/// state -- which is precisely the discipline the WITHDRAWN
+/// `#dense-budget-valve` failed ("verified in unit tests and never end to end").
+/// The tests below therefore assert the END-TO-END shapes: the quiescent host
+/// where this must be inert, the OOM host where it must bind, and the
+/// page-cache host where only the backstop can see the danger.
+///
+/// Two terms, both narrowing, combined by `narrowest_headroom`:
+///
+/// * `MemAvailable` less [`SYSTEM_MEMORY_RESERVE_BYTES`]. LIVE: as NY grows,
+///   `MemAvailable` falls and this term falls with it, exactly as cgroup
+///   headroom (`limit - usage`) already does. This is what turns a fixed
+///   ceiling into a governor.
+/// * The [`SELF_RSS_CEILING_NUMERATOR`] backstop, which contributes `Some(0)`
+///   -- refuse every Dense materialization, take the patches/IBP route -- once
+///   NY's own resident set crosses its share of `MemTotal`, and contributes NO
+///   bound below it. A hard backstop rather than another proportional term, so
+///   that ordinary operation is bit-identical to before and only the runaway
+///   shape is touched.
+///
+/// # This can only LOSE proofs, never mint one
+///
+/// The result is consumed at every call site as a `min` against an existing
+/// budget (`clamp_dense_budget_to_process_envelope`,
+/// `adaptive_cpu_crown_dense_budget_from`, `narrowest_conv_crown_mem_cap`,
+/// `runtime_host_budget_bytes`, `admitted_memory_plan`,
+/// `build_post_c_survivor_plan_with_headroom`). A SMALLER headroom can only
+/// refuse or split a materialization that would otherwise have been admitted;
+/// there is no path on which it admits one. A refused Dense materialization
+/// takes the pre-existing documented fallback -- `CpuMemoryExceeded` mapped to
+/// IBP for the target by the CROWN-IBP collector and the alpha paths, patches
+/// re-entry, or simply declining an optional tightening sweep -- and every one
+/// of those is a LOOSER sound bound, never a tighter one. So this governor can
+/// cost a proof (`unsat` -> `timeout`/`unknown`) and cannot mint a verdict.
+#[cfg(target_os = "linux")]
+fn system_memory_headroom_from(
+    available_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    self_rss_bytes: Option<u64>,
+) -> Option<u64> {
+    let available_term =
+        available_bytes.map(|available| available.saturating_sub(SYSTEM_MEMORY_RESERVE_BYTES));
+    let backstop_term = total_bytes.zip(self_rss_bytes).and_then(|(total, rss)| {
+        let ceiling = total / SELF_RSS_CEILING_DENOMINATOR * SELF_RSS_CEILING_NUMERATOR;
+        (rss >= ceiling).then_some(0)
+    });
+    narrowest_headroom(&[available_term, backstop_term])
+}
+
+/// Everything one `#mem-governor` line reports.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MemoryGovernorReport {
+    cgroup: Option<u64>,
+    address_space: Option<u64>,
+    system: Option<u64>,
+    headroom: Option<u64>,
+    available: Option<u64>,
+    total: Option<u64>,
+    self_rss: Option<u64>,
+}
+
+/// Which term actually decided the headroom, for the governor's own observable.
+#[cfg(target_os = "linux")]
+fn memory_governor_source(report: MemoryGovernorReport) -> &'static str {
+    let Some(headroom) = report.headroom else {
+        return "none";
+    };
+    if report.cgroup == Some(headroom) {
+        "cgroup"
+    } else if report.address_space == Some(headroom) {
+        "rlimit-as"
+    } else if report.system == Some(headroom) {
+        // A zero can only come from the backstop when `MemAvailable` alone
+        // has not yet reached the reserve; report the term that is really
+        // holding the line so the log distinguishes them.
+        let backstop_only = headroom == 0
+            && report
+                .available
+                .is_some_and(|available| available > SYSTEM_MEMORY_RESERVE_BYTES);
+        if backstop_only {
+            "self-rss-backstop"
+        } else {
+            "system-available"
+        }
+    } else {
+        "none"
+    }
+}
+
+/// Emit the governor's own observable (#mem-governor).
+///
+/// Prints on `stderr` via `eprintln!` rather than `tracing`, because
+/// `RUST_LOG` is not honoured by the competition binary and a lever whose
+/// telemetry is silent produces VOID measurements, not negative ones.
+///
+/// Exactly one line is guaranteed per process (the ARMED proof: it must be
+/// possible to tell "the governor is present and inert" from "the governor is
+/// not in this binary"), then at most one line per
+/// [`MEMORY_GOVERNOR_LOG_INTERVAL_MS`] thereafter.
+#[cfg(target_os = "linux")]
+fn report_memory_governor(report: MemoryGovernorReport) {
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    let first = !ARMED.swap(true, Ordering::Relaxed);
+    let now = Instant::now();
+    let start = *START.get_or_init(|| now);
+    let elapsed_ms = u64::try_from(now.saturating_duration_since(start).as_millis())
+        .unwrap_or(u64::MAX)
+        .min(u64::MAX - 1);
+    if !first {
+        let last = LAST_MS.load(Ordering::Relaxed);
+        if last != u64::MAX && elapsed_ms.saturating_sub(last) < MEMORY_GOVERNOR_LOG_INTERVAL_MS {
+            return;
+        }
+        if LAST_MS
+            .compare_exchange(last, elapsed_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+    } else {
+        LAST_MS.store(elapsed_ms, Ordering::Relaxed);
+    }
+
+    let render = |value: Option<u64>| value.map_or(-1_i128, i128::from);
+    let ceiling = report
+        .total
+        .map(|total| total / SELF_RSS_CEILING_DENOMINATOR * SELF_RSS_CEILING_NUMERATOR);
+    eprintln!(
+        "[mem-governor] armed=1 elapsed_ms={} source={} headroom={} dense_share={} \
+         system={} cgroup={} rlimit_as={} mem_available={} mem_total={} self_rss={} \
+         reserve={} rss_ceiling={}",
+        elapsed_ms,
+        memory_governor_source(report),
+        render(report.headroom),
+        render(
+            report
+                .headroom
+                .map(|headroom| headroom / PROCESS_ENVELOPE_DENSE_BUDGET_SHARE_DIVISOR)
+        ),
+        render(report.system),
+        render(report.cgroup),
+        render(report.address_space),
+        render(report.available),
+        render(report.total),
+        render(report.self_rss),
+        SYSTEM_MEMORY_RESERVE_BYTES,
+        render(ceiling),
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -20,9 +20,15 @@ use ny_build::EXPAND_LIVE_SHAPE_REFERENCE_ATTR;
 use ny_core::{NyError, Result};
 use ny_propagate::layers::NORMALIZATION_MIN_EPS;
 use tracing::debug;
+mod native_ops;
 mod op_map;
+mod resize_linear;
+mod reverse_slice;
 mod selection;
+use native_ops::{canonicalize_standard_scatter_elements, canonicalize_standard_trilu};
 use op_map::op_type_to_layer_type;
+use resize_linear::canonicalize_linear_resize;
+use reverse_slice::canonicalize_reversed_slice;
 use selection::canonicalize_standard_topk;
 
 // Composing authored f32 affine coefficients through f32 dot products changes
@@ -459,6 +465,32 @@ pub(super) fn convert_graph_to_layers(
             .and_then(|&producer_idx| nodes.get(producer_idx));
         if let Some(topk_layers) = canonicalize_standard_topk(node, idx, weights, opset_imports)? {
             layers.extend(topk_layers);
+            continue;
+        }
+        // Standard-domain ops whose ny layer already exists and is reached by
+        // the trace bridge, but which the ONNX intake used to refuse. Each
+        // canonicalizer is TOTAL for its own op type (Ok(Some) or Err), so no
+        // unrepresented configuration falls through to `op_map`'s generic arm.
+        if let Some(trilu) = canonicalize_standard_trilu(node, idx, weights, opset_imports)? {
+            layers.push(trilu);
+            continue;
+        }
+        if let Some(scatter) = canonicalize_standard_scatter_elements(node, idx, opset_imports)? {
+            layers.push(scatter);
+            continue;
+        }
+        // A REVERSING Slice only; every forward Slice returns None here and
+        // keeps its existing single-layer lowering byte for byte.
+        if let Some(reversed) = canonicalize_reversed_slice(node, idx, weights, tensor_shapes)? {
+            layers.extend(reversed);
+            continue;
+        }
+        // A LINEAR Resize only; mode='nearest' returns None and keeps its
+        // existing `LayerType::Resize` lowering.
+        if let Some(resampler) =
+            canonicalize_linear_resize(node, idx, weights, tensor_shapes, opset_imports)?
+        {
+            layers.extend(resampler);
             continue;
         }
         if let Some(mut layer) =

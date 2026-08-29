@@ -68,7 +68,7 @@ impl PgdAttacker<'_> {
 
         // Main PGD loop: all restarts advance in lockstep
         for _step in 0..self.config.num_steps {
-            if self.config.past_deadline() {
+            if self.past_deadline() {
                 info!("PGD batched: deadline exceeded, stopping at step {}", _step);
                 break;
             }

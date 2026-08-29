@@ -137,22 +137,22 @@ pub(super) fn merge_tightest_intermediate_bounds(
             let best_lower = best_concrete.lower()[[row_idx]];
             let candidate_lower = candidate_concrete.lower()[[row_idx]];
             if candidate_lower > best_lower {
-                merged_layer
-                    .lower_a_mut()
-                    .row_mut(row_idx)
-                    .assign(&candidate_layer.lower_a().row(row_idx));
-                merged_layer.lower_b_mut()[row_idx] = candidate_layer.lower_b()[row_idx];
+                // #merge-err-row: adopt coefficients, bias AND the certified
+                // coefficient-error row atomically. Writing the coefficients
+                // through `lower_a_mut()` alone would leave BEST's error row
+                // (or, when best carried `None`, the claim "exact") attached to
+                // CANDIDATE's coefficients, and `concretize_sound` would then
+                // omit the penalty it owes — publishing a row tighter than
+                // either input relation certified.
+                merged_layer.adopt_lower_row_from(candidate_layer, row_idx)?;
                 changed = true;
             }
 
             let best_upper = best_concrete.upper()[[row_idx]];
             let candidate_upper = candidate_concrete.upper()[[row_idx]];
             if candidate_upper < best_upper {
-                merged_layer
-                    .upper_a_mut()
-                    .row_mut(row_idx)
-                    .assign(&candidate_layer.upper_a().row(row_idx));
-                merged_layer.upper_b_mut()[row_idx] = candidate_layer.upper_b()[row_idx];
+                // #merge-err-row: see the lower-side note.
+                merged_layer.adopt_upper_row_from(candidate_layer, row_idx)?;
                 changed = true;
             }
         }
@@ -508,6 +508,166 @@ mod tests {
         assert!(
             result.is_err(),
             "dimension mismatch must be an error, never a silent no-op"
+        );
+    }
+
+    /// #merge-err-row CONTAINMENT test.
+    ///
+    /// Underlying scalar function h(x) = 0.6 - 0.5x on x in [0, 1], so
+    /// min h = 0.1. Two SOUND lower relations over that box:
+    ///
+    ///   best      : a = 0.0, b = 0.05, err = 0.0  -> certifies h >= 0.05
+    ///   candidate : a = 0.0, b = 0.60, err = 0.5  -> the true coefficient
+    ///               -0.5 lies inside |0.0 - (-0.5)| <= 0.5, and
+    ///               concretize_sound charges the 0.5*max(|0|,|1|) penalty,
+    ///               so it certifies h >= 0.6 - 0.5 = 0.1
+    ///
+    /// The candidate concretizes tighter (0.1 > 0.05), so the merge adopts its
+    /// row. If the coefficient row is swapped in while BEST's error row (0.0)
+    /// stays behind, the merged relation concretizes to 0.6 — half a unit above
+    /// the true minimum of the function it claims to bound below, and 0.5 above
+    /// anything either input relation certified. Finite, non-NaN, non-inverted,
+    /// `root_bounds_are_finite()` green, and NOT containing.
+    ///
+    /// This test fails (merged = 0.6) if `adopt_lower_row_from` is replaced by
+    /// the raw `lower_a_mut().row_mut(..).assign(..)` + `lower_b_mut()[..]`
+    /// pair it superseded.
+    #[test]
+    fn test_merge_row_swap_carries_the_candidates_certificate_merge_err_row() {
+        let layer0_box = box1(0.0, 1.0);
+        let layer_bounds = vec![Arc::new(layer0_box.clone())];
+
+        let best = LinearBounds::from_prevalidated_parts_with_optional_err(
+            arr2(&[[0.0_f32]]),
+            arr1(&[0.05_f32]),
+            arr2(&[[0.0_f32]]),
+            arr1(&[1.0_f32]),
+            Some(arr2(&[[0.0_f32]])),
+            Some(arr2(&[[0.0_f32]])),
+        )
+        .expect("valid best");
+        let candidate = LinearBounds::from_prevalidated_parts_with_optional_err(
+            arr2(&[[0.0_f32]]),
+            arr1(&[0.6_f32]),
+            arr2(&[[0.0_f32]]),
+            arr1(&[1.0_f32]),
+            Some(arr2(&[[0.5_f32]])),
+            Some(arr2(&[[0.0_f32]])),
+        )
+        .expect("valid candidate");
+
+        // Both inputs are individually sound for h, and h's true minimum is 0.1.
+        let best_lower = best.concretize_sound(&layer0_box).lower()[[0]];
+        let candidate_lower = candidate.concretize_sound(&layer0_box).lower()[[0]];
+        assert!(
+            best_lower <= 0.1 + 1e-6 && candidate_lower <= 0.1 + 1e-6,
+            "fixture broken: inputs must be sound for h (best={best_lower}, cand={candidate_lower})"
+        );
+        assert!(
+            candidate_lower > best_lower,
+            "fixture broken: the candidate row must win the merge \
+             (best={best_lower}, cand={candidate_lower})"
+        );
+
+        let mut best_intermediate = IntermediateLinearBounds {
+            bounds_at_layer: vec![Arc::new(best)],
+            start_layer: 0,
+        };
+        let candidate_intermediate = IntermediateLinearBounds {
+            bounds_at_layer: vec![Arc::new(candidate)],
+            start_layer: 0,
+        };
+        merge_tightest_intermediate_bounds(
+            &mut best_intermediate,
+            &candidate_intermediate,
+            &layer_bounds,
+        )
+        .expect("merge should succeed");
+
+        let merged = best_intermediate.bounds_at_layer[0].as_ref();
+        let merged_lower = merged.concretize_sound(&layer0_box).lower()[[0]];
+
+        // CONTAINMENT: the merged relation must still bound h from below.
+        assert!(
+            merged_lower <= 0.1 + 1e-6,
+            "merged lower {merged_lower} exceeds the true minimum 0.1 of the function \
+             it certifies — the candidate's coefficients were adopted without its \
+             certified coefficient error"
+        );
+        // And it must never claim more than the best of its two sound inputs.
+        assert!(
+            merged_lower <= best_lower.max(candidate_lower) + 1e-6,
+            "merged lower {merged_lower} exceeds max(best={best_lower}, cand={candidate_lower})"
+        );
+        assert_eq!(
+            merged.lower_a_err().map(|e| e[[0, 0]]),
+            Some(0.5),
+            "the merged row must carry the CANDIDATE's certified error"
+        );
+    }
+
+    /// A `None` error on the destination is the strongest claim there is
+    /// ("these coefficients are exact"). Adopting a row from a source that
+    /// carries error must materialize the certificate rather than inherit that
+    /// claim.
+    #[test]
+    fn test_adopt_row_materializes_err_when_destination_claimed_exact() {
+        let layer0_box = box1(0.0, 1.0);
+        let layer_bounds = vec![Arc::new(layer0_box.clone())];
+
+        let best = LinearBounds::new(
+            arr2(&[[0.0_f32]]),
+            arr1(&[0.0_f32]),
+            arr2(&[[0.0_f32]]),
+            arr1(&[1.0_f32]),
+        )
+        .expect("valid best");
+        assert!(best.lower_a_err().is_none(), "fixture: best claims exact");
+
+        let candidate = LinearBounds::from_prevalidated_parts_with_optional_err(
+            arr2(&[[0.0_f32]]),
+            arr1(&[1.0_f32]),
+            arr2(&[[0.0_f32]]),
+            arr1(&[1.0_f32]),
+            Some(arr2(&[[0.5_f32]])),
+            None,
+        )
+        .expect("valid candidate");
+
+        let best_lower = best.concretize_sound(&layer0_box).lower()[[0]];
+        let candidate_lower = candidate.concretize_sound(&layer0_box).lower()[[0]];
+        assert!(
+            candidate_lower > best_lower,
+            "fixture broken: candidate must win (best={best_lower}, cand={candidate_lower})"
+        );
+
+        let mut best_intermediate = IntermediateLinearBounds {
+            bounds_at_layer: vec![Arc::new(best)],
+            start_layer: 0,
+        };
+        let candidate_intermediate = IntermediateLinearBounds {
+            bounds_at_layer: vec![Arc::new(candidate)],
+            start_layer: 0,
+        };
+        merge_tightest_intermediate_bounds(
+            &mut best_intermediate,
+            &candidate_intermediate,
+            &layer_bounds,
+        )
+        .expect("merge should succeed");
+
+        let merged = best_intermediate.bounds_at_layer[0].as_ref();
+        assert_eq!(
+            merged.lower_a_err().map(|e| e[[0, 0]]),
+            Some(0.5),
+            "adopting a row from an err-carrying source must not keep the \
+             destination's `None` (= exact) claim"
+        );
+        let merged_lower = merged.concretize_sound(&layer0_box).lower()[[0]];
+        assert!(
+            merged_lower <= best_lower.max(candidate_lower) + 1e-6,
+            "merged lower {merged_lower} exceeds max(best={best_lower}, cand={candidate_lower}) \
+             — the certificate was erased by the swap"
         );
     }
 }

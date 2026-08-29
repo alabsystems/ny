@@ -310,6 +310,10 @@ pub(crate) struct CrownIbpTruncatedReuseScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrownIbpTruncatedReusePolicy {
     pub(crate) deadline_bearing: bool,
+    /// Canonical identity of the exact receipt-owning set on scored paths.
+    /// Legacy/interactive graphs retain `None` and use the compatibility fields
+    /// below until their entry boundary is migrated.
+    pub(crate) frozen_lever_fingerprint: Option<[u8; 32]>,
     // `dense_budget_bytes` was REMOVED from this identity (2026-08-03,
     // #cgan-scope-memory-probe). It is `cpu_crown_dense_budget_bytes()`, which
     // on a host without an explicit override is a LIVE MEASUREMENT of free
@@ -356,12 +360,43 @@ pub(crate) struct CrownIbpTruncatedReusePolicy {
     pub(crate) chunk_wave_workers: usize,
     pub(crate) chunk_abort_enabled: bool,
     pub(crate) chunk_grow_enabled: bool,
-    pub(crate) no_chunk_wave_parallel_env: Option<std::ffi::OsString>,
-    pub(crate) patches_deadline_flat_bias_env: Option<std::ffi::OsString>,
-    pub(crate) patches_deadline_parallel_scatter_env: Option<std::ffi::OsString>,
-    pub(crate) crown_honest_provenance_env: Option<std::ffi::OsString>,
+    pub(crate) patches_deadline_flat_bias_enabled: bool,
+    pub(crate) crown_honest_provenance_enabled: bool,
     pub(crate) hopeless_class_skip_enabled: bool,
     pub(crate) prefix_cost_admission_enabled: bool,
+}
+
+/// Immutable CROWN controls resolved from one graph-local run authority.
+///
+/// A scored graph always derives these values from its frozen
+/// [`ny_levers::LeverSet`]. A
+/// legacy/interactive graph without one retains the historical live-reader
+/// compatibility boundary. Keeping the coupled controls together prevents
+/// cache identity, M1 planning, and target execution from selecting different
+/// process-global answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CrownIbpRuntimePolicy {
+    pub(crate) objective_chunk_rows: usize,
+    pub(crate) chunk_projection_abort_enabled: bool,
+    pub(crate) chunk_adaptive_growth_enabled: bool,
+    pub(crate) chunk_wave_parallel_enabled: bool,
+    pub(crate) patches_deadline_flat_bias_enabled: bool,
+    pub(crate) honest_provenance_enabled: bool,
+}
+
+impl CrownIbpRuntimePolicy {
+    /// Whether an explicitly selected objective-chunk treatment requires the
+    /// graph-native collector that implements those controls.
+    ///
+    /// The sequential shortcut has its own whole-prefix collector and cannot
+    /// honor explicit chunk width, rollback, or parallel-wave treatments. Its
+    /// default route remains eligible when no such treatment was requested.
+    pub(crate) const fn requires_graph_native_chunk_execution(self) -> bool {
+        self.objective_chunk_rows > 0
+            || !self.chunk_projection_abort_enabled
+            || !self.chunk_adaptive_growth_enabled
+            || self.chunk_wave_parallel_enabled
+    }
 }
 
 /// One cached CROWN-IBP collection result.
@@ -377,8 +412,9 @@ pub(crate) struct CrownIbpCollectionCacheEntry {
     /// (adversarial-review hardening, #cgan-collection-cache).
     pub(crate) fingerprint: std::sync::Arc<[u8]>,
     pub(crate) result: std::sync::Arc<crate::types::GraphCrownIbpBoundsResult>,
-    /// No time-budget truncation occurred (no Deadline/PerNodeDeadline/
-    /// PatchesBudget fallback events): re-running could never compute more.
+    /// Every requested CROWN target completed. Structural omissions are
+    /// allowed; time, memory, backend, shape, and numerical fallbacks are not,
+    /// because a later consumer may be able to compute a tighter result.
     pub(crate) complete: bool,
     /// Number of nodes with `BoundsProvenance::Crown` — the completeness
     /// order used when comparing two truncated collections.
@@ -426,6 +462,16 @@ pub struct GraphNetwork {
     /// (a 2 s floor and an adaptive cap equal to one quarter of the remaining
     /// collection budget, clamped to 12..=600 s).
     pub(crate) crown_ibp_per_node_time_budget: crate::types::CrownIbpPerNodeTimeBudget,
+    /// Frozen positive decision for the legacy objective-chunk wave drivers.
+    /// False is the production one-frontier memory guard. Configured verifier
+    /// graphs stamp this from `BetaCrownConfig`; clones carry it unchanged.
+    pub(crate) chunk_wave_parallel_enabled: bool,
+    /// Exact per-run parameter authority whose receipt the frontend emitted.
+    ///
+    /// Scored graphs retain the same Arc through every clone. `None` marks an
+    /// interactive/legacy graph whose readers have not yet migrated to frozen
+    /// authority; cache code must then retain its compatibility identity.
+    pub(crate) frozen_levers: Option<std::sync::Arc<ny_levers::LeverSet>>,
     /// Scheduling-only mirror of
     /// `AlphaCrownConfig::forward_linear_deadline_fallback_to_ibp`.
     ///
@@ -855,6 +901,8 @@ impl GraphNetwork {
             use_patches_mode: true,
             forward_linear_spec_alpha: false,
             crown_ibp_per_node_time_budget: crate::types::CrownIbpPerNodeTimeBudget::default(),
+            chunk_wave_parallel_enabled: false,
+            frozen_levers: None,
             forward_linear_deadline_fallback_to_ibp: false,
             cached_exec_order: OnceLock::new(),
             cached_dispatch_plan: OnceLock::new(),
@@ -1109,6 +1157,64 @@ impl GraphNetwork {
         budget: crate::types::CrownIbpPerNodeTimeBudget,
     ) {
         self.crown_ibp_per_node_time_budget = budget;
+    }
+
+    /// Set the frozen objective-chunk wave decision. This is scheduling-only;
+    /// truncated CROWN cache identity includes it explicitly.
+    pub fn set_chunk_wave_parallel_enabled(&mut self, enabled: bool) {
+        self.chunk_wave_parallel_enabled = enabled;
+    }
+
+    /// Attach the receipt-owning frozen parameter set to this graph.
+    pub fn set_frozen_levers(
+        &mut self,
+        frozen_levers: Option<std::sync::Arc<ny_levers::LeverSet>>,
+    ) {
+        self.frozen_levers = frozen_levers;
+    }
+
+    /// Borrow the exact receipt-owning authority, when this graph has one.
+    pub fn frozen_levers(&self) -> Option<&std::sync::Arc<ny_levers::LeverSet>> {
+        self.frozen_levers.as_ref()
+    }
+
+    /// Retain the source graph's exact receipt-owning parameter authority.
+    ///
+    /// Derived prefix/tail graphs do not otherwise inherit runtime-only graph
+    /// state. Keeping this as one explicit operation makes authority loss at a
+    /// subgraph boundary reviewable and preserves Arc identity without a
+    /// second resolution.
+    pub fn inherit_frozen_levers_from(&mut self, source: &Self) {
+        self.frozen_levers.clone_from(&source.frozen_levers);
+    }
+
+    /// Resolve the coupled CROWN execution policy from this graph's immutable
+    /// authority, falling back to historical compatibility readers only for a
+    /// graph that has not crossed a frozen entry boundary.
+    pub(crate) fn crown_ibp_runtime_policy(&self) -> CrownIbpRuntimePolicy {
+        use ny_levers::decls::crown_ibp_budget::{
+            CROWN_HONEST_PROVENANCE, CROWN_OBJ_CHUNK, NO_CHUNK_ABORT, NO_CHUNK_GROW,
+            NO_CHUNK_WAVE_PAR, PATCHES_DEADLINE_FLAT_BIAS,
+        };
+
+        let value = |decl: &'static ny_levers::LeverDecl| match self.frozen_levers.as_ref() {
+            Some(levers) => levers.get(decl),
+            None => ny_levers::read(decl).value,
+        };
+        CrownIbpRuntimePolicy {
+            objective_chunk_rows: value(&CROWN_OBJ_CHUNK)
+                .as_u64()
+                .and_then(|rows| usize::try_from(rows).ok())
+                .unwrap_or(0),
+            chunk_projection_abort_enabled: !value(&NO_CHUNK_ABORT).as_bool(),
+            chunk_adaptive_growth_enabled: !value(&NO_CHUNK_GROW).as_bool(),
+            chunk_wave_parallel_enabled: match self.frozen_levers.as_ref() {
+                Some(_) => !value(&NO_CHUNK_WAVE_PAR).as_bool(),
+                None => self.chunk_wave_parallel_enabled,
+            },
+            patches_deadline_flat_bias_enabled: value(&PATCHES_DEADLINE_FLAT_BIAS).as_bool(),
+            honest_provenance_enabled: value(&CROWN_HONEST_PROVENANCE).as_bool(),
+        }
     }
 
     /// Set the typed forward-linear deadline fallback policy. This never

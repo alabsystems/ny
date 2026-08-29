@@ -320,13 +320,22 @@ fn test_dispatch_node_backward_add_splits_bias_with_shared_dispatch_1949() {
 
 #[test]
 fn test_dispatch_node_backward_concat_constant_first_input_uses_shared_dispatch_1949() {
+    // #nary-zip: the ORIGINAL fixture for this test declared
+    // `node.inputs = ["const_token", "_input"]`, an input list the loader can
+    // never produce — `find_graph_input_nodes` filters every
+    // `weights` / `evaluated_constants` name out BEFORE the Concat keep-branch,
+    // so the embedded constant's name is absent and only the DYNAMIC edge
+    // survives. That impossible fixture is exactly why the positional `zip`
+    // defect lived here undetected: with two names the `zip` happened to reach
+    // the dynamic slot. The fixture below is the loader-accurate shape (ONE
+    // dynamic edge), i.e. the ViT CLS-concat shape.
     let constant = BoundedTensor::new(arr1(&[0.25]).into_dyn(), arr1(&[0.25]).into_dyn())
         .expect("constant bounded tensor");
     let concat = ConcatLayer::with_constants(0, vec![vec![1], vec![2]], vec![Some(constant), None]);
     let node = GraphNode::new(
         "concat",
         Layer::Concat(concat),
-        vec!["const_token".to_string(), "_input".to_string()],
+        vec![NETWORK_INPUT.to_string()],
     );
     let node_lb = LinearBounds::identity(3);
 
@@ -375,6 +384,35 @@ fn test_dispatch_node_backward_concat_constant_first_input_uses_shared_dispatch_
         node_linear_bounds.input_accumulated()[0],
         "propagating concat split to _input should mark input_accumulated"
     );
+
+    // CONTAINMENT, not finiteness. The published relation must COVER the true
+    // range of `concat([0.25], x)` over x in [-1,1] x [-2,2]:
+    //   row 0 = 0.25 (constant), row 1 = x0 in [-1,1], row 2 = x1 in [-2,2].
+    //
+    // Under the positional `zip` this assertion FAILS: the single dynamic name
+    // is paired with the constant's `None` slot and skipped, the trailing
+    // `Some` is truncated, and rows 1/2 are published as +-1.18e-38 — finite,
+    // non-NaN, non-inverted, `root_bounds_are_finite()` GREEN, and NOT
+    // containing. Finiteness proves nothing; containment is the property.
+    let concrete = input_lb.concretize_sound(&constrained_inputs[0]);
+    let true_lower = [0.25_f32, -1.0, -2.0];
+    let true_upper = [0.25_f32, 1.0, 2.0];
+    for row in 0..3 {
+        let lo = concrete.lower()[row];
+        let hi = concrete.upper()[row];
+        assert!(
+            lo <= true_lower[row] + 1e-5,
+            "row {row}: published lower {lo} does not contain true lower {} \
+             (concat branch dropped from the backward walk)",
+            true_lower[row]
+        );
+        assert!(
+            hi >= true_upper[row] - 1e-5,
+            "row {row}: published upper {hi} does not contain true upper {} \
+             (concat branch dropped from the backward walk)",
+            true_upper[row]
+        );
+    }
 }
 
 #[test]

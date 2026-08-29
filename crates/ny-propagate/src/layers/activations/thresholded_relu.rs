@@ -51,18 +51,23 @@ impl BoundPropagation for ThresholdedReluLayer {
     ///
     /// - If lower > alpha: both bounds pass through unchanged
     /// - If upper <= alpha: output is [0, 0]
-    /// - If lower <= alpha < upper: output is [0, upper]
+    /// - If lower <= alpha < upper (crossing), outputs are {0} ∪ (alpha, upper]:
+    ///   the enclosure is [min(alpha, 0), max(0, upper)]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
-        // Guard: non-finite input bounds → NaN comparisons always return false
-        // (NaN > alpha = false, NaN <= alpha = false), so NaN falls to the
-        // crossing case which pushes NaN u into upper bounds unchecked.
-        // CROWN path rejects via non_finite_domain_guard (thresholded_relu.rs:92-94).
+        // Guard: NaN input bounds fail closed — NaN comparisons always return
+        // false (NaN > alpha = false, NaN <= alpha = false), so NaN would fall
+        // to the crossing case which pushes NaN u into upper bounds unchecked.
         // (#3203, Finding 3)
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        //
+        // ±Inf endpoints are NOT rejected (deep-stack IBP overflow saturation,
+        // dc9da0fde class): the piecewise analysis below is limit-correct at
+        // infinity — l = +inf passes through ([+inf, +inf], the TRelu(+inf) =
+        // +inf limit), u = -inf lands in the inactive branch ([0, 0], the
+        // TRelu(-inf) = 0 limit), and an infinite endpoint in the crossing
+        // case widens the enclosure to the matching infinite bound.
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "ThresholdedRelu IBP: non-finite input bounds".to_string(),
+                "ThresholdedRelu IBP: NaN input bounds".to_string(),
             ));
         }
 
@@ -82,9 +87,18 @@ impl BoundPropagation for ThresholdedReluLayer {
                 lower_data.push(0.0);
                 upper_data.push(0.0);
             } else {
-                // Crosses threshold: lower could be 0, upper passes through
-                lower_data.push(0.0);
-                upper_data.push(u);
+                // Crosses threshold (l <= alpha < u): the reachable outputs
+                // are {0} (inactive side) ∪ (alpha, u] (active side).
+                //
+                // False-proof fix: with alpha < 0 the active side reaches
+                // NEGATIVE outputs in (alpha, 0), so the lower endpoint must
+                // be alpha, not 0 (TRelu(-0.5) = -0.5 for alpha = -1 escaped
+                // the old [0, u] box). Symmetrically, with u < 0 the attained
+                // inactive output 0 dominates u, so the upper endpoint is
+                // max(0, u), not u (the old (0, u) pair was inverted and
+                // aborted). alpha >= 0 keeps the classic ReLU-style [0, u].
+                lower_data.push(if alpha < 0.0 { alpha } else { 0.0 });
+                upper_data.push(if u > 0.0 { u } else { 0.0 });
             }
         }
 
@@ -93,7 +107,12 @@ impl BoundPropagation for ThresholdedReluLayer {
         let upper = ArrayD::from_shape_vec(IxDyn(&lower_shape), upper_data)
             .map_err(|e| NyError::InvalidSpec(format!("ThresholdedRelu upper reshape: {}", e)))?;
 
-        BoundedTensor::new(lower, upper)
+        // Conservative-bounds convention (dc9da0fde class): a saturated input
+        // legitimately yields an infinite upper endpoint (TRelu(+inf) = +inf).
+        // An infinite endpoint is a sound, maximally conservative bound —
+        // reject only NaN (fail closed, and already impossible given the
+        // entry guard), never the saturation itself.
+        BoundedTensor::new_allow_infinite(lower, upper)
     }
 
     impl_elementwise_activation!(
@@ -812,16 +831,120 @@ mod tests {
         assert!(matches!(err, NyError::NumericalInstability(_)));
     }
 
+    /// Saturation flow (dc9da0fde class): ±inf input endpoints are the
+    /// deep-stack IBP overflow convention and must map to the exact limits —
+    /// TRelu(-inf) = 0, TRelu(+inf) = +inf — instead of aborting. Supersedes
+    /// the pre-migration test_ibp_inf_input_rejected (NaN rejection is
+    /// retained separately by the two tests above).
     #[test]
-    fn test_ibp_inf_input_rejected() {
+    fn test_ibp_saturated_input_flows_with_exact_limits() {
         let layer = ThresholdedReluLayer::new(1.0);
-        let input = BoundedTensor::new_unchecked(
+
+        // Crossing with a saturated lower endpoint: [-inf, 3] → [0, 3].
+        let input = BoundedTensor::new_allow_infinite(
             ArrayD::from_elem(IxDyn(&[2]), f32::NEG_INFINITY),
             ArrayD::from_elem(IxDyn(&[2]), 3.0_f32),
         )
         .unwrap();
-        let err = layer.propagate_ibp(&input).expect_err("Inf input");
-        assert!(matches!(err, NyError::NumericalInstability(_)));
+        let out = layer
+            .propagate_ibp(&input)
+            .expect("saturated lower endpoint must propagate, not error");
+        assert_eq!(out.lower()[[0]], 0.0, "TRelu(-inf) limit is exactly 0");
+        assert_eq!(out.upper()[[0]], 3.0);
+
+        // Fully saturated box [-inf, +inf] → [0, +inf].
+        let input = BoundedTensor::new_allow_infinite(
+            ArrayD::from_elem(IxDyn(&[1]), f32::NEG_INFINITY),
+            ArrayD::from_elem(IxDyn(&[1]), f32::INFINITY),
+        )
+        .unwrap();
+        let out = layer.propagate_ibp(&input).unwrap();
+        assert_eq!(out.lower()[[0]], 0.0);
+        assert!(
+            out.upper()[[0]].is_infinite() && out.upper()[[0]].is_sign_positive(),
+            "TRelu(+inf) limit is +inf, got {}",
+            out.upper()[[0]]
+        );
+
+        // Entirely below threshold with a saturated lower endpoint:
+        // [-inf, -5] → exactly [0, 0].
+        let input = BoundedTensor::new_allow_infinite(
+            ArrayD::from_elem(IxDyn(&[1]), f32::NEG_INFINITY),
+            ArrayD::from_elem(IxDyn(&[1]), -5.0_f32),
+        )
+        .unwrap();
+        let out = layer.propagate_ibp(&input).unwrap();
+        assert_eq!(out.lower()[[0]], 0.0);
+        assert_eq!(out.upper()[[0]], 0.0);
+
+        // Entirely above threshold with a saturated upper endpoint:
+        // [2, +inf] passes through exactly.
+        let input = BoundedTensor::new_allow_infinite(
+            ArrayD::from_elem(IxDyn(&[1]), 2.0_f32),
+            ArrayD::from_elem(IxDyn(&[1]), f32::INFINITY),
+        )
+        .unwrap();
+        let out = layer.propagate_ibp(&input).unwrap();
+        assert_eq!(out.lower()[[0]], 2.0);
+        assert!(out.upper()[[0]].is_infinite() && out.upper()[[0]].is_sign_positive());
+    }
+
+    /// False-proof regression: with alpha < 0 the crossing case reaches
+    /// NEGATIVE outputs in (alpha, 0) — e.g. TRelu(-0.5) = -0.5 for
+    /// alpha = -1 — so the old [0, u] enclosure excluded reachable values.
+    /// The lower endpoint must be alpha.
+    #[test]
+    fn test_ibp_negative_alpha_crossing_encloses_negative_outputs() {
+        let alpha = -1.0_f32;
+        let layer = ThresholdedReluLayer::new(alpha);
+        let input = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[1]), -2.0_f32),
+            ArrayD::from_elem(IxDyn(&[1]), 1.0_f32),
+        )
+        .unwrap();
+        let out = layer.propagate_ibp(&input).unwrap();
+        // Reachable outputs: {0} ∪ (-1, 1]; enclosure [-1, 1].
+        assert_eq!(out.lower()[[0]], alpha, "lower must be alpha, not 0");
+        assert_eq!(out.upper()[[0]], 1.0);
+        for x in [-2.0_f32, -1.5, -0.5, -0.001, 0.0, 0.5, 1.0] {
+            let y = trelu_eval(x, alpha);
+            assert!(
+                out.lower()[[0]] <= y && y <= out.upper()[[0]],
+                "TRelu({x}) = {y} escapes the enclosure [{}, {}]",
+                out.lower()[[0]],
+                out.upper()[[0]]
+            );
+        }
+    }
+
+    /// False-proof regression: with alpha < u < 0 the crossing case attains 0
+    /// (inactive side) while every active output is negative — the old
+    /// (0, u) pair was inverted and aborted propagation. The enclosure is
+    /// [alpha, 0].
+    #[test]
+    fn test_ibp_negative_alpha_negative_upper_crossing_is_valid() {
+        let alpha = -2.0_f32;
+        let layer = ThresholdedReluLayer::new(alpha);
+        let input = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[1]), -3.0_f32),
+            ArrayD::from_elem(IxDyn(&[1]), -1.0_f32),
+        )
+        .unwrap();
+        let out = layer
+            .propagate_ibp(&input)
+            .expect("negative-upper crossing must produce a valid box, not invert");
+        // Reachable outputs: {0} ∪ (-2, -1]; enclosure [-2, 0].
+        assert_eq!(out.lower()[[0]], alpha);
+        assert_eq!(out.upper()[[0]], 0.0);
+        for x in [-3.0_f32, -2.5, -1.9, -1.5, -1.0] {
+            let y = trelu_eval(x, alpha);
+            assert!(
+                out.lower()[[0]] <= y && y <= out.upper()[[0]],
+                "TRelu({x}) = {y} escapes the enclosure [{}, {}]",
+                out.lower()[[0]],
+                out.upper()[[0]]
+            );
+        }
     }
 
     // ── CROWN relaxation soundness proptest (#3321) ─────────────────────

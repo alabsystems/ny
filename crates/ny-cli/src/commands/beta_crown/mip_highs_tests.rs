@@ -1146,6 +1146,34 @@ fn sequential_mip_serial_gate_is_exact_and_fail_closed() {
     }
 }
 
+/// #safenlp-cycle: within the one full-cycle gate the DEFAULT is the serial
+/// one-model solve; outside it every historical spelling is byte-identical.
+#[test]
+fn safenlp_mip_cycle_defaults_the_sequential_solve_to_serial() {
+    let historical = MipConfig::default().parallel_split;
+    // Cycle off == the exact historical resolver for every spelling.
+    for value in [None, Some("0"), Some("1"), Some(""), Some("true")] {
+        assert_eq!(
+            sequential_mip_parallel_split_from_value_and_cycle(value, false),
+            sequential_mip_parallel_split_from_value(value),
+            "cycle-off must be byte-identical to the historical resolver"
+        );
+    }
+    // Cycle on: serial is the default, including for malformed spellings
+    // (fail closed INTO the gate-appropriate default).
+    for value in [None, Some("0"), Some("1"), Some(""), Some("true")] {
+        assert_eq!(
+            sequential_mip_parallel_split_from_value_and_cycle(value, true),
+            1,
+            "the cycle gate must default {value:?} to the serial one-model solve"
+        );
+    }
+    assert_eq!(
+        sequential_mip_parallel_split_from_value_and_cycle(None, false),
+        historical
+    );
+}
+
 #[test]
 fn objective_first_sat_window_floor_is_one_shared_absolute_envelope() {
     // Discriminating regression for the audit failure: the 4s probe is sized
@@ -1273,6 +1301,46 @@ fn objective_first_sat_ledger_never_extends_outer_deadline() {
         ObjectiveFirstSatLedger::start(budget, Some(Instant::now())),
         None,
         "an exhausted outer deadline must not arm a probe"
+    );
+}
+
+#[test]
+fn postbab_reserve_mip_late_gate_never_claims_a_timeout_source() {
+    let deadline = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("one millisecond before now is representable");
+
+    super::super::output::begin_capture();
+    super::super::output::record_captured_deadline_plan(
+        Duration::from_millis(10),
+        Some(deadline),
+        true,
+    );
+    let carried = gate_mip_result_at_deadline(timeout_verification_result(1), 1, deadline);
+    let carried_plan = super::super::output::take_captured_deadline_plan()
+        .expect("capture records the configured deadline plan");
+    super::super::output::end_capture();
+    assert!(matches!(carried, VerificationResult::Timeout { .. }));
+    assert!(
+        !carried_plan.configured_deadline_caused_terminal_timeout,
+        "a pre-existing MIP timeout must not be credited to the later configured wall"
+    );
+
+    super::super::output::begin_capture();
+    super::super::output::record_captured_deadline_plan(
+        Duration::from_millis(10),
+        Some(deadline),
+        true,
+    );
+    let decided = map_mip_nonsat_result(MipResult::Unsat { certified: true }, 1);
+    let converted = gate_mip_result_at_deadline(decided, 1, deadline);
+    let converted_plan = super::super::output::take_captured_deadline_plan()
+        .expect("capture records the configured deadline plan");
+    super::super::output::end_capture();
+    assert!(matches!(converted, VerificationResult::Timeout { .. }));
+    assert!(
+        !converted_plan.configured_deadline_caused_terminal_timeout,
+        "a decided MIP result unwinding after the wall is not typed abort evidence"
     );
 }
 

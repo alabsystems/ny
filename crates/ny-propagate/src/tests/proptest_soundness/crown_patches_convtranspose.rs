@@ -41,6 +41,30 @@
 //! 10-20x the measured isolated cost. The failure these exist to catch is an
 //! infinite loop, and no finite wall lets one of those through.
 //! MEASURE BEFORE LOWERING THEM.
+//!
+//! !! MEASUREMENT CORRECTION, 2026-08-20 !!
+//! Several wall-clock justifications in this file and its siblings were derived
+//! from timings taken while 14 stray busy-loop processes -- left running by my
+//! own earlier load experiment -- were saturating this 14-core box for 15+
+//! hours. Every "isolated" cost measured in that window is inflated, typically
+//! 5-7x. Re-measured on a clean box:
+//!
+//!   obj_chunk_equivalence_and_containment   29.57s -> 4.15s   (wall margin 7.2x, NOT 1.01x)
+//!   convtranspose2d_relu_chain_soundness    16.44s -> 2.74s   (margin 7.3x, NOT 1.22x)
+//!   conv2d_relu_patches_vs_dense            12.59s -> 2.36s
+//!   cosine_distance_crown_bounds_noninvert  15.05s -> 2.60s  (at 16 cases)
+//!
+//! So the claim that these walls were "coin flips with no margin" was WRONG:
+//! they had 5-7x headroom and were tripping because of my contamination, not
+//! because they were mis-sized. The enlarged walls are retained -- a hang
+//! sentinel loses nothing by being generous, and CI hosts are shared -- but the
+//! reasoning that produced them does not stand, and no future change should
+//! cite those numbers.
+//!
+//! What is NOT affected: the env-leak findings. `budget_bytes: 0` and
+//! `crown=-inf` against a finite IBP are causal evidence of a leaked
+//! `NY_DENSE_BUDGET_MB`, not timing artifacts, and they reproduce independently
+//! of machine load.
 
 use crate::bounds::patches::{
     CrownBounds, PatchGeometry, PatchesData, PatchesLinearBounds, UnstableIdx,

@@ -63,8 +63,45 @@ impl Default for ZonotopePropagationOptions {
 impl GraphNetwork {
     /// Propagate bounds through the graph using zonotopes for correlation-aware attention.
     ///
-    /// Zonotopes track correlations between Q and K through shared error symbols,
-    /// giving tighter bounds for Q@K^T in attention than IBP.
+    /// **This is a DIAGNOSTIC / localization instrument, not a production
+    /// tightening path, and it has no production callers by design** (#orphans-lies-1).
+    /// Its consumers are the stage-by-stage width-localization harnesses
+    /// (`ny-onnx` Whisper `attention_stage_localization` / `attention_context_matrix`
+    /// / `attention_context_fallback`) that ask "which operator is the widener?"
+    /// by running IBP and this pass over the same prefix and printing the ratio.
+    /// [`ZonotopeSoftmaxMode::IntervalFallback`] exists for exactly that bisection.
+    ///
+    /// # Why it is not routed
+    ///
+    /// The obvious reading — that the graph IBP paths are correlation-blind and
+    /// this is the tightening they are missing — is wrong on all three counts:
+    ///
+    /// 1. **The correlation win is already in production, node-locally.**
+    ///    `propagate_ibp` and its three siblings run
+    ///    `try_attention_matmul_bounds_zonotope` (attention `Q@K^T`) and
+    ///    `try_ffn_swiglu_bounds_zonotope` (SwiGLU `MulBinary`) and merge the
+    ///    result through [`super::dispatch::intersect_zonotope_ibp`], so those
+    ///    paths can only be tighter than plain interval arithmetic. Those helpers
+    ///    rebuild a fresh zonotope at the *shared base* of the Q and K
+    ///    projections, which is where the Q/K correlation lives.
+    /// 2. **Carrying symbols through the normalization — the one thing this pass
+    ///    does that they do not — measures WORSE, not better.** See
+    ///    `graph_alpha/zonotope/attention.rs:108-116`: on Qwen3-0.6B, propagating
+    ///    the zonotope through LayerNorm gives `Q@K^T` width `2.44e3`, versus
+    ///    `1e-6`..`1e-3` when a fresh zonotope is started at the LayerNorm output.
+    ///    `layer_norm_affine`'s relaxation error swamps the correlation it keeps.
+    ///    The tests in `propagate_zonotope_vs_production_ibp` below reproduce that
+    ///    ordering on a hand-checkable fixture.
+    /// 3. **It has no floor.** Unlike the node-local helpers, this pass publishes
+    ///    its output zonotope verbatim — there is no `intersect_zonotope_ibp`
+    ///    anywhere in it — so routing it could *widen* a bound rather than only
+    ///    tighten it. Two further blockers before it could ever carry a verdict:
+    ///    the Softmax arm's own comment below disclaims global soundness, and the
+    ///    error-symbol count is uncapped (it scales with input size).
+    ///
+    /// If you are here looking for attention tightness, the live levers are the
+    /// two node-local helpers above and the BilinearCrown McCormick alphas in
+    /// `graph_alpha/propagate_dag` — not this function.
     ///
     /// # Arguments
     /// * `input` - Input bounded tensor (center values)
@@ -487,5 +524,264 @@ impl GraphNetwork {
                 node.layer.layer_type()
             ))),
         }
+    }
+}
+
+/// Evidence for the "route it or delete it" question on [`GraphNetwork::propagate_zonotope`]
+/// (#orphans-lies-1).
+///
+/// The claim under test is the one in this module's own doc: that a whole-graph
+/// zonotope forward gives "tighter bounds for Q@K^T in attention than IBP", and
+/// therefore that its zero production callers are a missed tightness win.
+///
+/// On an attention-shaped fixture it does not hold. `propagate_ibp` is **not**
+/// correlation-blind: it already runs the node-local zonotope tightenings
+/// (`try_attention_matmul_bounds_zonotope` for `MatMul{transpose_b}`,
+/// `try_ffn_swiglu_bounds_zonotope` for `MulBinary`) and merges them through
+/// [`super::dispatch::intersect_zonotope_ibp`], so it can only be tighter than
+/// plain interval arithmetic. Those helpers rebuild a FRESH zonotope at the
+/// shared base of the Q and K projections, which is where the Q/K correlation
+/// actually lives — while this whole-graph pass insists on carrying symbols
+/// *through* the normalization via `layer_norm_affine`, whose relaxation error
+/// swamps the correlation it preserves. That is the measurement already recorded
+/// at `graph_alpha/zonotope/attention.rs:108-116` (Qwen3-0.6B: Q@K^T width
+/// 2.44e3 propagating through LayerNorm vs 1e-6..1e-3 restarting after it), and
+/// these tests reproduce the same ordering on a fixture small enough to check by
+/// hand against concrete forward evaluations.
+///
+/// MEASURED here (`_input -> LayerNorm -> {q, k} -> q @ k^T`, `max_width`):
+///
+/// | input radius | `propagate_ibp` | `propagate_zonotope` | ratio |
+/// |---|---|---|---|
+/// | 0.001 | 8.744907e-2 | 1.365502e-1 | 1.56x WORSE |
+/// | 0.02  | 2.230007e0  | 5.794865e0  | 2.60x WORSE |
+/// | 0.1   | 2.110639e1  | 3.037820e2  | 14.4x WORSE |
+///
+/// And the control, at radius 0.02: the same graph with Q and K fed by two
+/// SEPARATE LayerNorms (no shared base, so nothing for the node-local zonotope
+/// to exploit) gives `4.083443e0` against the shared-base `2.230007e0` — i.e.
+/// `propagate_ibp` really is 1.83x tighter *because* of the correlation
+/// tightening, so the comparison above is against the correlation-aware path.
+#[cfg(test)]
+mod propagate_zonotope_vs_production_ibp {
+    use crate::layers::{Layer, LayerNormLayer, LinearLayer, MatMulLayer};
+    use crate::network::core::{GraphNetwork, GraphNode};
+    use ndarray::{Array2, ArrayD, IxDyn};
+    use ny_tensor::BoundedTensor;
+
+    const SEQ: usize = 4;
+    const DIM: usize = 6;
+    const EPS: f32 = 1e-5;
+
+    fn projection(seed: f32) -> Array2<f32> {
+        Array2::from_shape_fn((DIM, DIM), |(o, i)| {
+            let t = seed + o as f32 * 0.37 - i as f32 * 0.19;
+            0.5 * t.sin() + 0.25 * (t * 1.7).cos()
+        })
+    }
+
+    /// `_input -> ln -> {q, k} -> scores = q @ k^T`.
+    ///
+    /// This is the shape ny-build emits for a traced attention block: one shared
+    /// normalized activation feeding two projections whose product is the score
+    /// matrix. It is exactly the pattern the module doc claims the whole-graph
+    /// zonotope wins on.
+    fn attention_scores_graph() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "ln",
+            Layer::LayerNorm(LayerNormLayer::new_default(DIM, EPS).expect("layernorm")),
+        ));
+        graph.add_node(GraphNode::new(
+            "q",
+            Layer::Linear(LinearLayer::new(projection(0.3), None).expect("q proj")),
+            vec!["ln".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "k",
+            Layer::Linear(LinearLayer::new(projection(1.9), None).expect("k proj")),
+            vec!["ln".to_string()],
+        ));
+        graph.add_node(GraphNode::binary(
+            "scores",
+            Layer::MatMul(MatMulLayer::new(true, None)),
+            "q",
+            "k",
+        ));
+        graph.set_output("scores");
+        graph
+    }
+
+    fn input_box(radius: f32) -> BoundedTensor {
+        let center = ArrayD::from_shape_fn(IxDyn(&[SEQ, DIM]), |ix| {
+            let (s, d) = (ix[0] as f32, ix[1] as f32);
+            0.8 * (s * 1.3 + d * 0.7).sin() + 0.2 * d
+        });
+        BoundedTensor::new(center.mapv(|v| v - radius), center.mapv(|v| v + radius))
+            .expect("input box")
+    }
+
+    /// Concrete forward, written out independently of ny's propagation code so
+    /// the enclosure check is not circular: LayerNorm over the last axis, two
+    /// `x @ W^T` projections, then `q @ k^T`.
+    fn concrete_scores(x: &Array2<f32>) -> Array2<f32> {
+        let mut normalized = Array2::<f32>::zeros((SEQ, DIM));
+        for s in 0..SEQ {
+            let row = x.row(s);
+            let mean = row.sum() / DIM as f32;
+            let var = row.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / DIM as f32;
+            let inv = 1.0 / (var + EPS).sqrt();
+            for d in 0..DIM {
+                normalized[[s, d]] = (row[d] - mean) * inv;
+            }
+        }
+        let q = normalized.dot(&projection(0.3).t());
+        let k = normalized.dot(&projection(1.9).t());
+        q.dot(&k.t())
+    }
+
+    /// Deterministic sample points spanning the input box: both corners, the
+    /// center, and interior points that vary the sign pattern per coordinate.
+    fn samples(input: &BoundedTensor) -> Vec<Array2<f32>> {
+        let lower = input.lower();
+        let upper = input.upper();
+        let at = |f: &dyn Fn(usize, usize) -> f32| {
+            Array2::from_shape_fn((SEQ, DIM), |(s, d)| {
+                let (lo, hi) = (lower[[s, d]], upper[[s, d]]);
+                lo + f(s, d).clamp(0.0, 1.0) * (hi - lo)
+            })
+        };
+        vec![
+            at(&|_, _| 0.0),
+            at(&|_, _| 1.0),
+            at(&|_, _| 0.5),
+            at(&|s, d| ((s + d) % 2) as f32),
+            at(&|s, d| ((s * DIM + d) % 3) as f32 / 2.0),
+            at(&|s, d| (((s * 7 + d * 5) % 11) as f32) / 10.0),
+        ]
+    }
+
+    fn assert_encloses(bounds: &BoundedTensor, input: &BoundedTensor, label: &str) {
+        for (idx, x) in samples(input).iter().enumerate() {
+            let out = concrete_scores(x);
+            for i in 0..SEQ {
+                for j in 0..SEQ {
+                    let v = out[[i, j]];
+                    assert!(
+                        v >= bounds.lower()[[i, j]] - 1e-4 && v <= bounds.upper()[[i, j]] + 1e-4,
+                        "{label} sample {idx}: scores[{i},{j}]={v} escapes [{}, {}]",
+                        bounds.lower()[[i, j]],
+                        bounds.upper()[[i, j]],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Both paths are enclosures — the orphan is not unsound, it is redundant.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn both_paths_enclose_concrete_attention_scores() {
+        let graph = attention_scores_graph();
+        for radius in [0.001_f32, 0.02, 0.1] {
+            let input = input_box(radius);
+            let ibp = graph.propagate_ibp(&input).expect("production IBP");
+            assert_encloses(&ibp, &input, "propagate_ibp");
+            let zono = graph
+                .propagate_zonotope(&input, radius)
+                .expect("whole-graph zonotope");
+            assert_encloses(&zono, &input, "propagate_zonotope");
+        }
+    }
+
+    /// The tightness claim fails on the shape it was written for: the whole-graph
+    /// zonotope is never tighter than production IBP here, and is much looser as
+    /// the box grows.
+    ///
+    /// This is the load-bearing assertion behind the recommendation to DELETE
+    /// rather than route `propagate_zonotope`. If a future change makes the
+    /// whole-graph pass genuinely win on this fixture, this test fails and the
+    /// recommendation should be revisited — that is the intent.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn whole_graph_zonotope_is_not_tighter_than_production_ibp_on_attention() {
+        let graph = attention_scores_graph();
+        for radius in [0.001_f32, 0.02, 0.1] {
+            let input = input_box(radius);
+            let ibp = graph.propagate_ibp(&input).expect("production IBP");
+            let zono = graph
+                .propagate_zonotope(&input, radius)
+                .expect("whole-graph zonotope");
+            println!(
+                "radius={radius:.4}: propagate_ibp max_width={:.6e}  propagate_zonotope max_width={:.6e}",
+                ibp.max_width(),
+                zono.max_width()
+            );
+            assert!(
+                zono.max_width() >= ibp.max_width() * (1.0 - 1e-3),
+                "radius {radius}: whole-graph zonotope ({:.6e}) beat production IBP ({:.6e}) — \
+                 the orphan may be worth routing after all; see the module note",
+                zono.max_width(),
+                ibp.max_width(),
+            );
+        }
+    }
+
+    /// Production IBP's correlation awareness is not incidental: removing the
+    /// shared-base link (Q and K fed by two *different* normalizations) is what
+    /// a correlation-blind path would look like, and it is measurably worse.
+    /// This pins that `propagate_ibp` really is exercising the node-local
+    /// zonotope tightening on the shared-base fixture, so the comparison above
+    /// is against the correlation-aware path and not a strawman.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn production_ibp_exercises_the_node_local_zonotope_on_the_shared_base() {
+        let shared = attention_scores_graph();
+
+        let mut split = GraphNetwork::new();
+        split.add_node(GraphNode::from_input(
+            "ln_q",
+            Layer::LayerNorm(LayerNormLayer::new_default(DIM, EPS).expect("layernorm")),
+        ));
+        split.add_node(GraphNode::from_input(
+            "ln_k",
+            Layer::LayerNorm(LayerNormLayer::new_default(DIM, EPS).expect("layernorm")),
+        ));
+        split.add_node(GraphNode::new(
+            "q",
+            Layer::Linear(LinearLayer::new(projection(0.3), None).expect("q proj")),
+            vec!["ln_q".to_string()],
+        ));
+        split.add_node(GraphNode::new(
+            "k",
+            Layer::Linear(LinearLayer::new(projection(1.9), None).expect("k proj")),
+            vec!["ln_k".to_string()],
+        ));
+        split.add_node(GraphNode::binary(
+            "scores",
+            Layer::MatMul(MatMulLayer::new(true, None)),
+            "q",
+            "k",
+        ));
+        split.set_output("scores");
+
+        let input = input_box(0.02);
+        let shared_width = shared
+            .propagate_ibp(&input)
+            .expect("shared-base IBP")
+            .max_width();
+        let split_width = split
+            .propagate_ibp(&input)
+            .expect("split-base IBP")
+            .max_width();
+        println!(
+            "shared-base IBP max_width={shared_width:.6e}  split-base IBP max_width={split_width:.6e}"
+        );
+        assert!(
+            shared_width <= split_width,
+            "shared-base IBP ({shared_width:.6e}) should be at least as tight as split-base \
+             ({split_width:.6e}); if not, the node-local zonotope tightening did not fire and \
+             the orphan comparison is against a strawman"
+        );
     }
 }

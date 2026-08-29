@@ -46,14 +46,24 @@ fn combination_count_within_limit(total: usize, choose: usize, limit: usize) -> 
     if choose > total {
         return true;
     }
-    let choose = choose.min(total - choose);
+    // Totalized like `branch::slab_index`: every saturation/clamp below is
+    // UNREACHABLE on the paths this function admits, so the rewrite is
+    // behaviour-identical and removes the MIR asserts rather than assuming them
+    // away. The verifier refutes these three today (1 Sub, 1 Add, 1 div-by-zero)
+    // because it cannot connect them to the guards that make them safe.
+    //   total - choose   the early return at the top of this fn is
+    //                    `if choose > total { return true }`, so `choose <= total`.
+    //   ... + i          `i <= choose <= total`, so the sum is at most `total`.
+    //   / i              `i` ranges over `1..=choose`, so it is never zero;
+    //                    `.max(1)` is the identity on that range.
+    let choose = choose.min(total.saturating_sub(choose));
     let mut count = 1_u128;
     for i in 1..=choose {
-        let numerator = total - choose + i;
+        let numerator = total.saturating_sub(choose).saturating_add(i);
         let Some(product) = count.checked_mul(numerator as u128) else {
             return false;
         };
-        count = product / i as u128;
+        count = product / (i as u128).max(1);
         if count > limit as u128 {
             return false;
         }

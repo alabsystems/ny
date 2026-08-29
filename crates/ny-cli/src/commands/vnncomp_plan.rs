@@ -39,11 +39,7 @@ pub(crate) fn handle_vnncomp_plan_command(
     // run; retiring the env var is I10 work, not the printer's), then
     // auto-derivation from binary/ONNX/cwd ancestors.
     let configs_dir = configs_dir
-        .or_else(|| {
-            std::env::var_os("NY_CONFIGS_DIR")
-                .map(PathBuf::from)
-                .filter(|dir| dir.is_dir())
-        })
+        .or_else(super::vnncomp::configs_dir_from_env)
         .or_else(|| {
             let mut starts = Vec::new();
             if let Ok(exe) = std::env::current_exe() {

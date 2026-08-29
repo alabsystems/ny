@@ -69,10 +69,15 @@ use std::str::FromStr;
 ///
 /// ## Dimensional Conversions
 ///
-/// | LayerType | 3D Kernel | 4D Kernel |
-/// |-----------|-----------|-----------|
-/// | `Conv2d` | `Conv1dLayer` | `Conv2dLayer` |
-/// | `ConvTranspose2d` | `ConvTranspose1dLayer` | `ConvTranspose2dLayer` |
+/// | LayerType | 3D Kernel | 4D Kernel | 5D Kernel |
+/// |-----------|-----------|-----------|-----------|
+/// | `Conv2d` | `Conv1dLayer` | `Conv2dLayer` | `Conv3dLayer` |
+/// | `ConvTranspose2d` | `ConvTranspose1dLayer` | `ConvTranspose2dLayer` | unsupported |
+///
+/// ONNX has ONE `Conv` op for every spatial rank, so the loader maps all of
+/// them onto the `Conv2d` compatibility variant and the converter dispatches on
+/// the kernel's rank. `LayerType::Conv3d` exists for producers that already
+/// know the rank (the trace bridge) and can name it directly.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayerType {
@@ -80,6 +85,15 @@ pub enum LayerType {
     Linear,
     Conv1d,
     Conv2d,
+    /// 3-D (volumetric) convolution: kernel `[out_c, in_c/group, kD, kH, kW]`.
+    ///
+    /// Video and volumetric stems (Qwen3-VL / PaddleOCR-VL 3-D patch
+    /// embeddings, Smart Turn's video backbone) open with one of these. NY
+    /// lowers it to `ny_propagate::layers::Conv3dLayer`, which is IBP-ONLY: its
+    /// interval forward is a certified directed-binary64 enclosure and its
+    /// CROWN backward fails closed, so a Conv3d node degrades a network to IBP
+    /// at that node rather than making it unverifiable.
+    Conv3d,
     ConvTranspose1d,
     ConvTranspose2d,
     /// Average pooling over spatial dimensions
@@ -217,6 +231,10 @@ pub enum LayerType {
     DequantizeLinear,
     /// ONNX QuantizeLinear: y = saturate(round_to_even(x / scale) + zero_point).
     QuantizeLinear,
+    /// Certified additive widening: y = x + e with e in [-epsilon, +epsilon]
+    /// per element. A sound Minkowski enclosure (used e.g. for index-agnostic
+    /// Embedding relaxations); carries no quantization semantics.
+    EpsilonExpand,
     /// Squeeze: remove dimension of size 1 at specified axis
     Squeeze,
     /// Unsqueeze: insert dimension of size 1 at specified axis
@@ -313,6 +331,23 @@ pub enum LayerType {
     Gather,
     /// ScatterND: scatter update values into data at computed indices.
     ScatterND,
+    /// ScatterAdd: accumulate `src` into `data` along `axis` at positions given
+    /// by an `index` tensor shaped like `src`
+    /// (`out[i][index[i][j][k]][k] += src[i][j][k]` for `axis == 1`).
+    ///
+    /// Additive, so — unlike the overwriting [`LayerType::ScatterND`] — a
+    /// duplicate destination index is deterministic (the contributions sum) and
+    /// needs no union treatment. Attributes: `axis` (i64, trailing-relative).
+    /// Inputs: `(data, index, src)`.
+    ScatterAdd,
+    /// IndexAdd: accumulate `src` into `data` along `axis` at positions given by
+    /// a 1-D `index` of length `src.shape()[axis]`
+    /// (`out[index[i], j, ...] += src[i, j, ...]` for `axis == 0`).
+    ///
+    /// The 1-D-index sibling of [`LayerType::ScatterAdd`]; likewise additive and
+    /// duplicate-deterministic. Attributes: `axis` (i64, trailing-relative).
+    /// Inputs: `(data, index, src)`.
+    IndexAdd,
     /// Slice: extracts a contiguous range along an axis.
     /// Used to implement Split (multi-output op) as multiple Slice layers.
     /// Attributes: "axis" (i64), "start" (i64), "end" (i64).
@@ -333,6 +368,7 @@ impl fmt::Display for LayerType {
             LayerType::Linear => write!(f, "Linear"),
             LayerType::Conv1d => write!(f, "Conv1d"),
             LayerType::Conv2d => write!(f, "Conv2d"),
+            LayerType::Conv3d => write!(f, "Conv3d"),
             LayerType::ConvTranspose1d => write!(f, "ConvTranspose1d"),
             LayerType::ConvTranspose2d => write!(f, "ConvTranspose2d"),
             LayerType::AveragePool => write!(f, "AveragePool"),
@@ -390,6 +426,7 @@ impl fmt::Display for LayerType {
             LayerType::Cast => write!(f, "Cast"),
             LayerType::DequantizeLinear => write!(f, "DequantizeLinear"),
             LayerType::QuantizeLinear => write!(f, "QuantizeLinear"),
+            LayerType::EpsilonExpand => write!(f, "EpsilonExpand"),
             LayerType::Squeeze => write!(f, "Squeeze"),
             LayerType::Unsqueeze => write!(f, "Unsqueeze"),
             LayerType::Pad => write!(f, "Pad"),
@@ -424,6 +461,8 @@ impl fmt::Display for LayerType {
             LayerType::NonZero => write!(f, "NonZero"),
             LayerType::Gather => write!(f, "Gather"),
             LayerType::ScatterND => write!(f, "ScatterND"),
+            LayerType::ScatterAdd => write!(f, "ScatterAdd"),
+            LayerType::IndexAdd => write!(f, "IndexAdd"),
             LayerType::Slice => write!(f, "Slice"),
             LayerType::Shape => write!(f, "Shape"),
             LayerType::Unknown => write!(f, "Unknown"),
@@ -445,6 +484,7 @@ impl FromStr for LayerType {
             "Linear" => LayerType::Linear,
             "Conv1d" => LayerType::Conv1d,
             "Conv2d" => LayerType::Conv2d,
+            "Conv3d" => LayerType::Conv3d,
             "ConvTranspose1d" => LayerType::ConvTranspose1d,
             "ConvTranspose2d" => LayerType::ConvTranspose2d,
             "AveragePool" => LayerType::AveragePool,
@@ -502,11 +542,21 @@ impl FromStr for LayerType {
             "Cast" => LayerType::Cast,
             "DequantizeLinear" => LayerType::DequantizeLinear,
             "QuantizeLinear" => LayerType::QuantizeLinear,
+            "EpsilonExpand" => LayerType::EpsilonExpand,
             "Squeeze" => LayerType::Squeeze,
             "Unsqueeze" => LayerType::Unsqueeze,
             "Pad" => LayerType::Pad,
             "Resize" | "Upsample" => LayerType::Resize,
-            "MatMul" => LayerType::MatMul,
+            // "BilinearCrown" is ny-propagate's own name for a MatMul whose
+            // BOTH operands are bounded (`Layer::BilinearCrown`, the McCormick
+            // relaxation ny-build emits for `Q @ K^T` and `probs @ V`);
+            // ONNX/ny-build spell the same op "MatMul". Without this alias the
+            // propagate-side name parses to `Unknown`, so every conformance
+            // report calls it unsupported — and since a variable-times-variable
+            // MatMul is exactly what attention is made of, that condemned every
+            // attention model as a soundness hole. Same failure mode, and same
+            // fix, as the "Pow" | "PowConstant" alias below.
+            "MatMul" | "BilinearCrown" => LayerType::MatMul,
             "Mul" | "MulBinary" => LayerType::Mul,
             "Min" | "MinBinary" => LayerType::Min,
             "Max" | "MaxBinary" => LayerType::Max,
@@ -518,7 +568,12 @@ impl FromStr for LayerType {
             "Sqrt" => LayerType::Sqrt,
             "Div" => LayerType::Div,
             "Sub" => LayerType::Sub,
-            "Pow" => LayerType::Pow,
+            // "PowConstant" is ny-propagate's own name for the constant-exponent
+            // power layer (`Layer::PowConstant`); ONNX/ny-build spell the same
+            // op "Pow". Without this alias the propagate-side name parses to
+            // `Unknown` and every conformance report calls a perfectly
+            // well-relaxed layer unsupported.
+            "Pow" | "PowConstant" => LayerType::Pow,
             "ReduceMean" => LayerType::ReduceMean,
             "ReduceSum" => LayerType::ReduceSum,
             "Argmax" | "ArgMax" => LayerType::Argmax,
@@ -536,6 +591,8 @@ impl FromStr for LayerType {
             "NonZero" => LayerType::NonZero,
             "Gather" => LayerType::Gather,
             "ScatterND" | "ScatterNd" => LayerType::ScatterND,
+            "ScatterAdd" => LayerType::ScatterAdd,
+            "IndexAdd" => LayerType::IndexAdd,
             "Slice" => LayerType::Slice,
             "Shape" => LayerType::Shape,
             _ => LayerType::Unknown,
@@ -555,6 +612,12 @@ mod tests {
         // LeakyRelu ↔ LeakyReLU
         assert_eq!(LayerType::from_str("LeakyRelu"), Ok(LayerType::LeakyRelu));
         assert_eq!(LayerType::from_str("LeakyReLU"), Ok(LayerType::LeakyRelu));
+
+        // MatMul ↔ BilinearCrown. ny-propagate names the both-operands-bounded
+        // McCormick form "BilinearCrown"; it is the same op. Unaliased, every
+        // attention model (Q @ K^T, probs @ V) read as Unknown/unsupported.
+        assert_eq!(LayerType::from_str("MatMul"), Ok(LayerType::MatMul));
+        assert_eq!(LayerType::from_str("BilinearCrown"), Ok(LayerType::MatMul));
 
         // RMSNorm ↔ RmsNorm
         assert_eq!(LayerType::from_str("RMSNorm"), Ok(LayerType::RMSNorm));
@@ -584,9 +647,49 @@ mod tests {
     }
 
     #[test]
+    fn epsilon_expand_round_trips_via_display_and_from_str() {
+        assert_eq!(
+            LayerType::from_str("EpsilonExpand"),
+            Ok(LayerType::EpsilonExpand)
+        );
+        assert_eq!(LayerType::EpsilonExpand.to_string(), "EpsilonExpand");
+    }
+
+    #[test]
     fn atan2_round_trips_via_display_and_from_str() {
         assert_eq!(LayerType::from_str("Atan2"), Ok(LayerType::Atan2));
         assert_eq!(LayerType::Atan2.to_string(), "Atan2");
+    }
+
+    /// The additive scatter family round-trips by name. `ScatterAdd` and
+    /// `IndexAdd` are distinct layer types, not aliases of each other or of
+    /// `ScatterND`: they differ in index rank (src-shaped vs 1-D) and, more
+    /// importantly, in COMBINE semantics (accumulate vs overwrite), so a
+    /// collapsed mapping would silently bound a different function.
+    #[test]
+    fn additive_scatter_family_round_trips_via_display_and_from_str() {
+        assert_eq!(LayerType::from_str("ScatterAdd"), Ok(LayerType::ScatterAdd));
+        assert_eq!(LayerType::ScatterAdd.to_string(), "ScatterAdd");
+
+        assert_eq!(LayerType::from_str("IndexAdd"), Ok(LayerType::IndexAdd));
+        assert_eq!(LayerType::IndexAdd.to_string(), "IndexAdd");
+
+        // The three scatter-family types stay pairwise distinct.
+        assert_ne!(LayerType::ScatterAdd, LayerType::IndexAdd);
+        assert_ne!(LayerType::ScatterAdd, LayerType::ScatterND);
+        assert_ne!(LayerType::IndexAdd, LayerType::ScatterND);
+    }
+
+    /// ONNX's `ScatterElements` is NOT admitted as an alias for `ScatterAdd`:
+    /// its default `reduction` is `"none"` (overwrite), so parsing it as the
+    /// additive layer would model the wrong function. It must fall through to
+    /// `Unknown` until an explicit reduction-aware conversion exists.
+    #[test]
+    fn scatter_elements_is_not_aliased_to_the_additive_layer() {
+        assert_eq!(
+            LayerType::from_str("ScatterElements"),
+            Ok(LayerType::Unknown)
+        );
     }
 
     #[test]

@@ -1585,9 +1585,22 @@ impl MipSolver {
         {
             return Err("the caller deadline is absent or expired");
         }
-        let split_cols = self
-            .split_plan()
-            .ok_or("no live phase-split prefix is available")?;
+        // Prefix availability is not worker availability. `split_plan` derives
+        // its width from the thread count because the historical phase-split
+        // race spends one DETACHED THREAD per region; the shared-prefix
+        // session spends none — AY seats all `2^k` regions inside ONE
+        // `BabSession` over ONE lowered model with one dual. Under the cycle's
+        // measured serial default the race is correctly disabled and the
+        // prefix is still exactly as meaningful, so the required marked-margin
+        // ingress must not be refused for a worker-count reason.
+        let (split_cols, serial_prefix) = match self.split_plan() {
+            Some(split_cols) => (split_cols, false),
+            None => (
+                self.serial_marked_margin_prefix(mode)
+                    .ok_or("no live phase-split prefix is available")?,
+                true,
+            ),
+        };
         if !(1..=MAX_SPLIT_K).contains(&split_cols.len()) {
             return Err("the phase-split prefix width is outside 1..=4");
         }
@@ -1612,6 +1625,20 @@ impl MipSolver {
             if std::mem::replace(seen, true) {
                 return Err("the phase-split prefix contains a duplicate column");
             }
+        }
+        if serial_prefix {
+            // R9 observable for the arm-C route: unconditional (not behind
+            // NY_PHASE_TELEMETRY) because it is the ONE line that separates
+            // "the serial admission fired" from "the ingress refused again",
+            // and it can only reach a stderr stream on the required
+            // marked-margin ingress, which is dark by default.
+            eprintln!(
+                "NY_MIP_SAFENLP_MARKED_MARGIN_SERIAL_PREFIX_V1 event=admitted width={} \
+                 regions={} parallel_split={}",
+                split_cols.len(),
+                1usize << split_cols.len(),
+                self.config.parallel_split
+            );
         }
         Ok(match mode {
             SafeNlpSharedPrefixMode::Plain => SafeNlpSharedPrefixPlan::Plain(split_cols),
@@ -1828,6 +1855,65 @@ impl MipSolver {
         }
 
         // Rank binaries using the advice policy and take the top k.
+        let order = self.ranked_binaries();
+        Some(
+            order[..k]
+                .iter()
+                .map(|&i| self.parts.binary_vars[i])
+                .collect(),
+        )
+    }
+
+    /// The ranked shared-prefix the required MARKED-MARGIN ingress may use when
+    /// [`Self::split_plan`] has declined for lack of workers.
+    ///
+    /// # Why this is not a global un-disable
+    ///
+    /// `parallel_split = 1` is an explicit instruction about CONCURRENCY: run
+    /// one model at a time instead of racing `2^k` cloned subproblems across
+    /// detached threads. Three of the four [`Self::split_plan`] callers consume
+    /// exactly that meaning and are untouched here —
+    /// [`Self::check_feasibility_with_warm_start`] and
+    /// [`Self::check_feasibility_cached`] fall through to the serial
+    /// [`Self::solve_ir`], and
+    /// [`Self::effective_feasibility_timeout_secs_with_window_value`] keeps
+    /// reporting the serial (window-floor) envelope rather than the
+    /// phase-split one.
+    ///
+    /// The fourth caller is the SafeNLP shared-prefix admission, and there the
+    /// worker count is simply the wrong question: one admitted session lowers
+    /// ONE model, creates ONE `BabSession`, and seats every region inside it
+    /// (`ay_lib::check_feasibility_shared_binary_prefix_inner`), so the prefix
+    /// costs no threads at all. The cycle's serial default (mip_highs
+    /// `sequential_mip_parallel_split_from_value_and_cycle`) is measured-right
+    /// for the sequential lane and structurally refused this ingress 9/9
+    /// (docs/BIG3_CORE_CAMPAIGN_2026-08-19.md, "L1 MEASUREMENT CAMPAIGN
+    /// VERDICTS").
+    ///
+    /// Scope is DOUBLE: the caller's typed ingress must be
+    /// [`MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix`]
+    /// AND the mode carried into this admission must be the marked one, so
+    /// neither historical ingress nor required-plain ingress can reach it. The
+    /// width is the same `1..=MAX_SPLIT_K` ranked top-k the auto-split path
+    /// produces on this box (`ceil(log2(20)) -> 4`), from the same
+    /// [`Self::ranked_binaries`] order, so the admitted prefix is identical to
+    /// the parallel arm's rather than a second selection policy.
+    ///
+    /// Nothing about verdict authority moves: the admitted plan re-enters the
+    /// same [`SafeNlpSharedPrefixPlan`] validation below and the same AY entry,
+    /// whose UNSAT still requires the whole-tree certificate replayed against
+    /// the ORIGINAL lowered model in `map_shared_binary_prefix_outcome`.
+    fn serial_marked_margin_prefix(&self, mode: SafeNlpSharedPrefixMode) -> Option<Vec<ir::Col>> {
+        if mode != SafeNlpSharedPrefixMode::MarkedMargin
+            || self.config.feasibility_ingress
+                != MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix
+        {
+            return None;
+        }
+        let k = MAX_SPLIT_K.min(self.parts.binary_vars.len());
+        if k == 0 {
+            return None; // pure LP: nothing to split on, exactly as `split_plan`
+        }
         let order = self.ranked_binaries();
         Some(
             order[..k]
@@ -2702,6 +2788,187 @@ mod split_tests {
                 binaries[2],
             ])),
             "the marked lane must reuse the historical ranked split handles"
+        );
+    }
+
+    /// The arm-C unblocker: `parallel_split = 1` is a CONCURRENCY instruction,
+    /// and the shared-prefix session spends no workers, so the required
+    /// marked-margin ingress must admit the same ranked width-4 prefix the
+    /// parallel arm would have used instead of refusing with "no live
+    /// phase-split prefix is available".
+    #[test]
+    fn serial_parallel_split_still_admits_the_required_marked_margin_prefix() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (mut solver, binaries) =
+            shared_prefix_plan_solver(MipBackend::Ay, Some(deadline), true);
+        solver.safenlp_shared_prefix = SafeNlpSharedPrefixState::Disabled;
+        solver.safenlp_target_fsb_prefix = SafeNlpTargetFsbPrefixState::Disabled;
+        solver.config.feasibility_ingress =
+            MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix;
+        solver.config.parallel_split = 1;
+
+        assert!(
+            solver.split_plan().is_none(),
+            "the explicit disable path must still refuse the phase-split RACE"
+        );
+        let plan = solver
+            .safenlp_shared_prefix_plan(false)
+            .expect("serial parallel_split must not refuse the required marked ingress")
+            .expect("required ingress never declines silently");
+        let SafeNlpSharedPrefixPlan::MarkedMargin(split_cols) = &plan else {
+            panic!("unexpected serial admission plan: {plan:?}");
+        };
+        assert!(
+            (1..=MAX_SPLIT_K).contains(&split_cols.len()),
+            "the serial admission must stay inside the 1..=4 shared-prefix width"
+        );
+        assert_eq!(
+            plan,
+            SafeNlpSharedPrefixPlan::MarkedMargin(vec![
+                binaries[1],
+                binaries[3],
+                binaries[4],
+                binaries[2],
+            ]),
+            "the serial prefix must be the SAME ranked top-k the parallel arm admits"
+        );
+    }
+
+    /// End-to-end through the SOLVER, which is where the 9/9 refusal happened:
+    /// with the cycle's serial default the required marked-margin ingress must
+    /// now REACH the AY marked-margin shared-prefix session instead of failing
+    /// closed before any backend entry.
+    #[test]
+    fn serial_required_marked_margin_ingress_reaches_the_ay_session() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (mut solver, _) = shared_prefix_plan_solver(MipBackend::Ay, Some(deadline), true);
+        solver.safenlp_shared_prefix = SafeNlpSharedPrefixState::Disabled;
+        solver.safenlp_target_fsb_prefix = SafeNlpTargetFsbPrefixState::Disabled;
+        solver.config.feasibility_ingress =
+            MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix;
+        solver.config.parallel_split = 1;
+
+        let result = solver
+            .check_feasibility_with_warm_start(None)
+            .expect("the serial admission must reach AY, not fail closed at the ingress");
+        assert!(
+            !matches!(result, MipResult::Error(_)),
+            "the admitted serial session must not error at the backend seam: {result:?}"
+        );
+    }
+
+    /// Width scoping: fewer live binaries than [`MAX_SPLIT_K`] narrows the
+    /// serial prefix rather than declining, and zero binaries (a pure LP) still
+    /// declines exactly as [`MipSolver::split_plan`] does.
+    #[test]
+    fn serial_marked_margin_prefix_narrows_and_still_declines_a_pure_lp() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let (mut solver, binaries) =
+            shared_prefix_plan_solver(MipBackend::Ay, Some(deadline), true);
+        solver.safenlp_shared_prefix = SafeNlpSharedPrefixState::Disabled;
+        solver.safenlp_target_fsb_prefix = SafeNlpTargetFsbPrefixState::Disabled;
+        solver.config.feasibility_ingress =
+            MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix;
+        solver.config.parallel_split = 1;
+
+        solver.parts.binary_vars = vec![binaries[1], binaries[3]];
+        solver.parts.binary_widths = vec![5.0, 4.0];
+        assert_eq!(
+            solver.safenlp_shared_prefix_plan(false).expect("admitted"),
+            Some(SafeNlpSharedPrefixPlan::MarkedMargin(vec![
+                binaries[1],
+                binaries[3]
+            ])),
+            "two live binaries admit a width-2 prefix, not a decline"
+        );
+
+        solver.parts.binary_vars.clear();
+        solver.parts.binary_widths.clear();
+        let error = solver
+            .safenlp_shared_prefix_plan(false)
+            .expect_err("a pure LP has nothing to split on");
+        assert!(
+            error
+                .to_string()
+                .contains("no live phase-split prefix is available"),
+            "unexpected pure-LP decline: {error}"
+        );
+    }
+
+    /// Every OTHER caller of the explicit disable path keeps its exact
+    /// semantics: historical ingress and required-PLAIN ingress both still see
+    /// no prefix under `parallel_split = 1`.
+    #[test]
+    fn serial_admission_is_ingress_scoped_and_never_a_global_un_disable() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let (mut historical, _) = shared_prefix_plan_solver(MipBackend::Ay, Some(deadline), false);
+        historical.safenlp_shared_prefix = SafeNlpSharedPrefixState::Enabled;
+        historical.config.parallel_split = 1;
+        assert_eq!(
+            historical.config.feasibility_ingress,
+            MipFeasibilityIngress::Historical
+        );
+        assert!(
+            historical.split_plan().is_none()
+                && historical
+                    .serial_marked_margin_prefix(SafeNlpSharedPrefixMode::Plain)
+                    .is_none()
+                && historical
+                    .serial_marked_margin_prefix(SafeNlpSharedPrefixMode::MarkedMargin)
+                    .is_none(),
+            "historical ingress must keep the explicit disable semantics"
+        );
+        assert!(
+            historical
+                .safenlp_shared_prefix_plan(false)
+                .expect("historical admission decline is not an error")
+                .is_none(),
+            "historical ingress must still fall back to the serial solve"
+        );
+
+        let (mut required_plain, _) =
+            shared_prefix_plan_solver(MipBackend::Ay, Some(deadline), false);
+        required_plain.config.feasibility_ingress =
+            MipFeasibilityIngress::RequireSafeNlpSharedBinaryPrefix;
+        required_plain.config.parallel_split = 1;
+        assert!(
+            required_plain
+                .serial_marked_margin_prefix(SafeNlpSharedPrefixMode::Plain)
+                .is_none(),
+            "required-plain ingress is out of scope for the marked-margin admission"
+        );
+        let error = required_plain
+            .safenlp_shared_prefix_plan(false)
+            .expect_err("required-plain ingress keeps refusing under the explicit disable");
+        assert!(
+            error
+                .to_string()
+                .contains("no live phase-split prefix is available"),
+            "unexpected required-plain decline: {error}"
+        );
+    }
+
+    /// The serial admission must not change the WALL the caller is promised:
+    /// `effective_feasibility_timeout_secs` still reports the serial envelope
+    /// (it asks `split_plan`, which is untouched).
+    #[test]
+    fn serial_admission_does_not_move_the_reported_feasibility_envelope() {
+        // No absolute deadline: the reported envelope is then a pure function
+        // of the phase-split classification and the window floor, so this
+        // compares bits rather than a ticking clock.
+        let (mut solver, _) = shared_prefix_plan_solver(MipBackend::Ay, None, true);
+        solver.config.parallel_split = 1;
+
+        let historical = solver.effective_feasibility_timeout_secs_with_window_value(None);
+        solver.config.feasibility_ingress =
+            MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix;
+        assert_eq!(
+            solver
+                .effective_feasibility_timeout_secs_with_window_value(None)
+                .to_bits(),
+            historical.to_bits(),
+            "admitting a serial prefix must not reclassify the wall as phase-split"
         );
     }
 

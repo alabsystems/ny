@@ -209,10 +209,21 @@ mod tests {
             .iter()
             .map(|s| s.as_str().unwrap().to_owned())
             .collect();
-        // Spot-check the roadmap-pinned must-refuse ops appear in the manifest.
-        // (Custom moved to sound_but_loose at INC-FINAL: the explicit opaque
-        // escape hatch lowers to the vacuous-but-sound ±inf OpaqueSkip.)
-        for op in ["Argmax", "Topk", "WhereCond", "MoeGating"] {
+        // Spot-check the must-refuse ops appear in the manifest.
+        //
+        // Trimmed as the bridge grew real lowerings — the manifest is a
+        // taxonomy, so an op leaves this list the moment a sound lowering
+        // exists, and pinning a stale name here would misreport coverage:
+        //   - `Argmax` / `Argmin` / `ArgSort` are now Sound (exact index
+        //     under interval separation, [0, n-1] hull otherwise) and `Sort`
+        //     Exact (monotone, tie-agnostic order statistics).
+        //   - `WhereCond` is now sound_but_loose (union-hull select).
+        //   - `Topk` STAYS unsupported, but for the missing largest/sorted
+        //     flags — not for a data-dependent output shape.
+        //   - `Custom` moved to sound_but_loose at INC-FINAL: the explicit
+        //     opaque escape hatch lowers to the vacuous-but-sound ±inf
+        //     OpaqueSkip.
+        for op in ["Topk", "Scatter", "MoeGating", "GridSample"] {
             assert!(
                 unsupported.iter().any(|o| o == op),
                 "{op} must be listed as unsupported in the manifest"
@@ -228,6 +239,22 @@ mod tests {
             loose.iter().any(|o| o == "Custom"),
             "Custom must be listed sound_but_loose (vacuous ±inf OpaqueSkip)"
         );
+        assert!(
+            loose.iter().any(|o| o == "WhereCond"),
+            "WhereCond must be listed sound_but_loose (union-hull select)"
+        );
+        let sound: Vec<String> = v["ops"]["sound"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_owned())
+            .collect();
+        for op in ["Argmax", "Argmin", "ArgSort"] {
+            assert!(
+                sound.iter().any(|o| o == op),
+                "{op} must be listed sound (index layers), not unsupported"
+            );
+        }
     }
 
     #[test]

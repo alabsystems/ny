@@ -11,6 +11,7 @@
 
 use super::demand::nodes_requiring_crown_tightening;
 use crate::layers::Layer;
+use crate::network::core::graph::CrownIbpRuntimePolicy;
 use crate::network::core::{GraphNetwork, Network};
 use crate::network::ibp::NetworkIbpExt;
 use crate::types::{
@@ -59,6 +60,7 @@ impl GraphNetwork {
         ibp_bounds: &HashMap<String, BoundedTensor>,
         engine: Option<&dyn GemmEngine>,
         deadline: Option<std::time::Instant>,
+        runtime_policy: CrownIbpRuntimePolicy,
     ) -> Result<Option<GraphCrownIbpBoundsResult>> {
         let Some(chain) = self.try_unary_chain(exec_order)? else {
             return Ok(None);
@@ -88,7 +90,7 @@ impl GraphNetwork {
 
         let sequential = chain
             .network
-            .collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_impl(
+            .collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_and_flat_bias_policy_impl(
                 input,
                 precomputed_ibp,
                 engine,
@@ -96,6 +98,8 @@ impl GraphNetwork {
                 // Preset-scoped per-node budget survives the sequential
                 // delegation (#cgan-bn11-budget); default = old constants.
                 &self.crown_ibp_per_node_time_budget,
+                runtime_policy.honest_provenance_enabled,
+                runtime_policy.patches_deadline_flat_bias_enabled,
             )?;
         let demand_set = nodes_requiring_crown_tightening(self, exec_order, ibp_bounds);
 

@@ -42,11 +42,49 @@ general:
   csv_name: instances.csv
 
 solver:
-  # Plain CROWN per-domain bounds (winner-aligned). ny default alpha-CROWN threads
-  # FROZEN root alphas into every input-split sub-domain (#3453 acasxu pattern) —
-  # too loose for the finetune UNSAT rows: 5/6 stuck unknown at 18-40s. With
-  # plain CROWN all 6 verify in 2-30s (A/B 2026-07-03, 12/12 category solve,
-  # zero regressions). Attribution: this knob alone flips the verdicts.
+  # Plain CROWN per-domain bounds (winner-aligned).
+  #
+  # HISTORICAL (2026-07-03, NO LONGER REPRODUCES — see below): ny default
+  # alpha-CROWN was recorded as threading FROZEN root alphas into every
+  # input-split sub-domain (#3453 acasxu pattern), "too loose for the finetune
+  # UNSAT rows: 5/6 stuck unknown at 18-40s", with plain CROWN verifying all 6
+  # in 2-30s and the knob alone flipping the verdicts.
+  #
+  # RE-MEASURED 2026-08-09 at 6ff297c5, release `mip,cuda`, GB10, full 12-row
+  # sweep at the official 100 s budget in BOTH arms, `Loading preset:` verified
+  # on every run. The 2026-07-03 claim does NOT reproduce in its stated form:
+  # alpha-CROWN does NOT leave "5/6 finetune UNSAT rows stuck unknown at 18-40s",
+  # and the knob does not flip 5 verdicts. But alpha-CROWN is NOT free either —
+  # it costs exactly one row. Two independent sweeps, and the difference between
+  # them is HOST LOAD, which is why both are recorded:
+  #
+  #   row (idx)                    loaded box (loadavg 27-52)   QUIET box (loadavg 2-6)
+  #                                crown        alpha-crown     crown        alpha-crown
+  #   0,1,4,5,8,9 (*_pretrain_*)   sat 1-2s     sat 1-2s        sat ~1.0s    sat ~1.0s
+  #   2  lane_keep_finetune_con    unsat  6s    unsat  5s       unsat  2.6s  unsat  2.7s
+  #   3  lane_keep_finetune_inv    unsat 31s    unsat 54s       unsat 17.4s  unsat 44.2s
+  #   6  pendulum_finetune_con     unsat  8s    unsat  2s       unsat  2.4s  unsat  2.5s
+  #   7  pendulum_finetune_inv     unsat 13s    unsat  5s       unsat  3.6s  unsat  4.0s
+  #   10 point_mass_finetune_con   unsat  8s    unsat  4s       unsat  2.5s  unsat  2.7s
+  #   11 point_mass_finetune_inv   timeout 96s  timeout 95s     unsat 49.3s  timeout 94.9s
+  #   TOTAL                        11/12        11/12           12/12        11/12
+  #
+  # ROW 11 IS THE WHOLE RESULT, and it is 4/4 REPRODUCIBLE IN EACH DIRECTION on a
+  # quiet box: crown unsat 49.2 / 49.5 / 49.4 / 49.3 s; alpha-crown timeout
+  # 94.9 / 94.9 / 94.8 / 94.9 s (variance under 0.4 s, loadavg 2.9-6.0). On a
+  # LOADED box crown's 49 s row stretches past the 100 s budget too, so BOTH arms
+  # fail it and the arm looks like a tie. It is not a tie: alpha-CROWN here is
+  # NET -1 ROW.
+  #
+  # The "alpha-CROWN is 2-4x FASTER on three of five unsat rows" reading is also
+  # a contention artefact: on a quiet box rows 2/6/7/10 are 2.4-3.6 s under crown
+  # and alpha-CROWN is marginally SLOWER on every one of them, and 2.5x slower on
+  # row 3 (17.4 s -> 44.2 s). alpha-CROWN is slower or equal on 5 of 5 UNSAT rows.
+  #
+  # KEPT AT `crown`, now on a measured loss rather than a tie. Recorded so the
+  # next reader does not re-derive a #3453 prize from the stale comment above —
+  # AND does not flip this knob believing it is free. Any future cersyve A/B must
+  # state its loadavg; at loadavg > ~25 this category cannot distinguish the arms.
   bound_prop_method: crown
   batch_size: 500000
   min_batch_size_ratio: 0.1

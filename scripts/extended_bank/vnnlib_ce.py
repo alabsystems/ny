@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import math
+import os
 import re
 import struct
 import sys
@@ -62,7 +63,8 @@ COUNTEREXAMPLE_ASSIGNMENT = re.compile(r"\(\s*X_([^\s()]+)\s+([^\s()]+)\s*\)")
 COUNTEREXAMPLE_ASSIGNMENT_MARKER = re.compile(r"\(\s*X_")
 SOURCE_CHUNK_CHARS = 64 * 1024
 MAX_ATOM_CHARS = 256
-MAX_EXPRESSION_TOKENS = 100_000
+DEFAULT_MAX_EXPRESSION_TOKENS = 100_000
+
 MAX_EXPRESSION_DEPTH = 128
 MAX_VARIABLE_INDEX = 10_000_000
 RESULT_DETAIL_LIMIT = 32
@@ -98,6 +100,47 @@ class UnsupportedSyntaxError(ValidationError):
     handler still refuses the witness; the distinction is in the type and the
     message, never in the safety.
     """
+
+
+EXPRESSION_TOKENS_ENV = "NY_VNNLIB_MAX_EXPRESSION_TOKENS"
+
+
+def configured_expression_tokens() -> int:
+    """Read the per-expression token bound from the environment, fail-closed.
+
+    The bound is a denial-of-service guard against untrusted input, not a
+    semantic rule. Whole `nn4sys` families are ONE `(assert (or ...))` of
+    millions of tokens, so refusing them makes the oracle unable to GRADE a
+    witness at all -- blindness, not strictness. Operators pointing the oracle
+    at a KNOWN benchmark corpus raise the bound; anything that is not a
+    positive integer is a configuration error and is refused loudly rather
+    than silently falling back to the default.
+    """
+    raw = os.environ.get(EXPRESSION_TOKENS_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_EXPRESSION_TOKENS
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValidationError(
+            f"{EXPRESSION_TOKENS_ENV}={raw!r} is not an integer"
+        ) from error
+    if value <= 0:
+        raise ValidationError(f"{EXPRESSION_TOKENS_ENV}={raw!r} must be positive")
+    return value
+
+
+# Module-level default. Callers may pass ``max_expression_tokens=`` to the
+# entry points instead; rebinding this name (as offline audits do) still works.
+MAX_EXPRESSION_TOKENS = configured_expression_tokens()
+
+
+def _expression_token_cap(max_expression_tokens: int | None) -> int:
+    if max_expression_tokens is None:
+        return MAX_EXPRESSION_TOKENS
+    if max_expression_tokens <= 0:
+        raise ValidationError("max_expression_tokens must be positive")
+    return max_expression_tokens
 
 
 class MissingDependencyError(RuntimeError):
@@ -336,6 +379,12 @@ class PropertySummary:
     output_assertion_count: int
     # None for VNN-LIB 1.x; the declared tensor layouts for 2.0.
     layout: SpecLayout | None = None
+    # Assertions that mention Y yet still PIN inputs (the nn4sys shape:
+    # `(or (and (>= X_0 a) (<= X_0 b) (<= Y_0 c)) ...)`). When this is non-zero
+    # the Y-free raw-domain pre-gate sees only part of the input domain -- or,
+    # when `input_assertion_count` is 0, none of it -- and the projection gate
+    # in `validate` is what actually enforces the box.
+    nested_domain_assertion_count: int = 0
 
 
 @dataclass
@@ -520,7 +569,10 @@ def tokenize(source: str | Iterable[str] | TextIO) -> Iterator[str]:
     yield from _segment_tokens("", pending, terminate=True)
 
 
-def _expressions(tokens: Iterable[str]) -> Iterator[Any]:
+def _expressions(
+    tokens: Iterable[str], *, max_expression_tokens: int | None = None
+) -> Iterator[Any]:
+    token_cap = _expression_token_cap(max_expression_tokens)
     stack: list[list[Any]] = []
     expression_tokens = 0
     for token in tokens:
@@ -529,9 +581,11 @@ def _expressions(tokens: Iterable[str]) -> Iterator[Any]:
         if token not in {"(", ")"} and len(token) > MAX_ATOM_CHARS:
             raise ValidationError(f"VNN-LIB atom exceeds {MAX_ATOM_CHARS} characters")
         expression_tokens += 1
-        if expression_tokens > MAX_EXPRESSION_TOKENS:
+        if expression_tokens > token_cap:
             raise ValidationError(
-                f"top-level expression exceeds {MAX_EXPRESSION_TOKENS} tokens"
+                f"top-level expression exceeds {token_cap} tokens; raise it "
+                f"with {EXPRESSION_TOKENS_ENV} or --max-expression-tokens when "
+                "the source is a known benchmark corpus"
             )
         if token == "(":
             if len(stack) >= MAX_EXPRESSION_DEPTH:
@@ -559,22 +613,28 @@ def _expressions(tokens: Iterable[str]) -> Iterator[Any]:
         raise ValidationError("unterminated VNN-LIB expression")
 
 
-def parse(tokens: Iterable[str]) -> Any:
+def parse(tokens: Iterable[str], *, max_expression_tokens: int | None = None) -> Any:
     """Parse the first expression from an incremental token iterable."""
     try:
-        return next(_expressions(tokens))
+        return next(_expressions(tokens, max_expression_tokens=max_expression_tokens))
     except StopIteration as error:
         raise ValidationError("unexpected end of VNN-LIB expression") from error
 
 
-def parse_all(source: str | Iterable[str]) -> Iterator[Any]:
+def parse_all(
+    source: str | Iterable[str], *, max_expression_tokens: int | None = None
+) -> Iterator[Any]:
     """Yield parsed top-level expressions one at a time."""
-    return _expressions(tokenize(source))
+    return _expressions(
+        tokenize(source), max_expression_tokens=max_expression_tokens
+    )
 
 
-def _file_expressions(path: str | Path) -> Iterator[Any]:
+def _file_expressions(
+    path: str | Path, *, max_expression_tokens: int | None = None
+) -> Iterator[Any]:
     with Path(path).open("r", encoding="utf-8", newline="") as source:
-        yield from parse_all(source)
+        yield from parse_all(source, max_expression_tokens=max_expression_tokens)
 
 
 def _float32(value: float) -> float:
@@ -704,6 +764,104 @@ def _references(node: Any, prefix: str, layout: SpecLayout | None = None) -> set
     return references
 
 
+def _has_reference(node: Any, prefix: str, layout: SpecLayout | None = None) -> bool:
+    """Early-exit twin of :func:`_references` -- presence only, no set built.
+
+    Resolves through :func:`resolve_variable` for the same reason
+    :func:`_references` does: under a 2.0 layout an atom is a TENSOR NAME, and
+    a `VARIABLE.fullmatch` scan would silently report "no Y here" for an
+    assertion that does mention Y. That answer feeds `_constrained_inputs`,
+    where treating a mixed assertion as Y-free would admit input bounds the
+    disjunction does not actually pin.
+    """
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            resolved = resolve_variable(item, layout)
+            if resolved is not None and resolved[0] == prefix:
+                return True
+        elif isinstance(item, list):
+            stack.extend(item)
+    return False
+
+
+def _constrained_inputs(node: Any, layout: SpecLayout | None = None) -> set[int]:
+    """X indices that EVERY satisfying assignment of ``node`` bounds.
+
+    The historical rule looked only at whole top-level assertions mentioning no
+    ``Y_i``, so a spec stating its input interval INSIDE a disjunct --
+    ``(assert (or (and (>= X_0 a) (<= X_0 b) (<= Y_0 c)) ...))``, the shape the
+    entire ``nn4sys`` family uses -- looked as if it constrained nothing and was
+    refused before the model ever ran. That refusal is blindness, not rigour: it
+    costs the oracle the ABILITY to grade a witness on those rows.
+
+    The rule is the same judgement applied at any depth, and is a strict
+    superset of the old one (a Y-free node still contributes every ``X_i`` it
+    mentions, so every file that scanned before still scans):
+
+    * Y-free subtree -> every ``X_i`` it mentions is pinned by it.
+    * ``and``        -> the union; each conjunct must hold.
+    * ``or``         -> the INTERSECTION; an ``X_i`` bounded in only one arm is
+                        not bounded by the disjunction, so it stays free.
+    * ``not`` and everything else -> nothing.
+
+    This widens what can be SCANNED. It never widens what counts as a
+    counterexample: `_evaluate_full` still evaluates every assertion -- input
+    bounds included -- at the raw witness and the executed outputs.
+    """
+    if not _has_reference(node, "Y", layout):
+        return _references(node, "X", layout)
+    if isinstance(node, list) and node and isinstance(node[0], str):
+        if node[0] == "and":
+            union: set[int] = set()
+            for child in node[1:]:
+                union |= _constrained_inputs(child, layout)
+            return union
+        if node[0] == "or" and len(node) > 1:
+            common = _constrained_inputs(node[1], layout)
+            for child in node[2:]:
+                if not common:
+                    break
+                common &= _constrained_inputs(child, layout)
+            return common
+    return set()
+
+
+def _input_projection(node: Any, variables: "_VariableEnvironment") -> bool:
+    """Evaluate an assertion with every output atom relaxed to ``true``.
+
+    This is the in-box gate for properties whose input interval lives inside a
+    mixed disjunct. Replacing each ``Y``-bearing Boolean atom with ``true``
+    yields the projection of the property onto the input space: what remains is
+    exactly "is this witness inside the union of the declared boxes?".
+
+    It is an over-approximation only under MONOTONE structure, so ``not`` --
+    which no VNN-LIB benchmark spec uses -- makes the projection meaningless and
+    is refused rather than guessed at. Nothing here decides whether a witness is
+    a counterexample; that stays with `_evaluate_full`.
+    """
+    if isinstance(node, list) and node and isinstance(node[0], str):
+        operator = node[0]
+        if operator in {"and", "or"}:
+            if len(node) < 2:
+                raise ValidationError(f"{operator!r} requires at least one operand")
+            result = operator == "and"
+            for child in node[1:]:
+                value = _input_projection(child, variables)
+                result = result and value if operator == "and" else result or value
+            return result
+        if operator == "not":
+            raise ValidationError(
+                "input projection is undefined under 'not'; no separate in-box "
+                "gate is available for this property"
+            )
+    if _has_reference(node, "Y", variables.layout):
+        return True
+    return _boolean(evaluate(node, variables))
+
+
+
 def _top_level_kind(expression: Any) -> str:
     if (
         not isinstance(expression, list)
@@ -748,18 +906,23 @@ def _assertion(expression: Any) -> Any | None:
     return expression[1] if _top_level_kind(expression) == "assert" else None
 
 
-def _scan_property(vnnlib_path: str | Path) -> PropertySummary:
+def _scan_property(
+    vnnlib_path: str | Path, *, max_expression_tokens: int | None = None
+) -> PropertySummary:
     declared_inputs = _IndexBitmap("X")
     declared_outputs = _IndexBitmap("Y")
     constrained_inputs = _IndexBitmap("X")
     assertion_count = domain_count = input_count = output_count = 0
+    nested_domain_count = 0
     maximum_input_reference = maximum_output_reference = -1
     layout: SpecLayout | None = None
     legacy_declarations = 0
     tensor_forms = 0
 
     phase = "start"
-    for expression in _file_expressions(vnnlib_path):
+    for expression in _file_expressions(
+        vnnlib_path, max_expression_tokens=max_expression_tokens
+    ):
         kind = _top_level_kind(expression)
         if kind == "set-logic":
             if phase != "start":
@@ -815,6 +978,16 @@ def _scan_property(vnnlib_path: str | Path) -> PropertySummary:
                 maximum_output_reference, max(output_references)
             )
             output_count += 1
+            # #nn4sys-nested-domain: a MIXED assertion can still pin inputs --
+            # every arm of `(or (and <input box> <output claim>) ...)` bounds
+            # them. Credit only the indices `_constrained_inputs` proves EVERY
+            # satisfying assignment bounds (`or` intersects), so this can widen
+            # what scans but never invents a bound the property does not state.
+            nested_references = _constrained_inputs(assertion, layout)
+            if nested_references:
+                nested_domain_count += 1
+                for index in nested_references:
+                    constrained_inputs.mark(index)
         else:
             domain_count += 1
             if input_references:
@@ -853,6 +1026,7 @@ def _scan_property(vnnlib_path: str | Path) -> PropertySummary:
         input_assertion_count=input_count,
         output_assertion_count=output_count,
         layout=layout,
+        nested_domain_assertion_count=nested_domain_count,
     )
 
 
@@ -919,27 +1093,42 @@ def _evaluate_domains(
     vnnlib_path: str | Path,
     raw: _VariableEnvironment,
     executed: _VariableEnvironment,
-) -> tuple[_ResultAccumulator, _ResultAccumulator]:
+    *,
+    projection: bool = False,
+    max_expression_tokens: int | None = None,
+) -> tuple[_ResultAccumulator, _ResultAccumulator, _ResultAccumulator]:
     raw_results = _ResultAccumulator()
     executed_results = _ResultAccumulator()
+    projection_results = _ResultAccumulator()
     layout = raw.layout
-    for expression in _file_expressions(vnnlib_path):
+    for expression in _file_expressions(
+        vnnlib_path, max_expression_tokens=max_expression_tokens
+    ):
         assertion = _assertion(expression)
-        if assertion is None or _references(assertion, "Y", layout):
+        if assertion is None:
+            continue
+        if _references(assertion, "Y", layout):
+            # Mixed assertion: the input interval, if any, is nested inside it.
+            if projection:
+                projection_results.add(_input_projection(assertion, raw))
             continue
         raw_results.add(_boolean(evaluate(assertion, raw)))
         executed_results.add(_boolean(evaluate(assertion, executed)))
-    return raw_results, executed_results
+    return raw_results, executed_results, projection_results
 
 
 def _evaluate_full(
     vnnlib_path: str | Path,
     executed: _VariableEnvironment,
+    *,
+    max_expression_tokens: int | None = None,
 ) -> tuple[_ResultAccumulator, _ResultAccumulator]:
     all_results = _ResultAccumulator()
     output_results = _ResultAccumulator()
     layout = executed.layout
-    for expression in _file_expressions(vnnlib_path):
+    for expression in _file_expressions(
+        vnnlib_path, max_expression_tokens=max_expression_tokens
+    ):
         assertion = _assertion(expression)
         if assertion is None:
             continue
@@ -954,9 +1143,13 @@ def validate(
     onnx_path: str | Path,
     vnnlib_path: str | Path,
     values: dict[int, float],
+    *,
+    max_expression_tokens: int | None = None,
 ) -> tuple[bool, bool, str]:
     try:
-        summary = _scan_property(vnnlib_path)
+        summary = _scan_property(
+            vnnlib_path, max_expression_tokens=max_expression_tokens
+        )
     except UnsupportedSyntaxError as error:
         # DISTINCT from "invalid property structure": that verdict describes a
         # property this validator READ and rejected.  This one says the file was
@@ -972,14 +1165,39 @@ def validate(
     executed_environment = _VariableEnvironment(
         values, executed_inputs=True, layout=summary.layout
     )
+    nested = summary.nested_domain_assertion_count > 0
+    projection_note = ""
     try:
-        raw_domain, executed_domain = _evaluate_domains(
-            vnnlib_path, raw_environment, executed_environment
+        raw_domain, executed_domain, projected_domain = _evaluate_domains(
+            vnnlib_path,
+            raw_environment,
+            executed_environment,
+            projection=nested,
+            max_expression_tokens=max_expression_tokens,
         )
     except UnsupportedSyntaxError as error:
         return False, False, f"{UNSUPPORTED_SYNTAX_PREFIX} {error}"
     except (OSError, UnicodeError, RecursionError, ValidationError) as error:
-        return False, False, f"invalid input assertion: {error}"
+        if not nested:
+            return False, False, f"invalid input assertion: {error}"
+        # The projection gate is an EXTRA check only nested-domain specs need
+        # (`not` makes it undefined, for instance). If it cannot be formed the
+        # property is still fully evaluated below, so degrade to the
+        # non-nested behaviour and SAY SO in the verdict string rather than
+        # letting a silently-absent gate look like a passed one.
+        try:
+            raw_domain, executed_domain, projected_domain = _evaluate_domains(
+                vnnlib_path,
+                raw_environment,
+                executed_environment,
+                projection=False,
+                max_expression_tokens=max_expression_tokens,
+            )
+        except UnsupportedSyntaxError as inner:
+            return False, False, f"{UNSUPPORTED_SYNTAX_PREFIX} {inner}"
+        except (OSError, UnicodeError, RecursionError, ValidationError) as inner:
+            return False, False, f"invalid input assertion: {inner}"
+        projection_note = f" projection_gate_unavailable={error}"
     # In-box gate = RAW-value domain check, matching the official zero-tol
     # semantics: SCORING-ZERO-TOL/counterexamples.py evaluates
     # `is_specification_vio(..., tuple(x_list), ..., 0.0)` on the raw parsed
@@ -992,14 +1210,23 @@ def validate(
     # rejects counterexamples the organizer scores CORRECT (abc/PyRAT banked 28
     # such falsifications at zero-tol in 2025). The executed-f32 domain result
     # is still computed and reported below as a diagnostic, never as a gate.
-    in_box = raw_domain.all_hold
+    # `projected_domain` carries the in-box answer for properties that state
+    # their input interval only inside a mixed disjunct (nn4sys). With no such
+    # assertions it is empty and this reduces exactly to `raw_domain.all_hold`.
+    in_box = raw_domain.all_hold and projected_domain.all_hold
+    gate_shape = (
+        f"complete_inputs={summary.input_count} "
+        f"input_assertions={summary.input_assertion_count} "
+        f"nested_domain_assertions={summary.nested_domain_assertion_count}"
+        f"{projection_note}"
+    )
     if not in_box:
         return (
             False,
             False,
-            f"in_box=False complete_inputs={summary.input_count} "
-            f"input_assertions={summary.input_assertion_count} "
+            f"in_box=False {gate_shape} "
             f"raw_domain_results={raw_domain.detail()} "
+            f"projected_domain_results={projected_domain.detail()} "
             f"executed_domain_results={executed_domain.detail()}",
         )
     if not executed_domain.all_hold:
@@ -1074,16 +1301,20 @@ def validate(
         values, output, executed_inputs=False, layout=summary.layout
     )
     try:
-        all_results, output_results = _evaluate_full(vnnlib_path, full_environment)
+        all_results, output_results = _evaluate_full(
+            vnnlib_path,
+            full_environment,
+            max_expression_tokens=max_expression_tokens,
+        )
     except UnsupportedSyntaxError as error:
         return True, False, f"{UNSUPPORTED_SYNTAX_PREFIX} {error}"
     except (OSError, UnicodeError, RecursionError, ValidationError) as error:
         return True, False, f"invalid output assertion: {error}"
     detail = (
-        f"in_box=True complete_inputs={summary.input_count} "
-        f"input_assertions={summary.input_assertion_count} "
+        f"in_box=True {gate_shape} "
         f"yasserts={summary.output_assertion_count} all_hold={all_results.all_hold} "
         f"raw_domain_results={raw_domain.detail()} "
+        f"projected_domain_results={projected_domain.detail()} "
         f"executed_domain_results={executed_domain.detail()} "
         f"output_results={output_results.detail()}"
     )
@@ -1134,6 +1365,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("onnx")
     parser.add_argument("vnnlib")
     parser.add_argument("counterexample")
+    parser.add_argument(
+        "--max-expression-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "per-expression token bound for this run; overrides "
+            f"{EXPRESSION_TOKENS_ENV}. Raise it only for a KNOWN corpus -- the "
+            "bound is a denial-of-service guard on untrusted input."
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         require_runtime_dependencies()
@@ -1147,7 +1389,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         text = counterexample.read_text(encoding="utf-8")
     values = _extract_cli_assignment(text)
-    in_box, is_counterexample, detail = validate(args.onnx, args.vnnlib, values)
+    in_box, is_counterexample, detail = validate(
+        args.onnx,
+        args.vnnlib,
+        values,
+        max_expression_tokens=args.max_expression_tokens,
+    )
     print(detail)
     if not is_counterexample and str(detail).startswith(UNSUPPORTED_SYNTAX_PREFIX):
         # Never "OUT-OF-BOX": that would report a containment decision this run

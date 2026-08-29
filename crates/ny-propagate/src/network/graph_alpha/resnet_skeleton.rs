@@ -342,6 +342,7 @@ pub(crate) fn build_resnet_segment_skeleton<
     // combined with either flag, and `prep_resnet_domain_with` declines the
     // skeleton fold entirely whenever a caller sets one of them).
     let mut stopped_at: Option<String> = None;
+    let mut bn_layers_extracted = 0usize;
     let mut segments = extract_gpu_resnet_segments_collect(
         graph,
         input,
@@ -356,8 +357,10 @@ pub(crate) fn build_resnet_segment_skeleton<
         false,
         false,
         &mut stopped_at,
+        &mut bn_layers_extracted,
     )?;
     debug_assert!(stopped_at.is_none(), "frozen_stop=false can never stop");
+    debug_assert_eq!(bn_layers_extracted, 0, "skeleton build disables BN");
     // Recorder hygiene: every origin must have been committed to a segment, and
     // the frontier-name list must mirror the legacy `frontier_abs` 1:1.
     if !rec.is_drained() || rec.frontier_nodes.len() != segments.len() {
@@ -966,8 +969,9 @@ pub(crate) mod test_support {
     /// #extract-skeleton x #image-node-crown: the legacy extraction with the
     /// merged API's new flags hard-false (allow_bn=false, frozen_stop=false) —
     /// the ONLY configuration the skeleton fold may compare against. Asserts the
-    /// 5th slot's contract (`stop_node` is None whenever frozen_stop=false) and
-    /// drops it so the 4-tuple oracles keep their historical shape.
+    /// stop/BN-usage slots' contract (`stop_node` is None and BN usage is zero
+    /// whenever both flags are false) and drops them so the 4-tuple oracles
+    /// keep their historical shape.
     pub(crate) fn legacy_ext(
         graph: &GraphNetwork,
         input: &BoundedTensor,
@@ -977,18 +981,20 @@ pub(crate) mod test_support {
         alpha: Option<&GraphAlphaState>,
         allow_pure_chain: bool,
     ) -> Option<Extraction> {
-        let (segs, names, frontier, node_abs, stop) = extract_gpu_segments_with_relu_names_ext(
-            graph,
-            input,
-            start,
-            crown,
-            ibp,
-            alpha,
-            allow_pure_chain,
-            false,
-            false,
-        )?;
+        let (segs, names, frontier, node_abs, stop, bn_layers_extracted) =
+            extract_gpu_segments_with_relu_names_ext(
+                graph,
+                input,
+                start,
+                crown,
+                ibp,
+                alpha,
+                allow_pure_chain,
+                false,
+                false,
+            )?;
         assert!(stop.is_none(), "frozen_stop=false must never stop");
+        assert_eq!(bn_layers_extracted, 0, "allow_bn=false cannot extract BN");
         Some((segs, names, frontier, node_abs))
     }
 

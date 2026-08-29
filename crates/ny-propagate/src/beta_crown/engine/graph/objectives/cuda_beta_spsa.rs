@@ -944,6 +944,7 @@ mod tests {
             in_lo: Vec::new(),
             in_hi: Vec::new(),
             stop_node: None,
+            bn_layers_extracted: 0,
         }
     }
 

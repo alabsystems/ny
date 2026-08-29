@@ -364,7 +364,14 @@ pub(crate) fn compute_crown_or_ibp_bounds_with_node_bounds(
 ///
 /// Returns the spec-guided objective bounds + linear bounds (computed with the
 /// REFINED alphas and refined intermediate bounds) AND the refined `GraphAlphaState`
-/// so it can be saved onto BOTH child sub-domains as their warm-start seed.
+/// so it can be saved onto BOTH child sub-domains as their warm-start seed,
+/// AND the refined per-node bounds bundled with the exact `input_bounds` they
+/// were computed for ([`super::f64_tail::F64TailAnchors`], design B step B3 +
+/// FIX B4): the certified f64 tail must anchor on the SAME warm-refined boxes
+/// the f32 pass used — falling back to a fresh `collect_intermediate_bounds`
+/// gives looser anchors and a vacuous NotVerified that reads as "fp is not
+/// the problem". Bundling here (the one site that has both the box and the
+/// map from one invocation) makes cross-box anchor reuse unrepresentable.
 ///
 /// SOUND: `collect_alpha_crown_bounds_dag_warm_with_engine` keeps every α in [0,1]
 /// (so every per-domain bound is a valid CROWN over-approximation), and the final
@@ -385,7 +392,12 @@ pub(crate) fn compute_warm_start_crown_bounds_with_refined_alpha(
     deadline: Option<Instant>,
     crown_backward_layers: Option<usize>,
     config: &crate::beta_crown::config::BetaCrownConfig,
-) -> Result<(BoundedTensor, Option<LinearBounds>, GraphAlphaState)> {
+) -> Result<(
+    BoundedTensor,
+    Option<LinearBounds>,
+    GraphAlphaState,
+    super::f64_tail::F64TailAnchors,
+)> {
     let alpha_config = warm_start_alpha_config(config, deadline);
 
     // Step 1: warm-start + re-optimize alphas for this sub-domain's tighter box.
@@ -415,7 +427,10 @@ pub(crate) fn compute_warm_start_crown_bounds_with_refined_alpha(
         config.input_split_ibp_enhancement,
     )?;
 
-    Ok((bounds, linear, refined_alpha))
+    // FIX B4: bundle the refined node bounds with the EXACT box they were
+    // computed for, at the only site that has both from one invocation.
+    let anchors = super::f64_tail::F64TailAnchors::bundle_for(input_bounds, refined_node_bounds);
+    Ok((bounds, linear, refined_alpha, anchors))
 }
 
 /// Derive the deliberately lightweight child-domain alpha configuration.
@@ -476,6 +491,7 @@ pub(crate) fn compute_crown_or_ibp_bounds_batched(
         crown_backward_layers,
         ibp_enhancement,
         stacked_rebound: false,
+        nested_deadline: None,
     })?;
 
     let n = spec_result.bounds.len();

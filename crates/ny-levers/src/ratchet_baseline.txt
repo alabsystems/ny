@@ -86,4 +86,256 @@
 #                   open-coded form having accepted the single spelling "1".
 #                   Both halves now answer with the declared Bool parser:
 #                   711 var + 94 var_os.
-805
+# 2026-08-20  801   Declared `NY_WIDE_PROBE` and governed all EIGHT open-coded
+#                   readers of it in ny-gpu's wgpu CROWN-backward kernels
+#                   through one chokepoint.
+#
+#                   The gate had gone RED again at 808 against the 805 above:
+#                   incoming commits added three more counted reads (and nine
+#                   new .rs files) without migrating any. Same rule as last
+#                   time -- the baseline may only go DOWN, so the debt gets
+#                   paid rather than the number raised.
+#
+#                   Same latent inconsistency as NY_BETA_GPU_PROBE, caught
+#                   before anyone hit it: the open-coded form accepted the
+#                   single spelling "1", so every other truthy spelling left
+#                   the probe dark. All eight now answer with the declared
+#                   Bool parser: 707 var + 94 var_os.
+# 2026-08-20  798   Merge reconciliation: the NY_WIDE_PROBE payment above (-7
+#                   from the shared base) lands together with this branch's
+#                   three conversions -- NY_AY_MARGIN_REFRAME routed through
+#                   the declared #safenlp-cycle resolver, NY_NN4SYS_CTX_GROUP
+#                   declared (exact-"1"-equivalent Bool), NY_POLLABLE_FAER
+#                   declared (Text + legacy truthy parser via read_raw, so
+#                   "true"/"yes"/"2" keep arming and non-UTF-8 stays dark).
+#                   Union scan on the merged tree: 704 var + 94 var_os.
+# 2026-08-21  798   Merge reconciliation #2: an incoming commit added
+#                   `NY_SEQ_WEIGHTED_BUDGET` (the sequential CROWN-IBP
+#                   cost-weighted grant OPT-OUT) as a raw read, taking the tree
+#                   to 799 against the 798 above. Same rule, same answer: the
+#                   debt gets paid, not the number raised. Declared as Text
+#                   (legacy truthy `!= "0"`, DefaultSpec::Unset) so the shipped
+#                   engaged-by-absence arm and every token it accepts stay
+#                   recorded in the receipt, and the site now reads through
+#                   `read_raw`. Net: the tree returns to the 798 above rather
+#                   than going below it — the payment cancels the incoming debt
+#                   exactly. 704 var + 94 var_os.
+# 2026-08-21  797   `NY_CONFIGS_DIR` consolidated. Three byte-identical copies
+#                   of the same read (vnncomp.rs, vnncomp_plan.rs,
+#                   vnncomp_sweep.rs) sat in the tree, and #lane-budget-frame's
+#                   hard-stop flush needed a FOURTH. Rather than add one --
+#                   which this file forbids -- all four now route through
+#                   `vnncomp::configs_dir_from_env`, the single reader.
+#                   Behaviour is unchanged: the directory is honored only when
+#                   it exists, exactly as every copy did. Net -1 against 798:
+#                   704 var + 93 var_os.
+# 2026-08-21  796   Merge reconciliation #3: incoming commits added
+#                   `NY_ACASXU_PROF` (a THIRD raw reader of a var that already
+#                   had two) and `NY_BAB_CHILD_TRACE`. Declared both as
+#                   #bab-diagnostics and routed all FOUR readers through
+#                   read_raw, so paying the +2 debt returns -1 net. Their
+#                   parsers DISAGREE and the declarations record it:
+#                   NY_ACASXU_PROF is PRESENCE-armed (`is_ok()`, so "0" and ""
+#                   both ARM it) and is Text/Unset for that reason;
+#                   NY_BAB_CHILD_TRACE is exact-"1" Bool. Both INSTRUMENT_ONLY.
+#                   703 var + 93 var_os.
+# 2026-08-22  796   Merge reconciliation #4, NET ZERO by construction. Incoming
+#                   origin/main merges carried +6 (measured: the working tree
+#                   vs HEAD delta was exactly 0, so no local agent added any).
+#                   Paid with exactly 6: NY_RESNET_ERR_CONCRETIZE had SIX
+#                   readers in ONE file
+#                   (wgpu_device/ops/crown_backward_sound_resident.rs), all
+#                   with the byte-identical exact-"1" parser, now declared and
+#                   routed through one chokepoint helper. The helper is
+#                   deliberately UNCACHED: that file flips the variable
+#                   mid-process with ScopedEnvVar in its own differential
+#                   tests, so a OnceLock would make them measure the pre-set
+#                   value. Declared MoatRisk::High, not the None a probe would
+#                   get -- it is on the certified lane and feeds the main-bound
+#                   auto-fallback. Its PER-RELU sibling
+#                   NY_RESNET_ERR_CONCRETIZE_FINE is declared alongside it (one
+#                   more reader) rather than left raw, because incoming main
+#                   moved again mid-migration: the scan read 802 when the debt
+#                   was attributed and 797 after the first six were paid. Seven
+#                   paid in total, landing back ON the baseline rather than
+#                   below it.
+#                   696 var + 93 var_os.
+# 2026-08-24  793   Governed the canonical NY_MO_KFSB master and its distinct
+#                   legacy NY_BRANCH_KFSB_CHILDSIM compound compatibility
+#                   switch, replacing both engine readers and the CLI effective-
+#                   treatment projection's canonical mirror with shared
+#                   ny-levers resolution. The canonical runtime path now uses
+#                   environment-over-typed-config-over-default layering; the
+#                   legacy path remains absence-only and retains its implicit
+#                   candidate-count default of two. 700 var + 93 var_os.
+# 2026-08-24  793   Governed the newly landed NY_MO_ALPHA_HEURISTIC raw reader
+#                   from 9e695ba92. The runtime now layers exact environment
+#                   0/1 over bab.mo_alpha_heuristic and the dark declaration
+#                   default through one preset-gate resolver; malformed
+#                   presence is receipted and fails dark. The incoming probe
+#                   would have raised the raw total to 794, so paying that one
+#                   reader holds the baseline at 700 var + 93 var_os.
+# 2026-08-24  789   Governed NY_MO_KFSB_K and NY_MO_KFSB_REDUCE through the
+#                   existing bab.branching.candidates/reduceop typed fields,
+#                   replacing their engine readers and the CLI effective-
+#                   treatment mirrors with shared layered resolution. Exact
+#                   environment tokens still override typed config; rejected
+#                   presence is receipted and falls to declaration defaults.
+#                   696 var + 93 var_os.
+# 2026-08-24  788   Governed the raw optimizer selectors that landed in recent
+#                   history: measured default-on NY_MO_BETA_SPSA now layers
+#                   its exact-0 rollback over bab.mo_beta_spsa, and measured-
+#                   negative default-dark NY_MO_ALPHA_STEP layers exact 0/1
+#                   over bab.mo_alpha_step. Both engine reads now use the shared
+#                   preset-gate resolver. The alpha-step commit had already
+#                   raised the live count above the previous baseline, so the
+#                   two migrations move 697 var + 93 var_os to
+#                   695 var + 93 var_os.
+# 2026-08-24  782  MERGE RECONCILIATION. Two sessions paid raw-read debt
+#                   concurrently: the #epoch-bab family (six declarations,
+#                   NY_EPOCH_{DEPTH,ATTEMPTS,TIER0,UNIVERSE,RETAIN,DEBUG}) and
+#                   the #stale-alpha promotion, plus this branch's own two
+#                   migrations. Neither branch's integer describes the merged
+#                   tree, so the number is re-derived from the registry rather
+#                   than taken from either side — the same rule the registry
+#                   count assertion in decls/mod.rs now records after catching
+#                   its third merge. Net -6 against 788. 689 var + 93 var_os.
+# 2026-08-24  780   Governed the two lane-setup readers for NY_MARGIN_ROW_LRU
+#                   and NY_MARGIN_ROW_PARALLEL through typed preset cells. The
+#                   former keeps its untrimmed usize parser and default 64;
+#                   the latter keeps its contextual all-worker default and
+#                   full legacy text grammar. 687 var + 93 var_os.
+# 2026-08-24  779   `NY_METAROOM_119_ROOT` consolidated. Four copies of the
+#                   same six-line resolver sat in
+#                   cz_metaroom_qualification.rs -- three of them
+#                   byte-identical to the documented
+#                   `metaroom_119_default_assets()` helper right beside them,
+#                   which already carried the "historical research-probe
+#                   resolution" doc comment. Three arrived with recent work
+#                   and took the source frontier from 1 site to 4; blessing
+#                   that into the reviewed manifest would have recorded
+#                   copy-paste as review. All three now call the helper, which
+#                   is the only reader. Behaviour is unchanged -- every copy
+#                   resolved the identical benchmark paths. Net -3 against
+#                   782: 686 var + 93 var_os.
+# 2026-08-25  777   MERGE RECONCILIATION. Two sessions paid raw-read debt
+#                   concurrently against the same 782 and neither side's
+#                   integer describes the merged tree: the LRU/PARALLEL lane
+#                   setup migration paid 2, the NY_METAROOM_119_ROOT
+#                   consolidation paid 3, and the payments are disjoint. The
+#                   number is re-derived from the merged tree rather than taken
+#                   from either side, which is the rule this file already
+#                   records from its previous merge.
+# 2026-08-25  771   AUDIT RECONCILIATION plus the Sign-network upfront-budget
+#                   migration. A fresh exact scan found the merged HEAD already
+#                   at 773 (684 var + 89 var_os), four below the recorded 777;
+#                   retaining that inherited slack would let four raw readers
+#                   return unnoticed. NY_BNN_ATTACK_FRAC and
+#                   NY_BNN_ATTACK_CAP now resolve once through the entry-time
+#                   LeverSet, layer environment over typed attack preset keys,
+#                   and carry the frozen values into both sizing and execution,
+#                   removing two more var readers. Re-derived current tree:
+#                   682 var + 89 var_os.
+# 2026-08-25  769   Phase-1 D1 removed the two remaining direct-literal readers
+#                   for the hard-quarantined resident cut-fold request and the
+#                   unconditionally declining terminal-Sigmoid compatibility
+#                   seam. The retired WGPU mode and unused span-profiler readers
+#                   were alias-based and therefore outside this narrow count.
+#                   Re-derived current tree: 680 var + 89 var_os.
+# 2026-08-25  757   Govern the exact-VJP PGD family through one frozen typed
+#                   policy. Removed twelve direct readers spanning the shared
+#                   exact-batch selector, conjunctive route controls, and the
+#                   disjunctive batch/width controls. Re-derived current tree:
+#                   668 var + 89 var_os.
+# 2026-08-25  756   Reconciled the direct NY_PGD_FAST_GRAD reader removed by
+#                   9c228bbe5 when the exact graph-gradient route moved onto
+#                   its frozen typed policy. Re-derived tree: 667 var + 89
+#                   var_os.
+# 2026-08-25  755   Governed NY_POSTBAB_RESERVE_SECS through the scored entry's
+#                   frozen per-run LeverSet and typed
+#                   bab.phase_budget.post_bab_reserve_secs delivery route.
+#                   Removed the wrapper's sole direct-literal environment
+#                   reader while retaining its trimmed-u64, malformed-to-zero
+#                   contract. Re-derived current tree: 666 var + 89 var_os.
+# 2026-08-25  755   MERGE RECONCILIATION. The #graph-free-sat branch and the
+#                   NY_PGD_FAST_GRAD / NY_POSTBAB_RESERVE_SECS migrations both
+#                   moved this file against the same base, so neither side's
+#                   integer describes the merged tree. Re-derived from the
+#                   merged tree with the test's own two substrings rather than
+#                   taken from either side: 666 var + 89 var_os. The
+#                   graph-free-sat change itself adds and removes zero counted
+#                   reads; the -1 it had independently observed is the same
+#                   NY_PGD_FAST_GRAD reader the entry above already paid.
+# 2026-08-25  741   Governed the root-joint intermediate-alpha execution family
+#                   through typed bab.* preset keys: the shared master, wall
+#                   request, iterations, learning rate, finite-deadline ascent
+#                   arm and graph admission floor. Fourteen production readers
+#                   across ny-cli engine selection, both root entry routes,
+#                   finite-deadline capability admission and the optimizer
+#                   policy now share environment-over-preset-over-default
+#                   resolution. Re-derived current tree: 652 var + 89 var_os.
+# 2026-08-25  732   Closed the remaining root-joint option bypasses: max selected
+#                   rows, frozen-stop, pure-chain and BatchNorm extraction,
+#                   instance-local layer selection, plus all four print-only
+#                   probe readers now resolve through declared governance.
+#                   Re-derived current tree: 643 var + 89 var_os.
+# 2026-08-25  731   Governed the optional CPU compute-engine handle through an
+#                   exact Boolean declaration and typed
+#                   bab.cpu_compute_engine delivery route. Exact `0` remains
+#                   the kill switch; absence, exact `1`, malformed and
+#                   non-UTF-8 values retain the historical enabled arm. The
+#                   sole direct-literal reader is removed: 642 var + 89 var_os.
+# 2026-08-25  756   #tableau-f32 promotion: `NY_MARGIN_ROW_TABLEAU_F32`
+#                   declared (exact-"1" Bool, Deliver::PresetKey
+#                   margin_row.tableau_f32) and its one raw reader in
+#                   margin_row/root.rs::tableau_f32_requested routed through
+#                   the shared preset-gate resolver. NOTE the promotion
+#                   narrowed the ad-hoc parser ("1"/"true"/"on") to the repo
+#                   arming rule; recorded on the declaration. MERGE
+#                   RECONCILIATION: rebased across the exact-VJP PGD payment
+#                   (757) and the alpha-opt/bi_chunk_secs repair, so neither
+#                   side's integer describes this tree -- re-derived by scan:
+#                   667 var + 89 var_os.
+# 2026-08-25  730   MERGE RECONCILIATION #3 (#tableau-f32 ship). Rebased across 25
+#                   commits; neither side's integer describes this tree, so it
+#                   is RE-DERIVED BY SCAN on the merged tree, not by delta from
+#                   either base: 641 var + 89 var_os. The #tableau-f32
+#                   promotion's own payment (NY_MARGIN_ROW_TABLEAU_F32 declared,
+#                   its raw reader in margin_row/root.rs routed through the
+#                   preset-gate resolver) is included in that scan.
+# 2026-08-25  726   MERGE RECONCILIATION (#tableau-f32 plus immutable margin-row
+#                   policy). The tableau promotion removes one direct reader;
+#                   governing per-column beta, its width, certificate-backed
+#                   column retirement, and parallel pack prebuild removes four
+#                   more. Re-derived on the combined tree: 637 var + 89 var_os.
+# 2026-08-25  724   Governed root compute and tableau storage precision in one
+#                   frozen entry policy. Removed their remaining raw readers
+#                   from production and the differential test helper:
+#                   635 var + 89 var_os.
+# 2026-08-26  723   Governed NY_MO_KFSB_CERT_REUSE and moved its scored runtime
+#                   authority onto the same entry-time frozen LeverSet that is
+#                   serialized in the flight receipt. Interactive use retains
+#                   exact environment-over-config resolution through the
+#                   ny-levers chokepoint. Removed the sole direct var_os reader:
+#                   635 var + 88 var_os.
+# 2026-08-26  720   Governed the five coupled margin-row scheduler controls in
+#                   one immutable receipt-owned policy while retaining each
+#                   legacy parser at the registry chokepoint. Removed the three
+#                   remaining direct literal readers from scored scheduling:
+#                   633 var + 87 var_os.
+# 2026-08-26  719   Governed NY_POSTBAB_ATTACK as a source-sensitive one-way
+#                   kill override and moved the scored wrapper decision onto
+#                   the same frozen LeverSet serialized in the flight receipt.
+#                   Removed the sole direct var_os reader from vnncomp.rs:
+#                   633 var + 86 var_os.
+# 2026-08-26  716   Completed the margin-row scheduler-resource migration:
+#                   early exit, verifier width, and companion-lane width now
+#                   consume the entry-time frozen LeverSet instead of rereading
+#                   the process environment. Removed three direct var readers:
+#                   630 var + 86 var_os.
+# 2026-08-26  710   Governed the coupled objective-chunk controls, Patches
+#                   flat-bias experiment, and honest-provenance guard through
+#                   ny-levers; retired the already-inert deadline-scatter flag
+#                   and removed redundant raw cache-identity readers:
+#                   627 var + 83 var_os.
+710

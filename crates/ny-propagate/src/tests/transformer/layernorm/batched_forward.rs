@@ -482,24 +482,26 @@ fn test_layernorm_forward_mode_low_variance_center() {
 #[ntest::timeout(10000)]
 #[test]
 fn test_layernorm_ibp_rejects_nonfinite_input() {
-    // Category B per domain validation policy: non-finite inputs → NumericalInstability.
-    // Previously this test verified silent NaN-to-MAX_BOUND clamping; now it verifies
-    // explicit error return per designs/2026-02-07-domain-validation-policy.md.
+    // Category B per domain validation policy: NaN inputs → NumericalInstability.
+    // ±Inf (no NaN) is a SATURATED interval — a legitimate conservative box
+    // from deep-stack overflow (see tests/deep_ibp_overflow_saturates.rs) —
+    // and now takes the analytic fallback enclosure instead of erroring, the
+    // same route the internal has_nonfinite_mean overflow already used.
     let hidden = 4;
     let ln = LayerNormLayer::new_default(hidden, 1e-5).unwrap();
 
-    // Case 1: Infinity in bounds
+    // Case 1: ±Infinity bounds (no NaN) SATURATE to the conservative
+    // fallback enclosure — sound, finite for Standard mode, no error.
     let lower = ArrayD::from_elem(IxDyn(&[2, hidden]), f32::NEG_INFINITY);
     let upper = ArrayD::from_elem(IxDyn(&[2, hidden]), f32::INFINITY);
     let input = BoundedTensor::new_unchecked(lower, upper).unwrap();
 
-    let err = ln
+    let out = ln
         .propagate_ibp(&input)
-        .expect_err("LayerNorm IBP should reject non-finite inputs");
-    assert!(
-        matches!(err, NyError::NumericalInstability(_)),
-        "Expected NumericalInstability, got: {err:?}"
-    );
+        .expect("saturated input must yield the conservative fallback, not an error");
+    for (l, u) in out.lower().iter().zip(out.upper().iter()) {
+        assert!(!l.is_nan() && !u.is_nan() && l <= u, "valid fallback box");
+    }
 
     // Case 2: NaN in lower bounds
     let lower = ArrayD::from_shape_vec(IxDyn(&[1, hidden]), vec![f32::NAN, 1.0, 2.0, 3.0]).unwrap();

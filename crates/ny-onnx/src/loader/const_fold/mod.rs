@@ -4,6 +4,10 @@
 
 mod broadcast;
 pub(super) mod common;
+mod interval;
+mod interval_fold;
+#[cfg(test)]
+mod interval_tests;
 mod ops;
 mod shape_inference;
 
@@ -12,7 +16,38 @@ use crate::WeightStore;
 use ndarray::ArrayD;
 use shape_inference::ConstFoldLookups;
 use std::collections::HashMap;
-use tracing::debug;
+use std::sync::atomic::{AtomicU8, Ordering};
+use tracing::{debug, warn};
+
+// Process-global CLI -> loader bridge. `0` keeps the typed layer absent, `1`
+// is explicit OFF, and `2` is explicit ON. Presence is retained so an explicit
+// preset false can disarm an inherited selection rather than being confused
+// with an absent preset.
+static INTERVAL_CARRIER_PRESET: AtomicU8 = AtomicU8::new(0);
+
+fn encode_bool_preset(value: Option<bool>) -> u8 {
+    match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
+}
+
+fn decode_bool_preset(value: u8) -> Option<bool> {
+    match value {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+pub(super) fn set_interval_carrier_preset(value: Option<bool>) {
+    INTERVAL_CARRIER_PRESET.store(encode_bool_preset(value), Ordering::Release);
+}
+
+fn interval_carrier_preset() -> Option<bool> {
+    decode_bool_preset(INTERVAL_CARRIER_PRESET.load(Ordering::Acquire))
+}
 
 pub(super) struct FoldedTensor {
     pub(super) float_data: ArrayD<f32>,
@@ -62,13 +97,129 @@ pub(super) fn fold_constant_nodes(
     inferred_shapes: &mut HashMap<String, Vec<i64>>,
 ) {
     let model_unbatched = graph_model_is_unbatched(graph, weights);
+    // Read ONCE, before any fold is attempted. Disarmed, `fold_constant_nodes_once`
+    // never enters the interval fallback at all, so no carrier is allocated and the
+    // weight store's interval map stays empty.
+    let interval_carrier = interval_carrier_armed();
     // Variable-start affine Slice extents are intentionally not promoted to
     // static shapes here. ONNX clamps starts/ends to the data dimension, so
     // `ends = starts + width` does not imply a constant runtime extent near an
     // edge. Any future specialized optimization must authenticate the complete
     // consumer cone (or carry a dynamic/clamped shape), not publish the
     // unclamped maximum as global Shape authority.
-    fold_constant_nodes_once(graph, weights, inferred_shapes, model_unbatched);
+    fold_constant_nodes_once(
+        graph,
+        weights,
+        inferred_shapes,
+        model_unbatched,
+        interval_carrier,
+    );
+}
+
+/// Whether the interval-valued frozen-constant carrier is armed.
+///
+/// Read through the levers registry (`NY_CONST_MATMUL_INTERVAL`,
+/// `decls::dark_probes::CONST_MATMUL_INTERVAL`) — this adds no raw environment
+/// read. DARK by default: absent environment resolves to `false`.
+fn interval_carrier_armed() -> bool {
+    // #interval-carrier-quarantine: LIFTED 2026-08-25 after a RE-AUDIT that
+    // measured the carrier rather than the quarantine. The lever is restored;
+    // it is NOT armed. Default is still `false` and no shipped preset or
+    // harness sets it.
+    //
+    // WHY IT WAS QUARANTINED, AND WHY THAT REASON IS GONE.
+    // The carrier was blamed for a false proof: [-1.9464622e-31, +1.9464622e-31]
+    // stamped `mode: Sound` -> SAFE on six lsnc_relu rows. The blame was
+    // misplaced. 97909a8e1 found the real defect: the DAG alpha-CROWN backward
+    // walk (`graph_alpha::backward`) took the GPU-suffix shortcut while a
+    // SIBLING branch was still pending in the merge accumulator, leaving that
+    // branch's output rows with zero coefficients and zero bias; they
+    // concretized to +/-(fp residue) and were published as a certified
+    // interval. That was LIVE ON CLEAN main WITH ZERO LEVERS. The carrier's
+    // only role was to remove an OpaqueSkip taint, which flipped
+    // `actual_method` Ibp -> AlphaCrown and made the already-broken path
+    // REACHABLE on lsnc_relu.
+    //
+    // The fix is carried by a TYPE, not by a check a caller can forget:
+    // `SoleCarrierWitness` (ny-propagate merge_accumulator.rs) has a private
+    // unit field, is issued only when `is_empty() && !input_accumulated`, and
+    // is a required parameter of `try_alpha_backward_gpu_suffix`.
+    //
+    // THE RE-AUDIT, WITH THE CARRIER GENUINELY ARMED. The previous audit could
+    // not measure this: it set `NY_CONST_MATMUL_INTERVAL=1` against a
+    // compile-time-`true` guard, which measures nothing. The re-audit declared
+    // the feature that made the guard bypassable and built a second binary, so
+    // the arming was real — receipted by the model itself (armed: 498
+    // parameters, 48 graph nodes, ZERO OpaqueSkip warnings; dark: 492
+    // parameters, 61 nodes, 3 OpaqueSkip warnings), and by the quarantined
+    // binary reproducing the DARK receipt even with the environment set.
+    //
+    //   * Six previously-affected rows (0, 1, 2, 18, 44, 54), armed, official
+    //     25 s budget, 3 repeats: 18/18 `timeout` or `sat`. ZERO `unsat`, ZERO
+    //     SAFE.
+    //   * The same six at 200 s (8x budget) on the scored preset path: five
+    //     VIOLATED with the ORT-confirmed DV = 2.8978e-4 counterexample, one
+    //     UNKNOWN that stopped at the 100000-DOMAIN CAP, not the wall — so the
+    //     relaxation floor, not the budget, is what blocks a proof.
+    //   * `scratchpad/vgcheck/check.py` (the four-node
+    //     `Concat(Slice(X,0:2), Relu(Gemm(X)))` repro): PASS on the genuinely
+    //     armed binary with the lever armed — [-0.70000005, +0.70000005],
+    //     UNKNOWN, against an ORT-reachable 0.7.
+    //
+    // CONTAINMENT, NOT FINITENESS. That distinction is the whole point: the
+    // incident bound was +/-1.9e-31, which is perfectly FINITE, so the old
+    // acceptance test would have stayed green through the incident it existed
+    // to catch. Armed, all six rows give the same root bound, and it CONTAINS
+    // an independently computed 200065-point ORT reachable envelope on all 8
+    // outputs, with only 9.9e-4 of slack at the tightest coordinate
+    // (Y_2 armed [-0.73205644, +0.7322922] against reachable
+    // [-0.7310616, +0.7309364]). A tight-but-wrong bound cannot pass that.
+    // `tests/lsnc_interval_carrier.rs` now asserts exactly this, and would
+    // FAIL on the incident bound.
+    //
+    // LEVER-UNSET BEHAVIOUR IS UNCHANGED, MEASURED NOT ASSERTED. Pre-lift binary
+    // versus lifted binary, lever unset, through `ny benchmarks run` at the
+    // official per-instance budget, three rows from each of the six
+    // no-regression families: 18/18 rows VERDICT-IDENTICAL (cersyve
+    // sat/sat/timeout, traffic_signs timeout/sat/sat, monotonic sat/sat/sat,
+    // soundnessbench unknown/unsat/timeout, isomorphic unsat/unsat/unsat,
+    // lsnc_relu unknown/unknown/unknown). The only per-row differences are
+    // wall seconds, in both directions, on a box carrying 300-1300% foreign
+    // CPU throughout.
+    //
+    // (A first attempt at this check compared raw stdout on hand-built corpus
+    // paths and reported 8/8 byte-identical. It was VACUOUS: every one of
+    // those runs died on `File not found` or an unparsed budget before loading
+    // a model. Two identical error messages are not evidence of identical
+    // behaviour. The numbers above come from the official runner, and each row
+    // is confirmed to carry a real verdict and a nonzero wall.)
+    //
+    // WHAT LIFTING DOES NOT DO. It buys no proofs. Armed, the carrier converts
+    // ZERO lsnc_relu rows; it only turns +/-inf into finite-but-insufficient
+    // bounds, which is a necessary gate in front of a SECOND wall (the
+    // bilinear-decorrelation relaxation floor). It stays `Class::Unsafe` /
+    // `MoatRisk::High` and it stays dark.
+    //
+    // ENV ONLY, ENFORCED HERE AND NOT ONLY DECLARED. `space.rs` narrowed this
+    // lever from `Deliver::PresetKey("solver.const_matmul_interval")` to
+    // `Deliver::EnvOnly` (43666c6b7) precisely so that lifting the quarantine
+    // could not put a false-proof-capable bound path one config line away from
+    // the competition harness. `space.rs` is a governance declaration; it does
+    // not gate this read. So the typed preset is passed as `None` below and the
+    // refusal is LOGGED rather than silent. `the_typed_preset_cannot_arm_the_carrier`
+    // fails if that is ever weakened.
+    if interval_carrier_preset() == Some(true) {
+        warn!(
+            "solver.const_matmul_interval: REFUSED. NY_CONST_MATMUL_INTERVAL is \
+             Deliver::EnvOnly (Class::Unsafe, MoatRisk::High, a BOUND path on a \
+             family that has published false proofs twice). A preset key is \
+             reachable from a scored run; set the environment variable instead."
+        );
+    }
+    ny_levers::read_over_config(&ny_levers::decls::dark_probes::CONST_MATMUL_INTERVAL, None)
+        .expect("an absent config is admissible for any lever")
+        .value
+        .as_bool()
 }
 
 fn fold_constant_nodes_once(
@@ -76,6 +227,7 @@ fn fold_constant_nodes_once(
     weights: &mut WeightStore,
     inferred_shapes: &HashMap<String, Vec<i64>>,
     model_unbatched: bool,
+    interval_carrier: bool,
 ) {
     let lookups = ConstFoldLookups::new(graph, inferred_shapes, model_unbatched);
     let mut changed = true;
@@ -99,6 +251,30 @@ fn fold_constant_nodes_once(
                 }
                 weights.insert(output_name, output_tensor.float_data);
                 changed = true;
+                continue;
+            }
+            // FALLBACK ONLY. The exact folder above ran first and verbatim; this
+            // is reached solely on its `None`, and only when the carrier is
+            // armed. See `interval_fold` for the refusal policy.
+            if !interval_carrier {
+                continue;
+            }
+            if let Some((output_name, carrier)) =
+                interval_fold::try_fold_node_interval(node, weights)
+            {
+                debug!(
+                    "Interval-folded {}: {} shape {:?} (point: {})",
+                    node.op_type,
+                    output_name,
+                    carrier.shape(),
+                    carrier.is_point()
+                );
+                // `insert_interval` re-validates the enclosure and canonicalizes
+                // a zero-width carrier back into the point map; a refusal stores
+                // nothing and leaves the node unfolded.
+                if weights.insert_interval(output_name, carrier.lower, carrier.upper) {
+                    changed = true;
+                }
             }
         }
     }
@@ -123,6 +299,17 @@ fn try_fold_node(
         None
     }?;
     Some((output_name, output_tensor))
+}
+
+/// Test-only re-export of the UNMODIFIED bit-exact MatMul fold, so the carrier
+/// tests can assert containment against exactly what production publishes on the
+/// exact path.
+#[cfg(test)]
+pub(crate) fn ops_try_fold_matmul_exact_for_test(
+    lhs: &ArrayD<f32>,
+    rhs: &ArrayD<f32>,
+) -> Option<ArrayD<f32>> {
+    ops::try_fold_matmul_exact_for_test(lhs, rhs)
 }
 
 pub(super) fn is_standard_onnx_domain(domain: &str) -> bool {
@@ -641,3 +828,46 @@ fn constant_is_raw_int64(node: &onnx_proto::NodeProto) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod carrier_delivery_tests {
+    use super::*;
+
+    /// #interval-carrier-quarantine (LIFTED 2026-08-25). The quarantine is
+    /// gone, but the narrowing it protected is not: `space.rs` declares
+    /// `NY_CONST_MATMUL_INTERVAL` `Deliver::EnvOnly`, and `space.rs` does not
+    /// gate the read. This is where that declaration is actually enforced.
+    ///
+    /// A preset key is reachable from a SCORED run; an environment variable is
+    /// not. This lever is `Class::Unsafe` / `MoatRisk::High` and it sits on a
+    /// BOUND path, on a family where ny has published false proofs twice. If
+    /// someone re-threads `interval_carrier_preset()` into the resolver, this
+    /// test fails.
+    #[test]
+    fn the_typed_preset_cannot_arm_the_carrier() {
+        set_interval_carrier_preset(Some(true));
+        assert_eq!(
+            interval_carrier_preset(),
+            Some(true),
+            "precondition: the explicit ON preset must be visible to the gate"
+        );
+        assert!(
+            !interval_carrier_armed(),
+            "NY_CONST_MATMUL_INTERVAL is Deliver::EnvOnly: an explicit ON preset must \
+             NOT arm an Unsafe bound-path lever from a config file"
+        );
+        set_interval_carrier_preset(None);
+    }
+
+    /// The carrier ships DARK. Lifting the quarantine restored the lever; it
+    /// did not arm it. With no preset and no environment value the gate must
+    /// resolve to the declaration default, `false`.
+    #[test]
+    fn the_carrier_is_dark_by_default() {
+        set_interval_carrier_preset(None);
+        assert!(
+            !interval_carrier_armed(),
+            "absent preset and absent environment must resolve DARK"
+        );
+    }
+}

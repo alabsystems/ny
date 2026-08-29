@@ -63,21 +63,17 @@ pub struct SimplexSupportLp {
 }
 
 /// Errors from building or certifying an SBAR support bound.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SbarError {
     /// The `g`, `p_lo`, `p_hi` vectors had mismatched lengths.
-    #[error("dimension mismatch")]
     Dimension,
     /// `Σ p_lo > 1` or `Σ p_hi < 1`: the truncated simplex is empty, so these
     /// are not valid softmax weight bounds.
-    #[error("box-truncated simplex is infeasible (Σp_lo>1 or Σp_hi<1)")]
     Infeasible,
     /// A bound was malformed (`p_lo_j > p_hi_j`).
-    #[error("p_lo[{0}] > p_hi[{0}]")]
     BadBox(usize),
     /// The position count exceeds the complete certificate producer's explicit
     /// resource cap.
-    #[error("position count {got} exceeds the supported maximum {max}")]
     TooLarge {
         /// Requested number of positions.
         got: usize,
@@ -88,11 +84,69 @@ pub enum SbarError {
     /// internal strong-duality invariant. Reported (fail-closed) instead of
     /// asserting so the certifier rejects rather than panicking; unreachable
     /// for valid simplex+box inputs.
-    #[error("internal LP strong-duality check failed (dual != primal)")]
     DualityGap,
     /// Exact arithmetic failure.
-    #[error(transparent)]
-    Rat(#[from] RatError),
+    Rat(RatError),
+}
+
+// Hand-written `Display`/`Error`/`From` (previously `#[derive(thiserror::Error)]`):
+// the proc-macro dependency is excluded from the verification TCB, so the generated
+// impls are written out here verbatim. The message strings are byte-identical to the
+// former `#[error("…")]` attributes.
+impl core::fmt::Display for SbarError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Dimension => write!(f, "dimension mismatch"),
+            Self::Infeasible => {
+                write!(
+                    f,
+                    "box-truncated simplex is infeasible (Σp_lo>1 or Σp_hi<1)"
+                )
+            }
+            Self::BadBox(j) => write!(f, "p_lo[{0}] > p_hi[{0}]", j),
+            Self::TooLarge { got, max } => {
+                write!(
+                    f,
+                    "position count {got} exceeds the supported maximum {max}"
+                )
+            }
+            Self::DualityGap => {
+                write!(
+                    f,
+                    "internal LP strong-duality check failed (dual != primal)"
+                )
+            }
+            // `#[error(transparent)]`: the derived impl forwards `Display` to the
+            // wrapped error verbatim, adding no text of its own.
+            Self::Rat(e) => core::fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl core::error::Error for SbarError {
+    /// Only [`SbarError::Rat`] carries an inner error, and it is
+    /// `#[error(transparent)]`: the derived impl forwards to the *wrapped
+    /// error's own* `source()` (`Error::source(transparent.as_dyn_error())`),
+    /// i.e. the transparent wrapper is spliced out of the chain rather than
+    /// appearing in it. Every other variant is a chain root.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Dimension
+            | Self::Infeasible
+            | Self::BadBox(_)
+            | Self::TooLarge { .. }
+            | Self::DualityGap => None,
+            Self::Rat(e) => core::error::Error::source(e),
+        }
+    }
+}
+
+impl From<RatError> for SbarError {
+    /// The former `Rat(#[from] RatError)` conversion, relied on by `?` in
+    /// [`SimplexSupportLp::objective`] and [`SimplexSupportLp::certify_upper`].
+    fn from(source: RatError) -> Self {
+        Self::Rat(source)
+    }
 }
 
 /// A certified SBAR upper bound on `Σ_j g_j p_j` over the truncated simplex.

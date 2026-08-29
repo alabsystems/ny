@@ -10,8 +10,8 @@
 //! GPU-resident resnet backward (#w4-root-gpu route), then registers the old
 //! public fold entries and proves every request is an exact no-op.
 //!
-//! Gate: `NY_CUT_FOLD_RESIDENT=1` plus any populated public registry must yield
-//! zero applications and margins exactly equal to baseline.
+//! Any populated public registry must yield zero applications and margins
+//! exactly equal to baseline.
 //!
 //! The retired C2b objective-signed experiment remains below as historical
 //! research code, but the executable exits before GPU setup: the proof-path
@@ -69,7 +69,6 @@ fn c2_cut_fold_resident_root_margin_experiment() {
     let _g_alpha = ny_test_utils::env::ScopedEnvVar::set("NY_SPEC_ROOT_ALPHA", "0");
     let _g_budget = ny_test_utils::env::ScopedEnvVar::set("NY_RESNET_GPU_TIME_BUDGET_MS", "600000");
     let _g_trace = ny_test_utils::env::ScopedEnvVar::set("NY_RESNET_GPU_TRACE", "1");
-    let _g_fold_off = ny_test_utils::env::ScopedEnvVar::unset("NY_CUT_FOLD_RESIDENT");
     clear_resident_cut_fold();
 
     // --- Load model as a GraphNetwork (same options as the CPU-lane C2
@@ -213,9 +212,8 @@ fn c2_cut_fold_resident_root_margin_experiment() {
         t0.elapsed().as_secs_f32()
     );
 
-    // --- Gate (a1): NY_CUT_FOLD_RESIDENT=1 with an EMPTY registry ⇒ exactly
-    // equal (no split, no fold — the zero-cost dark path). ---
-    let _g_fold_on = ny_test_utils::env::ScopedEnvVar::set("NY_CUT_FOLD_RESIDENT", "1");
+    // --- Gate (a1): an EMPTY registry ⇒ exactly equal (no split, no fold —
+    // the zero-cost dark path). ---
     reset_resident_cut_fold_applied_count();
     let gated = run(&graph);
     assert_eq!(
@@ -225,7 +223,7 @@ fn c2_cut_fold_resident_root_margin_experiment() {
     );
     assert_eq!(
         base, gated,
-        "gate (a1) FAILED: empty-registry NY_CUT_FOLD_RESIDENT=1 run differs from baseline"
+        "gate (a1) FAILED: empty-registry run differs from baseline"
     );
     println!("gate (a1) PASSED: empty-registry run exactly equals baseline");
 
@@ -349,7 +347,6 @@ fn c2b_signed_cut_fold_resident_root_margin_experiment() {
     let _g_budget =
         ny_test_utils::env::ScopedEnvVar::set("NY_RESNET_GPU_TIME_BUDGET_MS", "3600000");
     let _g_trace = ny_test_utils::env::ScopedEnvVar::set("NY_RESNET_GPU_TRACE", "1");
-    let _g_fold_off = ny_test_utils::env::ScopedEnvVar::unset("NY_CUT_FOLD_RESIDENT");
     let _g_cap_off = ny_test_utils::env::ScopedEnvVar::unset("NY_CUT_FOLD_CAPTURE");
     clear_resident_cut_fold();
 
@@ -471,7 +468,6 @@ fn c2b_signed_cut_fold_resident_root_margin_experiment() {
 
     // --- A public registry request must neither fold nor expose proof-adjacent
     // frontier capture through the quarantined consumer. ---
-    let _g_fold_on = ny_test_utils::env::ScopedEnvVar::set("NY_CUT_FOLD_RESIDENT", "1");
     let g_cap_on = ny_test_utils::env::ScopedEnvVar::set("NY_CUT_FOLD_CAPTURE", "1");
     set_resident_cut_fold(ResidentCutFold {
         coeffs: Vec::new(),

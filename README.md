@@ -39,45 +39,38 @@ counterexample is validated by concrete re-execution before it is reported.
 Models: ONNX, NNet, PyTorch, SafeTensors, CoreML, GGUF. Properties: VNN-LIB.
 Written in Rust.
 
-> **Status:** `ny` is pre-1.0 research software under active development. All
+> **Status:** `ny` is pre-1.0 research software under active development, and
+> its public surface is intentionally small while the internals stabilize. All
 > solving happens on the first-party [`ay`](https://github.com/alabsystems/ay)
 > engine — by repo policy, no third-party LP/MIP/SMT/SAT solver appears on any
-> verdict path. The public surface is intentionally small while the internals
-> stabilize; the measurement methodology and rerun protocol are in
-> [`reports/measured/README.md`](reports/measured/README.md), and the current
-> score/cGAN/WGPU evidence boundary is in
-> the internal current-state note (`docs/CURRENT_STATE_2026-08-10.md`, not part of the public snapshot).
+> verdict path. Measurement methodology and the rerun protocol are in
+> [`reports/measured/README.md`](reports/measured/README.md); the current
+> score/cGAN/WGPU evidence boundary is in the internal current-state note
+> (`docs/CURRENT_STATE_2026-08-10.md`, not part of the public snapshot).
 
 ## Quick start
 
 Build `ny` from source with [`rustup`](https://rustup.rs/) and a native C/C++
-build toolchain. The
-repository pins the supported Rust version in `rust-toolchain.toml`; `rustup`
-installs it automatically. On Ubuntu, install the native compiler, linker, and
-C++ standard-library development files plus the checkout/download tools with:
+build toolchain. The repository pins the supported Rust version in
+`rust-toolchain.toml`; `rustup` installs it automatically.
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y build-essential git curl gzip pkg-config python3 unzip xz-utils
-```
 
-Then build the CLI:
-
-```bash
 git clone https://github.com/alabsystems/ny
 cd ny
 cargo build --locked --release -p ny-cli    # → target/release/ny
 export PATH="$PWD/target/release:$PATH"
 ```
 
-On Linux this needs an Ubuntu 24.04-era native toolchain or newer: the default
-build downloads a prebuilt static ONNX Runtime compiled with a newer GCC than
-Ubuntu 22.04 ships, so on 22.04 (gcc-11/binutils 2.38) the final link fails with
-undefined references to ONNX Runtime internals. Ubuntu 24.04 and 26.04 are known
-good once the C/C++ prerequisites above are installed. On an older host, build
-inside a 24.04+ container or point `ORT_LIB_LOCATION` at a locally built ONNX
-Runtime. The default runtime download uses rustls, so a system OpenSSL
-development package is not required.
+On Linux this needs an Ubuntu 24.04-era native toolchain or newer (24.04 and
+26.04 are known good): the build downloads a prebuilt static ONNX Runtime
+compiled with a newer GCC than 22.04 ships, so on 22.04 (gcc-11/binutils 2.38)
+the final link fails with undefined references to ONNX Runtime internals. On an
+older host, build inside a 24.04+ container or point `ORT_LIB_LOCATION` at a
+locally built ONNX Runtime. The runtime download uses rustls, so no system
+OpenSSL development package is needed.
 
 `crossing_relu.nnet` is a tiny network that computes `f(x) = |x|`. Its shipped
 property asks `ny` to prove the output stays below a bound for *every* input in
@@ -115,10 +108,12 @@ Counterexample input: [0.508...]
 runs it back through the model and confirms the violation before reporting it.
 
 `verify` and `beta-crown` exit `0` proved, `1` falsified, `2` unknown, `3`
-timeout, and `4` for an invalid invocation or operational error. `ny --help`
-lists the supported command surface. The explicit `ny verify --allow-unknown`
-CI override maps an `unknown` result to `0`; it never masks a timeout or an
-operational error.
+timeout, and `4` for an invalid invocation or operational error; the explicit
+`ny verify --allow-unknown` CI override maps `unknown` to `0` and never masks a
+timeout or an operational error. `ny --version` reports a build-derived version
+(`<major>.<minor>.<commit count>`, plus a dirty suffix) rather than the frozen
+manifest version, and `ny --build-id` prints the full content-addressed build
+identity.
 
 New to verification? `ny tutorial` is an interactive walk through the same
 ideas — `ny tutorial demo` runs this exact check for you.
@@ -162,12 +157,17 @@ maximize verify-rate and never weakens a verdict's soundness.
 
 ## Use ny
 
-`ny` auto-detects model formats and exposes a command per task:
+`ny` auto-detects model formats and exposes a command per task. `ny --help` and
+`ny <command> --help` are the authoritative flag reference.
 
 ```bash
 ny beta-crown model.onnx -p prop.vnnlib            # complete β-CROWN branch-and-bound
-ny verify model.onnx -p prop.vnnlib --method alpha # single-method bounds (ibp | crown | alpha)
+ny verify model.onnx -p prop.vnnlib --method alpha # single-method bounds (ibp | crown | alpha;
+                                                   #   beta is sequential-only)
 ny vnncomp v1 acasxu_2023 model.onnx prop.vnnlib out.txt 116   # one VNN-COMP instance, competition protocol
+ny vnncomp plan acasxu_2023 model.onnx prop.vnnlib 116         # the resolved run plan, without running it
+ny coverage                                        # soundness class of every ingestable operator
+ny claims verify                                   # re-derive recorded empirical claims from pinned artifacts
 ny inspect model.onnx                              # model structure
 ny lipschitz model.onnx                            # sound certified global Lipschitz bound
 ny diff a.onnx b.onnx                              # where two models diverge (porting)
@@ -182,200 +182,143 @@ ny gt verify model.onnx spec.gt.json --property dominates \
 ```
 
 `ny verify` and `ny beta-crown` write their verdict to stdout and encode it in
-the exit code; `ny vnncomp` writes the verdict to the competition results file.
+the exit code; `ny vnncomp` writes it to the competition results file.
+
+`ny coverage` prints the trace-bridge soundness manifest: all 123 ingestable
+operators classified `exact`, `sound`, `sound_but_loose`, or `unsupported` by a
+wildcard-free `match`, so a new operator fails to compile until it is
+deliberately classified. It is the soundness *taxonomy*, not the porting status —
+`translate()` still fails closed on any classified-but-unported operator.
+
+`ny claims verify` reads a claims ledger, re-derives each recorded empirical
+claim from the content-pinned artifacts it was made from, and prints `TRUE` /
+`FALSE` / `STALE` / `VACUOUS` / `UNGROUNDED`. It also ships as the leaf
+`ny-claims` binary, which links in seconds instead of relinking the whole CLI.
 
 ### VNN-COMP benchmark workflow
 
-The `ny benchmarks` commands acquire a corpus, inventory it, run local sweeps,
-compare result banks, and check for path-dependent behavior. Run acquisition
-and status commands from this checkout (or one of its subdirectories):
+`ny benchmarks` acquires a corpus, inventories it, runs local sweeps, compares
+result banks, and checks for path-dependent behavior. Run it from this checkout
+or a subdirectory; `--help` on each subcommand is the authoritative reference.
 
 ```bash
-ny benchmarks download 2025 2026       # positional years
-ny benchmarks download --all           # 2021-2026, including optional 2022
-ny benchmarks status --year 2026
-ny benchmarks status --year 2025 --year 2026 --strict
+ny benchmarks download 2025 2026                    # positional years; --all adds historical ones
+ny benchmarks status --year 2026 --strict           # asset inventory, not a parse or a run
+ny benchmarks run --year 2026 --vnnlib-version 2.0 \
+  --category adaptive_cruise_control_non_linear_2026 \
+  --output reports/sweeps/acc-2026.csv [--resume]
+ny benchmarks score --results reports/measured-2026 --baseline previous.csv
+ny benchmarks reseed --year 2026 --category adaptive_cruise_control_non_linear_2026 --limit 10
 ```
 
-`download` runs the upstream setup scripts and can consume substantial network
-bandwidth and disk space. Existing year directories are normally reused; this
-is not a promise to update an existing checkout to the latest upstream commit.
-`status` is an asset inventory (models, properties, and instance CSVs), not a
-parse, execution, or correctness test. `--strict` fails when a category present
-in the selected local corpus is missing required model/property assets.
+`download` runs the upstream setup scripts, can consume substantial bandwidth
+and disk, and reuses rather than updates existing year directories. `status`
+inventories models, properties, and instance CSVs; `--strict` fails when a
+locally present category is missing required assets. `--vnnlib-version` is
+needed only where a checkout holds parallel `1.0/` and `2.0/` instance lists —
+the runner refuses to guess — and applies to every requested category.
 
-Run one category, then resume the same output safely:
+**`run` writes three paired artifacts.** The CSV uses the official six-column
+order `category,network,property,prepare_time,result,run_time`, with
+`prepare_time` zero because this runner has no separate preparation phase.
+`<name>.metadata.jsonl` is the authoritative, atomically replaced row state, and
+the CSV is regenerated from it in canonical order, so a crash between
+publications is repaired by the next `--resume`. `<name>.manifest.json` pins the
+schema/year, VNN-LIB version, timeout-cap policy, `instances.csv` hashes,
+configuration-tree hash, executable hash and build provenance, applied lever arm,
+and target OS/architecture, and refuses a resume whose provenance no longer
+matches — but asset bytes, hardware, drivers, and the process environment are
+*not* hashed and still belong in an audited external run record. An existing bank
+is protected by default: `--resume` continues a compatible one, `--overwrite`
+discards all three.
 
-```bash
-ny benchmarks run \
-  --year 2026 \
-  --vnnlib-version 2.0 \
-  --category adaptive_cruise_control_non_linear_2026 \
-  --output reports/sweeps/acc-2026.csv
+Each instance runs in an isolated child under an outer `budget + 30s` cleanup
+watchdog; the grace never extends scoring, so a decided child that exceeds its
+official budget is recorded as `timeout`. A failed child becomes an `error` row
+and the sweep continues, but the command exits nonzero after preserving state,
+and `--resume` retries those rows rather than skipping them. Budgets otherwise
+come from each category's `instances.csv`.
 
-ny benchmarks run \
-  --year 2026 \
-  --vnnlib-version 2.0 \
-  --category adaptive_cruise_control_non_linear_2026 \
-  --output reports/sweeps/acc-2026.csv \
-  --resume
-```
+| `run` flag | Effect |
+| --- | --- |
+| `--timeout-cap N` | Only *lowers* each `instances.csv` budget; any capped sweep is a lower bound, not an official result. |
+| `--instances FILE` | Runs exactly the named `category,onnx,vnnlib` rows. A row the corpus lacks is an error, never a skip. |
+| `--lever NAME=VALUE` | Applies a validated arm to every child *as data* — recorded per row and sealed into the manifest, so a resume under a different arm refuses. Inert and `Unsafe` axes are rejected rather than measured; `ny benchmarks space` prints the compiled search space. |
+| `--cache off\|read\|read-write` | Verdict cache keyed on binary, configuration, category, model, property, budget, arm, backend, host, and ambient lever set. A served row is marked `from_cache`, so a replay is never read as evidence that a child ran. |
 
-Flat corpora and categories with exactly one instance list need no version
-option. If a checkout contains parallel `1.0/instances.csv` and
-`2.0/instances.csv` lists, the runner refuses to guess: pass
-`--vnnlib-version 1.0` or `--vnnlib-version 2.0`. The selection applies to
-every requested category, so use separate category selections when a corpus
-mixes versions.
+`--limit N` takes a prefix of each category, `--dry-run` writes no bank, and
+`--json` changes the stdout summary without suppressing the three artifacts.
+Matching the official budgets does not make even an uncapped full local sweep
+competition-comparable: hardware, environment, software revision, preparation
+logs, inputs, and SAT witnesses must all be preserved and independently replayed
+before an audited result claim.
 
-The primary output uses the official six-column aggregate-results order:
-`category,network,property,prepare_time,result,run_time`. The direct runner has
-no separate preparation phase, so it records `prepare_time` as zero. A
-neighboring `acc-2026.metadata.jsonl` is the authoritative, atomically replaced
-state: it records stable duplicate occurrences, applied/official budgets, cap
-provenance, and bounded diagnostics. The official CSV is regenerated from that
-state in canonical order, so a crash between publications is repaired by the
-next `--resume`. Prior `error` rows are retried at the same occurrence instead
-of being silently skipped; summaries and exit status cover the entire bank,
-including rows from earlier invocations.
-
-`acc-2026.manifest.json` pins the schema/year, requested VNN-LIB version,
-timeout-cap policy, `instances.csv` paths and hashes, configuration-tree hash,
-executable hash/build provenance, and target OS/architecture. Resume refuses
-incompatible state before running; changing any of those inputs requires a new
-output bank.
-Model/property asset bytes, hardware, drivers, and the wider process
-environment are not hashed by this manifest and still belong in an audited
-external run record.
-
-An existing output bank is protected by default: use `--resume` only for a
-compatible continuation, or `--overwrite` to discard all three artifacts and
-start a new bank explicitly.
-
-Each instance runs in an isolated child with an outer `budget + 30s` cleanup
-watchdog. The extra 30 seconds does not extend scoring: a decided child whose
-measured run time exceeds its official budget is recorded as `timeout`. A
-failed child becomes an `error` row and the sweep continues so later instances
-are still measured, but the command exits nonzero after preserving state.
-
-By default the budget comes from each category's `instances.csv`.
-`--timeout-cap` can only lower it; any capped sweep is a lower bound, not
-an official result. `--limit` is a partial sweep, `--dry-run` writes no result
-bank, and `--json` changes the stdout summary rather than suppressing the
-CSV/metadata/manifest outputs. Matching the official instance budgets alone
-does not make even an uncapped full local sweep competition-comparable:
-hardware,
-environment, software revision, preparation logs, inputs, and SAT witnesses
-must be preserved and independently replayed before making an audited result
-claim.
-
-Compare the current bank with a historical reference and, optionally, a
-multi-tool results field:
+**`score`** compares a bank against a baseline over the union of both identity
+sets, so a row that disappeared is still a regression. The baseline is a
+historical reference, never ground truth, and a `sat`↔`unsat` flip is a
+soundness alarm requiring evidence review. Without `--official` it reports exact
+row/solve deltas and invents no normalized score.
 
 ```bash
-ny benchmarks score \
-  --results reports/sweeps/acc-2026.csv \
-  --baseline reports/sweeps/acc-2026-before.csv
-
-ny benchmarks score \
-  --results reports/measured \
+ny benchmarks score --results reports/measured-2026 \
   --official /path/to/vnncomp2026_results \
-  --year 2026 \
-  --track regular \
-  --json
+  --year 2026 --track regular --budget-year 2026 --json
 ```
 
-As of 2026-08-08, the official VNN-COMP 2026 aggregate results are public at
-results commit
-[`eea564f5`](https://github.com/VNN-COMP/vnncomp2026_results/tree/eea564f5d0a8751d8321a409214db14d03f452b8).
-The pinned [regular table](https://github.com/VNN-COMP/vnncomp2026_results/blob/eea564f5d0a8751d8321a409214db14d03f452b8/SCORING/latex/total_regular.tex)
-reports alpha-beta-CROWN at 2344.0 and Vibecheck at 2278.6; the pinned
-[extended table](https://github.com/VNN-COMP/vnncomp2026_results/blob/eea564f5d0a8751d8321a409214db14d03f452b8/SCORING/latex/total_extended.tex)
-reports alpha-beta-CROWN at 600.0. Those artifacts make the public organizer
-field usable with `--official`. They do **not** establish an NY score: NY was
-not an official entrant and `reports/measured-2026/` is not a complete 2026
-result bank. Partial local rows and 2025 carry-overs must not be extrapolated
-across resampled 2026 properties.
+With `--official`, `--year 2025` or `--year 2026` is required — membership is
+never inferred, because several category ids occur in both editions but changed
+tracks. The scorer models the VNN-COMP raw-point rules (+10 correct decided,
+−150 incorrect, 0 undecided; no time bonus), keeps `--track regular` (default)
+and `--track extended` separate, and applies winner-relative per-benchmark
+normalization clipped at zero over the categories the supplied field represents;
+only identities present in that field earn modeled points. `--budget-year YEAR`
+loads that edition's per-instance budgets and drops any solved row recorded above
+its own budget as a phantom point — omit it and runtimes go unchecked, which the
+report states. `--witnesses assumed-valid` (default) treats every `sat` as a
+strictly valid counterexample, so an `unsat` it contradicts takes the real −150;
+`unvalidated` credits every claimed verdict and only reproduces a published
+board's arithmetic.
 
-The comparison uses the union of current and reference identities, so a row
-that disappeared from the current bank is still a regression. The baseline is
-only a historical reference, never ground truth; a `sat`↔`unsat` flip is a
-soundness alarm requiring evidence review. Without `--official`, the command
-reports exact row/solve deltas and deliberately invents no normalized score.
+The result is a supplied-field model, not official Regular or Extended scoring:
+it does not reproduce the organizer's cross-version positional alignment, and raw
+CSVs omit organizer witness validation, so it can penalize a contradicted `unsat`
+but cannot detect an invalid SAT witness. `score_year`, `score_track`,
+`modeled_score_caveat`, and `officially_scored_benchmarks` make the edition and
+those limits machine-visible in `--json`. The official 2026 results — public at
+[`VNN-COMP/vnncomp2026_results`](https://github.com/VNN-COMP/vnncomp2026_results),
+pinned here at
+[`eea564f5`](https://github.com/VNN-COMP/vnncomp2026_results/tree/eea564f5d0a8751d8321a409214db14d03f452b8)
+— are what make `--official` usable; that field establishes no NY score.
 
-With `--official`, `--year 2025` or `--year 2026` is required. The explicit
-edition selects that release's category membership; it is never inferred
-because several category ids occur in both years but changed tracks. The scorer
-models the VNN-COMP raw-point rules: a correct decided result earns +10, an
-incorrect result earns −150, and an undecided result earns zero; there is no
-time bonus. `--track regular` (the default) and `--track extended` keep the two
-published category sets separate. The scorer then applies winner-relative
-per-benchmark normalization, clipped at zero, for selected-track categories
-represented in the supplied field. Only normalized instance identities present
-in that field earn modeled points; extra current rows remain visible in
-solve-count comparisons but cannot inflate the score.
+**`reseed`** runs each original and a byte-identical twin under fresh,
+content-derived model and property names (including relational and `.onnx.gz`
+models) — a rename metamorphism, not regeneration of the dataset or its seed. A
+pass needs at least one pair with matching decided `sat`/`unsat` verdicts and no
+timeout, unknown, child error, missing asset, or disagreement; matching
+inconclusive results do not pass.
 
-This is still a supplied-field/category model, not official Regular or Extended
-track scoring. The imported CSV reader requires finite nonnegative recorded
-times, but it does not load each version's `instances.csv` to force over-budget
-decisions to timeout. It structurally normalizes relational model lists and
-path suffixes; it does not reproduce the organizer's cross-version positional
-alignment checks. Raw CSVs also omit organizer witness-validation outcomes, so
-the model assumes every `sat` row carries a strictly valid counterexample. It
-can therefore penalize a contradicted `unsat`, but cannot detect an invalid SAT
-witness from CSV alone. The JSON fields `score_year`, `score_track`,
-`modeled_score_caveat`, and `officially_scored_benchmarks` make the selected
-edition and those limits machine-visible.
-
-Finally, check that decided verdicts do not depend on recognizable paths:
-
-```bash
-ny benchmarks reseed \
-  --year 2026 \
-  --vnnlib-version 2.0 \
-  --category adaptive_cruise_control_non_linear_2026 \
-  --limit 10
-```
-
-`reseed` runs each original and a byte-identical twin under fresh,
-content-derived model/property names (including relational and `.onnx.gz`
-models). It is a rename metamorphism, not regeneration of the underlying
-dataset or seed. A pass requires at least one pair with matching decided
-`sat`/`unsat` verdicts and no timeout, unknown, child error, missing asset, or
-disagreement; matching inconclusive results do not pass.
-
-For audited VNN-COMP counterexamples in NY's flat result format, recompute only
-the `Y_*` values with the requested ONNX Runtime version and provider while
-preserving every submitted `X_*` token:
+**Counterexample canonicalization.** For audited VNN-COMP counterexamples in
+NY's flat result format, recompute only the `Y_*` values under a pinned ONNX
+Runtime while preserving every submitted `X_*` token:
 
 ```bash
 python scripts/canonicalize_vnncomp_ce_y.py \
-  --onnx model.onnx \
-  --result original.results \
-  --output canonical.results \
+  --onnx model.onnx --result original.results --output canonical.results \
   --vnnlib property.vnnlib \
-  --scoring-dir external_tools/vnncomp2026_results/SCORING \
+  --scoring-dir /path/to/vnncomp2026_results/SCORING \
   --receipt canonical.receipt.json \
-  --require-onnxruntime 1.16.3 \
-  --require-provider CPUExecutionProvider
+  --require-onnxruntime 1.16.3 --require-provider CPUExecutionProvider
 ```
 
-The helper accepts a standalone `sat`, then contiguous `X_0...X_n` entries
-followed by contiguous `Y_0...Y_m` entries. It requires exactly one ONNX model
-input and exactly one model output, then flattens the sole output tensor; it is
-not a converter for VNN-LIB 2.0 tensor or relational assignments. The command
-pins the requested ONNX Runtime version and provider, installs that provider as
-the session's only execution provider, and never overwrites an existing output
-or receipt. A mandatory tol=0 replay gate (official SCORING checker at
-abs_tol=0/rel_tol=0, plus a written-witness violation check on the canonical
-`Y_*` values) refuses any canonicalization whose witness stops violating the
-property at zero tolerance; the strict verdict and checker file hashes are
-sealed into the receipt. The JSON receipt hashes the model, source result, canonical result,
-preserved numeric `X_*` token stream, and recomputed `Y_*` token stream.
-Python, NumPy, ONNX Runtime, provider, shape, and dtype metadata are recorded in
-the receipt but, except for the required ONNX Runtime version/provider, are not
-independently pinned or hashed. The hardened atomic-publication path requires a
-POSIX host that exposes `O_DIRECTORY` and `O_NOFOLLOW`.
+It handles a standalone `sat` over exactly one model input and one model output —
+not VNN-LIB 2.0 tensor or relational assignments — pins the session to the
+requested provider, and never overwrites an existing output or receipt. A
+mandatory tol=0 gate (the official SCORING checker at `abs_tol=0`/`rel_tol=0`,
+plus a written-witness violation check on the canonical `Y_*`) refuses any
+canonicalization whose witness stops violating the property at zero tolerance,
+and the receipt seals that strict verdict, the checker hashes, and hashes of the
+model, both results, and both token streams. Atomic publication requires a POSIX
+host exposing `O_DIRECTORY` and `O_NOFOLLOW`.
 
 ## Methods and coverage
 
@@ -388,45 +331,48 @@ POSIX host that exposes `O_DIRECTORY` and `O_NOFOLLOW`.
 | Certificates | Exact-rational entailment + Farkas (eligible FC-ReLU nets) | `<model-stem>.cert.json`, re-checkable by an external kernel |
 | Escalation | Exact SMT via `ay` (`ny gt verify --escalate smt`) | An `ay` verdict on the escalated query |
 
+`ny coverage` prints the per-operator soundness classification behind the first
+two rows.
+
 ### VNN-LIB coverage
 
 The ordinary property path supports VNN-LIB 1.0 scalar declarations and affine
 constraints, plus partial VNN-LIB 2.0 tensor declarations, indexed variables,
-network wrappers, and relational forms. Unsupported syntax fails closed.
-Strict output comparisons (`Y < ...` and `Y > ...`) retain their strict
-semantics. Strict affine input-domain atoms are currently rejected because the
-ordinary input-box representation is closed; competition entry points return
-`unknown` instead of treating an excluded endpoint as inclusive.
+network wrappers, and relational forms; unsupported syntax fails closed. Strict
+output comparisons (`Y < ...`, `Y > ...`) keep their strict semantics, while
+strict affine input-domain atoms are rejected because the ordinary input-box
+representation is closed — competition entry points return `unknown` rather than
+treat an excluded endpoint as inclusive.
 
 For VNN-LIB 2.0 formulas rejected specifically because their arithmetic is
-nonlinear, the competition path has a dedicated fallback for tensor variables,
-`+`, `-`, `*`, `/`, comparisons (`<`, `<=`, `>`, `>=`, `=`, `==`, `!=`), and
-`and`/`or`/`not`. Source decimal literals retain their exact rational meaning.
-A `sat` result requires the complete unrelaxed formula to hold at a concrete
-input, trusted ONNX Runtime replay, and a definite true result from the sound
-f64 output enclosure; false, undecided, or unsupported evaluation returns
-`unknown`. This fallback does not reinterpret an otherwise-affine strict input
-atom as nonlinear arithmetic.
+nonlinear, the competition path has a dedicated fallback covering tensor
+variables, `+ - * /`, the comparisons `< <= > >= = == !=`, and `and`/`or`/`not`,
+with source decimals retaining their exact rational meaning. A `sat` requires the
+complete unrelaxed formula to hold at a concrete input, trusted ONNX Runtime
+replay, and a definite true result from the sound f64 output enclosure; anything
+else returns `unknown`, and the fallback never reinterprets an otherwise-affine
+strict input atom as nonlinear arithmetic. The nonlinear `unsat` lane is narrower
+still: every input coordinate needs a finite simple bound, the graph must support
+sound outward-rounded f64 interval propagation, input-space branch-and-bound is
+limited to at most four scalar inputs, and `unsat` is reported only after every
+subbox is definitely refuted against the original formula. An unsupported
+operator, a division interval crossing zero, an unresolved boundary, a
+higher-dimensional box, a resource limit, or an exhausted budget fails closed to
+`unknown`. This is targeted coverage, not a complete implementation of VNN-LIB
+2.0 arithmetic.
 
-The nonlinear `unsat` lane is intentionally narrower: every input coordinate
-must have a finite simple bound, the graph must support sound outward-rounded
-f64 interval propagation, and input-space branch-and-bound is limited to at
-most four scalar inputs. It reports `unsat` only after every subbox is
-definitely refuted against the original formula. An unsupported operator,
-division interval crossing zero, unresolved boundary, higher-dimensional box,
-resource limit, or exhausted budget fails closed to `unknown`. This is targeted
-nonlinear coverage, not a complete implementation of arbitrary VNN-LIB 2.0
-arithmetic.
+### Transformer models
 
-Whisper support currently includes model loading and component extraction.
-Whisper block compatibility calls execute CPU graph IBP only. Unsupported GPU,
-zonotope, CROWN, and overflow-control requests fail closed without returning
-substitute bounds. Sequential verification is unavailable, and Whisper CLI
-verdict commands fail closed without producing a verdict. The CROWN-named
-block API also fails closed. Compatibility detail records set
-`stage_metrics_available = false` when their stage-looking widths merely alias
-the final graph-IBP width. Heuristic LayerNorm forward-mode requests are
-rejected rather than returned as untagged proof-looking bounds.
+Transformer support stops short of verdicts. Whisper coverage is model loading
+and component extraction; block compatibility calls execute CPU graph IBP only,
+and GPU, zonotope, CROWN, sequential, and overflow-control requests fail closed
+rather than return substitute bounds — as do the Whisper CLI verdict commands and
+heuristic LayerNorm forward-mode requests. Decoder support likewise covers
+loading, structure inspection, and heuristic causal-self-attention/MLP graph
+artifacts; cross-attention extraction and every decoder verification
+compatibility API fail closed until the inferred topology, projections, masks,
+normalization attributes, and cross-attention composition are proven equivalent
+to the loaded graph.
 
 `ny export` writes a Python exporter; it does not download or convert a model
 inside the Rust process. Install its dependencies and run the generated script:
@@ -437,70 +383,40 @@ ny export --size tiny --output export_whisper.py
 python export_whisper.py
 ```
 
-Supported sizes are `tiny`, `base`, `small`, `medium`, and `large`. The script
-exports a CPU encoder with the model-declared mel-bin and fixed audio-context
-dimensions, validates the resulting ONNX file, and leaves only the batch axis
-dynamic. Current Torch exporters write tensor weights to a `.data` sidecar so
-even the large encoder stays below ONNX protobuf's 2 GiB message limit; keep
-that sidecar beside the `.onnx` file. NY's file loader resolves these relative
-external tensor slices, while its in-memory byte loader intentionally rejects
-models that have no filesystem origin. For external-data models, NY relies on
-the exporter's authored shapes instead of letting ONNX Runtime reopen sidecars
-outside NY's filesystem capability. The resulting model is for loading and
-block analysis; Whisper CLI verification remains fail-closed as described
-above.
+Sizes are `tiny`, `base`, `small`, `medium`, and `large`. The script exports a
+CPU encoder with the model-declared mel-bin and fixed audio-context dimensions,
+validates the resulting ONNX file, and leaves only the batch axis dynamic. Torch
+writes tensor weights to a `.data` sidecar so even the large encoder stays below
+ONNX protobuf's 2 GiB message limit; keep it beside the `.onnx` file. NY's file
+loader resolves those relative external tensor slices using the exporter's
+authored shapes, while its in-memory byte loader deliberately rejects models with
+no filesystem origin.
 
-Decoder transformer support currently covers loading, structure inspection,
-and heuristic causal-self-attention/MLP graph artifacts. Cross-attention
-extraction fails closed until the graph layer has a sound multi-input contract.
-CPU, GPU, single-block, and sequential decoder verification compatibility APIs
-fail closed without bounds or details until their inferred attention topology,
-projection conventions, masks, normalization attributes, and cross-attention
-composition are proven equivalent to the loaded graph.
+### Optional lanes and memory budgets
 
 The LP/MIP lane (`ny-mip`, in-process `ay-milp`) is available behind the `mip`
-feature. The exact SMT escalation path runs on an `ay` binary located at
-runtime through `$NY_AY` / `$PATH`.
+feature; exact SMT escalation runs on an `ay` binary located at runtime through
+`$NY_AY` / `$PATH`. An `mip` build also carries a default-dark cGAN input-leaf
+oracle, armed only by `NY_CGAN_INPUT_LEAF=1` and only for authenticated
+`cgan_2023` imgSz32 nCh1/nCh3 profiles with matching scalar-band properties; its
+deeper pullback is dormant machinery the production leaf constructor never
+requests, and the 22-row `cgan_2023` bank (12 `sat`, 7 `timeout`, 3 `unsat`)
+records no solve attributable to this route.
 
-An `mip` build also contains a category-typed, profile-limited, default-dark
-cGAN input-leaf oracle selected only by `NY_CGAN_INPUT_LEAF=1` for
-`cgan_2023`. It authenticates the authored imgSz32 nCh1/nCh3 profiles and
-matching scalar-band properties rather than accepting the whole category. Its
-final `Relu_23` strict M17/M20 portfolio may discharge an authenticated input-split
-leaf; M24 remains counterfactual telemetry. The deeper
-`Relu_20 -> BatchNormalization_21 -> Conv_22` pullback is implemented as
-dormant library/validation machinery but is deliberately not requested by the
-production leaf constructor, so its two measurements are `NotRequested` and
-have no verdict effect. Re-enabling it safely requires a second pass after the
-historical tail; retaining optional `Relu_20` state across mandatory work would
-change finite-cap completion. See the
-the internal current-state note.
-The current cGAN bank has 22 rows (12 SAT, 7 timeout, 2 unknown, and the
-`test_nano` UNSAT). Its 2026-08-11 parity-budget refresh changed no verdict;
-the bank commit reports a 1390.8 regular standing and closes the
-budget-starvation thesis. That commit-local standing does not replace the older
-fully pinned aggregate ledger described below, and the bank records no solve
-attributable to this default-dark leaf route.
-
-The supported graph BaB frontiers can budget their estimated resident domain
-payload directly or through a preset. Coverage includes the ordinary and
-precomputed ReLU-split heaps plus GPU `DomainList` ReLU- and input-split routes:
+The supported graph BaB frontiers — the ordinary and precomputed ReLU-split
+heaps plus the GPU `DomainList` ReLU- and input-split routes — can budget their
+estimated resident domain payload directly or through a preset:
 
 ```bash
-ny beta-crown model.onnx -p prop.vnnlib --max-queue-bytes 2147483648
+ny beta-crown model.onnx -p prop.vnnlib --max-queue-bytes 2147483648   # preset key: bab.max_queue_bytes
 ```
 
-```yaml
-bab:
-  max_queue_bytes: 2147483648
-```
-
-This setting sums NY's estimated live domain payload; it is not a process-RSS
-or allocator limit. `0` (the default) means unlimited. A queue always retains
-at least one domain, so one oversized domain may exceed the configured budget.
-If enforcement evicts any unverified domain, the final verdict is `unknown`,
-never a proof based on an incomplete search. Grouped-disjunctive `DomainList`
-storage rejects a nonzero byte cap until its row sidecar has a complete census.
+This sums NY's estimated live domain payload; it is not a process-RSS or
+allocator limit, and `0` (the default) means unlimited. A queue always retains at
+least one domain, so a single oversized domain may exceed the budget. If
+enforcement evicts any unverified domain the verdict is `unknown`, never a proof
+from an incomplete search. Grouped-disjunctive `DomainList` storage rejects a
+nonzero byte cap until its row sidecar has a complete census.
 
 ## GPU
 
@@ -512,67 +428,47 @@ ny beta-crown model.onnx -p prop.vnnlib --backend wgpu
 ```
 
 Verdict-bearing WGPU authority is explicit and request-scoped. An ordinary
-`WgpuDevice` is always unarmed. `WgpuVerdictRequest::new()` is the typed public
-request: construction of a verdict device creates one adapter context, runs
-the five live qualification rungs eagerly, and produces a complete
-`WgpuVerdictReport`. A successful device retains that report; a refusal
-preserves it in the typed qualification error. Only success lets the public
-`ComputeDevice` proof adapter expose CROWN. IBP, DAG, ordinary `GemmEngine`,
-and every other proof accessor remain closed.
+`WgpuDevice` is unarmed, and its ordinary `GemmEngine` methods (`gemm_f32`,
+`conv_transpose_2d`, …) are typed refusals. `WgpuVerdictRequest::new()` is the
+one typed public request: it creates a single adapter context, eagerly runs five
+live qualification rungs, and produces a `WgpuVerdictReport` — retained on
+success, preserved inside the typed error on refusal. Only success lets the
+public `ComputeDevice` proof adapter expose CROWN; IBP, DAG, and every other
+proof accessor stay closed. There is no ambient self-arm environment grant and
+no CLI opt-out that lets an unqualified GPU bound decide a verdict.
 
-`--backend wgpu` asks for that qualified CROWN route. If device construction or
-any rung refuses, the CLI fails closed to the sound CPU implementation. It
-emits the unconditional `NY-HARNESS: BACKEND-OVERRIDE` marker and an
-authenticated `ProofBackendReceipt` recording the request source,
-qualification/failure detail, effective backend, fallback, adapter, and proof
-provenance; JSON mode carries the same receipt. There is no CLI opt-out that
-allows an unqualified GPU bound to decide a verdict. Building with `--features
-cuda` adds a dynamically loaded native CUDA/cuBLAS accelerator for supported
-non-WGPU routes.
+`--backend wgpu` asks for that qualified route. If device construction or any
+rung refuses, the CLI fails closed to the sound CPU implementation, emits the
+unconditional `NY-HARNESS: BACKEND-OVERRIDE` marker, and publishes an
+authenticated `ProofBackendReceipt` naming the request source, qualification or
+failure detail, effective backend, fallback, adapter, and proof provenance (JSON
+mode carries the same receipt). `--features cuda` adds a dynamically loaded
+native CUDA/cuBLAS accelerator for supported non-WGPU routes.
 
-Current Apple status is measured rather than inferred: on the 2026-08-11 Apple
-M5 Max/Metal run the live ladder passed 3/5 (IEEE f32, host EFT, and sentinel
-taint) but failed EFT primitives and gradual underflow. The typed request
-therefore refused and the hermetic proof A/B fell back to byte-identical CPU
-output. See the
-the internal WGPU Metal qualification record.
+Qualification is measured per adapter, never assumed. On the 2026-08-11 Apple
+M5 Max/Metal run the ladder passed 3/5 (IEEE f32, host EFT, sentinel taint) but
+failed EFT primitives and gradual underflow, so the request refused and the
+hermetic proof A/B fell back to byte-identical CPU output. The measured
+GB10/Vulkan + DenormPreserve ladder is 5/5, and on that adapter the raw
+`WgpuDevice` CROWN gate is open, with an armed preflight that refuses absent or
+tainted rows; unsupported configurations typed-refuse rather than drop word
+state. The internal current-state note and WGPU Metal qualification record are
+the canonical ledger for both.
 
-One narrow WGPU exception is verdict-safe without opening that general
-authority: `FlValueGemmDevice` may compute only forward-linear value products
-under the `NY_FORWARD_LINEAR_F32` treatment. The caller charges the complete
-f32 accumulation/FTZ error separately, the certified error-base products stay
-on CPU f64, and non-finite or finite-sentinel results cause typed fallback. It
-cannot be used as an ordinary `GemmEngine` or CROWN backend.
-
-The raw `WgpuDevice` CROWN authority gate opened in the 2026-08-11 UTC B0
-review. U1 and U3 are discharged. U4 is also discharged: the AUTO/default
-route carries out-of-band words through the applicable twins, on-device row
-state, host folds, resident Conv, and ResNet segment composition; C2 protects
-the error-lowering EFT combine and the armed C1 preflight refuses absent or
-tainted rows. Host fused Conv and segment-resident device streams still
-typed-refuse instead of dropping word state; other unsupported configurations
-also refuse. U5/U6 are discharged by adversarial device oracles for activation
-Lipschitz/intercept propagation and concretize enclosure/fail-closed identity.
-The measured GB10/Vulkan + DenormPreserve ladder is 5/5. There is no ambient
-self-arm environment grant: only the exact typed verdict request plus all five
-live probes can qualify the narrow public CROWN accessor, and every failure
-remains closed. The canonical current ledger is the the WGPU verdict-authority section of the internal current-state note.
-
-Ordinary `GemmEngine` methods on `WgpuDevice`, including `gemm_f32` and
-`conv_transpose_2d`, remain typed refusals. Its CROWN accessor is the narrow
-exception: after the explicit request and successful cached qualification it
-may expose the sound resident backward. Separate crate-internal inherent
-kernels remain available to device tests and diagnostics. Complete Clip does
-not trust a device suggestion as a bound: private host replay must reproduce
-it in the exact clip context before a context-bound affine-provenance token can
-be minted. Device code cannot construct that token, so malformed, stale, or
-cross-context suggestions remain non-authoritative and fall back safely.
+Two narrow seams sit outside that authority. `FlValueGemmDevice` computes only
+forward-linear value products under the `NY_FORWARD_LINEAR_F32` treatment: the
+caller charges the complete f32 accumulation/FTZ error separately, certified
+error-base products stay on CPU f64, and non-finite or sentinel results fall
+back; it can never act as an ordinary `GemmEngine` or CROWN backend. And Complete
+Clip treats a device result as a mere suggestion until private host replay
+reproduces it in the exact clip context and mints a context-bound
+affine-provenance token that device code cannot construct.
 
 Falsification is exempt and stays accelerated. Attack steering is
-verdict-neutral by construction — its floats only choose where to look next,
-and every candidate still passes the unchanged admission gates — so it keeps
-whichever accelerator the host has (the shared CUDA engine on an NVIDIA box,
-WGPU otherwise) even when the proof lane is forced to CPU.
+verdict-neutral by construction — its floats only choose where to look next, and
+every candidate still passes the unchanged admission gates — so it keeps
+whichever accelerator the host has (CUDA on an NVIDIA box, WGPU otherwise) even
+when the proof lane is forced to CPU.
 
 ## Python
 
@@ -597,71 +493,87 @@ The `ny` module provides `verify()` and `verify_torch()` (IBP/CROWN/α/β, on ON
 files or in-memory `torch.nn.Module`s), model diffing and equivalence checks
 across ONNX/SafeTensors/PyTorch/GGUF/CoreML, quantization-safety checks, bound
 profiling, and a pytest plugin (`ny_pytest`) with `assert_verified`,
-`assert_equivalent`, fixtures, and `--ny-*` options. Fully typed (`py.typed` +
-`.pyi` stubs).
+`assert_equivalent`, `assert_bounds`, fixtures, and `--ny-*` options. Fully
+typed (`py.typed` + `.pyi` stubs).
 
 ## Results
 
-Most checked-in VNN-COMP 2025 CSV rows are legacy six-column raw-verdict
-measurements without retained SAT witnesses. Two newer seven-column UNSAT rows
-(`linearizenn_2024` and `cora_2024`) have immutable external run artifacts and
-are bound by `reports/measured/regular_evidence_index.json`; the read-only
-validator reopens their manifests, hashes, official occurrence, budget, and
-published truth before the scorecard can credit them. The older seven-column
-`sat_relu` file identifies a sealed 100/100 local run, but its
-manifest/log/input/witness bundle is absent from this checkout, so the CSV
-alone remains neither revalidated score evidence nor an official rank.
-See [`reports/measured/README.md`](reports/measured/README.md) for the immutable
+**NY has never been an official VNN-COMP entrant.** Everything below is local,
+internally reproducible measurement — not an official result, an organizer
+certification, or a third-party attestation.
+[`reports/measured/README.md`](reports/measured/README.md) carries the immutable
 rerun, witness-replay, completion-gated promotion, and `--require-evidence`
-scorecard protocol. Earlier competition plans in this tree are experiment
-notebooks, not current score evidence.
+scorecard protocol.
 
-The latest pinned aggregate ledger is the 2026-08-07 snapshot in
-`configs/preset_score_at_risk.yaml` (regular-16 1394.5, extended-9 477.6,
-combined 1872.1), not an official result. Several category banks changed after
-that snapshot, so it is also not an exact aggregate for current `main`; no
-later fully refreshed aggregate and provenance block is checked in. NY has no
-exact 2026 score because `reports/measured-2026/` contains only the `cersyve`
-and `monotonic_acasxu_2026` category banks, not a complete regular or extended
-track. The the internal current-state note separates
-pinned snapshots, later row evidence, and implemented-but-unmeasured features.
+**2025 corpus.** `reports/measured/` is the bank. Rows carry a seventh
+provenance column: a run tag means the row was replayed at its official
+per-instance budget on a recorded build, while `inherited-unverified` means
+nobody has re-run it since it was banked — a claim, not a measurement. Four
+legacy files (`cgan_2023`, `dist_shift_2023`, `nn4sys`, `sat_relu`) remain
+six-column and untagged. Twenty-eight rows across six categories are bound to
+immutable external run artifacts by
+`reports/measured/regular_evidence_index.json`, and a read-only validator
+reopens their manifests, hashes, official occurrence, budget, and published truth
+before the scorecard may credit them. The sealed `sat_relu` file names a 100/100
+local run whose manifest/log/input/witness bundle is not in this checkout, so
+that CSV alone is neither revalidated evidence nor a rank. The latest checked-in
+aggregate ledger here is the 2026-08-11 snapshot at `0cb3005a` in
+`configs/preset_score_at_risk.yaml`, and that file now carries a STALE banner
+over two of its three totals. Only extended-9 is current: **482.8**
+(corrected 2026-08-27, was 499.6). Regular-16 **1406.8** is marked stale and
+drifting upward as banks convert, and full-field-25 **1906.4** is stale by
+construction — 1406.8 + 482.8 is 1889.6. Do not quote those two as current;
+no refreshed aggregate with its provenance block is checked in.
 
-The checked-in historical `sat_relu` proof corpus additionally LRAT/Lean-replays
-all 50 UNSAT rows from its recorded sweep. The current runtime path does not
-invoke Lean per request: it independently regenerates an in-memory AY
-ResolutionDag and RUP-replays it before admitting `verified`. On `cersyve`, 5
-of 9 control systems are certified safe for an unbounded horizon by a
-kernel-checked induction theorem over `ny`'s one-step verdicts.
+**2026 corpus.** Banks live in `reports/measured-2026/` (internal; not part of
+the public snapshot), where a family counts as banked only when every row of its
+`instances.csv` ran to a protocol verdict token at the official per-instance
+budget. Its generated coverage census is the index of record and currently
+reports complete banks for **19 of 30** scored categories. No refreshed
+normalized total for that census is checked in — the most recent board rollup
+predates three of those banks — so no current 2026 score should be quoted from
+this tree.
+
+Two proof-level results stand on their own artifacts rather than a scoreboard.
+The checked-in historical `sat_relu` proof corpus LRAT/Lean-replays all 49 unique
+UNSAT instances of its recorded sweep (the benchmark's `instances.csv` lists 50
+UNSAT rows, one duplicated); the runtime path does not invoke Lean per request —
+it independently regenerates an in-memory AY ResolutionDag and RUP-replays it
+before admitting `verified`. And on `cersyve`, 5 of 9 finetune control systems
+are certified safe for an unbounded horizon by a kernel-checked induction theorem
+over `ny`'s one-step `con`/`inv` verdicts.
 
 ## Testing and proofs
 
 `ny` is covered by thousands of Rust tests, property-based tests, and four fuzz
 targets, one of which asserts that computed bounds enclose concrete executions.
-Kani proof harnesses verify the `ny-relaxation` scalar-relaxation mirror
-(`proofs/kani/`; binding to the production `ny-propagate` paths is in progress —
-see the status note in `crates/ny-relaxation/src/lib.rs`), Lean proofs cover the
-certificate lemmas (`crates/ny-cert/proofs/lean/`), and a model-checked TLA+
-specification covers the documented CNF/cell/MIP/BaB verdict-admission
-abstraction (`specs/tla/`). Direct relational, TLL, fractional-head, and
-post-BaB margin-row lanes are outside that model.
+Kani harnesses verify the `ny-relaxation` scalar-relaxation mirror
+(`proofs/kani/`), and differential tests in `crates/ny-relaxation/tests/drift.rs`
+bind those mirrors to the production `ny-propagate` paths over an adversarial
+grid — every mirrored pair except the centered-normalization helpers, which
+production inlines and which therefore remain unbound. Lean proofs cover the
+certificate lemmas (`crates/ny-cert/proofs/lean/`; see
+[`crates/ny-cert/proofs/README.md`](crates/ny-cert/proofs/README.md) for what is
+proved and the one bridge lemma still taken as an axiom). Model-checked TLA+
+specifications (`specs/tla/`) cover the documented CNF/cell/MIP/BaB
+verdict-admission abstraction and the environment-lock contract; direct
+relational, TLL, fractional-head, and post-BaB margin-row lanes are outside the
+admission model.
 
-Cargo is the canonical correctness entry point. The complete hermetic workspace
-lane is:
+Cargo is the canonical correctness entry point; the complete hermetic lane is:
 
 ```bash
 cargo check --workspace --exclude ny-python
 cargo test --locked --workspace --exclude ny-python
 ```
 
-The default suite is hermetic and contains no ignored tests. Python-binding,
-real-corpus, external-checker, GPU, and measurement lanes are explicit and fail
-fast when selected without their prerequisites; see
-the internal `TEST_CONFORMANCE.md` note (not part of the public snapshot) for the commands and policy. The
-ordered solver/test program is tracked in the
-the internal 1–6 priority roadmap; it
-deliberately adds no hosted CI.
-
-The toolchain is pinned by `rust-toolchain.toml`.
+That suite is hermetic and contains no ignored tests — `#[ignore]`,
+`pytest.skip`, and their relatives are prohibited in first-party source and
+enforced by a lexical scanner. Python-binding, real-corpus, external-checker,
+GPU, and measurement lanes are explicit and fail fast when selected without their
+prerequisites; the internal `TEST_CONFORMANCE.md` note (not part of the public
+snapshot) has the commands and policy. There is deliberately no hosted CI, and
+the toolchain is pinned by `rust-toolchain.toml`.
 
 ## Workspace
 
@@ -670,9 +582,11 @@ The toolchain is pinned by `rust-toolchain.toml`.
 | Core types | `ny-core`, `ny-tensor` |
 | Runtime contracts and configuration | `ny-contracts`, `ny-levers` |
 | Model ingestion | `ny-load`, `ny-build`, `ny-onnx`, `ny-trace-bridge` |
-| Verification engines | `ny-propagate`, `ny-gpu`, `ny-cuda`, `ny-mip` |
+| Verification engines | `ny-propagate`, `ny-gpu`, `ny-gpu-passthrough`, `ny-cuda`, `ny-accelerate`, `ny-mip` |
+| Falsification | `ny-falsify` |
 | Ground truth | `ny-groundtruth` |
 | Certificates | `ny-cert`, `ny-relaxation` |
+| Evidence ledger | `ny-claims` |
 | Interfaces | `ny-cli`, `ny-api`, `ny-python` |
 | Dev tooling | `ny-test-utils`, `ny-lint-guard` |
 

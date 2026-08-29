@@ -41,7 +41,8 @@ pub use sequential::Network;
 pub(crate) use sequential::{apply_bn_werr_to_host_relu, try_extract_batch_norm_conv1x1};
 pub(crate) use sequential::{
     crown_backward_step_patches, crown_backward_step_patches_spec_crown,
-    crown_backward_step_patches_with_deadline_authority, SpecPatchesStepError,
+    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy,
+    SpecPatchesStepError,
 };
 pub(crate) use sequential::{gpu_relu_affine_cell, GpuReluAffineVariant};
 

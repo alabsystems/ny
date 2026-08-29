@@ -27,10 +27,13 @@ use crate::layers::common::BoundPropagation;
 use crate::LinearBounds;
 
 impl RmsNormLayer {
-    /// Fallback output bounds when input bounds are non-finite.
+    /// Fallback output bounds for a saturated (±inf, NaN-free) input box.
     ///
     /// Uses the fact that RMSNorm output magnitude is bounded by
-    /// |ny_i| * sqrt(n) (the maximum possible |z_i| for unit-RMS vector).
+    /// |ny_i| * sqrt(n) (the maximum possible |z_i| for unit-RMS vector) —
+    /// an analytic enclosure that holds for EVERY finite real input
+    /// regardless of magnitude, so it is sound whenever the incoming box
+    /// merely lost its finite endpoints to deep-stack IBP overflow.
     fn fallback_output_bounds(&self, shape: &[usize]) -> Result<BoundedTensor> {
         let ndim = shape.len();
         if ndim == 0 {
@@ -481,7 +484,22 @@ impl BoundPropagation for RmsNormLayer {
         let shape = input.shape();
         let ndim = shape.len();
 
-        validate_ibp_input(shape, &self.ny, self.forward_mode, input)?;
+        validate_ibp_input(shape, &self.ny, input)?;
+
+        // Deep-stack IBP overflow saturation (dc9da0fde class): a ±inf
+        // (NaN-free — NaN already failed closed above) input box is a
+        // legitimately saturated upstream interval, not an error. The true
+        // pre-activation values it encloses are finite reals, and the
+        // analytic |y_i| ≤ |ny_i|·√n fallback enclosure holds for every
+        // finite real input regardless of magnitude — the same route the
+        // forward-mode path already takes for a non-finite center
+        // (`outward_midpoint_radius` → None → fallback). Skipping the L2
+        // lever annotation here only forgoes tightening (sound).
+        if input.lower().iter().any(|x| x.is_infinite())
+            || input.upper().iter().any(|x| x.is_infinite())
+        {
+            return self.fallback_output_bounds(shape);
+        }
 
         if self.forward_mode {
             let out = self.propagate_ibp_forward_mode(input)?;
@@ -560,12 +578,10 @@ impl BoundPropagation for RmsNormLayer {
 // ── Free-standing helpers ──────────────────────────────────────────────────
 
 /// Validate input shape and parameters for IBP propagation.
-fn validate_ibp_input(
-    shape: &[usize],
-    ny: &Array1<f32>,
-    forward_mode: bool,
-    input: &BoundedTensor,
-) -> Result<()> {
+///
+/// NaN input bounds fail closed here (both modes); ±inf endpoints pass —
+/// the caller routes a saturated box to the conservative fallback enclosure.
+fn validate_ibp_input(shape: &[usize], ny: &Array1<f32>, input: &BoundedTensor) -> Result<()> {
     let ndim = shape.len();
     if ndim == 0 {
         return Err(NyError::InvalidSpec(
@@ -587,13 +603,15 @@ fn validate_ibp_input(
             "RMSNorm: zero-valued dimension in input shape".to_string(),
         ));
     }
-    // Reject non-finite input bounds (Category B per domain validation policy).
-    if !forward_mode
-        && (input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite()))
-    {
+    // Category B per domain validation policy: NaN input bounds fail closed in
+    // BOTH modes — NaN carries no bound information and a silently repaired
+    // NaN could mask a real numerical bug. ±Inf endpoints are NOT an error:
+    // they are the conservative-bounds convention for "unbounded in that
+    // direction" (deep-stack IBP overflow saturation, dc9da0fde class) and are
+    // routed to the analytic fallback enclosure by `propagate_ibp` instead.
+    if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
         return Err(NyError::NumericalInstability(
-            "RMSNorm IBP: non-finite input bounds".to_string(),
+            "RMSNorm IBP: NaN input bounds".to_string(),
         ));
     }
     let norm_size = shape[ndim - 1];

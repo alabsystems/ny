@@ -164,11 +164,7 @@ pub(crate) fn graph_spec_crown_with_mul_binary_and_truncation(
                 // deep BaB run stays readable — first 20 calls, then every
                 // 500th. Answers "how close does the per-domain C-margin get
                 // with split depth".
-                if std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_PROBE")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
-                {
+                if crate::preset_gates::root_joint_interm_alpha_probe_enabled() {
                     use std::sync::atomic::{AtomicUsize, Ordering};
                     static CMARGIN_CALLS: AtomicUsize = AtomicUsize::new(0);
                     let n = CMARGIN_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -192,6 +188,32 @@ pub(crate) fn graph_spec_crown_with_mul_binary_and_truncation(
                     .map(|(t, _)| t)
                     .unwrap_or(bounds)
             }
+            _ => bounds,
+        }
+    } else {
+        bounds
+    };
+    // #joint-bilinear (DARK, `NY_JOINT_BILINEAR_QUAD=1`): per-domain JOINT
+    // relaxation of `ReduceSum(A * B)` when both operands are functions of the
+    // same input. Factor-wise McCormick decorrelates the two factors; on a
+    // Lyapunov decrease `(f-x)'Q(f+x)` that is the dominant relaxation term
+    // (see `crate::joint_bilinear`). Sound: both operands of the intersection
+    // are certified enclosures of the same spec rows, and the joint pass is
+    // shrink-only and fail-open, so the disarmed arm is byte-identical.
+    let bounds = if crate::joint_bilinear::joint_bilinear_armed() {
+        match crate::joint_bilinear::joint_bilinear_spec_bounds(
+            graph,
+            input,
+            spec_matrix,
+            engine,
+            deadline,
+            reference_node_bounds.or(node_bounds),
+        ) {
+            Ok(Some(joint)) if joint.shape() == bounds.shape() => bounds
+                .intersection_per_element(&joint)
+                .filter(|(_, disjoint)| *disjoint == 0)
+                .map(|(tightened, _)| tightened)
+                .unwrap_or(bounds),
             _ => bounds,
         }
     } else {

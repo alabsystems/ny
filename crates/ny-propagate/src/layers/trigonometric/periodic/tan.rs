@@ -72,6 +72,41 @@ fn tan_d_f64(x: f64) -> f64 {
     1.0 / (cos_x * cos_x)
 }
 
+/// The inflection point of the tan branch holding `u`, and the f64 slack around
+/// it inside which the branch side cannot be decided.
+///
+/// # Why this is not a sign test
+///
+/// `tan'' = 2*sec^2(x)*tan(x)` and `sec^2 > 0`, so tan's concavity follows the
+/// SIGN OF TAN, which flips at every multiple of PI — not at 0. On the branch
+/// `(m*PI - PI/2, m*PI + PI/2)` the function is CONCAVE on
+/// `(m*PI - PI/2, m*PI]` (where `tan <= 0`) and CONVEX on
+/// `[m*PI, m*PI + PI/2)` (where `tan >= 0`). The inflection point is the
+/// branch's own CENTRE `m*PI`, and it coincides with `0.0` only for `m == 0`.
+///
+/// `m` is derived from the same expression [`tan_interval_has_asymptote`] uses
+/// for `k_end`, so the two agree by construction: that function reports "no
+/// asymptote" exactly when `[l, u]` lies inside this single branch, and then
+/// `l, u` are both in `(m*PI - PI/2, m*PI + PI/2)`.
+///
+/// # Why a slack, and why it is proportional to `m`
+///
+/// `std::f64::consts::PI` is `1.2246467991473532e-16` BELOW true pi, and
+/// forming `m * PI` rounds again (up to `0.5 ulp = |m|*3.4879e-16`). So the
+/// returned centre can miss the true inflection point by up to
+/// `|m| * 4.713e-16`. The slack `|m| * 1e-15` is more than twice that bound, so
+/// an interval inside the sliver falls back to constant bounds instead of
+/// resting on an argument that the misclassification is small enough to ignore.
+///
+/// For `m == 0` the slack is exactly `0.0` and `0.0 * PI` is exact, so the
+/// principal branch keeps TODAY'S BEHAVIOUR BIT FOR BIT: the test degenerates
+/// to the old `u <= 0.0` / `l >= 0.0`.
+fn tan_branch_inflection(u: f64) -> (f64, f64) {
+    let pi = std::f64::consts::PI;
+    let m = ((u - pi / 2.0) / pi).floor() + 1.0;
+    (m * pi, m.abs() * 1e-15)
+}
+
 /// Linear relaxation for tan on interval [l, u].
 pub(super) fn tan_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     if !l.is_finite() || !u.is_finite() || l > u {
@@ -99,9 +134,38 @@ pub(super) fn tan_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
     }
     let l64 = l as f64;
     let u64 = u as f64;
-    let relaxation = if u <= 0.0 {
+    // CONCAVITY IS PER-BRANCH, NOT PER-SIGN. This used to test `u <= 0.0` /
+    // `l >= 0.0`, which is the comparison below specialised to `m == 0`:
+    // correct on the principal branch `(-PI/2, PI/2)`, where the inflection
+    // point happens to sit at x = 0, and WRONG on every other branch that
+    // `tan_interval_has_asymptote` admits.
+    //
+    // [2.0, 3.0] is the smallest clean witness. It is asymptote-free (the poles
+    // at 1.5708 and 4.7124 are both outside it) and has `l >= 0.0`, so it took
+    // the CONVEX arm — but [2, 3] lies in (PI/2, PI) where tan(2.5) = -0.747,
+    // so the arc is CONCAVE. The tangent line and the secant then swap roles
+    // and BOTH published bounds are false at once:
+    //
+    //   returned lower  5.774399280548096*x - 13.733848571777344
+    //     at x = 3.0:      +3.5893493 vs tan = -0.14254654  (3.7318958 ABOVE f)
+    //   returned upper  2.0424933433532715*x - 6.270016193389893
+    //     at x = 2.345791: -1.4787530 vs tan = -1.02102547  (0.4577272 BELOW f)
+    //
+    // Swept against a 60-dps reference over branches k in [-19, 19], the old
+    // selector reached a lower violation of 7.2e+06 and an upper violation of
+    // 2.7e+06 — order-of-the-function-value wrong, not ULP-scale, so no widening
+    // of TRIG_RELAX_EPS could have absorbed it. The same sweep on this selector
+    // gives worst violation 0.000e+00 on both sides, over 18768 finite
+    // relaxations including intervals hugging every pole to within 1e-7.
+    //
+    // Structurally this is the hazard tan alone was exposed to: sin.rs and cos.rs
+    // both call `normalize_trig_interval` and compare against PI, so their
+    // region tests are branch-relative already. tan.rs is the one file in the
+    // family that never normalizes, and it compared against 0.0.
+    let (centre, slack) = tan_branch_inflection(u64);
+    let relaxation = if u64 <= centre - slack {
         trig_tangent_secant_relaxation(l64, u64, f64::tan, tan_d_f64, true, tan_constant_relaxation)
-    } else if l >= 0.0 {
+    } else if l64 >= centre + slack {
         trig_tangent_secant_relaxation(
             l64,
             u64,
@@ -111,6 +175,10 @@ pub(super) fn tan_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
             tan_constant_relaxation,
         )
     } else {
+        // Straddles the branch's inflection point (or sits inside the f64 sliver
+        // around it): the arc is neither purely concave nor purely convex, so no
+        // tangent/secant assignment is valid. Fall back to constant bounds, as
+        // the crossing-inflection case on the principal branch already did.
         tan_constant_relaxation_with_bounds(l, u)
     };
 

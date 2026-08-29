@@ -955,3 +955,147 @@ fn test_shape_with_prefolded_output_skips_instead_of_opaque_skip() {
     );
     assert!(graph.node("post").is_some(), "live path must survive");
 }
+
+/// Regression test for the "LayerNorm constant-cascade" gap (NY #4350), as
+/// surfaced by RT-DETR's decoder query embedding.
+///
+/// RT-DETR builds its decoder queries from a purely constant chain —
+/// `ConstantWeight -> Unsqueeze -> Expand -> LayerNorm`. `build_graph_network`
+/// const-folds that chain away, which deletes every node that produced the
+/// LayerNorm's DATA tensor, and ny-build has no constant-source node to hand the
+/// resulting frozen tensor back to the LayerNorm. This test collapses the chain
+/// to its essential shape: a LayerNorm whose data input is a frozen constant.
+///
+/// Before the fix this surfaced as a hard `ModelLoad` failure blaming a
+/// "possible dangling ONNX reference" — a badly misleading message for a tensor
+/// whose value ny had computed itself, and one that aborted the WHOLE model
+/// load. The contract asserted here is the fail-closed one: the load SUCCEEDS,
+/// that single node degrades to an `OpaqueSkip`, and its bounds still ENCLOSE
+/// the concrete value.
+///
+/// Note what is deliberately NOT done: const-folding straight through the
+/// LayerNorm. `evaluate_constant_layer` refuses exactly that for InstanceNorm
+/// because "a point IBP image may still collapse around a rounded result, so it
+/// is not an exact-real materialization certificate". Folding a normalization to
+/// a point would assert an exactness the arithmetic does not have.
+#[test]
+fn layernorm_over_const_folded_data_input_fails_closed_to_opaque_skip_4350() {
+    let mut weights = WeightStore::new();
+    // The frozen "query embedding": the LayerNorm's DATA input, not a parameter.
+    weights.insert(
+        "queries".to_string(),
+        arr1(&[1.0f32, 2.0, 3.0, 4.0]).into_dyn(),
+    );
+    weights.insert(
+        "gamma".to_string(),
+        arr1(&[1.0f32, 1.0, 1.0, 1.0]).into_dyn(),
+    );
+    weights.insert(
+        "beta".to_string(),
+        arr1(&[0.0f32, 0.0, 0.0, 0.0]).into_dyn(),
+    );
+
+    let layers = vec![layer_spec(
+        "layernorm",
+        LayerType::LayerNorm,
+        &["queries", "gamma", "beta"],
+        &["layernorm_out"],
+    )];
+    let inputs = vec![tensor_spec("input", &[4])];
+    let outputs = vec![tensor_spec("layernorm_out", &[4])];
+    let tensor_producer = HashMap::new();
+    let constant_tensors = HashSet::new();
+    let tensor_shapes = HashMap::from([
+        ("input".to_string(), vec![4]),
+        ("queries".to_string(), vec![4]),
+        ("layernorm_out".to_string(), vec![4]),
+    ]);
+
+    let data = GraphBuildInputs {
+        layers: &layers,
+        inputs: &inputs,
+        outputs: &outputs,
+        weights: &weights,
+        tensor_producer: &tensor_producer,
+        constant_tensors: &constant_tensors,
+        tensor_shapes: &tensor_shapes,
+    };
+
+    // 1. The load must SUCCEED rather than aborting the whole model.
+    let graph = build_graph_network(&data, GraphNetworkOptions::default())
+        .expect("a LayerNorm over a const-folded data input must not abort the load");
+
+    // 2. It must fail CLOSED — degraded to an OpaqueSkip, never wired to a
+    //    bogus input and never silently given some other tensor's bounds.
+    let skip = graph
+        .node("layernorm__skip")
+        .expect("the unwirable LayerNorm must degrade to an OpaqueSkip node");
+    assert!(
+        matches!(skip.layer(), Layer::OpaqueSkip(_)),
+        "expected OpaqueSkip, got {:?}",
+        skip.layer()
+    );
+    assert!(
+        graph.node("layernorm").is_none(),
+        "the original LayerNorm node must not survive with a fabricated input"
+    );
+
+    // 3. The bounds must ENCLOSE the concrete value. They are vacuous today
+    //    ([-inf, +inf]) because #4350 is unfixed, but the enclosure property is
+    //    what soundness rests on and is what must survive any future fix.
+    let point = arr1(&[0.0f32, 0.0, 0.0, 0.0]).into_dyn();
+    let output = graph
+        .propagate_ibp(&BoundedTensor::new(point.clone(), point).expect("point input"))
+        .expect("IBP must propagate through the degraded graph");
+
+    // Independently computed: layernorm([1,2,3,4]) with gamma=1, beta=0.
+    let values = [1.0f32, 2.0, 3.0, 4.0];
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32;
+    let deviation = (variance + 1e-5).sqrt();
+    let out_lower = output.lower().as_slice().expect("contiguous lower");
+    let out_upper = output.upper().as_slice().expect("contiguous upper");
+    assert_eq!(out_lower.len(), values.len());
+    for (index, value) in values.iter().enumerate() {
+        let concrete = (value - mean) / deviation;
+        assert!(
+            out_lower[index] <= concrete && concrete <= out_upper[index],
+            "bound [{}, {}] at index {index} must enclose the concrete \
+             LayerNorm value {concrete}",
+            out_lower[index],
+            out_upper[index]
+        );
+    }
+}
+
+/// The const-folded-constant refusal must not swallow the case it was carved
+/// out of: a tensor that nothing in the model produces or defines is still a
+/// genuine dangling reference, and must still fail the load hard rather than
+/// degrading to conservative bounds.
+#[test]
+fn a_genuinely_dangling_tensor_still_fails_the_load_4350() {
+    let weights = WeightStore::new();
+    let layers = vec![layer_spec("act", LayerType::ReLU, &["ghost"], &["act_out"])];
+    let inputs = vec![tensor_spec("input", &[4])];
+    let outputs = vec![tensor_spec("act_out", &[4])];
+    let tensor_producer = HashMap::new();
+    let constant_tensors = HashSet::new();
+    let tensor_shapes = HashMap::from([("input".to_string(), vec![4])]);
+
+    let data = GraphBuildInputs {
+        layers: &layers,
+        inputs: &inputs,
+        outputs: &outputs,
+        weights: &weights,
+        tensor_producer: &tensor_producer,
+        constant_tensors: &constant_tensors,
+        tensor_shapes: &tensor_shapes,
+    };
+
+    let error = build_graph_network(&data, GraphNetworkOptions::default())
+        .expect_err("a tensor with no producer and no constant value must fail the load");
+    assert!(
+        matches!(&error, NyError::ModelLoad(msg) if msg.contains("dangling")),
+        "unexpected error: {error:?}"
+    );
+}

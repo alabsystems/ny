@@ -549,6 +549,24 @@ impl BetaCrownVerifier {
                         active_child.delta_pre_nodes.clear();
                         let l = output.lower_scalar();
                         let u = output.upper_scalar();
+                        // #bab-warm-start trace, graph-lane twin of the
+                        // sequential [child-trace] (NY_BAB_CHILD_TRACE=1).
+                        {
+                            static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                            static COUNT: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            if *TRACE_ON.get_or_init(|| {
+                                std::env::var("NY_BAB_CHILD_TRACE").ok().as_deref() == Some("1")
+                            }) {
+                                let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if n.is_multiple_of(97) {
+                                    eprintln!(
+                                        "[gchild-trace] depth={} lower={l:.6} upper={u:.6} threshold_pending",
+                                        active_child.depth,
+                                    );
+                                }
+                            }
+                        }
                         active_child.lower_bound = l;
                         active_child.upper_bound = u;
 

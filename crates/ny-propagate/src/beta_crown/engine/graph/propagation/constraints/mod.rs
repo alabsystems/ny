@@ -484,9 +484,35 @@ impl BetaCrownVerifier {
                                     node_name, neuron_idx, u
                                 )));
                             }
-                            // NaN-safe: propagate NaN instead of silently clamping to 0.0 (#2643)
-                            lower[[neuron_idx]] = nan_propagating_max(l, 0.0);
-                            upper[[neuron_idx]] = u;
+                            // The active child is a subset of its parent, so the
+                            // parent's post-ReLU CROWN enclosure remains valid.
+                            // Preserve it just as the unconstrained arm below
+                            // does. Dropping it here erased warm-start progress at
+                            // every active split: the fresh forward interval could
+                            // widen back to `[max(l, 0), u]` even when the parent
+                            // had already proved a much tighter post-ReLU range.
+                            let relu_lower = nan_propagating_max(l, 0.0);
+                            let relu_upper = u;
+                            let crown_l = crown_bounds.lower()[[neuron_idx]];
+                            let crown_u = crown_bounds.upper()[[neuron_idx]];
+                            let tightened_lower = nan_propagating_max(relu_lower, crown_l);
+                            let tightened_upper = nan_propagating_min(relu_upper, crown_u);
+                            if reusing_inherited_bounds && tightened_lower > tightened_upper {
+                                // Match the adjacent unconstrained-cache policy:
+                                // a stale/numerically inconsistent inherited
+                                // entry must cost tightness, never manufacture an
+                                // infeasible child.
+                                debug!(
+                                    node = %node_name,
+                                    neuron_idx,
+                                    "Constraint forward: inherited active-ReLU cache conflicted with fresh child bounds; keeping re-propagated interval"
+                                );
+                                lower[[neuron_idx]] = relu_lower;
+                                upper[[neuron_idx]] = relu_upper;
+                            } else {
+                                lower[[neuron_idx]] = tightened_lower;
+                                upper[[neuron_idx]] = tightened_upper;
+                            }
                         }
                         Some(false) => {
                             if l > 0.0 {

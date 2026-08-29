@@ -11,7 +11,11 @@
 //!
 //! Covers the certificate types, the self-contained checkers, the shallow
 //! ([`Relu1Problem`]) and deep ([`DeepReluProblem`]) CROWN problem/result types,
-//! and the JSON schema emitters used to serialize certificates for Clean.
+//! the JSON schema emitters used to serialize certificates for Clean, and the
+//! Alethe proof emitters ([`entailment_to_alethe`] / [`farkas_to_alethe`] /
+//! [`branch_tree_to_alethe`]) whose SMT-LIB/Alethe pairs the standard external
+//! `carcara` checker replays. [`certify_graph_with_alethe`] threads that
+//! emission through the [`certify_graph`] certificate build itself.
 //!
 //! The [`certify_graph`] entry point wires this surface into the verifier path:
 //! it runs the normal graph verifier and, when the network and property are
@@ -47,10 +51,32 @@ pub use ny_cert::{
 };
 /// Self-contained certificate checkers (entailment / Farkas / chain).
 pub use ny_cert::{check_chain, check_entailment, check_farkas, CheckError};
+/// Deployed-f32 rounding margin: the exact-rational bound `delta` with
+/// `|fl32(net(x)) - net(x)| <= delta` over the whole input box, which folds a
+/// real-semantics certificate onto the network as it actually executes in f32.
+/// [`certify_graph_with_policy`] folds it into the strict-dominance gate when a
+/// [`DeployedPrecision::DeployedF32`] policy is active.
+pub use ny_cert::{deployed_fp_margin, deployed_fp_output_margin, FpMargin, FpMarginError};
 /// Shallow (one ReLU hidden layer) CROWN problem and certified result.
 pub use ny_cert::{CertifiedRelu1, CrownError, Relu1Problem};
 /// Exact-rational scalar arithmetic underlying every certificate.
 pub use ny_cert::{Rat, RatError};
+
+/// Alethe proof emission: turn a self-checked entailment / Farkas /
+/// branch-tree certificate into an SMT-LIB problem + Alethe proof pair
+/// ([`AletheEmission`]) checkable by the standard external `carcara` checker
+/// (`carcara check proof.alethe problem.smt2`). Fail-closed: every emitter
+/// replays the certificate through its in-tree checker first and refuses
+/// ([`EmitError`]) any certificate — or unsupported shape (equalities,
+/// non-SMT-LIB symbols) — rather than emit wrong proof text.
+pub use ny_cert::{
+    branch_tree_to_alethe, entailment_to_alethe, farkas_to_alethe, AletheEmission, EmitError,
+};
+/// Branch-tree (case-split) certificate surface: the [`branch_tree_to_alethe`]
+/// input type, its components, and the in-tree checker its emission replays.
+pub use ny_cert::{
+    check_branch_tree, AxisPartition, BranchError, BranchLeaf, BranchTreeCertificate, ThreshDir,
+};
 
 use crate::constraints::{augment_for_constraint, verify_with_constraints};
 use ndarray::{Array1, Array2};
@@ -83,6 +109,140 @@ pub struct CertifiedResult {
     /// Human-readable explanation of the certification outcome.
     pub note: String,
 }
+
+/// One discharged conjunct's Alethe emission: the SMT-LIB problem / Alethe
+/// proof pair for its entailment certificate and for its Farkas certificate,
+/// each independently checkable with `carcara check proof.alethe problem.smt2`.
+///
+/// The pair proves exactly what the conjunct's self-checked certificates
+/// state. For a STRICT (`ArgmaxMargin`) conjunct the strict relation
+/// `margin > 0` additionally rests on the conjunct's exact lower bound being
+/// strictly positive — a gate [`certify_graph_with_alethe`] enforces
+/// fail-closed BEFORE any emission, so no Alethe artifact ever accompanies an
+/// undischarged strict conjunct.
+#[derive(Debug, Clone)]
+pub struct ConjunctAlethe {
+    /// The conjunct's label — identical to the `discharged_conjunct` field of
+    /// the corresponding entry in [`CertifiedResult::certificate_json`].
+    pub label: String,
+    /// Alethe emission of the conjunct's entailment certificate.
+    pub entailment: AletheEmission,
+    /// Alethe emission of the conjunct's Farkas certificate.
+    pub farkas: AletheEmission,
+}
+
+/// Outcome of [`certify_graph_with_alethe`]: the plain certification outcome
+/// plus, when every discharged conjunct also emitted, its Alethe proofs.
+///
+/// The Alethe set is WHOLE-OR-NOTHING, mirroring the certificate discipline:
+/// `alethe == Some(v)` only when the exact-rational certificate was emitted
+/// AND every one of its conjuncts produced a checkable [`ConjunctAlethe`] —
+/// never a partial set that could be mistaken for full coverage. An emission
+/// refusal (an [`EmitError`], e.g. an unsupported shape) withholds ONLY the
+/// Alethe artifact; the JSON certificate and the verdict stand unchanged.
+#[derive(Debug, Clone)]
+pub struct AletheCertifiedResult {
+    /// The plain certification outcome — identical semantics to
+    /// [`certify_graph`] (verdict never altered, certificate never partial).
+    pub certified: CertifiedResult,
+    /// Per-conjunct Alethe emissions, in certificate-conjunct order. `Some`
+    /// only when the certificate was emitted and EVERY conjunct emitted.
+    pub alethe: Option<Vec<ConjunctAlethe>>,
+    /// Human-readable explanation of the Alethe outcome.
+    pub alethe_note: String,
+}
+
+/// Internal whole-or-nothing accumulator for per-conjunct Alethe emissions,
+/// threaded through the certificate build only by
+/// [`certify_graph_with_alethe`]. The first emission refusal clears every
+/// collected conjunct and records the reason — the certificate build itself
+/// continues unaffected (the Alethe artifact is additive on top of the
+/// already-additive certificate).
+#[derive(Debug, Default)]
+struct AletheAcc {
+    conjuncts: Vec<ConjunctAlethe>,
+    refusal: Option<String>,
+}
+
+/// Which arithmetic a certificate's STRICT (argmax dominance) conjuncts are
+/// required to hold in.
+///
+/// Every certificate this surface emits proves a property of the network's
+/// IDEAL real-valued semantics: the f32 weights enter as their exact rational
+/// values and all arithmetic is real. The network that ships, however, executes
+/// in f32 round-to-nearest, and a strict dominance `y_class > y_j` proven with
+/// an exact lower bound `L` as small as one ULP does NOT survive that rounding.
+/// This policy chooses whether the strict gate accounts for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[non_exhaustive]
+pub enum DeployedPrecision {
+    /// **Default.** Strict conjuncts require only `L > 0` — the certificate
+    /// attests the property of the ideal real-valued network, exactly as
+    /// before this policy existed. Certificate bytes under this variant are
+    /// bit-identical to the pre-policy emitter's.
+    #[default]
+    RealSemantics,
+    /// Fold the deployed-f32 rounding margin into the strict gate: a strict
+    /// conjunct is discharged only when `L > delta`, where `delta` bounds the
+    /// f32 rounding error of the deployed outputs the conjunct compares
+    /// ([`deployed_fp_output_margin`], computed in exact rationals). The
+    /// conjunct then also attests the dominance for the DEPLOYED network, and
+    /// records `delta` as its folded threshold.
+    ///
+    /// Fail-closed: if `delta` cannot be computed for any output the strict
+    /// conjunct reads (a parameter that is not the exact value of a finite
+    /// f32, an overflow-capable magnitude envelope, an affine row outside the
+    /// error model's domain), the WHOLE certificate is refused rather than
+    /// emitted with a real-semantics-only strict gate.
+    DeployedF32,
+}
+
+/// Certification policy: the opt-in knobs that change what a certificate
+/// attests.
+///
+/// [`CertifyPolicy::default`] is the historical behaviour in every field, so
+/// [`certify_graph`] and [`certify_graph_with_policy`] with the default policy
+/// emit byte-identical certificates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[non_exhaustive]
+pub struct CertifyPolicy {
+    /// Which arithmetic strict conjuncts must hold in. Default:
+    /// [`DeployedPrecision::RealSemantics`].
+    pub deployed_precision: DeployedPrecision,
+}
+
+impl CertifyPolicy {
+    /// The default policy: strict conjuncts attest the ideal real-valued
+    /// semantics (`L > 0`). Certificate bytes are bit-stable with
+    /// [`certify_graph`].
+    #[must_use]
+    pub const fn real_semantics() -> Self {
+        Self {
+            deployed_precision: DeployedPrecision::RealSemantics,
+        }
+    }
+
+    /// The deployed-f32 policy: strict conjuncts must clear the deployed
+    /// rounding margin (`L > delta`), fail-closed when `delta` is not
+    /// computable. See [`DeployedPrecision::DeployedF32`].
+    #[must_use]
+    pub const fn deployed_f32() -> Self {
+        Self {
+            deployed_precision: DeployedPrecision::DeployedF32,
+        }
+    }
+
+    /// Whether the deployed-f32 fold is active.
+    #[must_use]
+    pub const fn folds_deployed_fp_margin(&self) -> bool {
+        matches!(self.deployed_precision, DeployedPrecision::DeployedF32)
+    }
+}
+
+/// Per-output-index cache of deployed-f32 error bounds. Every entry is computed
+/// from the SAME hidden stack and input box, so one exact-rational interval
+/// propagation per distinct read-out row is all an argmax property needs.
+type DeployedErrorCache = std::collections::HashMap<usize, Rat>;
 
 /// Upper bound on the total hidden-neuron count we attempt to certify. Exact
 /// rational CROWN over a large net can create very large intermediate values
@@ -137,6 +297,39 @@ fn extract_fc_relu_stack(graph: &GraphNetwork) -> std::result::Result<FcReluStac
         let node = graph
             .node(&current)
             .ok_or_else(|| format!("dangling node reference '{current}'"))?;
+        // A provable identity is transparent to the chain.
+        //
+        // `translate_input` lowers every `TraceOp::Input` to `Add(input, 0)` so
+        // the traced input node has a layer to be (`ny-trace-bridge`,
+        // `translate/ops_core.rs`). That is NY's own construct, and rejecting it
+        // here made every trace-lowered graph — i.e. every model that reaches NY
+        // through the NN bridge rather than through ONNX — permanently
+        // ineligible for a certificate, with the confusing reason
+        // "unsupported layer for cert: AddConstant(...)".
+        //
+        // Only an EXACTLY-zero offset is skipped, checked elementwise. Adding
+        // zero maps `[l, u]` to `[l, u]` with no rounding at any finite
+        // endpoint, so the layer contributes nothing to the entailment and
+        // dropping it certifies the same function. A non-zero offset still
+        // disqualifies: it is a real affine term the Farkas rows would have to
+        // carry.
+        if let Layer::AddConstant(add) = node.layer() {
+            if add.constant().iter().all(|&c| c == 0.0) {
+                let inputs = node.inputs();
+                if inputs.len() != 1 {
+                    return Err(format!(
+                        "node '{current}' has {} inputs (cert needs a single linear chain)",
+                        inputs.len()
+                    ));
+                }
+                let pred = inputs[0].clone();
+                if pred == NETWORK_INPUT {
+                    break;
+                }
+                current = pred;
+                continue;
+            }
+        }
         match node.layer() {
             Layer::Linear(_) | Layer::ReLU(_) => {}
             other => return Err(format!("unsupported layer for cert: {other:?}")),
@@ -341,11 +534,20 @@ fn build_problem_for_margin(
 ///    positive the conjunct is NOT discharged and we return `Err` => the WHOLE
 ///    certificate is refused (fail-closed, no overclaim). The conjunct is then
 ///    labelled `> 0`, honestly stating the strict relation `L > 0` justifies.
+///
+/// `fp_margin` is `Some(delta)` ONLY for a strict conjunct under an active
+/// [`DeployedPrecision::DeployedF32`] policy: the gate then tightens from
+/// `L > 0` to `L > delta`, and the discharged conjunct additionally records the
+/// folded threshold so the artifact states the deployed claim it now supports.
+/// It is always `None` under the default policy, which keeps the emitted bytes
+/// bit-identical to the pre-policy emitter.
 fn certify_problem_into(
     problem: &DeepReluProblem,
     label: &str,
     strict: bool,
+    fp_margin: Option<Rat>,
     entries: &mut Vec<serde_json::Value>,
+    alethe: &mut Option<AletheAcc>,
 ) -> std::result::Result<(), String> {
     // certify(0): prove margin >= 0 exactly. Err means exact plain CROWN could
     // not close this conjunct (the verdict may rely on tighter alpha/beta/BaB
@@ -368,11 +570,44 @@ fn certify_problem_into(
     // non-negative); otherwise the conjunct is undischarged and the whole cert is
     // refused. This makes strictness kernel-checkable: the emitted conjunct
     // attests `exact_lower_bound = L` with `L > 0`, which entails `margin > 0`.
-    if strict && !certified.lower_bound.is_positive() {
-        return Err(format!(
-            "strict conjunct '{label}' not discharged: exact lower bound {lower_bound} is not > 0 \
-             (a tie does not establish strict argmax)"
-        ));
+    //
+    // Under a DEPLOYED-PRECISION policy the same gate is folded with the
+    // deployed f32 rounding margin `delta`: the deployed comparison reads
+    // `fl32` outputs, which sit within `delta` of the real ones, so `L > 0` no
+    // longer implies deployed dominance while `L > delta` does. The threshold
+    // is recorded on the conjunct below.
+    let mut deployed_record: Option<serde_json::Value> = None;
+    if strict {
+        match fp_margin {
+            None => {
+                if !certified.lower_bound.is_positive() {
+                    return Err(format!(
+                        "strict conjunct '{label}' not discharged: exact lower bound \
+                         {lower_bound} is not > 0 (a tie does not establish strict argmax)"
+                    ));
+                }
+            }
+            Some(delta) => {
+                let threshold = delta
+                    .to_clean_string()
+                    .map_err(|e| format!("deployed-f32 margin for '{label}' unprintable: {e}"))?;
+                if certified.lower_bound <= delta {
+                    return Err(format!(
+                        "strict conjunct '{label}' not discharged under the deployed-f32 policy: \
+                         exact lower bound {lower_bound} does not exceed the deployed rounding \
+                         margin {threshold} (the deployed f32 comparison could tie or invert)"
+                    ));
+                }
+                deployed_record = Some(serde_json::json!({
+                    "policy": "deployed-f32",
+                    "fp_margin": threshold,
+                    "folded_threshold": threshold,
+                    "attests": "the exact lower bound L exceeds the deployed f32 rounding margin \
+                                delta of the compared outputs, so the DEPLOYED (f32) comparison \
+                                is strictly satisfied: margin(fl32 outputs) >= L - delta > 0",
+                }));
+            }
+        }
     }
 
     // In-tree self-check (entailment + Farkas replay): refuse to emit a
@@ -386,12 +621,20 @@ fn certify_problem_into(
         .map_err(|e| format!("entailment not serialisable for '{label}': {e}"))?;
     let farkas_json = farkas_to_json(&certified.farkas)
         .map_err(|e| format!("farkas not serialisable for '{label}': {e}"))?;
+    // BRIDGE: ny-cert's bounded `Json` carries no serde impls by design; this
+    // entry is still assembled with `serde_json::json!`, so re-parse the
+    // canonical rendering. Removable once this file migrates to
+    // `ny_cert::Json` end-to-end.
+    let entailment_json: serde_json::Value = serde_json::from_str(&entailment_json.to_string())
+        .map_err(|e| format!("entailment JSON bridge for '{label}': {e}"))?;
+    let farkas_json: serde_json::Value = serde_json::from_str(&farkas_json.to_string())
+        .map_err(|e| format!("farkas JSON bridge for '{label}': {e}"))?;
     // Be honest about what L attests: a strict conjunct proves `margin > 0`
     // (justified by the just-checked `L > 0`); a non-strict one proves
     // `margin >= 0`. A Clean kernel re-checking only `>= 0` together with the
     // attested `L > 0` can re-derive the strict relation itself.
     let relation = if strict { "margin > 0" } else { "margin >= 0" };
-    entries.push(serde_json::json!({
+    let mut entry = serde_json::json!({
         "discharged_conjunct": label,
         "relation": relation,
         "strict": strict,
@@ -399,7 +642,48 @@ fn certify_problem_into(
         "depth": problem.depth(),
         "entailment": entailment_json,
         "farkas": farkas_json,
-    }));
+    });
+    // ADDITIVE, and only under an active deployed-precision policy: `relation`
+    // and every field above keep their exact pre-policy meaning (the real
+    // relation `L` proves), so a checker that ignores the extra object still
+    // checks a true statement. Under the default policy the entry is
+    // byte-identical to the pre-policy emitter's.
+    if let Some(record) = deployed_record {
+        entry["deployed_precision"] = record;
+    }
+    entries.push(entry);
+
+    // OPTIONAL Alethe emission for this (fully discharged, self-checked)
+    // conjunct. Whole-or-nothing: the first refusal clears the collected set
+    // and stops collecting; it NEVER withholds the JSON certificate — the
+    // Alethe pair is an additive artifact on top of an additive artifact, and
+    // its emitters can refuse shapes (equalities, non-SMT-LIB symbols) the
+    // certificate path soundly accepts.
+    if let Some(acc) = alethe.as_mut() {
+        if acc.refusal.is_none() {
+            let emitted = entailment_to_alethe(&certified.entailment)
+                .map_err(|e| format!("entailment Alethe emission refused for '{label}': {e}"))
+                .and_then(|entailment| {
+                    farkas_to_alethe(&certified.farkas)
+                        .map_err(|e| format!("farkas Alethe emission refused for '{label}': {e}"))
+                        .map(|farkas| ConjunctAlethe {
+                            label: label.to_string(),
+                            entailment,
+                            farkas,
+                        })
+                });
+            match emitted {
+                Ok(conjunct) => acc.conjuncts.push(conjunct),
+                Err(reason) => {
+                    // Fail-closed for the Alethe SET: never leave a partial
+                    // collection around that a caller could mistake for full
+                    // property coverage.
+                    acc.conjuncts.clear();
+                    acc.refusal = Some(reason);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -414,14 +698,104 @@ fn certify_margins_into(
     hi: &[f32],
     margins: &[Margin],
     entries: &mut Vec<serde_json::Value>,
+    alethe: &mut Option<AletheAcc>,
 ) -> std::result::Result<(), String> {
     for margin in margins {
         let problem = build_problem_for_margin(stack, lo, hi, margin)?;
         // Interval/bounds margins are NON-strict (`margin >= 0` is exactly the
-        // property); `L >= 0` discharges them.
-        certify_problem_into(&problem, &margin.label, false, entries)?;
+        // property); `L >= 0` discharges them, and the deployed-precision fold
+        // is a STRICT-gate policy (see `DeployedPrecision`), so `None` here.
+        certify_problem_into(&problem, &margin.label, false, None, entries, alethe)?;
     }
     Ok(())
+}
+
+/// Exact-rational bound on the deployed-f32 rounding error of ORIGINAL network
+/// output `out_idx` over the input box `[lo, hi]`, memoized in `cache`.
+///
+/// The problem handed to [`deployed_fp_output_margin`] is the deployed
+/// computation verbatim: the original FC-ReLU hidden stack, and the scalar
+/// read-out row `(Wr[out_idx], br[out_idx])` with NO folded threshold and unit
+/// coefficient — so the returned `e` satisfies
+/// `|fl32(y_out_idx(x)) - y_out_idx(x)| <= e` for every `x` in the box, where
+/// `fl32` is the deployed f32 inference of the same weights.
+///
+/// This is deliberately NOT computed on the folded margin row: a margin row
+/// like `Wr[class] - Wr[j]` is a different (and possibly much smaller) weight
+/// vector than either deployed row, so its error model would describe a network
+/// that fuses the comparison into the read-out — not the one that ships, which
+/// rounds each logit and only then compares them.
+///
+/// Returns `Err(reason)` (non-fatal at this level, fatal for the certificate)
+/// when the margin is unrepresentable — fail-closed by construction.
+fn deployed_output_error(
+    stack: &FcReluStack<'_>,
+    lo: &[f32],
+    hi: &[f32],
+    out_idx: usize,
+    cache: &mut DeployedErrorCache,
+) -> std::result::Result<Rat, String> {
+    if let Some(cached) = cache.get(&out_idx) {
+        return Ok(*cached);
+    }
+    let readout = Margin {
+        idx: out_idx,
+        coeff: 1,
+        const_term: Rat::ZERO,
+        label: format!("deployed read-out row {out_idx}"),
+    };
+    let problem = build_problem_for_margin(stack, lo, hi, &readout)?;
+    let error = deployed_fp_output_margin(&problem).map_err(|e| {
+        format!("deployed-f32 rounding margin for network output {out_idx} is unavailable: {e}")
+    })?;
+    cache.insert(out_idx, error);
+    Ok(error)
+}
+
+/// The deployed-f32 threshold row `k` of a margin map `M` must clear:
+/// `delta_k = sum_o |M[k][o]| * e_o`, where `e_o` is output `o`'s deployed
+/// rounding error ([`deployed_output_error`]).
+///
+/// SOUNDNESS. The deployed comparison evaluates `sum_o M[k][o] * fl32(y_o) +
+/// c[k]`, which differs from the certified real margin `sum_o M[k][o] * y_o +
+/// c[k]` by at most `sum_o |M[k][o]| * |fl32(y_o) - y_o| <= delta_k` (the
+/// constant `c[k]` is exact and contributes nothing). So a proven real lower
+/// bound `L > delta_k` gives `deployed margin >= L - delta_k > 0`. For an
+/// `ArgmaxMargin` row (`M[k] = e_class - e_j`, `c[k] = 0`) that is exactly
+/// "the deployed f32 logits still rank `class` strictly above `j`".
+///
+/// Every arithmetic step is exact rational: no float rounding enters the
+/// threshold itself.
+fn deployed_margin_threshold(
+    stack: &FcReluStack<'_>,
+    lo: &[f32],
+    hi: &[f32],
+    m: &Array2<f32>,
+    k: usize,
+    label: &str,
+    cache: &mut DeployedErrorCache,
+) -> std::result::Result<Rat, String> {
+    let badrat = |e: RatError| format!("exact arithmetic while folding '{label}': {e}");
+    if k >= m.nrows() {
+        return Err(format!(
+            "deployed-f32 fold: margin row {k} out of range ({} rows)",
+            m.nrows()
+        ));
+    }
+    let mut threshold = Rat::ZERO;
+    for (o, &coeff) in m.row(k).iter().enumerate() {
+        let coeff_rat = f32_to_rat(coeff).ok_or_else(|| {
+            format!("deployed-f32 fold: margin coeff not representable ({label})")
+        })?;
+        if coeff_rat == Rat::ZERO {
+            continue;
+        }
+        let error = deployed_output_error(stack, lo, hi, o, cache)?;
+        threshold = threshold
+            .add(coeff_rat.abs().mul(error).map_err(badrat)?)
+            .map_err(badrat)?;
+    }
+    Ok(threshold)
 }
 
 /// Recover the appended affine margin read-out `(M, c)` from an augmented margin
@@ -574,21 +948,31 @@ fn build_problem_for_margin_net_row(
 /// omitted, the verdict stands). NEVER emits a partial certificate while a
 /// requested conjunct is uncertified. The combined JSON is the Clean-canonical
 /// certificate set, one entry per discharged conjunct.
+///
+/// Under a [`DeployedPrecision::DeployedF32`] `policy` every STRICT conjunct's
+/// gate is folded with that conjunct's deployed rounding margin
+/// ([`deployed_margin_threshold`]) and the whole certificate is refused if any
+/// such margin cannot be computed. Non-strict conjuncts are untouched — the fold
+/// is a strict-dominance policy, and the emitted top-level `precision_policy`
+/// object says so verbatim so the artifact never implies wider coverage.
 fn try_build_certificate(
     stack: &FcReluStack<'_>,
     net: &GraphNetwork,
     spec: &VerificationSpec,
+    alethe: &mut Option<AletheAcc>,
+    policy: CertifyPolicy,
 ) -> std::result::Result<String, String> {
     let lo: Vec<f32> = spec.input_bounds().iter().map(Bound::lower).collect();
     let hi: Vec<f32> = spec.input_bounds().iter().map(Bound::upper).collect();
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut deployed_errors = DeployedErrorCache::new();
 
     // (a) Legacy output-bounds conjuncts over the original stack. An empty result
     // is fine ONLY because the constraints below may carry the actual conjuncts;
     // we enforce "at least one conjunct overall" after collecting everything.
     let bound_margins = margins_for_bounds(spec.output_bounds(), "Y")?;
-    certify_margins_into(stack, &lo, &hi, &bound_margins, &mut entries)?;
+    certify_margins_into(stack, &lo, &hi, &bound_margins, &mut entries, alethe)?;
 
     // (b) Rich output constraints. Each must be reduced and fully discharged, or
     // we refuse the whole certificate (no overclaim).
@@ -603,7 +987,7 @@ fn try_build_certificate(
                         "output_constraint[{ci}] Bounds has no finite endpoint to certify"
                     ));
                 }
-                certify_margins_into(stack, &lo, &hi, &margins, &mut entries)?;
+                certify_margins_into(stack, &lo, &hi, &margins, &mut entries, alethe)?;
             }
             OutputConstraint::Linear { .. } | OutputConstraint::ArgmaxMargin { .. } => {
                 // Reduce to a margin network via the P7 encoder. The encoder
@@ -640,9 +1024,32 @@ fn try_build_certificate(
                     } else {
                         format!("constraint[{ci}].margin[{k}] {rel}")
                     };
+                    // Fail-closed: an unavailable deployed margin aborts the
+                    // WHOLE certificate rather than silently reverting this
+                    // conjunct to the real-semantics gate.
+                    let fp_margin = if strict && policy.folds_deployed_fp_margin() {
+                        Some(deployed_margin_threshold(
+                            stack,
+                            &lo,
+                            &hi,
+                            &m,
+                            k,
+                            &label,
+                            &mut deployed_errors,
+                        )?)
+                    } else {
+                        None
+                    };
                     let problem =
                         build_problem_for_margin_net_row(stack, &lo, &hi, &m, &c, k, &label)?;
-                    certify_problem_into(&problem, &label, strict, &mut entries)?;
+                    certify_problem_into(
+                        &problem,
+                        &label,
+                        strict,
+                        fp_margin,
+                        &mut entries,
+                        alethe,
+                    )?;
                 }
             }
         }
@@ -660,13 +1067,30 @@ fn try_build_certificate(
         "exact CROWN discharges every conjunct of the output property (output_bounds) over the \
          whole input box"
     };
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "format": "ny-cert/crown-deep/v1",
         "claim": claim,
         "covers_output_bounds": true,
         "covers_output_constraints": has_constraints,
         "conjuncts": entries,
     });
+    // ADDITIVE and opt-in: absent (byte-for-byte) under the default policy. Its
+    // `scope` states the exact reach of the fold so the artifact never reads as
+    // "this whole certificate is deployment-covered".
+    if policy.folds_deployed_fp_margin() {
+        payload["precision_policy"] = serde_json::json!({
+            "mode": "deployed-f32",
+            "scope": "strict (argmax dominance) conjuncts only: each such conjunct attests \
+                      L > delta, where delta bounds the deployed f32 rounding error of the \
+                      outputs it compares, hence the dominance holds for the deployed network. \
+                      Non-strict conjuncts attest the ideal real-valued semantics, exactly as \
+                      under the default policy.",
+            "model": "layer-wise forward error analysis in exact rationals (ny-cert::fp_margin); \
+                      assumes the f32 weights ARE the deployed weights, per-operation \
+                      round-to-nearest, and exact f32 inputs (input quantization error is out of \
+                      scope and must be added by the caller).",
+        });
+    }
     serde_json::to_string(&payload).map_err(|e| format!("certificate serialisation failed: {e}"))
 }
 
@@ -721,6 +1145,166 @@ pub fn attach_proof(
 /// The verifier runs in `Crown` mode by default. The certificate is replayable
 /// independently of the verifier's floating-point bounds.
 pub fn certify_graph(net: &GraphNetwork, spec: &VerificationSpec) -> Result<CertifiedResult> {
+    certify_graph_inner(net, spec, &mut None, CertifyPolicy::real_semantics())
+}
+
+/// [`certify_graph`] under an explicit [`CertifyPolicy`].
+///
+/// `certify_graph(net, spec)` is exactly
+/// `certify_graph_with_policy(net, spec, CertifyPolicy::default())`, and the
+/// default policy emits BYTE-IDENTICAL certificates — the policy adds fields
+/// only when it is actually engaged.
+///
+/// With [`CertifyPolicy::deployed_f32`] the STRICT (argmax dominance)
+/// conjuncts are held to `L > delta` instead of `L > 0`, where `delta` is the
+/// exact-rational bound on the f32 rounding error of the deployed outputs that
+/// conjunct compares (see [`DeployedPrecision::DeployedF32`] and
+/// [`deployed_fp_output_margin`]). Each discharged strict conjunct then carries
+/// a `deployed_precision` object recording the folded threshold, and the
+/// certificate carries a top-level `precision_policy` object stating the fold's
+/// exact scope.
+///
+/// FAIL-CLOSED, twice over: a strict conjunct whose `L` does not clear `delta`
+/// is not discharged and the whole certificate is refused (never emitted with
+/// the weaker gate); and a `delta` that cannot be computed at all — a parameter
+/// that is not the exact value of a finite f32, an overflow-capable magnitude
+/// envelope, an affine row outside the error model's domain — likewise refuses
+/// the whole certificate rather than silently reverting to real semantics. In
+/// both cases the VERDICT is untouched, exactly as for any other certificate
+/// refusal.
+pub fn certify_graph_with_policy(
+    net: &GraphNetwork,
+    spec: &VerificationSpec,
+    policy: CertifyPolicy,
+) -> Result<CertifiedResult> {
+    certify_graph_inner(net, spec, &mut None, policy)
+}
+
+/// [`certify_graph`] plus per-conjunct Alethe proof emission, threaded through
+/// the SAME certificate build (one exact-rational certification per conjunct —
+/// the Alethe pairs are emitted from the very [`DeepReluProblem`] results the
+/// JSON certificate serializes, never from a re-derivation that could drift).
+///
+/// The certification outcome ([`AletheCertifiedResult::certified`]) is
+/// bit-for-bit the [`certify_graph`] contract: the verdict is never altered,
+/// and the JSON certificate is emitted or withheld on exactly the same
+/// conditions — an Alethe emission refusal NEVER withholds the certificate.
+///
+/// On top of that, `alethe` is `Some(pairs)` — one [`ConjunctAlethe`]
+/// (entailment + Farkas SMT-LIB/Alethe pair, checkable by the external
+/// `carcara` checker) per certificate conjunct, in certificate order — ONLY
+/// when the certificate was emitted AND every conjunct emitted. Whole or
+/// nothing: if any conjunct's emission is refused (an [`EmitError`], e.g. an
+/// unsupported shape), or the collected set does not match the certificate
+/// one-to-one, NO Alethe artifact is returned and `alethe_note` explains why —
+/// never a partial set that overclaims coverage.
+///
+/// STRICTNESS is inherited from the certificate build: a strict
+/// (`ArgmaxMargin`) conjunct is only ever certified — and therefore only ever
+/// emitted — after its exact lower bound is proven strictly positive, so an
+/// Alethe pair for a strict conjunct always accompanies a genuinely
+/// discharged `margin > 0`.
+pub fn certify_graph_with_alethe(
+    net: &GraphNetwork,
+    spec: &VerificationSpec,
+) -> Result<AletheCertifiedResult> {
+    certify_graph_with_alethe_and_policy(net, spec, CertifyPolicy::real_semantics())
+}
+
+/// [`certify_graph_with_alethe`] under an explicit [`CertifyPolicy`].
+///
+/// The Alethe surface is unchanged by the policy: a strict conjunct is emitted
+/// only after it is discharged, so under [`CertifyPolicy::deployed_f32`] an
+/// Alethe pair for a strict conjunct accompanies a gate that already cleared
+/// the deployed rounding margin. The emitted SMT-LIB/Alethe pair still proves
+/// the certificate's own `>= 0` inequality; the strict, deployed claim rests on
+/// the conjunct's recorded `exact_lower_bound` and `deployed_precision`
+/// threshold, exactly as the real-semantics strict claim rests on
+/// `exact_lower_bound > 0`.
+pub fn certify_graph_with_alethe_and_policy(
+    net: &GraphNetwork,
+    spec: &VerificationSpec,
+    policy: CertifyPolicy,
+) -> Result<AletheCertifiedResult> {
+    let mut acc = Some(AletheAcc::default());
+    let certified = certify_graph_inner(net, spec, &mut acc, policy)?;
+    let acc = acc.expect("accumulator is Some for the whole build");
+
+    // No certificate -> no Alethe artifact, whatever the accumulator holds
+    // (it is cleared on refusal, but a withheld certificate can also leave
+    // successfully-emitted conjuncts from before the failing one behind).
+    let Some(json) = certified.certificate_json.as_deref() else {
+        return Ok(AletheCertifiedResult {
+            certified,
+            alethe: None,
+            alethe_note: "no certificate emitted - no Alethe artifact".to_string(),
+        });
+    };
+
+    if let Some(reason) = acc.refusal {
+        return Ok(AletheCertifiedResult {
+            certified,
+            alethe: None,
+            alethe_note: format!(
+                "certificate emitted, but the Alethe artifact is withheld (whole-or-nothing): \
+                 {reason}"
+            ),
+        });
+    }
+
+    // FAIL-CLOSED cross-check: the Alethe set must cover the certificate
+    // one-to-one (same count, same labels in order). A mismatch means a code
+    // bug; withhold the artifact rather than return a set that could be
+    // mistaken for full coverage.
+    let covered = parse_certificate_conjunct_labels(json);
+    let labels: Vec<&str> = acc.conjuncts.iter().map(|c| c.label.as_str()).collect();
+    let matches = covered
+        .as_ref()
+        .is_some_and(|c| c.len() == labels.len() && c.iter().zip(&labels).all(|(a, b)| a == b));
+    if !matches {
+        return Ok(AletheCertifiedResult {
+            certified,
+            alethe: None,
+            alethe_note: format!(
+                "certificate emitted, but the Alethe artifact is withheld: emitted conjuncts \
+                 {labels:?} do not match the certificate's {covered:?} (internal invariant \
+                 violated; fail-closed)"
+            ),
+        });
+    }
+
+    let n = acc.conjuncts.len();
+    Ok(AletheCertifiedResult {
+        certified,
+        alethe: Some(acc.conjuncts),
+        alethe_note: format!(
+            "Alethe proofs emitted for all {n} certificate conjunct(s); check each with `carcara \
+             check proof.alethe problem.smt2`"
+        ),
+    })
+}
+
+/// Extract the `discharged_conjunct` labels of an emitted certificate, in
+/// order. `None` if the JSON does not parse into the expected shape (treated
+/// fail-closed by the caller).
+fn parse_certificate_conjunct_labels(json: &str) -> Option<Vec<String>> {
+    let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
+    parsed["conjuncts"]
+        .as_array()?
+        .iter()
+        .map(|c| c["discharged_conjunct"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Shared implementation of [`certify_graph`] / [`certify_graph_with_alethe`]:
+/// identical verdict and certificate behaviour; `alethe` is `Some` only for
+/// the Alethe-threading entry point.
+fn certify_graph_inner(
+    net: &GraphNetwork,
+    spec: &VerificationSpec,
+    alethe: &mut Option<AletheAcc>,
+    policy: CertifyPolicy,
+) -> Result<CertifiedResult> {
     let verifier = Verifier::new(PropagationConfig {
         method: PropagationMethod::Crown,
         ..Default::default()
@@ -757,7 +1341,7 @@ pub fn certify_graph(net: &GraphNetwork, spec: &VerificationSpec) -> Result<Cert
         });
     }
 
-    match try_build_certificate(&stack, net, spec) {
+    match try_build_certificate(&stack, net, spec, alethe, policy) {
         Ok(json) => {
             let proof = VerificationProof::from_parts(
                 ProofFormat::BoundTrace,
@@ -771,13 +1355,18 @@ pub fn certify_graph(net: &GraphNetwork, spec: &VerificationSpec) -> Result<Cert
             } else {
                 "output_bounds AND output_constraints"
             };
+            let precision = if policy.folds_deployed_fp_margin() {
+                "; strict conjuncts cleared the deployed-f32 rounding margin (policy: deployed-f32)"
+            } else {
+                ""
+            };
             Ok(CertifiedResult {
                 result,
                 certificate_json: Some(json),
                 eligible: true,
                 note: format!(
                     "exact-rational certificate covering {scope} emitted and attached to the \
-                     proof channel"
+                     proof channel{precision}"
                 ),
             })
         }
@@ -879,6 +1468,101 @@ mod tests {
         ));
         g.set_output("lin2");
         g
+    }
+
+    /// The trace-lowered shape: NY's own `Add(input, 0)` identity in front of
+    /// the FC-ReLU stack, exactly as `translate_input` emits it. Same function
+    /// as [`eligible_graph`], so it must certify identically.
+    fn trace_lowered_graph() -> GraphNetwork {
+        use ny_propagate::layers::AddConstantLayer;
+        let mut g = GraphNetwork::new();
+        g.add_node(GraphNode::from_input(
+            "input",
+            Layer::AddConstant(AddConstantLayer::new(ndarray::arr1(&[0.0f32]).into_dyn())),
+        ));
+        g.add_node(GraphNode::new(
+            "lin1",
+            linear(
+                Array2::from_shape_vec((1, 1), vec![1.0]).unwrap(),
+                vec![0.0],
+            ),
+            vec!["input".to_string()],
+        ));
+        g.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["lin1".to_string()],
+        ));
+        g.add_node(GraphNode::new(
+            "lin2",
+            linear(
+                Array2::from_shape_vec((1, 1), vec![2.0]).unwrap(),
+                vec![0.5],
+            ),
+            vec!["relu".to_string()],
+        ));
+        g.set_output("lin2");
+        g
+    }
+
+    /// A trace-lowered graph must be eligible: NY lowers every `TraceOp::Input`
+    /// to `Add(input, 0)`, so rejecting that identity made EVERY model arriving
+    /// through the NN bridge permanently uncertifiable, with the misleading
+    /// reason "unsupported layer for cert: AddConstant(...)".
+    #[test]
+    fn identity_add_constant_prefix_does_not_block_eligibility() {
+        let lowered = trace_lowered_graph();
+        let eligible = eligible_graph();
+        let stack = extract_fc_relu_stack(&lowered).expect("identity prefix is transparent");
+        let plain = extract_fc_relu_stack(&eligible).expect("plain stack is eligible");
+        assert_eq!(
+            stack.hidden.len(),
+            plain.hidden.len(),
+            "the identity must not appear in the extracted chain"
+        );
+    }
+
+    /// ...but only when it is EXACTLY zero. A real offset is an affine term the
+    /// Farkas rows would have to carry, so it must still disqualify rather than
+    /// be silently dropped — dropping it would certify a different function.
+    #[test]
+    fn nonzero_add_constant_prefix_still_disqualifies() {
+        use ny_propagate::layers::AddConstantLayer;
+        let mut g = GraphNetwork::new();
+        g.add_node(GraphNode::from_input(
+            "offset",
+            Layer::AddConstant(AddConstantLayer::new(ndarray::arr1(&[0.25f32]).into_dyn())),
+        ));
+        g.add_node(GraphNode::new(
+            "lin1",
+            linear(
+                Array2::from_shape_vec((1, 1), vec![1.0]).unwrap(),
+                vec![0.0],
+            ),
+            vec!["offset".to_string()],
+        ));
+        g.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["lin1".to_string()],
+        ));
+        g.add_node(GraphNode::new(
+            "lin2",
+            linear(
+                Array2::from_shape_vec((1, 1), vec![2.0]).unwrap(),
+                vec![0.5],
+            ),
+            vec!["relu".to_string()],
+        ));
+        g.set_output("lin2");
+        let err = match extract_fc_relu_stack(&g) {
+            Err(reason) => reason,
+            Ok(_) => panic!("a real offset must not be skipped"),
+        };
+        assert!(
+            err.contains("AddConstant"),
+            "refusal should name the layer, got: {err}"
+        );
     }
 
     /// Same shape but with a SiLU activation instead of ReLU -> ineligible.
@@ -1538,14 +2222,14 @@ mod tests {
 
         // strict=false: a `>= 0` conjunct is correct and accepted.
         let mut entries = Vec::new();
-        certify_problem_into(&problem, "tie >= 0", false, &mut entries)
+        certify_problem_into(&problem, "tie >= 0", false, None, &mut entries, &mut None)
             .expect("non-strict conjunct accepted at L == 0");
         assert_eq!(entries.len(), 1, "non-strict conjunct recorded");
         assert_eq!(entries[0]["strict"], serde_json::Value::Bool(false));
 
         // strict=true: a tie does NOT discharge `> 0` -> refuse (fail-closed).
         let mut entries = Vec::new();
-        let err = certify_problem_into(&problem, "tie > 0", true, &mut entries)
+        let err = certify_problem_into(&problem, "tie > 0", true, None, &mut entries, &mut None)
             .expect_err("strict conjunct must be refused at L == 0");
         assert!(
             err.contains("not > 0"),
@@ -1594,5 +2278,506 @@ mod tests {
                 "Bounds-constraint conjunct labelled, got '{label}'"
             );
         }
+    }
+
+    // --- certify_graph_with_alethe (Alethe emission threading) ----------------
+
+    /// E2E: an eligible, verified net emits BOTH the exact-rational certificate
+    /// and a non-empty Alethe pair per conjunct, with labels matching the
+    /// certificate one-to-one, and the certification outcome identical to
+    /// [`certify_graph`]'s contract.
+    #[test]
+    fn certify_graph_with_alethe_emits_checkable_pairs() {
+        let g = eligible_graph();
+        // Two conjuncts (finite lower AND upper) so per-conjunct order matters.
+        let spec = VerificationSpec::new(vec![Bound::new(1.0, 2.0)], vec![Bound::new(2.0, 5.0)])
+            .expect("valid spec");
+
+        let out = certify_graph_with_alethe(&g, &spec).expect("runs");
+        assert!(out.certified.eligible, "eligible: {}", out.certified.note);
+        assert!(
+            out.certified.result.is_verified(),
+            "2 <= y <= 5 holds: {:?}",
+            out.certified.result
+        );
+        let json = out
+            .certified
+            .certificate_json
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected certificate; note: {}", out.certified.note));
+
+        let alethe = out
+            .alethe
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected Alethe set; note: {}", out.alethe_note));
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("cert JSON parses");
+        let conjuncts = parsed["conjuncts"].as_array().expect("conjuncts");
+        assert_eq!(
+            alethe.len(),
+            conjuncts.len(),
+            "one Alethe pair per certificate conjunct (whole-or-nothing)"
+        );
+        for (pair, entry) in alethe.iter().zip(conjuncts) {
+            assert_eq!(
+                pair.label,
+                entry["discharged_conjunct"].as_str().unwrap(),
+                "Alethe pair labelled with its certificate conjunct"
+            );
+            // Non-empty, recognisably SMT-LIB / Alethe text for BOTH artifacts.
+            for emission in [&pair.entailment, &pair.farkas] {
+                assert!(
+                    emission.problem.contains("assert"),
+                    "SMT-LIB problem has asserts: {}",
+                    emission.problem
+                );
+                assert!(
+                    emission.proof.contains("la_generic"),
+                    "Alethe proof has the la_generic step: {}",
+                    emission.proof
+                );
+                assert!(
+                    emission.proof.contains("(cl)"),
+                    "Alethe proof derives the empty clause: {}",
+                    emission.proof
+                );
+            }
+        }
+
+        // The certification outcome must match the plain entry point's.
+        let plain = certify_graph(&g, &spec).expect("plain runs");
+        assert_eq!(
+            plain.certificate_json.as_deref(),
+            Some(json.as_str()),
+            "Alethe threading must not perturb the certificate build"
+        );
+    }
+
+    /// NO OVERCLAIM: when no certificate is emitted (ineligible net), no Alethe
+    /// artifact may be returned either.
+    #[test]
+    fn certify_graph_with_alethe_none_without_certificate() {
+        let g = ineligible_graph();
+        let spec = VerificationSpec::new(
+            vec![Bound::new(1.0, 2.0)],
+            vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY)],
+        )
+        .expect("valid spec");
+        let out = certify_graph_with_alethe(&g, &spec).expect("runs");
+        assert!(!out.certified.eligible, "SiLU net ineligible");
+        assert!(out.certified.certificate_json.is_none(), "no certificate");
+        assert!(
+            out.alethe.is_none(),
+            "no certificate -> no Alethe artifact: {}",
+            out.alethe_note
+        );
+    }
+
+    /// NO OVERCLAIM: an eligible net whose verdict is NOT Verified gets neither
+    /// a certificate nor an Alethe artifact.
+    #[test]
+    fn certify_graph_with_alethe_none_when_unverified() {
+        let g = eligible_graph();
+        // y in [5/2, 9/2]; demand y <= 1 (FALSE).
+        let spec = VerificationSpec::new(
+            vec![Bound::new(1.0, 2.0)],
+            vec![Bound::new_allow_infinite(f32::NEG_INFINITY, 1.0)],
+        )
+        .expect("valid spec");
+        let out = certify_graph_with_alethe(&g, &spec).expect("runs");
+        assert!(out.certified.eligible, "still FC-ReLU");
+        assert!(!out.certified.result.is_verified(), "property is false");
+        assert!(out.certified.certificate_json.is_none(), "no certificate");
+        assert!(out.alethe.is_none(), "no Alethe artifact");
+    }
+
+    /// STRICT conjuncts: an ArgmaxMargin certificate's Alethe set covers every
+    /// competitor margin, and is emitted only alongside the (already strictly
+    /// discharged) certificate.
+    #[test]
+    fn certify_graph_with_alethe_covers_strict_argmax() {
+        let g = classifier_strict_1to2();
+        let spec = VerificationSpec::new(
+            vec![Bound::new(1.0, 2.0)],
+            vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY)],
+        )
+        .expect("valid spec")
+        .with_output_constraints(vec![OutputConstraint::ArgmaxMargin { class: 0 }])
+        .expect("valid constraints");
+
+        let out = certify_graph_with_alethe(&g, &spec).expect("runs");
+        assert!(
+            out.certified.result.is_verified(),
+            "strict argmax holds: {:?}",
+            out.certified.result
+        );
+        assert!(
+            out.certified.certificate_json.is_some(),
+            "strict cert emitted; note: {}",
+            out.certified.note
+        );
+        let alethe = out
+            .alethe
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected Alethe set; note: {}", out.alethe_note));
+        assert_eq!(alethe.len(), 1, "one competitor margin (2-class)");
+        assert!(
+            alethe[0].label.contains("constraint[0].margin"),
+            "strict margin conjunct labelled: {}",
+            alethe[0].label
+        );
+        assert!(!alethe[0].entailment.proof.is_empty(), "non-empty proof");
+        assert!(!alethe[0].farkas.proof.is_empty(), "non-empty proof");
+    }
+
+    /// The facade's re-exported Alethe emitters work standalone on a certified
+    /// problem's certificates (the direct, non-threaded path).
+    #[test]
+    fn standalone_alethe_emitters_accept_selfchecked_certificates() {
+        let g = eligible_graph();
+        let spec = VerificationSpec::new(
+            vec![Bound::new(1.0, 2.0)],
+            vec![Bound::new_allow_infinite(0.0, f32::INFINITY)],
+        )
+        .expect("valid spec");
+        let stack = extract_fc_relu_stack(&g).expect("eligible");
+        let margins = margins_for_bounds(spec.output_bounds(), "Y").expect("margins");
+        let problem =
+            build_problem_for_margin(&stack, &[1.0], &[2.0], &margins[0]).expect("build problem");
+        let cert = problem.certify(Rat::ZERO).expect("certify");
+
+        let ent = entailment_to_alethe(&cert.entailment).expect("entailment emits");
+        assert!(ent.problem.contains("set-logic"), "SMT-LIB header present");
+        assert!(ent.proof.contains("la_generic"), "la_generic step present");
+        let far = farkas_to_alethe(&cert.farkas).expect("farkas emits");
+        assert!(far.problem.contains("assert"), "asserts present");
+        assert!(far.proof.contains("(cl)"), "empty clause derived");
+    }
+
+    // ---------------------------------------------------------------------
+    // Deployed-precision policy (fp_margin fold into the strict gate).
+    // ---------------------------------------------------------------------
+
+    /// A 1->2->2 classifier whose argmax margin is real but TINY: y0 =
+    /// (1 + 2^-23)*h, y1 = h with h = relu(x0) in [1, 2], so the exact margin
+    /// lower bound is L = 2^-23 ~= 1.19e-7. That clears `L > 0` comfortably in
+    /// real semantics but sits an order of magnitude BELOW the deployed f32
+    /// rounding error of the two logits, so the deployed comparison could tie
+    /// or invert. `1 + 2^-23` is the float immediately above 1.0, hence an
+    /// exact f32 (and an exact rational lift).
+    fn classifier_hairline_1to2() -> GraphNetwork {
+        let epsilon = f32::EPSILON; // exactly 2^-23: the gap above 1.0
+        assert_eq!(epsilon, 2.0_f32.powi(-23), "hairline epsilon is 2^-23");
+        let mut g = GraphNetwork::new();
+        g.add_node(GraphNode::from_input(
+            "lin1",
+            linear(
+                Array2::from_shape_vec((1, 1), vec![1.0]).unwrap(),
+                vec![0.0],
+            ),
+        ));
+        g.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["lin1".to_string()],
+        ));
+        g.add_node(GraphNode::new(
+            "lin2",
+            linear(
+                Array2::from_shape_vec((2, 1), vec![1.0 + epsilon, 1.0]).unwrap(),
+                vec![0.0, 0.0],
+            ),
+            vec!["relu".to_string()],
+        ));
+        g.set_output("lin2");
+        g
+    }
+
+    fn argmax_spec_over_1_to_2() -> VerificationSpec {
+        VerificationSpec::new(
+            vec![Bound::new(1.0, 2.0)],
+            vec![Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY)],
+        )
+        .expect("valid spec")
+        .with_output_constraints(vec![OutputConstraint::ArgmaxMargin { class: 0 }])
+        .expect("valid constraints")
+    }
+
+    /// BIT-STABILITY PIN: the default policy must not perturb a single byte of
+    /// an emitted certificate, and must not introduce either policy field.
+    /// `certify_graph` and `certify_graph_with_policy(.., default)` are the same
+    /// emitter.
+    #[test]
+    fn default_policy_certificates_are_bit_stable() {
+        let cases: Vec<(GraphNetwork, VerificationSpec)> = vec![
+            (
+                eligible_graph(),
+                VerificationSpec::new(
+                    vec![Bound::new(1.0, 2.0)],
+                    vec![Bound::new_allow_infinite(0.0, f32::INFINITY)],
+                )
+                .expect("valid spec"),
+            ),
+            (classifier_strict_1to2(), argmax_spec_over_1_to_2()),
+        ];
+
+        for (net, spec) in cases {
+            let legacy = certify_graph(&net, &spec).expect("certify_graph runs");
+            let explicit = certify_graph_with_policy(&net, &spec, CertifyPolicy::default())
+                .expect("policy entry runs");
+            let json = legacy
+                .certificate_json
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected a certificate; note: {}", legacy.note));
+
+            assert_eq!(
+                legacy.certificate_json, explicit.certificate_json,
+                "the default policy must emit byte-identical certificate JSON"
+            );
+            assert_eq!(
+                legacy.note, explicit.note,
+                "the default policy must not change the outcome note"
+            );
+            assert_eq!(legacy.eligible, explicit.eligible);
+            assert!(
+                !json.contains("precision_policy"),
+                "default certificates carry no precision_policy field: {json}"
+            );
+            assert!(
+                !json.contains("deployed_precision"),
+                "default certificates carry no deployed_precision field: {json}"
+            );
+            // And the default policy really is RealSemantics.
+            assert!(
+                !CertifyPolicy::default().folds_deployed_fp_margin(),
+                "the deployed fold must be OFF by default"
+            );
+        }
+    }
+
+    /// A comfortable strict margin (L = 1) survives the deployed fold, and the
+    /// discharged conjunct records the folded threshold it cleared.
+    #[test]
+    fn deployed_policy_records_the_folded_threshold_it_cleared() {
+        let g = classifier_strict_1to2(); // margin = h in [1, 2] -> L = 1.
+        let spec = argmax_spec_over_1_to_2();
+
+        let out = certify_graph_with_policy(&g, &spec, CertifyPolicy::deployed_f32())
+            .expect("certify_graph_with_policy runs");
+        let json = out
+            .certificate_json
+            .as_ref()
+            .unwrap_or_else(|| panic!("L = 1 must clear the fp margin; note: {}", out.note));
+        assert!(
+            out.note.contains("deployed-f32"),
+            "the outcome note must state the active policy: {}",
+            out.note
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("certificate parses");
+        assert_eq!(
+            parsed["precision_policy"]["mode"],
+            serde_json::Value::String("deployed-f32".into()),
+            "top-level policy recorded"
+        );
+        let scope = parsed["precision_policy"]["scope"]
+            .as_str()
+            .expect("scope recorded");
+        assert!(
+            scope.contains("strict") && scope.contains("Non-strict"),
+            "the recorded scope must state exactly which conjuncts are covered: {scope}"
+        );
+
+        let conjuncts = parsed["conjuncts"].as_array().expect("conjuncts");
+        assert_eq!(conjuncts.len(), 1, "single competitor margin (2-class)");
+        let c = &conjuncts[0];
+        assert_eq!(c["strict"], serde_json::Value::Bool(true));
+        let deployed = &c["deployed_precision"];
+        assert_eq!(
+            deployed["policy"],
+            serde_json::Value::String("deployed-f32".into())
+        );
+        let fp_margin = deployed["fp_margin"].as_str().expect("fp_margin recorded");
+        assert_eq!(
+            deployed["folded_threshold"].as_str(),
+            Some(fp_margin),
+            "the folded threshold IS the fp margin"
+        );
+
+        // The recorded threshold must be exactly the fold this net's deployed
+        // read-out rows produce, strictly positive, and strictly below the
+        // attested exact lower bound (L = 1 for this net).
+        let stack = extract_fc_relu_stack(&g).expect("eligible");
+        let augmented = augment_for_constraint(&g, &OutputConstraint::ArgmaxMargin { class: 0 })
+            .expect("augment");
+        let (m, _c) = margin_layer_from_augmented(&augmented).expect("margin layer");
+        let mut cache = DeployedErrorCache::new();
+        let expected = deployed_margin_threshold(&stack, &[1.0], &[2.0], &m, 0, "row0", &mut cache)
+            .expect("fold recomputes");
+        assert_eq!(
+            fp_margin,
+            expected.to_clean_string().expect("threshold prints"),
+            "the recorded threshold must be the exact fold, verbatim"
+        );
+        assert!(expected.is_positive(), "the fp margin is strictly positive");
+        assert!(
+            expected < Rat::ONE,
+            "the fp margin must be strictly below L = 1 for this net"
+        );
+        assert_eq!(
+            c["exact_lower_bound"].as_str(),
+            Some("1/1"),
+            "the attested exact lower bound for this net is 1"
+        );
+    }
+
+    /// FAIL-CLOSED: a strict margin that is real but smaller than the deployed
+    /// rounding error is discharged under the default policy and REFUSED under
+    /// the deployed policy — the differential is the whole point of the fold.
+    #[test]
+    fn deployed_policy_refuses_a_margin_below_the_rounding_error() {
+        let g = classifier_hairline_1to2(); // L = 2^-23, delta ~ 8x larger.
+        let spec = argmax_spec_over_1_to_2();
+
+        let real = certify_graph(&g, &spec).expect("certify_graph runs");
+        assert!(
+            real.certificate_json.is_some(),
+            "the real-semantics gate (L > 0) discharges a 2^-23 margin; note: {}",
+            real.note
+        );
+
+        let deployed = certify_graph_with_policy(&g, &spec, CertifyPolicy::deployed_f32())
+            .expect("certify_graph_with_policy runs");
+        assert!(
+            deployed.certificate_json.is_none(),
+            "a margin below the deployed f32 rounding error must NOT be certified: {}",
+            deployed.note
+        );
+        assert!(
+            deployed.note.contains("deployed rounding margin"),
+            "the refusal must name the deployed margin: {}",
+            deployed.note
+        );
+        // The VERDICT is never touched by a certificate refusal.
+        assert_eq!(
+            real.result.is_verified(),
+            deployed.result.is_verified(),
+            "the fold refuses the certificate, never the verdict"
+        );
+        if let VerificationResult::Verified { proof, .. } = &deployed.result {
+            assert!(proof.is_none(), "no proof attached on a refused fold");
+        }
+    }
+
+    /// SCOPE: the fold is a STRICT-gate policy. A property with only non-strict
+    /// (interval) conjuncts emits conjunct entries that are byte-identical to
+    /// the default policy's; only the top-level scope note is added.
+    #[test]
+    fn deployed_policy_leaves_non_strict_conjuncts_untouched() {
+        let g = eligible_graph();
+        let spec = VerificationSpec::new(
+            vec![Bound::new(1.0, 2.0)],
+            vec![Bound::new_allow_infinite(0.0, f32::INFINITY)],
+        )
+        .expect("valid spec");
+
+        let default_json = certify_graph(&g, &spec)
+            .expect("certify_graph runs")
+            .certificate_json
+            .expect("certificate emitted");
+        let deployed_json = certify_graph_with_policy(&g, &spec, CertifyPolicy::deployed_f32())
+            .expect("policy entry runs")
+            .certificate_json
+            .expect("certificate emitted");
+
+        let default_parsed: serde_json::Value = serde_json::from_str(&default_json).unwrap();
+        let deployed_parsed: serde_json::Value = serde_json::from_str(&deployed_json).unwrap();
+        assert_eq!(
+            default_parsed["conjuncts"], deployed_parsed["conjuncts"],
+            "non-strict conjuncts must be identical under both policies"
+        );
+        assert!(
+            default_parsed.get("precision_policy").is_none(),
+            "no policy object under the default policy"
+        );
+        assert!(
+            deployed_parsed.get("precision_policy").is_some(),
+            "the active policy is recorded even when it changes no conjunct"
+        );
+    }
+
+    /// The folded threshold is the sum of the DEPLOYED read-out rows' errors,
+    /// NOT the error of the fused margin row — and the fused row's error is
+    /// strictly smaller, which is exactly why folding on it would understate
+    /// the deployed error of a network that rounds each logit before comparing.
+    #[test]
+    fn folded_threshold_sums_deployed_row_errors_not_the_fused_row() {
+        let g = classifier_strict_1to2(); // y0 = 2h, y1 = h.
+        let stack = extract_fc_relu_stack(&g).expect("eligible");
+        let augmented = augment_for_constraint(&g, &OutputConstraint::ArgmaxMargin { class: 0 })
+            .expect("augment");
+        let (m, c) = margin_layer_from_augmented(&augmented).expect("margin layer");
+        let lo = vec![1.0f32];
+        let hi = vec![2.0f32];
+
+        let mut cache = DeployedErrorCache::new();
+        let threshold =
+            deployed_margin_threshold(&stack, &lo, &hi, &m, 0, "row0", &mut cache).expect("fold");
+
+        // Independent hand-built deployed read-out rows: y0 = 2*h and y1 = 1*h
+        // over the SAME hidden stack (w = 1, b = 0) and box.
+        let deployed_row = |w: Rat| DeepReluProblem {
+            weights: vec![vec![vec![Rat::ONE]]],
+            biases: vec![vec![Rat::ZERO]],
+            out_weight: vec![w],
+            out_bias: Rat::ZERO,
+            input_lower: vec![Rat::from_int(1)],
+            input_upper: vec![Rat::from_int(2)],
+            alpha: None,
+            interm_round: false,
+        };
+        let e0 = deployed_fp_output_margin(&deployed_row(Rat::from_int(2))).expect("e0");
+        let e1 = deployed_fp_output_margin(&deployed_row(Rat::ONE)).expect("e1");
+        let expected = e0.add(e1).expect("e0 + e1");
+        assert_eq!(
+            threshold, expected,
+            "the folded threshold must be |M[k][0]|*e0 + |M[k][1]|*e1 exactly"
+        );
+
+        // The FUSED margin row (out_weight = 2 - 1 = 1) has a strictly smaller
+        // error bound — the underestimate the per-row fold deliberately avoids.
+        let fused = build_problem_for_margin_net_row(&stack, &lo, &hi, &m, &c, 0, "fused")
+            .expect("fused margin problem");
+        let fused_error = deployed_fp_output_margin(&fused).expect("fused row error");
+        assert!(
+            fused_error < threshold,
+            "folding on the fused margin row would understate the deployed error"
+        );
+
+        // And the cache really memoizes: two outputs, two entries.
+        assert_eq!(cache.len(), 2, "one cached error per deployed read-out row");
+    }
+
+    /// The Alethe surface composes with the policy: a strict conjunct that
+    /// cleared the deployed fold still emits a checkable pair.
+    #[test]
+    fn alethe_entry_composes_with_the_deployed_policy() {
+        let out = certify_graph_with_alethe_and_policy(
+            &classifier_strict_1to2(),
+            &argmax_spec_over_1_to_2(),
+            CertifyPolicy::deployed_f32(),
+        )
+        .expect("alethe policy entry runs");
+        let json = out
+            .certified
+            .certificate_json
+            .as_ref()
+            .expect("certificate emitted under the deployed policy");
+        assert!(json.contains("deployed_precision"), "fold recorded");
+        let alethe = out
+            .alethe
+            .as_ref()
+            .unwrap_or_else(|| panic!("expected Alethe pairs; note: {}", out.alethe_note));
+        assert_eq!(alethe.len(), 1, "one pair per certificate conjunct");
+        assert!(!alethe[0].entailment.proof.is_empty());
     }
 }

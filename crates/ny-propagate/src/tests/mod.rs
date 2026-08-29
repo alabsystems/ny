@@ -409,3 +409,164 @@ pub fn assert_relaxation_sound<F>(
         );
     }
 }
+
+/// Assert that a `LinearRelaxation` is sound for `f_ref` at every sampled `x`,
+/// in **f64**, with **ZERO tolerance**.
+///
+/// The companion to [`assert_relaxation_sound`], for the two blind spots that
+/// helper has by construction.
+///
+/// # Blind spot 1: the comparison itself is in f32
+///
+/// `assert_relaxation_sound` is typed `F: Fn(f32) -> f32`. Every one of its 38
+/// call sites therefore compares an f32 bound against an **f32 evaluator**, in
+/// f32 arithmetic — `selu_eval`, `libm::erff`, `f32::tanh`, `gelu_eval`. The
+/// tolerance is absorbing the *test's own* rounding, so it is not a knob that
+/// can be tightened: shrinking it manufactures false alarms rather than
+/// detections. Re-derived against this tree, not quoted: 34 sites pass `1e-4`,
+/// one passes `2.0e-6`, one forwards a `tol` whose callers pass `1e-5 .. 1e-1`,
+/// and the two `0.0` sites (`gelu/heuristic_relax_tests.rs:61` and `:259`) pass
+/// `|x| gelu_eval(x, approx)` — the f32 evaluator — so they pin f32
+/// self-consistency, not the certified real-arithmetic bound.
+///
+/// # Blind spot 2: a uniform grid over a finite `[l, u]`
+///
+/// `assert_relaxation_sound` walks 201 points of `[l, u]`, so it never reaches a
+/// CONSTANT/SATURATING branch — those require an infinite endpoint — nor the
+/// deep tail where a saturation constant is the binding bound.
+///
+/// Both blind spots were live at once. SELU's saturation intercept certified
+/// `SELU(x) >= -1.7580993175506592` — the f32 round-to-nearest product
+/// `-(LAMBDA * ALPHA)`, which sits `2.879e-8` ABOVE the true infimum
+/// `-1.7580993463430303` and is therefore false for every `x < -17.93`
+/// (fixed in 64f39e061). That is 3_500x under the common tolerance and 70x
+/// under the tightest, on a branch no grid could enter.
+///
+/// # Why ZERO tolerance is sound here — and what it actually rests on
+///
+/// NOT on the coefficients carrying a rounding cushion. Several of the branches
+/// this helper exists to cover carry no cushion at all:
+///
+/// * `elu_family_linear_relaxation`'s purely-positive branch publishes
+///   `(positive_slope_f32, 0, positive_slope_f32, 0)`, so BOTH bounds evaluate
+///   to `f64::from(LAMBDA) * x` — which is exactly what `selu_f64_reference`
+///   computes. The check passes by bit-identical equality; the margin is 0.
+/// * `next_down_f32((intercept as f32) - slope_err)` (elu_family.rs) does not
+///   ADD a cushion — the `next_down` CANCELS the two preceding round-to-nearest
+///   steps. With `A = f32(intercept) = intercept + e_i`,
+///   `B = f32(A - slope_err) = A - slope_err + e_s`, `|e_i|, |e_s| <= ulp/2`,
+///   and `li = next_down(B) = B - ulp`:
+///
+///   ```text
+///   lower(x) - tangent(x) = -d*x - slope_err + e_i + e_s - ulp
+///   ```
+///
+///   The `next_up_f32` applied to the error term makes
+///   `slope_err > |d| * max|x| >= |d*x|` strictly, so the first two terms are
+///   negative and the rest is `<= ulp/2 + ulp/2 - ulp = 0`. The guaranteed
+///   cushion is `> 0`, NOT `>= ulp/2`. (One corner this argument does not
+///   cover: if `B` lands exactly on a power of two, `next_down` steps by only
+///   `ulp/2` of the binade below. Not observed, but do not claim `>= ulp/2` as
+///   a theorem.)
+///
+/// What it DOES rest on: `f_ref` must be **the same f64 expression, built from
+/// the same f32 constants**, that the relaxation was derived from. Where a
+/// tangent or a chord endpoint TOUCHES the function the two then agree
+/// bit-for-bit and the difference is exactly `0` — not `1e-16`. An
+/// *independent* f64 reference carries its own relative error, and zero
+/// tolerance would then produce FALSE ALARMS at every touching point.
+///
+/// Concretely: `selu_f64_reference` must keep using `SeluLayer::LAMBDA as f64`
+/// (`1.0507010221481323`). "Improving" it to the textbook SELU lambda
+/// `1.0507009873554805` makes the purely-positive LOWER bound
+/// `f64::from(LAMBDA) * x` sit `3.5e-8 * x` above the reference for every
+/// `x > 0` — a spurious failure. **Reuse the in-tree f64 evaluators; do not
+/// re-derive them.**
+///
+/// # Non-goal
+///
+/// This does not assert NON-VACUITY. `(0, -inf, 0, +inf)` passes every sample.
+/// Rejecting a degenerate relaxation is the caller's job, because only the
+/// caller knows which branch it is pinning — so every call site should assert
+/// the coefficient shape it depends on before calling this.
+#[allow(dead_code)]
+pub fn assert_relaxation_sound_exact<F>(
+    l: f32,
+    u: f32,
+    relaxation: LinearRelaxation,
+    f_ref: F,
+    samples: &[f64],
+    label: &str,
+) where
+    F: Fn(f64) -> f64,
+{
+    let LinearRelaxation {
+        lower_slope: ls,
+        lower_intercept: li,
+        upper_slope: us,
+        upper_intercept: ui,
+    } = relaxation;
+
+    // Fail closed on a vacuous call: a check with nothing to check is VOID, not
+    // a pass — the same trap as `cargo test <filter>` matching nothing.
+    assert!(
+        !samples.is_empty(),
+        "{label}: no samples — a check with nothing to check is VOID, not a pass"
+    );
+    // A NaN coefficient makes every comparison below false-by-NaN-ordering, so
+    // it would fail anyway — but with a message pointing at the wrong thing.
+    assert!(
+        !ls.is_nan() && !li.is_nan() && !us.is_nan() && !ui.is_nan(),
+        "{label}: NaN coefficient (ls={ls}, li={li}, us={us}, ui={ui}) — the \
+         comparisons below would be decided by NaN ordering, not by soundness"
+    );
+
+    let l64 = f64::from(l);
+    let u64 = f64::from(u);
+
+    for &x in samples {
+        // `0.0 * inf` is NaN, which would silently void the comparison.
+        assert!(
+            x.is_finite(),
+            "{label} @ x={x}: samples must be finite (`0.0 * inf` is NaN, and a \
+             NaN comparison voids the check)"
+        );
+        // A sample outside [l, u] is a TEST bug, not a soundness failure: the
+        // relaxation certifies nothing there. Name which one, so the two cannot
+        // be confused — sampling the SiLU minimum against [-inf, -5.0] reads as
+        // a 0.245 "violation" and is pure artifact.
+        assert!(
+            l64 <= x && x <= u64,
+            "{label} @ x={x}: sample is OUTSIDE [{l}, {u}] — the relaxation \
+             certifies nothing there; fix the sample, not the bound"
+        );
+
+        let y = f_ref(x);
+        assert!(
+            y.is_finite(),
+            "{label} @ x={x}: reference f(x)={y} is not finite — the sample is \
+             outside the modelled domain, so the comparison is meaningless"
+        );
+
+        let lower = f64::from(ls) * x + f64::from(li);
+        let upper = f64::from(us) * x + f64::from(ui);
+
+        assert!(
+            lower <= upper,
+            "{label} @ x={x}: lower={lower:.17e} exceeds upper={upper:.17e} — \
+             the relaxation is inverted"
+        );
+        assert!(
+            lower <= y,
+            "{label} @ x={x}: lower={lower:.17e} EXCEEDS f(x)={y:.17e} \
+             (violation={:.6e}) — this certifies a bound the function goes BELOW",
+            lower - y,
+        );
+        assert!(
+            upper >= y,
+            "{label} @ x={x}: upper={upper:.17e} is BELOW f(x)={y:.17e} \
+             (violation={:.6e}) — this certifies a bound the function goes ABOVE",
+            y - upper,
+        );
+    }
+}

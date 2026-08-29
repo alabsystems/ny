@@ -58,10 +58,12 @@ const MO_GPU_SINGLE_PASS_CHUNK: usize = 8;
 /// `NY_MO_GPU_CHUNK_DEADLINE=1` (exact) lets `NY_MO_GPU_CHUNK` raise the wide
 /// batch width even under an authoritative deadline. Default OFF keeps every
 /// scored run byte-identical; see the use site for the granularity trade.
+/// DELIVERY SEAM (#lever-reachability): the env name still wins in BOTH
+/// directions where present; absent, the typed `bab.mo_gpu_chunk_deadline` key
+/// decides. Default OFF either way, so a build that sets no key is
+/// byte-identical.
 fn deadline_chunk_override_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::wide_lane::MO_GPU_CHUNK_DEADLINE)
-        .value
-        .as_bool()
+    crate::preset_gates::mo_gpu_chunk_deadline_enabled()
 }
 const MO_GPU_AUTHORITY_RESERVE: Duration = Duration::from_secs(5);
 
@@ -1242,41 +1244,65 @@ impl BetaCrownVerifier {
         // strictly-authorized scalar lower certificate; incomplete child
         // covers or per-domain misses fall back to `select_graph_branch_multi`
         // below. Both gates off ⇒ empty map ⇒ byte-identical to today.
-        let kfsb_precomputed: std::sync::Mutex<
-            std::collections::HashMap<usize, super::kfsb_multi::KfsbMultiChildren>,
-        > = std::sync::Mutex::new(
-            maybe_run_unbounded_advisory(
-                bounded_shared_lane,
-                self.kfsb_multi_wave_enabled_at_round(bab_round),
-                || {
-                    // #phase-telemetry: inside the closure so a skipped wave
-                    // (bounded lane, or the gate off at this round) prints
-                    // nothing at all — a zero-duration line would be
-                    // indistinguishable from an instant wave.
-                    let __t_kfsb_wave =
-                        crate::phase_telemetry::phase_telemetry_enabled().then(Instant::now);
-                    let committed = self.select_graph_branch_kfsb_multi_batched(
-                        bab_round,
-                        graph,
-                        &domains_with_unstable,
-                        relu_nodes,
-                        objectives,
-                        thresholds,
-                        engine,
+        let kfsb_policy = self.kfsb_multi_wave_policy_at_round(bab_round);
+        let mut kfsb_reduce_policy = kfsb_policy
+            .configured_reduce_op
+            .zip(kfsb_policy.effective_reduce_op);
+        let kfsb_precomputed_result =
+            maybe_run_unbounded_advisory(bounded_shared_lane, kfsb_policy.wave_enabled, || {
+                // #phase-telemetry: inside the closure so a skipped wave
+                // (bounded lane, or the gate off at this round) prints
+                // nothing at all — a zero-duration line would be
+                // indistinguishable from an instant wave.
+                let __t_kfsb_wave =
+                    crate::phase_telemetry::phase_telemetry_enabled().then(Instant::now);
+                let (_, effective_reduce_op) = *kfsb_reduce_policy
+                    .get_or_insert_with(|| self.kfsb_multi_reduce_policy_for_receipt());
+                let committed = self.select_graph_branch_kfsb_multi_batched_with_policy(
+                    bab_round,
+                    kfsb_policy.effective_candidates,
+                    effective_reduce_op,
+                    graph,
+                    &domains_with_unstable,
+                    relu_nodes,
+                    objectives,
+                    thresholds,
+                    engine,
+                );
+                if let Some(t) = __t_kfsb_wave {
+                    eprintln!(
+                        "[phase] mo-kfsb-wave domains={} committed={} secs={:.2}",
+                        domains_with_unstable.len(),
+                        committed.len(),
+                        t.elapsed().as_secs_f64(),
                     );
-                    if let Some(t) = __t_kfsb_wave {
-                        eprintln!(
-                            "[phase] mo-kfsb-wave domains={} committed={} secs={:.2}",
-                            domains_with_unstable.len(),
-                            committed.len(),
-                            t.elapsed().as_secs_f64(),
-                        );
-                    }
-                    committed
-                },
-            )
-            .unwrap_or_default(),
-        );
+                }
+                committed
+            });
+        // A returned selector map is about to be consumed by child creation,
+        // so an active observation run must retain its primitive counts now.
+        // The selector-OFF branch performs no telemetry check or construction
+        // here: its receipt is built only after every ordinary deadline poll.
+        let (kfsb_precomputed, kfsb_selector_primitive, kfsb_selector_ran) =
+            match kfsb_precomputed_result {
+                Some(committed) => {
+                    let primitive = crate::execution_telemetry::observation_recording_active()
+                        .then(|| {
+                            let committed_parents = committed.len();
+                            let committed_leaves =
+                                committed.values().try_fold(0usize, |total, children| {
+                                    total.checked_add(children.len())
+                                });
+                            (committed_parents, committed_leaves)
+                        });
+                    (std::sync::Mutex::new(committed), primitive, true)
+                }
+                None => (
+                    std::sync::Mutex::new(std::collections::HashMap::new()),
+                    None,
+                    false,
+                ),
+            };
 
         // Branch-selection and child-construction failures preserve whether
         // the cause was numerical or the authoritative deadline (#2143).
@@ -1429,7 +1455,6 @@ impl BetaCrownVerifier {
                 t.elapsed().as_secs_f64(),
             );
         }
-
         // Handle branch selection failures explicitly (#2143).
         let mut branch_selection_failures: std::collections::HashSet<usize> =
             std::collections::HashSet::new();
@@ -1643,6 +1668,7 @@ impl BetaCrownVerifier {
                     &mut beta_state,
                     &targets,
                     false, // conjunctive: batched path always uses disjunctive mode (#3334 closed)
+                    true,  // relu_split_route: THE per-child relu-split disjunctive eval
                     &pruned_cached_las,
                     true,
                 )
@@ -1658,6 +1684,52 @@ impl BetaCrownVerifier {
                     true,
                 )
             };
+            // #beta-plumb-test (NY_BAB_BETA_PLUMB_TEST=1): the decisive
+            // end-to-end check of the beta term's plumbing on this lane —
+            // recompute the SAME child with every beta entry hand-set to 0.5
+            // and print both bounds. If the bound does not move, the beta
+            // term never reaches the bound computation (wiring bug); if it
+            // moves, the optimizer's gradients are the defect. Diagnostics
+            // only: the probe result is discarded.
+            {
+                static PLUMB_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                static PLUMB_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                if *PLUMB_ON.get_or_init(|| {
+                    std::env::var("NY_BAB_BETA_PLUMB_TEST").ok().as_deref() == Some("1")
+                }) && !beta_state.entries.is_empty()
+                    && PLUMB_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8
+                {
+                    let mut plumb_beta = beta_state.clone();
+                    for entry in plumb_beta.entries.iter_mut() {
+                        entry.set_value(0.5);
+                    }
+                    let plumb = self.propagate_multi_objective_with_beta_and_cache(
+                        graph,
+                        child.input_bounds.as_ref(),
+                        &context,
+                        &plumb_beta,
+                        &targets,
+                        &pruned_cached_las,
+                        true,
+                    );
+                    let base_min = result.as_ref().ok().map(|(b, _, _)| {
+                        b.iter()
+                            .map(|&(l, _)| f64::from(l))
+                            .fold(f64::INFINITY, f64::min)
+                    });
+                    let plumb_min = plumb.as_ref().ok().map(|(b, _, _)| {
+                        b.iter()
+                            .map(|&(l, _)| f64::from(l))
+                            .fold(f64::INFINITY, f64::min)
+                    });
+                    eprintln!(
+                        "[beta-plumb] depth={} constraints={} base_min={base_min:?} beta0.5_min={plumb_min:?}",
+                        child.depth,
+                        plumb_beta.entries.len(),
+                    );
+                }
+            }
             match result {
                 Ok((active_bounds, node_cache, active_cached_las)) => {
                     if bounded_shared_lane {
@@ -2162,16 +2234,57 @@ impl BetaCrownVerifier {
                     };
                     let obj_bounds = if bounded_shared_lane {
                         inherit_bounded_child_bounds(&child.objective_bounds, obj_bounds)
-                    } else if gpu_single_pass_lane {
-                        tighten_child_bounds_with_parent(&child.objective_bounds, obj_bounds)
                     } else {
-                        obj_bounds
+                        // #bab-warm-start, joint-lane monotone inheritance
+                        // (2026-08-22): the plain CPU arm installed the raw
+                        // recompute, and the recompute LOSES ancestor gains —
+                        // [mchild-trace] on `mnist_fc 256x4` shows depth-1
+                        // children at -8.2 (root -21.8) collapsing back to
+                        // -22..-23 by depth 13+, so no domain ever closed.
+                        // `tighten_child_bounds_with_parent` is the shipped
+                        // subset-containment guard the GPU single-pass lane
+                        // already uses (never inverts; proof at
+                        // multi_objective/shared.rs) — a child's feasible
+                        // region is a subset of its parent's, so the parent's
+                        // sound lower bound floors the child on every
+                        // objective row.
+                        tighten_child_bounds_with_parent(&child.objective_bounds, obj_bounds)
                     };
                     // Keep continuation state staged until objective bounds
                     // validate. A failed publication must leave the inherited
                     // child unchanged, especially before the f64 retry.
                     let mut continuation_state =
                         Some((node_cache, beta_state, alpha_state, state_provenance));
+                    // #bab-warm-start trace, joint multi-objective twin
+                    // (NY_BAB_CHILD_TRACE=1): sampled per-child objective
+                    // bounds vs depth on the ACTUAL joint-lane install site
+                    // (the 2026-08-22 doc entry mis-attributed this lane
+                    // because only the single/relu_split sites were probed).
+                    {
+                        static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        static COUNT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if *TRACE_ON.get_or_init(|| {
+                            std::env::var("NY_BAB_CHILD_TRACE").ok().as_deref() == Some("1")
+                        }) {
+                            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if n.is_multiple_of(197) {
+                                let min_l = obj_bounds
+                                    .iter()
+                                    .map(|&(l, _)| f64::from(l))
+                                    .fold(f64::INFINITY, f64::min);
+                                let max_l = obj_bounds
+                                    .iter()
+                                    .map(|&(l, _)| f64::from(l))
+                                    .fold(f64::NEG_INFINITY, f64::max);
+                                eprintln!(
+                                    "[mchild-trace] depth={} objs={} min_lower={min_l:.4} max_lower={max_l:.4}",
+                                    child.depth,
+                                    obj_bounds.len(),
+                                );
+                            }
+                        }
+                    }
                     let mut bounds_ok = child.update_bounds(obj_bounds, thresholds, false).is_ok();
                     if !bounds_ok && !bounded_shared_lane {
                         // Publication validation failure (non-finite, inverted,
@@ -2561,7 +2674,49 @@ impl BetaCrownVerifier {
                 })
             })
             .collect();
-        publish_bounded_wave_results(bounded_shared_lane, engine, results)
+        let published_results = publish_bounded_wave_results(bounded_shared_lane, engine, results);
+
+        // Close the execution receipt only after the final bounded-wave
+        // publication barrier. Child evaluation and publication both contain
+        // authoritative deadline polls, so recording earlier could perturb an
+        // ordinary selector-OFF wave's outcome. The OFF branch also defers its
+        // first telemetry-active check until this point.
+        let kfsb_execution_primitive = if kfsb_selector_ran {
+            kfsb_selector_primitive.map(|(parents, leaves)| (true, parents, leaves))
+        } else {
+            crate::execution_telemetry::observation_recording_active().then_some((
+                false,
+                0,
+                Some(0),
+            ))
+        };
+        if let Some((selector_ran, committed_parents, committed_leaves)) = kfsb_execution_primitive
+        {
+            let (configured_reduce_op, effective_reduce_op) =
+                kfsb_reduce_policy.unwrap_or_else(|| self.kfsb_multi_reduce_policy_for_receipt());
+            crate::execution_telemetry::record_mo_kfsb_invocation(
+                crate::execution_telemetry::MoKfsbInvocation {
+                    canonical_master: kfsb_policy.canonical_master,
+                    legacy_childsim: kfsb_policy.legacy_childsim,
+                    configured_master: kfsb_policy.configured_master,
+                    configured_candidates: kfsb_policy.configured_candidates,
+                    effective_candidates: kfsb_policy.effective_candidates,
+                    configured_reduce_op: configured_reduce_op.into(),
+                    effective_reduce_op: effective_reduce_op.into(),
+                    heuristic_eligible: kfsb_policy.heuristic_eligible,
+                    typed_select: kfsb_policy.typed_select,
+                    lower_master: kfsb_policy.lower_master,
+                    effective_master: kfsb_policy.effective_master,
+                    bounded_shared_lane,
+                    offered_domains: domains_with_unstable.len(),
+                    selector_ran,
+                    committed_parents,
+                    committed_leaves,
+                },
+            );
+        }
+
+        published_results
     }
 }
 

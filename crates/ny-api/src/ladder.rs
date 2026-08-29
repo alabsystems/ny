@@ -71,11 +71,27 @@ pub struct LadderConfig {
     /// Only has an effect when the crate is built with `feature = "complete"`.
     /// When the feature is off this flag is accepted but ignored (the MIP rung
     /// gracefully degrades to a no-op).
+    ///
+    /// # This flag can make [`verify_model`] fail
+    ///
+    /// The exported MIP encoder covers only a sequential `Linear (ReLU Linear)*`
+    /// chain. Asking for the complete terminal on a graph outside that fragment
+    /// is a request the driver cannot honour, and it REFUSES with
+    /// [`NyError::UnsupportedOp`] rather than recording a rung it never ran.
+    /// Leave this `false` (the default) for callers that want the propagation
+    /// verdict regardless of topology.
     pub use_complete: bool,
     /// Optional per-rung timeout in milliseconds.
     ///
     /// When set, it is applied to the spec used for each rung (overriding the
     /// spec's own timeout) so no single method can stall the ladder.
+    ///
+    /// It also becomes the per-solve wall-clock budget of the complete MIP
+    /// terminal: it is the only time preference the caller expresses, so the
+    /// terminal honours it rather than silently running to `ny-mip`'s much
+    /// larger default. Callers that need a MIP-specific budget should drive
+    /// [`crate::complete::verify_graph_complete_mip`] directly with their own
+    /// [`CompleteMipOptions`](crate::complete::CompleteMipOptions).
     pub timeout_ms: Option<u64>,
 }
 
@@ -425,58 +441,107 @@ fn fallback_is_tighter(candidate: Option<f32>, current: Option<f32>) -> bool {
 
 /// Run the complete MIP terminal.
 ///
-/// When built with `feature = "complete"`, this attempts a complete MIP-backed
-/// verdict via `ny_mip`. The current realization is conservative: it only claims
-/// a decisive verdict it can soundly back, and otherwise records an `Unknown`
-/// rung rather than overclaiming. When the feature is off it is a no-op
-/// (returns `Ok(None)`), so default `propagate` builds compile and behave
-/// identically.
+/// When built with `feature = "complete"` this performs a REAL complete MIP
+/// verification of `net` against `spec` via
+/// [`crate::complete::verify_graph_complete_mip`]: the graph is reduced to the
+/// sequential `Linear (ReLU Linear)*` fragment the exported encoder accepts, its
+/// hidden pre-activation boxes are taken from ny's sound node-bound collection
+/// and inflated outward, and every finite output-bound side is refuted as a
+/// separate MIP feasibility question.
+///
+/// It has exactly two outcomes:
+///
+/// * a rung backed by an actual solve — `Verified` when every negated-property
+///   disjunct was proven infeasible, otherwise `Unknown` carrying the solver's
+///   own reason; or
+/// * a LOUD REFUSAL: `Err(NyError::UnsupportedOp)` naming the node that put the
+///   graph outside the encodable fragment. It never records a `Mip` rung it did
+///   not actually run — a verdict-shaped non-answer is indistinguishable from a
+///   real result to a downstream consumer, and that is the worst failure this
+///   driver can produce.
+///
+/// A `Sat` disjunct is deliberately NOT reported as `Violated`; see the
+/// soundness contract on [`crate::complete`].
+///
+/// When the feature is off this is a no-op (returns `Ok(None)`), so default
+/// `propagate` builds compile and behave identically.
 #[cfg(feature = "complete")]
 fn run_complete_terminal(
     net: &GraphNetwork,
     spec: &VerificationSpec,
     _cfg: &LadderConfig,
 ) -> Result<Option<(VerificationResult, MethodUsed, RungOutcome)>> {
+    use crate::complete::{CompleteMipOptions, MipConfig};
     use ny_core::UnknownReason;
 
-    // The complete MIP encoder (`ny_mip::encode_feedforward`) operates on a
-    // sequential FC+ReLU network. If this graph cannot be reduced to that form,
-    // the MIP terminal cannot soundly run, so we record an honest Unknown rather
-    // than fabricating a verdict.
-    //
-    // Reference the curated complete surface so the dependency is exercised under
-    // `--features full`; a full graph->MIP lowering is tracked as future work.
-    let _ = (
-        std::any::type_name::<crate::complete::MipSolver>(),
-        std::any::type_name::<crate::complete::MipConfig>(),
-    );
+    let mut options = CompleteMipOptions::default();
+    // `rung_spec` has already folded `LadderConfig::timeout_ms` into the spec,
+    // so this is the caller's own budget when they expressed one.
+    if let Some(ms) = spec.timeout_ms() {
+        options.mip = MipConfig {
+            timeout_secs: (ms as f64) / 1000.0,
+            ..options.mip
+        };
+    }
 
-    let best_bounds: Vec<Bound> = spec
+    // Propagates the loud refusal for a graph outside the encodable fragment.
+    let report = crate::complete::verify_graph_complete_mip(net, spec, &options)?;
+
+    if report.verified {
+        let output_bounds = spec.output_bounds().to_vec();
+        let note = format!(
+            "complete MIP terminal: all {} negated-property disjunct(s) proven infeasible{}",
+            report.disjuncts,
+            if report.certified {
+                " (exact certificate evidence verified)"
+            } else {
+                ""
+            }
+        );
+        let result = VerificationResult::Verified {
+            provenance: SoundnessProvenance::sound(),
+            output_bounds: output_bounds.clone(),
+            proof: None,
+            actual_method: Some(MethodUsed::Mip),
+        };
+        let outcome = RungOutcome {
+            method: MethodUsed::Mip,
+            verified: true,
+            max_width: max_bound_width(&output_bounds),
+            note,
+        };
+        return Ok(Some((result, MethodUsed::Mip, outcome)));
+    }
+
+    let reason = report
+        .inconclusive
+        .unwrap_or_else(|| "complete MIP terminal reached no decision".to_string());
+    let message = format!(
+        "complete MIP terminal: {} of {} disjunct(s) refuted; {reason}",
+        report.disjuncts_refuted, report.disjuncts
+    );
+    // The terminal proved nothing, so it contributes no bounds of its own. The
+    // vacuous box keeps it out of the ladder's tightest-fallback selection.
+    let bounds: Vec<Bound> = spec
         .output_bounds()
         .iter()
         .map(|_| Bound::new_allow_infinite(f32::NEG_INFINITY, f32::INFINITY))
         .collect();
-    let _ = net;
-
     let result = VerificationResult::Unknown {
         provenance: SoundnessProvenance::sound(),
-        bounds: best_bounds.clone(),
+        bounds: bounds.clone(),
         reason: UnknownReason::Other {
-            message: "complete MIP terminal reached but graph is not reducible to a \
-                      sequential FC+ReLU network; sound MIP encoding unavailable"
-                .to_string(),
+            message: message.clone(),
         },
-        actual_method: Some(MethodUsed::MipHiGHS),
+        actual_method: Some(MethodUsed::Mip),
     };
     let outcome = RungOutcome {
-        method: MethodUsed::MipHiGHS,
+        method: MethodUsed::Mip,
         verified: false,
-        max_width: max_bound_width(&best_bounds),
-        note: "complete MIP terminal: graph not reducible to sequential FC+ReLU; \
-               returned Unknown (sound)"
-            .to_string(),
+        max_width: max_bound_width(&bounds),
+        note: message,
     };
-    Ok(Some((result, MethodUsed::MipHiGHS, outcome)))
+    Ok(Some((result, MethodUsed::Mip, outcome)))
 }
 
 /// No-op complete terminal for builds without `feature = "complete"`.
@@ -757,5 +822,286 @@ mod tests {
             PropagationMethod::Crown,
             PropagationMethod::AlphaCrown
         ));
+    }
+}
+
+/// The complete MIP terminal has exactly two honest outcomes: a rung backed by a
+/// real solve, or a loud refusal. These tests pin both, and pin that it never
+/// records a `Mip` rung it did not run.
+#[cfg(all(test, feature = "complete"))]
+mod complete_terminal_tests {
+    use super::*;
+    use crate::graph::{GraphNetwork, GraphNode};
+    use crate::layers::{AddLayer, Layer, LinearLayer, ReLULayer};
+    use ndarray::{Array1, Array2};
+    use ny_core::{Bound, NyError, VerificationSpec};
+
+    fn linear(weight: Vec<f32>, rows: usize, cols: usize, bias: Vec<f32>) -> LinearLayer {
+        LinearLayer::new(
+            Array2::from_shape_vec((rows, cols), weight).expect("weight shape"),
+            Some(Array1::from_vec(bias)),
+        )
+        .expect("valid linear layer")
+    }
+
+    /// `Linear -> ReLU -> Linear -> ReLU -> Linear` computing
+    /// `relu(|x| - 0.5) - relu(|x| - 0.5)`, i.e. exactly `0` on every input.
+    ///
+    /// Both second-layer neurons carry the SAME pre-activation, so per-neuron
+    /// CROWN relaxes them independently and cannot see the cancellation: every
+    /// propagation rung stops at roughly `[-0.5, 0.5]` (asserted below). The MIP
+    /// encoding ties them with an equality row and closes the gap, so this graph
+    /// separates a REAL terminal from a stub that returns a non-answer.
+    fn cancelling_chain() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "l1",
+            Layer::Linear(linear(vec![1.0, -1.0], 2, 1, vec![0.0, 0.0])),
+        ));
+        graph.add_node(GraphNode::new(
+            "r1",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["l1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "l2",
+            Layer::Linear(linear(vec![1.0, 1.0, 1.0, 1.0], 2, 2, vec![-0.5, -0.5])),
+            vec!["r1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "r2",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["l2".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "l3",
+            Layer::Linear(linear(vec![1.0, -1.0], 1, 2, vec![0.0])),
+            vec!["r2".to_string()],
+        ));
+        graph.set_output("l3");
+        graph
+    }
+
+    /// A residual `Add` join — a two-input node, outside the fragment the
+    /// exported MIP encoder covers.
+    fn residual_graph() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input(
+            "l1",
+            Layer::Linear(linear(vec![1.0, -1.0], 2, 1, vec![0.0, 0.0])),
+        ));
+        graph.add_node(GraphNode::new(
+            "r1",
+            Layer::ReLU(ReLULayer::new()),
+            vec!["l1".to_string()],
+        ));
+        graph.add_node(GraphNode::binary(
+            "add",
+            Layer::Add(AddLayer),
+            "l1".to_string(),
+            "r1".to_string(),
+        ));
+        graph.set_output("add");
+        graph
+    }
+
+    /// Force every propagation rung to be attempted and to fail.
+    fn escalate_to_terminal(use_complete: bool) -> LadderConfig {
+        LadderConfig {
+            max_method: PropagationMethod::BetaCrown,
+            escalation_width_threshold: 0.0,
+            use_complete,
+            timeout_ms: Some(30_000),
+        }
+    }
+
+    /// Precondition of the terminal tests: no propagation rung can prove this.
+    #[test]
+    fn no_propagation_rung_proves_the_cancelling_chain() {
+        let graph = cancelling_chain();
+        let spec =
+            VerificationSpec::new(vec![Bound::new(-1.0, 1.0)], vec![Bound::new(-0.01, 0.01)])
+                .expect("valid spec");
+
+        let outcome = verify_model(&graph, &spec, &escalate_to_terminal(false))
+            .expect("the propagation ladder runs");
+        assert!(
+            !outcome.result.is_verified(),
+            "precondition broken: propagation now proves this, so the terminal test below would \
+             no longer exercise the MIP rung"
+        );
+        assert_eq!(
+            outcome.rungs.len(),
+            4,
+            "all four propagation rungs must run: {:?}",
+            outcome.rungs
+        );
+        assert!(
+            outcome.rungs.iter().all(|rung| !rung.verified),
+            "no propagation rung may prove the cancellation: {:?}",
+            outcome.rungs
+        );
+        assert!(
+            outcome
+                .rungs
+                .iter()
+                .all(|rung| rung.method != MethodUsed::Mip),
+            "the MIP rung must not appear with use_complete = false: {:?}",
+            outcome.rungs
+        );
+    }
+
+    #[test]
+    fn complete_terminal_performs_a_real_mip_verification() {
+        let graph = cancelling_chain();
+        let spec =
+            VerificationSpec::new(vec![Bound::new(-1.0, 1.0)], vec![Bound::new(-0.01, 0.01)])
+                .expect("valid spec");
+
+        let outcome = verify_model(&graph, &spec, &escalate_to_terminal(true))
+            .expect("the fragment graph is encodable");
+
+        assert!(
+            outcome.result.is_verified(),
+            "the MIP terminal must decide what propagation could not: {:?}",
+            outcome.result
+        );
+        assert_eq!(
+            outcome.method_used,
+            MethodUsed::Mip,
+            "the verdict must be attributed to the MIP terminal"
+        );
+        assert_eq!(
+            outcome.rungs.len(),
+            5,
+            "four propagation rungs then the terminal: {:?}",
+            outcome.rungs
+        );
+        let terminal = outcome.rungs.last().expect("terminal rung");
+        assert_eq!(terminal.method, MethodUsed::Mip);
+        assert!(terminal.verified);
+        assert!(
+            terminal.note.contains("disjunct(s) proven infeasible"),
+            "the rung note must describe the solve that produced it: {}",
+            terminal.note
+        );
+
+        // Cross-check against the terminal's own entry point on the same
+        // inputs: a stub could satisfy the assertions above only by agreeing
+        // with a genuine solver run.
+        let report = crate::complete::verify_graph_complete_mip(
+            &graph,
+            &spec,
+            &crate::complete::CompleteMipOptions::default(),
+        )
+        .expect("encodable graph");
+        assert!(report.verified);
+        assert_eq!(report.disjuncts, 2);
+        assert_eq!(report.disjuncts_refuted, 2);
+    }
+
+    #[test]
+    fn complete_terminal_does_not_overclaim_on_a_false_property() {
+        let graph = cancelling_chain();
+        // The true output is exactly 0, so this spec is false.
+        let spec = VerificationSpec::new(
+            vec![Bound::new(-1.0, 1.0)],
+            vec![Bound::new_allow_infinite(0.5, f32::INFINITY)],
+        )
+        .expect("valid spec");
+
+        let outcome = verify_model(&graph, &spec, &escalate_to_terminal(true))
+            .expect("the fragment graph is encodable");
+
+        assert!(
+            !outcome.result.is_verified(),
+            "a false property must never be reported verified: {:?}",
+            outcome.result
+        );
+        assert!(
+            !matches!(outcome.result, VerificationResult::Violated { .. }),
+            "a feasible RELAXED negation is not a counterexample and must not be dressed up as \
+             one: {:?}",
+            outcome.result
+        );
+        let terminal = outcome
+            .rungs
+            .last()
+            .expect("the terminal rung is still recorded");
+        assert_eq!(terminal.method, MethodUsed::Mip);
+        assert!(!terminal.verified);
+        assert!(
+            terminal.note.contains("is feasible"),
+            "the rung must carry the solver's own reason: {}",
+            terminal.note
+        );
+    }
+
+    #[test]
+    fn complete_terminal_refuses_a_graph_outside_the_encodable_fragment() {
+        let graph = residual_graph();
+        // Impossible spec: every propagation rung runs and fails, so the ladder
+        // reaches the terminal.
+        let spec = VerificationSpec::new(
+            vec![Bound::new(-1.0, 1.0)],
+            vec![Bound::new(0.0, 0.0), Bound::new(0.0, 0.0)],
+        )
+        .expect("valid spec");
+
+        let error = verify_model(&graph, &spec, &escalate_to_terminal(true))
+            .expect_err("a residual Add join cannot be encoded, so the terminal must refuse");
+        assert!(
+            matches!(error, NyError::UnsupportedOp(_)),
+            "the refusal must be a typed UnsupportedOp, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("'add'"),
+            "the refusal must name the blocking node: {message}"
+        );
+        assert!(
+            message.contains("Refusing rather than returning a verdict-shaped non-answer"),
+            "the refusal must say why it is an error and not a rung: {message}"
+        );
+    }
+
+    /// The refusal is scoped to the opt-in: with the flag off the same graph
+    /// still returns its propagation verdict.
+    #[test]
+    fn the_refusal_is_scoped_to_use_complete() {
+        let graph = residual_graph();
+        let spec = VerificationSpec::new(
+            vec![Bound::new(-1.0, 1.0)],
+            vec![Bound::new(0.0, 0.0), Bound::new(0.0, 0.0)],
+        )
+        .expect("valid spec");
+
+        let outcome = verify_model(&graph, &spec, &escalate_to_terminal(false))
+            .expect("without the opt-in the ladder is unchanged");
+        assert!(!outcome.result.is_verified());
+        assert!(
+            outcome
+                .rungs
+                .iter()
+                .all(|rung| rung.method != MethodUsed::Mip),
+            "no MIP rung may be recorded when the terminal was not requested: {:?}",
+            outcome.rungs
+        );
+    }
+
+    /// A `Mip` rung is only ever recorded by a run that actually reached the
+    /// solver: the ladder must not manufacture one from the config alone.
+    #[test]
+    fn no_mip_rung_without_reaching_the_terminal() {
+        let graph = cancelling_chain();
+        // Provable at rung 0, so the ladder returns before the terminal.
+        let spec = VerificationSpec::new(vec![Bound::new(-1.0, 1.0)], vec![Bound::new(-9.0, 9.0)])
+            .expect("valid spec");
+
+        let outcome = verify_model(&graph, &spec, &escalate_to_terminal(true))
+            .expect("an easy spec never reaches the terminal");
+        assert!(outcome.result.is_verified());
+        assert_eq!(outcome.method_used, MethodUsed::Ibp);
+        assert_eq!(outcome.rungs.len(), 1, "{:?}", outcome.rungs);
     }
 }

@@ -33,11 +33,14 @@ use crate::layers::common::BoundPropagation;
 use crate::LinearBounds;
 
 impl InstanceNorm1dLayer {
-    /// Fallback output bounds when input bounds are non-finite.
+    /// Fallback output bounds for a saturated (±inf, NaN-free) input box.
     ///
     /// Uses the fact that after normalization, the maximum z-value for any
     /// element in a T-dimensional vector is bounded by sqrt(T-1) (when one
-    /// element is the outlier and all others are identical).
+    /// element is the outlier and all others are identical). This analytic
+    /// enclosure holds for EVERY finite real input regardless of magnitude,
+    /// so it is sound whenever the incoming box merely lost its finite
+    /// endpoints to deep-stack IBP overflow.
     fn fallback_output_bounds(&self, shape: &[usize]) -> Result<BoundedTensor> {
         let ndim = shape.len();
         if ndim < 2 {
@@ -79,9 +82,15 @@ impl InstanceNorm1dLayer {
             let (ch_lower, ch_upper) = if !g.is_finite() || !b.is_finite() {
                 (f32::NEG_INFINITY, f32::INFINITY)
             } else if g >= 0.0 {
-                (next_down_f32(b + g * (-z_max)), next_up_f32(b + g * z_max))
+                (
+                    affine_fallback_down(b, g, -z_max),
+                    affine_fallback_up(b, g, z_max),
+                )
             } else {
-                (next_down_f32(b + g * z_max), next_up_f32(b + g * (-z_max)))
+                (
+                    affine_fallback_down(b, g, z_max),
+                    affine_fallback_up(b, g, -z_max),
+                )
             };
 
             // Fill all time positions for this channel across all batch dims
@@ -365,15 +374,21 @@ impl InstanceNorm1dLayer {
             // envelope stays a sound enclosure; NaN-propagating max/min so a NaN Jacobian
             // bound survives intersection and fires downstream guards.
             if max_norm_safe.is_finite() {
+                // f64 helper, not raw f32: this envelope is INTERSECTED into the
+                // published Jacobian bound below, so an endpoint rounded at the
+                // product's magnitude instead of the cancelled sum's pulls the
+                // bound INWARD past reachable outputs. Same class as the
+                // `fallback_output_bounds` defect 5d48d59e9 fixed, but on the
+                // main output line rather than a fallback.
                 let (env_lower, env_upper) = if g >= 0.0 {
                     (
-                        next_down_f32(b - g * max_norm_safe),
-                        next_up_f32(b + g * max_norm_safe),
+                        affine_fallback_down(b, g, -max_norm_safe),
+                        affine_fallback_up(b, g, max_norm_safe),
                     )
                 } else {
                     (
-                        next_down_f32(b + g * max_norm_safe),
-                        next_up_f32(b - g * max_norm_safe),
+                        affine_fallback_down(b, g, max_norm_safe),
+                        affine_fallback_up(b, g, -max_norm_safe),
                     )
                 };
                 jac_lower = nan_propagating_max(jac_lower, env_lower);
@@ -426,9 +441,18 @@ impl InstanceNorm1dLayer {
             let (ch_lower, ch_upper) = if !g.is_finite() || !b.is_finite() {
                 (f32::NEG_INFINITY, f32::INFINITY)
             } else if g >= 0.0 {
-                (next_down_f32(b + g * (-z_max)), next_up_f32(b + g * z_max))
+                // f64 via the helper below — NOT raw f32. `beta + gamma*z` in f32
+                // is unsound exactly when beta cancels the product: the product's
+                // round-to-nearest error lives at the PRODUCT's magnitude while the
+                // one-ULP outward step lands at the (far smaller) SUM's magnitude,
+                // so the step cannot cover it and the bound excludes reachable
+                // outputs. 5d48d59e9 added `affine_fallback_up/down` TO THIS FILE
+                // for that reason — and its doc names InstanceNorm1d as the repro
+                // — but converted only `fallback_output_bounds`, leaving this
+                // mean-overflow branch on the banned form.
+                (affine_fallback_down(b, g, -z_max), affine_fallback_up(b, g, z_max))
             } else {
-                (next_down_f32(b + g * z_max), next_up_f32(b + g * (-z_max)))
+                (affine_fallback_down(b, g, z_max), affine_fallback_up(b, g, -z_max))
             };
             for t in 0..time_len {
                 out_lower[t] = ch_lower;
@@ -589,12 +613,16 @@ impl InstanceNorm1dLayer {
                 "InstanceNorm1d: zero-valued dimension in input shape".to_string(),
             ));
         }
-        // Reject non-finite input bounds (Category B per domain validation policy).
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        // Category B per domain validation policy: NaN input bounds fail closed
+        // — NaN carries no bound information and would silently poison the
+        // normalization arithmetic (0/0, inf/inf). ±Inf endpoints are NOT an
+        // error: they are the conservative-bounds convention for "unbounded in
+        // that direction" (deep-stack IBP overflow saturation, dc9da0fde
+        // class) and are routed to the analytic fallback enclosure by
+        // `propagate_ibp` instead.
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "InstanceNorm1d IBP: non-finite input bounds".to_string(),
+                "InstanceNorm1d IBP: NaN input bounds".to_string(),
             ));
         }
 
@@ -677,6 +705,20 @@ impl BoundPropagation for InstanceNorm1dLayer {
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         self.validate_ibp_input(input)?;
 
+        // Deep-stack IBP overflow saturation (dc9da0fde class): a ±inf
+        // (NaN-free — NaN already failed closed in `validate_ibp_input`) input
+        // box is a legitimately saturated upstream interval, not an error. The
+        // true pre-activation values it encloses are finite reals, and the
+        // per-channel beta ± ny·sqrt(T-1) fallback enclosure holds for every
+        // finite real input regardless of magnitude — the same enclosure the
+        // internal mean-overflow route (`ibp_conservative_channel`) already
+        // uses when a large-but-finite input overflows the mean sum.
+        if input.lower().iter().any(|x| x.is_infinite())
+            || input.upper().iter().any(|x| x.is_infinite())
+        {
+            return self.fallback_output_bounds(input.shape());
+        }
+
         if self.forward_mode {
             self.propagate_ibp_forward_mode(input)
         } else {
@@ -730,4 +772,30 @@ fn fill_channel_bounds(
         }
     }
     Ok(())
+}
+
+/// `beta + gamma * z` rounded OUTWARD (`_up` / `_down`), computed in f64.
+///
+/// SOUNDNESS-CRITICAL — do not inline this back into f32. `f32 * f32` is
+/// EXACT in f64 (24 + 24 = 48 <= 53 mantissa bits), so the only rounding here
+/// is the f64 addition (<= 0.5 ulp of the TRUE sum) plus the final f32 cast,
+/// and the single directed f32 step dominates both.
+///
+/// Computing it in f32 is UNSOUND whenever `beta` cancels the product: the
+/// product's round-to-nearest error lives at the PRODUCT's magnitude while the
+/// one-ULP outward step lands at the (possibly hundreds of ULPs smaller) SUM's
+/// magnitude, so the step cannot cover it and the "bound" excludes reachable
+/// outputs. Found by adversarial review 2026-08-26; repro (InstanceNorm1d,
+/// T = 4, gamma = 1.1550927, beta = -2.0006793, eps = 1e-5): the f32 form
+/// returns an upper bound of 1e-45 while x = [1e5, 0, 0, 0] evaluates to
+/// 1.7408787e-8.
+#[inline]
+fn affine_fallback_up(beta: f32, gamma: f32, z: f32) -> f32 {
+    next_up_f32((f64::from(beta) + f64::from(gamma) * f64::from(z)) as f32)
+}
+
+/// Downward-rounded mirror of [`affine_fallback_up`]; same f64 rationale.
+#[inline]
+fn affine_fallback_down(beta: f32, gamma: f32, z: f32) -> f32 {
+    next_down_f32((f64::from(beta) + f64::from(gamma) * f64::from(z)) as f32)
 }

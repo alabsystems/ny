@@ -141,6 +141,42 @@ struct SegMergeParams {
 fn eft_err_env_enabled() -> bool {
     std::env::var("NY_EFT_ERR").ok().as_deref() == Some("1")
 }
+/// #ratchet: the ONE chokepoint for `NY_RESNET_ERR_CONCRETIZE`.
+///
+/// Six call sites in this file previously open-coded the byte-identical parser
+/// `std::env::var(..).ok().as_deref() == Some("1")`. They are declared as
+/// `decls::sound_channel::RESNET_ERR_CONCRETIZE`, whose chokepoint pins exactly
+/// that exact-`"1"` rule and records a near-miss token (`"true"`, `" 1"`) as a
+/// REJECTION on the flight receipt instead of losing it.
+///
+/// DELIBERATELY UNCACHED — no `OnceLock`, the same choice `NY_EFT_ERR`'s twin
+/// gates document. This file's own differential tests flip the variable
+/// mid-process with `ScopedEnvVar::set`, and a latch would make them measure the
+/// value from before the set. `ny_levers::read` does a live `var_os` lookup, and
+/// every one of the six reads is once per WALK, never per element.
+///
+/// DELIVERY SEAM (#lever-reachability): env first in BOTH directions, then the
+/// typed `bab.resnet_err_concretize` key, then the declaration's dark default.
+/// This moves WHERE the certified walk discharges its accumulated coefficient
+/// error and feeds the main-bound auto-fallback, so it changes which bound is
+/// published — and it had no route into a scored run.
+fn resnet_err_concretize_armed() -> bool {
+    ny_propagate::preset_gates::resnet_err_concretize_enabled()
+}
+
+/// #ratchet: the chokepoint for `NY_RESNET_ERR_CONCRETIZE_FINE`, the PER-RELU
+/// refinement of the gate above.
+///
+/// Same exact-`"1"` parser, same deliberate absence of a latch, same
+/// `ScopedEnvVar` test that flips it mid-process. Declared separately rather
+/// than folded into its parent because the two arm DIFFERENT granularities and
+/// the fine one is admissible only when `node_abs` is non-empty — collapsing
+/// them would make the receipt claim a decision the walk did not make.
+///
+/// Same delivery seam as its parent, through `bab.resnet_err_concretize_fine`.
+fn resnet_err_concretize_fine_armed() -> bool {
+    ny_propagate::preset_gates::resnet_err_concretize_fine_enabled()
+}
 
 /// Governed live read for the resident segment-composition diagnostics.
 ///
@@ -3184,6 +3220,11 @@ impl WgpuDevice {
             // treats either case as a typed fail-closed refusal.
             c.taint_rows.as_deref(),
         )
+        // R2 (sweep ledger availability): the concretize funnel runs under the
+        // same call-local deadline and is the second phase both sweep routes
+        // execute with an armed scope. Same classification rule as the walk:
+        // deadline ⇒ bounded drain then release; anything else fails closed.
+        .inspect_err(super::intermediate_sweep::note_deadline_shaped_abort)
     }
 
     /// COEFFICIENT EGRESS (#cert-coeffs): the seeded sound resident walk's
@@ -4050,7 +4091,7 @@ impl WgpuDevice {
             // #NY_WIDE_PROBE: per-resident-call phase breakdown so STEP-1 profiling can
             // attribute the wide-node chunk overhead (setup / CPU weight-prep / gpu
             // submit / readback). Inert unless the probe env is set.
-            let __probe = std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1");
+            let __probe = super::crown_backward::wide_probe_armed();
             let __t_start = std::time::Instant::now();
             let mut __cpu_wprep = std::time::Duration::ZERO;
             // Cached, build-once resident pipelines (pure compiled shaders, no
@@ -6913,7 +6954,19 @@ impl WgpuDevice {
                 beta_gather_v,
                 taint_rows_out,
             ))
-        })?;
+        })
+        // R2 (sweep ledger availability, design §6 review item 1). The checked
+        // GPU wrapper can turn a SUCCESSFUL closure into
+        // `NyError::DeadlineExceeded` at its post-op fence ("deadline expired
+        // while finalizing reentrant WGPU work"), and the device-keep carrier
+        // shape above returns without any readback, so that abort can carry
+        // unsynchronized submits. Classify it while the sweep scope is still
+        // armed: a deadline is a host-side decision on a healthy device, so the
+        // reservation performs its bounded drain and releases instead of
+        // `SweepScope::drop` — which cannot see the error kind — defaulting to
+        // `UnknownInFlight` and poisoning the ledger for the whole instance.
+        // Inert outside an armed sweep; non-deadline errors still fail closed.
+        .inspect_err(super::intermediate_sweep::note_deadline_shaped_abort)?;
 
         Ok(ResidentCoeff {
             lower_a: fla,
@@ -7379,7 +7432,7 @@ impl WgpuDevice {
         // `−Σλ·B` on the lower bias, every spec row, BEFORE the target
         // Activation transform. `sound_round` selects the production
         // outward-rounded fold (stem lever) vs the legacy plain-f32 add
-        // (byte-identical to the `NY_CUT_FOLD_RESIDENT` experiment path).
+        // (byte-identical to the retired resident-fold experiment path).
         let d = c1.dim;
         for s in 0..num_specs {
             let base = s * d;
@@ -8222,15 +8275,10 @@ impl WgpuDevice {
         node_abs: &[&[f32]],
         force_fine: bool,
     ) -> Result<(ResidentCoeff, Vec<Vec<f32>>, Vec<Vec<f32>>)> {
-        let concretize_err = !frontier_abs.is_empty()
-            && (force_concretize
-                || std::env::var("NY_RESNET_ERR_CONCRETIZE").ok().as_deref() == Some("1"));
-        let concretize_fine = !node_abs.is_empty()
-            && (force_fine
-                || std::env::var("NY_RESNET_ERR_CONCRETIZE_FINE")
-                    .ok()
-                    .as_deref()
-                    == Some("1"));
+        let concretize_err =
+            !frontier_abs.is_empty() && (force_concretize || resnet_err_concretize_armed());
+        let concretize_fine =
+            !node_abs.is_empty() && (force_fine || resnet_err_concretize_fine_armed());
         if seg_probe_armed() {
             eprintln!(
                 "[conc-gate] concretize_err={concretize_err} concretize_fine={concretize_fine} \
@@ -8346,10 +8394,10 @@ impl WgpuDevice {
             let end = (start + count).min(node_abs.len());
             node_abs[start.min(end)..end].to_vec()
         };
-        // Certified Cut-CROWN C2 (dark `NY_CUT_FOLD_RESIDENT` gate): the fold
+        // Certified Cut-CROWN C2 (hard-quarantined registry): the fold
         // targets the LAST Activation in fold order — the network's FIRST ReLU
         // (innermost segment), whose post-activation the L1 cuts constrain.
-        // `None` (gate off / no entry / no Activations) ⇒ the dispatch below is
+        // `None` (authority quarantined / no entry / no Activations) ⇒ the dispatch below is
         // byte-identical to today.
         //
         // #mn-head-resident research retarget: the target derivation below is
@@ -9050,7 +9098,7 @@ impl WgpuDevice {
             .collect();
         // First pass: env-gated concretization (force=false → off by default, on if
         // NY_RESNET_ERR_CONCRETIZE=1; frontier_abs is threaded so the env path still works).
-        let env_concretize = std::env::var("NY_RESNET_ERR_CONCRETIZE").ok().as_deref() == Some("1");
+        let env_concretize = resnet_err_concretize_armed();
         let (lo, hi, _grads) = self.crown_backward_sound_resident_resnet_seeded(
             &internal,
             &seed.lower_a,
@@ -9249,7 +9297,7 @@ impl WgpuDevice {
                 }
             })
             .collect();
-        let env_concretize = std::env::var("NY_RESNET_ERR_CONCRETIZE").ok().as_deref() == Some("1");
+        let env_concretize = resnet_err_concretize_armed();
         let (lo, hi, grads) = self.crown_backward_sound_resident_resnet_seeded(
             &internal,
             &seed.lower_a,
@@ -9323,7 +9371,7 @@ impl WgpuDevice {
                 }
             })
             .collect();
-        let env_concretize = std::env::var("NY_RESNET_ERR_CONCRETIZE").ok().as_deref() == Some("1");
+        let env_concretize = resnet_err_concretize_armed();
         let (lo, hi, _grads) = self.crown_backward_sound_resident_resnet_seeded(
             &internal,
             &seed.lower_a,
@@ -9401,7 +9449,7 @@ impl WgpuDevice {
                 }
             })
             .collect();
-        let env_concretize = std::env::var("NY_RESNET_ERR_CONCRETIZE").ok().as_deref() == Some("1");
+        let env_concretize = resnet_err_concretize_armed();
         let (lo, hi, _grads, gathers) = self.crown_backward_sound_resident_resnet_seeded_gather(
             &internal,
             &seed.lower_a,
@@ -9518,7 +9566,7 @@ impl WgpuDevice {
                 }
             })
             .collect();
-        let env_concretize = std::env::var("NY_RESNET_ERR_CONCRETIZE").ok().as_deref() == Some("1");
+        let env_concretize = resnet_err_concretize_armed();
         let want_coeff = coeff_full_out.is_some();
         let mut coeff_full_out = coeff_full_out;
         let first_pass_coeff = if force_fine_coeff {
@@ -13846,7 +13894,6 @@ mod tests {
             sound_round: true,
         };
 
-        let _fold_off = ScopedEnvVar::unset("NY_CUT_FOLD_RESIDENT");
         clear_resident_cut_fold();
         let baseline = run(&device);
         assert!(
@@ -13855,7 +13902,6 @@ mod tests {
             baseline.0
         );
 
-        let _fold_on = ScopedEnvVar::set("NY_CUT_FOLD_RESIDENT", "1");
         let malformed = [
             (
                 "post-oob with valid pre",
@@ -13976,7 +14022,6 @@ mod tests {
             (lo[0], hi[0])
         };
 
-        let _fold_off = ScopedEnvVar::unset("NY_CUT_FOLD_RESIDENT");
         clear_resident_cut_fold();
         let (base_lo, base_hi) = run(&device);
         assert!(
@@ -13984,7 +14029,6 @@ mod tests {
             "plain resident CROWN on the k=3 geometry must be −4, got {base_lo}"
         );
 
-        let _fold_on = ScopedEnvVar::set("NY_CUT_FOLD_RESIDENT", "1");
         for lambda in [0.25f32, 0.5, 1.0] {
             set_resident_cut_fold(ResidentCutFold {
                 coeffs: vec![(0, lambda), (1, lambda), (2, lambda)],

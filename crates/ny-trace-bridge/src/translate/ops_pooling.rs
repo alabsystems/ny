@@ -20,10 +20,25 @@
 //!   evenly by the output dims (the common global-pool `output_size = [1, 1]`
 //!   case always does).
 //!
-//! `AvgPool1d`, `AdaptiveAvgPool1d`, and `AdaptiveMaxPool2d` have **no**
-//! lowering in NN's translator (they fall through to its catch-all), so they
-//! keep the sound-by-construction `UnsupportedOp` refusal here — inventing a
-//! lowering NN never emits would break emission parity.
+//! The family now lowers all seven ops. The remaining three —
+//! `AvgPool1d`, `AdaptiveAvgPool1d`, and `AdaptiveMaxPool2d` — are NY-NATIVE
+//! extensions beyond NN's translator, which still catch-alls them:
+//!
+//! - `AvgPool1d` → `LayerType::AveragePool`, `count_include_pad = 1`.
+//! - `AdaptiveAvgPool1d` → `LayerType::AveragePool` with kernel = stride =
+//!   `in_len / out_len`, refused unless the lengths divide evenly.
+//! - `AdaptiveMaxPool2d` → `LayerType::MaxPool` with kernel = stride =
+//!   `in / out` per spatial dim, refused unless both divide evenly.
+//!
+//! All three use EXPLICIT-PAIR geometry (`[1, k]` for the 1-D ops, `[kh, kw]`
+//! for the 2-D one) rather than NN's 1-element form. That is deliberate: the
+//! ny-build converter broadcasts a 1-element `kernel_shape` to a `(k, k)`
+//! pair and the propagate layers pool the LAST TWO axes of the traced
+//! `[batch, channels, length]` tensor, so 1-element geometry would pool
+//! across `channels` as well. `[1, k]` makes the channel axis a
+//! kernel-1/stride-1 passthrough and pools exactly the length axis.
+//! (`MaxPool1d` keeps NN's 1-element emission for byte-level parity — see the
+//! caveat on `translate_max_pool1d`.)
 
 use std::collections::HashMap;
 
@@ -37,10 +52,12 @@ use super::{dim_as_i64, op_name, simple_spec, Ctx, NodeOutput};
 /// Translate a pooling-family op (`AvgPool1d`, `AvgPool2d`, `MaxPool1d`, `MaxPool2d`, `AdaptiveAvgPool1d`, `AdaptiveAvgPool2d`, `AdaptiveMaxPool2d`) node.
 ///
 /// `AvgPool2d`, `MaxPool2d`, `MaxPool1d`, and `AdaptiveAvgPool2d` are ported
-/// from NN's emission (see the module docs for the exact LayerSpec shapes).
-/// The remaining ops refuse with the exact [`NyError::UnsupportedOp`] error
-/// the pre-split catch-all arm produced, matching NN, which has no lowering
-/// for them either.
+/// from NN's emission; `AvgPool1d`, `AdaptiveAvgPool1d`, and
+/// `AdaptiveMaxPool2d` are NY-native extensions NN has no lowering for (see
+/// the module docs for the exact LayerSpec shapes and why the new arms use
+/// explicit-pair geometry). Every op refuses fail-closed
+/// ([`NyError::UnsupportedOp`]) on geometry outside its exact regime rather
+/// than approximating it.
 pub(super) fn translate_pooling(
     node: &TraceNode,
     name: &str,
@@ -90,15 +107,26 @@ pub(super) fn translate_pooling(
             translate_adaptive_avg_pool2d(name, output_size, input_tensors, output_tensor, ctx)
         }
 
-        // Not ported: NN's trace-to-graph translator has no lowering for these
-        // (they fall through to its catch-all). Fail-closed refusal, same
-        // message shape as the pre-split catch-all arm.
-        TraceOp::AvgPool1d { .. }
-        | TraceOp::AdaptiveAvgPool1d { .. }
-        | TraceOp::AdaptiveMaxPool2d { .. } => Err(NyError::UnsupportedOp(format!(
-            "{} not supported in NY trace translation",
-            op_name(&node.op)
-        ))),
+        // NY-native extensions beyond NN's translator (see the module docs):
+        // deliberately explicit-pair geometry, not NN's 1-element form.
+        TraceOp::AvgPool1d {
+            kernel_size,
+            stride,
+            padding,
+        } => translate_avg_pool1d(
+            name,
+            *kernel_size,
+            *stride,
+            *padding,
+            input_tensors,
+            output_tensor,
+        ),
+        TraceOp::AdaptiveAvgPool1d { output_size } => {
+            translate_adaptive_avg_pool1d(name, *output_size, input_tensors, output_tensor, ctx)
+        }
+        TraceOp::AdaptiveMaxPool2d { output_size } => {
+            translate_adaptive_max_pool2d(name, output_size, input_tensors, output_tensor, ctx)
+        }
 
         // Dispatch in mod.rs only routes the seven family ops here; anything
         // else is a routing bug. Fail closed rather than emit a wrong layer.
@@ -215,6 +243,17 @@ fn translate_max_pool2d(
 /// and 2-element symmetric `pads = [p, p]` (the graph-build pooling converter
 /// broadcasts 1-element geometry across both spatial dims, exactly as it does
 /// for NN's emission).
+///
+/// KNOWN CAVEAT (pre-existing, inherited from NN's emission — flagged, not
+/// changed here): that broadcast makes the emitted pool a `(k, k)` window
+/// over the LAST TWO axes of the traced `[batch, channels, length]` tensor,
+/// so it also pools the channel axis. With `channels == 1` the geometry
+/// fails closed in `checked_pool_output_size` ("kernel larger than padded
+/// input"); with `channels > 1` it propagates a wrong-shaped pool. The three
+/// NY-native arms below therefore use explicit `[1, k]` pairs instead.
+/// Switching `MaxPool1d` to the same geometry would fix propagation at the
+/// cost of byte-level NN emission parity — a deliberate call for this
+/// module's owner, with its own test and changelog note.
 fn translate_max_pool1d(
     name: &str,
     kernel_size: usize,
@@ -329,6 +368,185 @@ fn translate_adaptive_avg_pool2d(
     )))
 }
 
+/// Translate `TraceOp::AvgPool1d` to an `AveragePool` LayerSpec.
+///
+/// Deliberately NOT the 1-element geometry `MaxPool1d` inherits from NN: the
+/// graph-build converter broadcasts a 1-element `kernel_shape` to a (k, k)
+/// PAIR, and the propagation layers pool the last TWO axes of the traced
+/// `[batch, channels, length]` tensor — a broadcast kernel would therefore
+/// pool across `channels` too (fail-closed only in the channels == 1 case,
+/// silently mis-shaped otherwise). The explicit pair `kernel_shape = [1, k]`
+/// / `strides = [1, s]` / `pads = [0, p]` makes the channel axis a
+/// kernel-1/stride-1 passthrough and pools exactly the length axis — PyTorch
+/// `nn.AvgPool1d` with its default `count_include_pad = true`.
+fn translate_avg_pool1d(
+    name: &str,
+    kernel_size: usize,
+    stride: usize,
+    padding: usize,
+    input_tensors: &[String],
+    output_tensor: &str,
+) -> Result<NodeOutput> {
+    if input_tensors.is_empty() {
+        return Err(NyError::UnsupportedOp(
+            "AvgPool1d has no inputs (expected 1)".to_string(),
+        ));
+    }
+    if kernel_size == 0 || stride == 0 {
+        return Err(NyError::UnsupportedOp(format!(
+            "AvgPool1d: kernel_size {kernel_size} / stride {stride} must be > 0"
+        )));
+    }
+    let k = dim_as_i64(kernel_size, "AvgPool1d kernel_size")?;
+    let s = dim_as_i64(stride, "AvgPool1d stride")?;
+    let p = dim_as_i64(padding, "AvgPool1d padding")?;
+    let mut attrs = HashMap::new();
+    attrs.insert("kernel_shape".to_string(), AttributeValue::Ints(vec![1, k]));
+    attrs.insert("strides".to_string(), AttributeValue::Ints(vec![1, s]));
+    attrs.insert("pads".to_string(), AttributeValue::Ints(vec![0, p]));
+    attrs.insert("count_include_pad".to_string(), AttributeValue::Int(1));
+    Ok(NodeOutput::one(simple_spec(
+        name,
+        LayerType::AveragePool,
+        input_tensors.to_vec(),
+        output_tensor,
+        attrs,
+    )))
+}
+
+/// Translate `TraceOp::AdaptiveAvgPool1d` by deriving kernel/stride from the
+/// input/output lengths, exactly as the `AdaptiveAvgPool2d` sibling does:
+/// with `in % out == 0`, PyTorch's adaptive window formula (`start =
+/// floor(i*in/out)`, `end = ceil((i+1)*in/out)`) degenerates to the regular
+/// non-overlapping pattern `kernel = stride = in / out`, so the lowering is
+/// exact; anything else is refused with the sibling's message shape.
+/// Geometry is the explicit `[1, k]` pair for the same channels-passthrough
+/// reason as `AvgPool1d`.
+fn translate_adaptive_avg_pool1d(
+    name: &str,
+    output_size: usize,
+    input_tensors: &[String],
+    output_tensor: &str,
+    ctx: &Ctx,
+) -> Result<NodeOutput> {
+    if input_tensors.is_empty() {
+        return Err(NyError::UnsupportedOp(
+            "AdaptiveAvgPool1d has no inputs (expected 1)".to_string(),
+        ));
+    }
+    if output_size == 0 {
+        return Err(NyError::UnsupportedOp(
+            "AdaptiveAvgPool1d output_size must be > 0".to_string(),
+        ));
+    }
+    let input_shape = ctx.tensor_shapes.get(&input_tensors[0]).ok_or_else(|| {
+        NyError::InternalError(format!(
+            "AdaptiveAvgPool1d: input shape for '{}' not found in context",
+            input_tensors[0]
+        ))
+    })?;
+    // Input is [batch, channels, length].
+    if input_shape.len() < 3 {
+        return Err(NyError::UnsupportedOp(format!(
+            "AdaptiveAvgPool1d: expected 3D input, got {}D",
+            input_shape.len()
+        )));
+    }
+    let in_len = checked_i64_to_usize(input_shape[2], "AdaptiveAvgPool1d input length")?;
+    if in_len == 0 {
+        return Err(NyError::UnsupportedOp(
+            "AdaptiveAvgPool1d: input length is 0".to_string(),
+        ));
+    }
+    if in_len % output_size != 0 {
+        return Err(NyError::UnsupportedOp(format!(
+            "AdaptiveAvgPool1d: input [{in_len}] not evenly divisible by output [{output_size}]"
+        )));
+    }
+    let k = dim_as_i64(in_len / output_size, "AdaptiveAvgPool1d kernel")?;
+    let mut attrs = HashMap::new();
+    attrs.insert("kernel_shape".to_string(), AttributeValue::Ints(vec![1, k]));
+    attrs.insert("strides".to_string(), AttributeValue::Ints(vec![1, k]));
+    attrs.insert("pads".to_string(), AttributeValue::Ints(vec![0, 0]));
+    attrs.insert("count_include_pad".to_string(), AttributeValue::Int(1));
+    Ok(NodeOutput::one(simple_spec(
+        name,
+        LayerType::AveragePool,
+        input_tensors.to_vec(),
+        output_tensor,
+        attrs,
+    )))
+}
+
+/// Translate `TraceOp::AdaptiveMaxPool2d` — the max twin of
+/// `translate_adaptive_avg_pool2d`. With evenly-divisible spatial dims the
+/// regular pattern `kernel = stride = in / out` reproduces PyTorch's adaptive
+/// windows EXACTLY (see the 1d sibling's derivation), so this is not merely an
+/// enclosure. Uneven geometry is refused with the sibling's message shape (a
+/// regular kernel would max over the wrong windows). No `count_include_pad`:
+/// max-pool padding never raises the max, and the pads are zero here anyway.
+fn translate_adaptive_max_pool2d(
+    name: &str,
+    output_size: &[usize; 2],
+    input_tensors: &[String],
+    output_tensor: &str,
+    ctx: &Ctx,
+) -> Result<NodeOutput> {
+    if input_tensors.is_empty() {
+        return Err(NyError::UnsupportedOp(
+            "AdaptiveMaxPool2d has no inputs (expected 1)".to_string(),
+        ));
+    }
+    let [out_h, out_w] = *output_size;
+    if out_h == 0 || out_w == 0 {
+        return Err(NyError::UnsupportedOp(
+            "AdaptiveMaxPool2d output_size must be > 0".to_string(),
+        ));
+    }
+    let input_shape = ctx.tensor_shapes.get(&input_tensors[0]).ok_or_else(|| {
+        NyError::InternalError(format!(
+            "AdaptiveMaxPool2d: input shape for '{}' not found in context",
+            input_tensors[0]
+        ))
+    })?;
+    // Input is [batch, channels, in_h, in_w].
+    if input_shape.len() < 4 {
+        return Err(NyError::UnsupportedOp(format!(
+            "AdaptiveMaxPool2d: expected 4D input, got {}D",
+            input_shape.len()
+        )));
+    }
+    let in_h = checked_i64_to_usize(input_shape[2], "AdaptiveMaxPool2d input height")?;
+    let in_w = checked_i64_to_usize(input_shape[3], "AdaptiveMaxPool2d input width")?;
+    if in_h == 0 || in_w == 0 {
+        return Err(NyError::UnsupportedOp(format!(
+            "AdaptiveMaxPool2d: input spatial extent [{in_h},{in_w}] is empty"
+        )));
+    }
+    if in_h % out_h != 0 || in_w % out_w != 0 {
+        return Err(NyError::UnsupportedOp(format!(
+            "AdaptiveMaxPool2d: input [{in_h},{in_w}] not evenly divisible \
+             by output [{out_h},{out_w}]"
+        )));
+    }
+    let kh = dim_as_i64(in_h / out_h, "AdaptiveMaxPool2d kernel_h")?;
+    let kw = dim_as_i64(in_w / out_w, "AdaptiveMaxPool2d kernel_w")?;
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "kernel_shape".to_string(),
+        AttributeValue::Ints(vec![kh, kw]),
+    );
+    attrs.insert("strides".to_string(), AttributeValue::Ints(vec![kh, kw]));
+    attrs.insert("pads".to_string(), AttributeValue::Ints(vec![0, 0, 0, 0]));
+    Ok(NodeOutput::one(simple_spec(
+        name,
+        LayerType::MaxPool,
+        input_tensors.to_vec(),
+        output_tensor,
+        attrs,
+    )))
+}
+
 /// Checked `i64` → `usize` conversion rejecting negative values.
 ///
 /// Local copy of NN's `graph_tensor::checked_i64_to_usize` — `mod.rs` has no
@@ -348,6 +566,7 @@ mod tests {
     use crate::schema::{ComputationGraph, DType, NodeId, TraceNode, TraceOp};
     use ny_build::{AttributeValue, GraphModel, LayerSpec};
     use ny_core::{LayerType, NyError};
+    use ny_propagate::BoundPropagation;
 
     fn node(id: u64, name: &str, op: TraceOp, inputs: &[u64], shape: &[usize]) -> TraceNode {
         TraceNode::new(
@@ -627,51 +846,313 @@ mod tests {
         );
     }
 
-    /// The three ops NN never lowers stay refused with the catch-all message.
+    // -----------------------------------------------------------------
+    // NY-native arms: AvgPool1d / AdaptiveAvgPool1d / AdaptiveMaxPool2d
+    // -----------------------------------------------------------------
+
+    /// Two-row `[1, C, L]` bounds with `lower[c][i] = c * len + i` and
+    /// `upper = lower + 1.0`, the fixture the 1-D pooling parity tests share.
+    fn ramp_bounds(channels: usize, len: usize) -> ny_tensor::BoundedTensor {
+        let values: Vec<f32> = (0..channels * len).map(|i| i as f32).collect();
+        let lower = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, channels, len]), values)
+            .expect("ramp shape");
+        let upper = lower.mapv(|v| v + 1.0);
+        ny_tensor::BoundedTensor::new(lower, upper).expect("ramp bounds")
+    }
+
+    /// Assert `[lo, hi]` encloses `expected` and is tight to `tol` on both
+    /// sides. AveragePool IBP directed-rounds outward, so the enclosure is
+    /// never exactly the real-arithmetic average.
+    fn assert_encloses_tightly(lo: f32, hi: f32, expected: f32, tol: f32, what: &str) {
+        assert!(
+            lo <= expected + tol && lo >= expected - tol,
+            "{what}: lower {lo} must enclose {expected} tightly"
+        );
+        assert!(
+            hi >= expected - tol && hi <= expected + tol,
+            "{what}: upper {hi} must enclose {expected} tightly"
+        );
+    }
+
+    /// AvgPool1d emits AveragePool with the EXPLICIT PAIR geometry
+    /// (`[1, k]` / `[1, s]` / `[0, p]`), so the channel axis is a
+    /// kernel-1/stride-1 passthrough and only the length axis is pooled.
+    /// 1-element geometry would be broadcast to `(k, k)` by ny-build and
+    /// would pool across channels as well.
     #[test]
-    fn unported_pooling_ops_stay_refused() {
-        let cases: Vec<(TraceOp, &str, Vec<usize>, Vec<usize>)> = vec![
-            (
+    fn avg_pool1d_maps_with_explicit_pair_geometry() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 2, 8]),
+            node(
+                1,
+                "pool",
                 TraceOp::AvgPool1d {
                     kernel_size: 2,
                     stride: 2,
                     padding: 0,
                 },
-                "AvgPool1d",
-                vec![1, 1, 8],
-                vec![1, 1, 4],
+                &[0],
+                &[1, 2, 4],
             ),
-            (
+        ]);
+        let model = translate(&graph).expect("AvgPool1d translates");
+        let pool = find_layer(&model, &LayerType::AveragePool);
+        assert_eq!(
+            pool.attributes.get("kernel_shape"),
+            Some(&AttributeValue::Ints(vec![1, 2])),
+            "explicit pair: channel axis kernel 1, length axis kernel 2"
+        );
+        assert_eq!(
+            pool.attributes.get("strides"),
+            Some(&AttributeValue::Ints(vec![1, 2]))
+        );
+        assert_eq!(
+            pool.attributes.get("pads"),
+            Some(&AttributeValue::Ints(vec![0, 0]))
+        );
+        assert_eq!(
+            pool.attributes.get("count_include_pad"),
+            Some(&AttributeValue::Int(1)),
+            "PyTorch nn.AvgPool1d default count_include_pad=true"
+        );
+        assert_builds(&model, "AvgPool1d");
+
+        // End-to-end: channels must survive untouched, lengths must halve.
+        let network = model
+            .build_graph_network(ny_build::GraphNetworkOptions::default())
+            .expect("AvgPool1d builds");
+        let out = network
+            .propagate_ibp(&ramp_bounds(2, 8))
+            .expect("AvgPool1d IBP");
+        assert_eq!(
+            out.lower().shape(),
+            &[1, 2, 4],
+            "the channel axis is NOT pooled"
+        );
+        let expected_lower = [0.5, 2.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5];
+        for (i, expected) in expected_lower.iter().enumerate() {
+            let (c, w) = (i / 4, i % 4);
+            assert_encloses_tightly(
+                out.lower()[[0, c, w]],
+                out.upper()[[0, c, w]] - 1.0,
+                *expected,
+                1e-4,
+                &format!("AvgPool1d [{c}][{w}]"),
+            );
+        }
+    }
+
+    /// AdaptiveAvgPool1d derives kernel = stride = in/out and agrees with the
+    /// direct `AveragePoolLayer` on the same geometry.
+    #[test]
+    fn adaptive_avg_pool1d_derives_kernel_and_matches_direct_layer() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 2, 6]),
+            node(
+                1,
+                "pool",
+                TraceOp::AdaptiveAvgPool1d { output_size: 3 },
+                &[0],
+                &[1, 2, 3],
+            ),
+        ]);
+        let model = translate(&graph).expect("AdaptiveAvgPool1d translates");
+        let pool = find_layer(&model, &LayerType::AveragePool);
+        assert_eq!(
+            pool.attributes.get("kernel_shape"),
+            Some(&AttributeValue::Ints(vec![1, 2])),
+            "kernel = in/out = 6/3, channel axis passthrough"
+        );
+        assert_eq!(
+            pool.attributes.get("strides"),
+            Some(&AttributeValue::Ints(vec![1, 2])),
+            "stride == kernel for the non-overlapping adaptive pattern"
+        );
+        assert_eq!(
+            pool.attributes.get("pads"),
+            Some(&AttributeValue::Ints(vec![0, 0]))
+        );
+        assert_eq!(
+            pool.attributes.get("count_include_pad"),
+            Some(&AttributeValue::Int(1))
+        );
+        assert_builds(&model, "AdaptiveAvgPool1d");
+
+        let network = model
+            .build_graph_network(ny_build::GraphNetworkOptions::default())
+            .expect("AdaptiveAvgPool1d builds");
+        let bounds = ramp_bounds(2, 6);
+        let out = network
+            .propagate_ibp(&bounds)
+            .expect("AdaptiveAvgPool1d IBP");
+        let direct = ny_propagate::layers::AveragePoolLayer::new((1, 2), (1, 2), (0, 0), true)
+            .propagate_ibp(&bounds)
+            .expect("direct AveragePoolLayer IBP");
+        assert_eq!(out.lower().shape(), direct.lower().shape());
+        // The built network may route AveragePool through the certified
+        // `propagate_ibp_sound` variant, which is the same enclosure widened
+        // by a Higham residual — so require ENCLOSURE of the direct layer's
+        // bounds, tight to 1e-4, rather than bitwise equality.
+        for (idx, expected) in direct.lower().indexed_iter() {
+            let got = out.lower()[idx.clone()];
+            assert!(
+                got <= *expected + 1e-6 && got >= *expected - 1e-4,
+                "lower at {idx:?}: {got} must enclose the direct layer's {expected} tightly"
+            );
+        }
+        for (idx, expected) in direct.upper().indexed_iter() {
+            let got = out.upper()[idx.clone()];
+            assert!(
+                got >= *expected - 1e-6 && got <= *expected + 1e-4,
+                "upper at {idx:?}: {got} must enclose the direct layer's {expected} tightly"
+            );
+        }
+        // Real-arithmetic ground truth for the first channel: averages of
+        // (0,1), (2,3), (4,5).
+        for (w, expected) in [0.5f32, 2.5, 4.5].iter().enumerate() {
+            assert_encloses_tightly(
+                out.lower()[[0, 0, w]],
+                out.upper()[[0, 0, w]] - 1.0,
+                *expected,
+                1e-4,
+                &format!("AdaptiveAvgPool1d [0][{w}]"),
+            );
+        }
+    }
+
+    /// AdaptiveAvgPool1d refuses uneven geometry and non-3D input.
+    #[test]
+    fn adaptive_avg_pool1d_uneven_refused() {
+        let uneven = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 1, 5]),
+            node(
+                1,
+                "pool",
+                TraceOp::AdaptiveAvgPool1d { output_size: 3 },
+                &[0],
+                &[1, 1, 3],
+            ),
+        ]);
+        let err = translate(&uneven).expect_err("uneven adaptive 1d pool refused");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("AdaptiveAvgPool1d") && m.contains("not evenly divisible")),
+            "expected UnsupportedOp mentioning divisibility, got: {err:?}"
+        );
+
+        let rank2 = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[2, 4]),
+            node(
+                1,
+                "pool",
                 TraceOp::AdaptiveAvgPool1d { output_size: 1 },
-                "AdaptiveAvgPool1d",
-                vec![1, 1, 8],
-                vec![1, 1, 1],
+                &[0],
+                &[2, 1],
             ),
-            (
+        ]);
+        let err = translate(&rank2).expect_err("2D input refused");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("AdaptiveAvgPool1d") && m.contains("expected 3D input")),
+            "expected UnsupportedOp naming AdaptiveAvgPool1d + 3D, got: {err:?}"
+        );
+    }
+
+    /// AdaptiveMaxPool2d derives kernel = stride = in/out per spatial dim,
+    /// emits NO count_include_pad, and matches the direct `MaxPool2dLayer`
+    /// exactly (max-pool IBP is comparison-only, so no rounding slack).
+    #[test]
+    fn adaptive_max_pool2d_derives_kernel_and_matches_direct_layer() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 2, 4, 6]),
+            node(
+                1,
+                "pool",
+                TraceOp::AdaptiveMaxPool2d {
+                    output_size: [2, 3],
+                },
+                &[0],
+                &[1, 2, 2, 3],
+            ),
+        ]);
+        let model = translate(&graph).expect("AdaptiveMaxPool2d translates");
+        let pool = find_layer(&model, &LayerType::MaxPool);
+        assert_eq!(
+            pool.attributes.get("kernel_shape"),
+            Some(&AttributeValue::Ints(vec![2, 2])),
+            "kernel = (4/2, 6/3)"
+        );
+        assert_eq!(
+            pool.attributes.get("strides"),
+            Some(&AttributeValue::Ints(vec![2, 2]))
+        );
+        assert_eq!(
+            pool.attributes.get("pads"),
+            Some(&AttributeValue::Ints(vec![0, 0, 0, 0]))
+        );
+        assert!(
+            !pool.attributes.contains_key("count_include_pad"),
+            "MaxPool has no count_include_pad (padding never raises the max)"
+        );
+        assert_builds(&model, "AdaptiveMaxPool2d");
+
+        let network = model
+            .build_graph_network(ny_build::GraphNetworkOptions::default())
+            .expect("AdaptiveMaxPool2d builds");
+        let values: Vec<f32> = (0..2 * 4 * 6).map(|i| i as f32).collect();
+        let lower = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 2, 4, 6]), values)
+            .expect("ramp shape");
+        let upper = lower.mapv(|v| v + 1.0);
+        let bounds = ny_tensor::BoundedTensor::new(lower, upper).expect("bounds");
+        let out = network
+            .propagate_ibp(&bounds)
+            .expect("AdaptiveMaxPool2d IBP");
+        let direct = ny_propagate::layers::MaxPool2dLayer::new((2, 2), (2, 2), (0, 0))
+            .propagate_ibp(&bounds)
+            .expect("direct MaxPool2dLayer IBP");
+        assert_eq!(out.lower(), direct.lower(), "max-pool IBP is exact");
+        assert_eq!(out.upper(), direct.upper(), "max-pool IBP is exact");
+    }
+
+    /// AdaptiveMaxPool2d refuses uneven geometry and non-4D input.
+    #[test]
+    fn adaptive_max_pool2d_uneven_refused() {
+        let uneven = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 1, 4, 4]),
+            node(
+                1,
+                "pool",
+                TraceOp::AdaptiveMaxPool2d {
+                    output_size: [3, 3],
+                },
+                &[0],
+                &[1, 1, 3, 3],
+            ),
+        ]);
+        let err = translate(&uneven).expect_err("uneven adaptive max pool refused");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("AdaptiveMaxPool2d") && m.contains("not evenly divisible")),
+            "expected UnsupportedOp mentioning divisibility, got: {err:?}"
+        );
+
+        let rank2 = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[2, 4]),
+            node(
+                1,
+                "pool",
                 TraceOp::AdaptiveMaxPool2d {
                     output_size: [1, 1],
                 },
-                "AdaptiveMaxPool2d",
-                vec![1, 1, 4, 4],
-                vec![1, 1, 1, 1],
+                &[0],
+                &[1, 1],
             ),
-        ];
-        for (op, opname, in_shape, out_shape) in cases {
-            let graph = ComputationGraph::from_nodes(vec![
-                node(0, "x", TraceOp::Input, &[], &in_shape),
-                node(1, "pool", op, &[0], &out_shape),
-            ]);
-            let err = translate(&graph).expect_err("unported pooling op refused");
-            match err {
-                NyError::UnsupportedOp(msg) => {
-                    assert_eq!(
-                        msg,
-                        format!("{opname} not supported in NY trace translation"),
-                        "exact catch-all refusal message for {opname}"
-                    );
-                }
-                other => panic!("expected UnsupportedOp for {opname}, got {other:?}"),
-            }
-        }
+        ]);
+        let err = translate(&rank2).expect_err("2D input refused");
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("AdaptiveMaxPool2d") && m.contains("expected 4D input")),
+            "expected UnsupportedOp naming AdaptiveMaxPool2d + 4D, got: {err:?}"
+        );
     }
 }

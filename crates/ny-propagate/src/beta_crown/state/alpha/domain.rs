@@ -169,6 +169,29 @@ impl DomainAlphaState {
         state
     }
 
+    /// Overwrite this state's neurons with the PARENT domain's optimized
+    /// entries wherever the key survives (#bab-warm-start).
+    ///
+    /// The receiver is expected to be freshly built by
+    /// [`Self::from_layer_bounds_and_constraints`], which derives the CORRECT
+    /// membership for the child (the newly-split neuron is excluded — its
+    /// relaxation is now a fixed slope — and newly-stable neurons are
+    /// dropped). This pass then carries the parent's optimized α plus its
+    /// Adam/momentum accumulators for every inherited unstable neuron, so the
+    /// child's 15 joint iterations continue the parent's trajectory instead
+    /// of re-deriving the `u > -l` heuristic from scratch every split.
+    ///
+    /// SOUNDNESS: α ∈ [0, 1] always yields a valid ReLU relaxation;
+    /// initialization affects only optimization trajectory, never bound
+    /// validity.
+    pub fn warm_start_from(&mut self, parent: &Self) {
+        for (key, neuron) in self.neurons.iter_mut() {
+            if let Some(parent_neuron) = parent.neurons.get(key) {
+                *neuron = *parent_neuron;
+            }
+        }
+    }
+
     /// α value for a neuron. Returns the heuristic default if not found.
     pub fn alpha(&self, layer_idx: usize, neuron_idx: usize) -> f32 {
         self.neurons

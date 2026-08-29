@@ -185,6 +185,107 @@ def _execution_observations(
             "skipped": 0,
             "tightened_dimensions": 0,
         },
+        "root_joint_interm_alpha": {
+            "schema": "ny_beta_crown_root_joint_interm_alpha_observations_v1",
+            "observed": False,
+            "attribution_conflict": False,
+            "counter_overflow": False,
+            "invocations": 0,
+            "input_split_invocations": 0,
+            "multi_objective_invocations": 0,
+            "configured_master": None,
+            "configured_max_dim_override": None,
+            "input_split_configured_max_dim": None,
+            "multi_objective_configured_max_dim": None,
+            "configured_secs": None,
+            "configured_iters": None,
+            "configured_lr_bits": None,
+            "configured_deadline_ascent": None,
+            "configured_min_remaining_secs": None,
+            "configured_max_sel": None,
+            "configured_frozen_stop": None,
+            "configured_pure_chain": None,
+            "configured_bn_gpu_extract": None,
+            "max_effective_iters": 0,
+            "target_count": 0,
+            "available_budget_ms": 0,
+            "effective_slice_ms": 0,
+            "configured_slice_work_invocations": 0,
+            "configured_iters_binding_invocations": 0,
+            "lowered_min_remaining_work_invocations": 0,
+            "raised_min_remaining_binding_refusals": 0,
+            "work_started": 0,
+            "attempts": 0,
+            "completed": 0,
+            "tightened_count": 0,
+            "target_attempts": 0,
+            "base_folds_completed": 0,
+            "ascent_iterations_attempted": 0,
+            "max_ascent_iterations_attempted": 0,
+            "optimizer_steps": 0,
+            "ascent_folds_completed": 0,
+            "max_selected_rows": 0,
+            "selection_cap_bound_targets": 0,
+            "frozen_stop_targets": 0,
+            "pure_chain_targets": 0,
+            "bn_extract_targets": 0,
+            "master_disabled": 0,
+            "admission_floor_refusals": 0,
+            "deadline_route_refusals": 0,
+            "slice_refusals": 0,
+            "no_target_refusals": 0,
+            "capability_refusals": 0,
+            "execution_refusals": 0,
+        },
+        "mo_kfsb": {
+            "schema": "ny_beta_crown_mo_kfsb_observations_v1",
+            "observed": False,
+            "attribution_conflict": False,
+            "counter_overflow": False,
+            "canonical_master": None,
+            "legacy_childsim": None,
+            "configured_master": None,
+            "configured_candidates": None,
+            "effective_candidates": None,
+            "configured_reduce_op": None,
+            "effective_reduce_op": None,
+            "heuristic_eligible": None,
+            "branch_opportunities": 0,
+            "offered_domains": 0,
+            "nonempty_domain_opportunities": 0,
+            "candidate_eligible_opportunities": 0,
+            "typed_select_opportunities": 0,
+            "lower_master_opportunities": 0,
+            "effective_master_opportunities": 0,
+            "route_eligible_opportunities": 0,
+            "selector_waves": 0,
+            "selector_domains": 0,
+            "committed_waves": 0,
+            "committed_parents": 0,
+            "committed_leaves": 0,
+            "force_on_binding_waves": 0,
+            "master_binding_refusals": 0,
+        },
+        "mo_alpha_step": {
+            "schema": "ny_beta_crown_mo_alpha_step_observations_v1",
+            "observed": False,
+            "effective_alpha_step": None,
+            "effective_beta_spsa": None,
+            "schedule_period": 4,
+            "alpha_round_remainder": 3,
+            "attribution_conflict": False,
+            "counter_overflow": False,
+            "optimizer_invocations": 0,
+            "eligible_invocations": 0,
+            "eligible_iterations": 0,
+            "fourth_iteration_opportunities": 0,
+            "alpha_rounds_scheduled": 0,
+            "beta_rounds_scheduled": 0,
+            "alpha_rounds_completed": 0,
+            "alpha_rounds_refused": 0,
+            "alpha_updates_applied": 0,
+            "perturbed_coordinates": 0,
+        },
         "patches_materialization": {
             "observed": False,
             "attribution_conflict": False,
@@ -220,6 +321,75 @@ def _execution_observations(
             "admitted_bytes": 0,
             "budget_bytes": 0,
         },
+    }
+
+
+def _configured_mo_kfsb_observations(
+    module, configured: bool, *, candidates: int = 7, reduce_op: str = "max"
+):
+    document = _execution_observations(module)
+    mo_kfsb = document["mo_kfsb"]
+    mo_kfsb.update(
+        observed=True,
+        canonical_master="absent",
+        legacy_childsim=False,
+        configured_master=configured,
+        configured_candidates=candidates,
+        effective_candidates=candidates,
+        configured_reduce_op=reduce_op,
+        effective_reduce_op=reduce_op,
+        heuristic_eligible=True,
+        branch_opportunities=1,
+        offered_domains=2,
+        nonempty_domain_opportunities=1,
+        candidate_eligible_opportunities=1,
+        typed_select_opportunities=0,
+        lower_master_opportunities=int(configured),
+        effective_master_opportunities=int(configured),
+        route_eligible_opportunities=1,
+        selector_waves=int(configured),
+        selector_domains=2 if configured else 0,
+        committed_waves=int(configured),
+        committed_parents=int(configured),
+        # Both sides may be proved infeasible. The committed parent map remains
+        # real selector work even though it contains no feasible leaves.
+        committed_leaves=0,
+        force_on_binding_waves=0,
+        master_binding_refusals=0,
+    )
+    return document
+
+
+def _live_mo_alpha_step_observations(module, *, enabled: bool = True):
+    document = _execution_observations(module)
+    document["mo_alpha_step"].update(
+        observed=True,
+        effective_alpha_step=enabled,
+        effective_beta_spsa=True,
+        optimizer_invocations=1,
+        eligible_invocations=1,
+        eligible_iterations=8,
+        fourth_iteration_opportunities=2,
+        alpha_rounds_scheduled=2 if enabled else 0,
+        beta_rounds_scheduled=6 if enabled else 8,
+        alpha_rounds_completed=2 if enabled else 0,
+        alpha_rounds_refused=0,
+        alpha_updates_applied=2 if enabled else 0,
+        perturbed_coordinates=20 if enabled else 0,
+    )
+    return document
+
+
+def _configured_mo_kfsb_expectation(
+    configured: bool, *, candidates: int = 7, reduce_op: str = "max"
+):
+    return {
+        "treatment": "mo_kfsb_configured",
+        "configured": configured,
+        "configured_candidates": candidates,
+        "effective_candidates": candidates,
+        "configured_reduce_op": reduce_op,
+        "effective_reduce_op": reduce_op,
     }
 
 
@@ -992,6 +1162,9 @@ def test_invprop_runtime_schema_rejects_invalid_evaluated_fold_causality(
         "ny_beta_crown_execution_observations_v2",
         "ny_beta_crown_execution_observations_v3",
         "ny_beta_crown_execution_observations_v4",
+        "ny_beta_crown_execution_observations_v5",
+        "ny_beta_crown_execution_observations_v6",
+        "ny_beta_crown_execution_observations_v7",
         "ny_beta_crown_execution_observations_v99",
     ],
 )
@@ -1002,12 +1175,12 @@ def test_stale_or_unknown_execution_observation_payload_is_rejected(
     document = _execution_observations(module)
     document["schema"] = unsupported_schema
 
-    assert "execution_observations_v5" in json.dumps(
+    assert "execution_observations_v8" in json.dumps(
         module._execution_observations_structure_issues(document)
     )
 
 
-def test_execution_observation_v5_requires_bounded_multi_iteration_aggregates():
+def test_execution_observation_v8_requires_bounded_multi_iteration_aggregates():
     module = _load_module()
     document = _execution_observations(module, exact_c_limit=4)
     document["exact_c"].pop("multi_iteration_evidence_outcomes")
@@ -1017,7 +1190,767 @@ def test_execution_observation_v5_requires_bounded_multi_iteration_aggregates():
     )
 
 
-def test_execution_observation_v5_requires_patches_materialization_section():
+def test_execution_observation_v8_requires_root_joint_observation_section():
+    module = _load_module()
+    document = _execution_observations(module)
+    document.pop("root_joint_interm_alpha")
+
+    assert (
+        "execution_observations.root_joint_interm_alpha is not an object"
+        in module._execution_observations_structure_issues(document)
+    )
+
+
+def test_execution_observation_v8_rejects_root_joint_config_without_invocation():
+    module = _load_module()
+    document = _execution_observations(module)
+    document["root_joint_interm_alpha"]["configured_master"] = True
+
+    assert "configuration completeness disagrees" in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+def test_execution_observation_v8_requires_mo_kfsb_section():
+    module = _load_module()
+    document = _execution_observations(module)
+    document.pop("mo_kfsb")
+
+    assert (
+        "execution_observations.mo_kfsb is not an object"
+        in module._execution_observations_structure_issues(document)
+    )
+
+
+def test_execution_observation_v8_requires_mo_alpha_step_section():
+    module = _load_module()
+    document = _execution_observations(module)
+    document.pop("mo_alpha_step")
+
+    assert (
+        "execution_observations.mo_alpha_step is not an object"
+        in module._execution_observations_structure_issues(document)
+    )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_mo_alpha_step_schema_accepts_live_every_fourth_schedule(enabled):
+    module = _load_module()
+    document = _live_mo_alpha_step_observations(module, enabled=enabled)
+
+    assert module._execution_observations_structure_issues(document) == []
+
+
+@pytest.mark.parametrize("field", ["schema", "alpha_rounds_refused"])
+def test_mo_alpha_step_schema_rejects_incomplete_field_set(field):
+    module = _load_module()
+    document = _execution_observations(module)
+    document["mo_alpha_step"].pop(field)
+
+    assert "unknown or incomplete field set" in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+def test_mo_alpha_step_schema_rejects_unknown_field():
+    module = _load_module()
+    document = _execution_observations(module)
+    document["mo_alpha_step"]["future"] = 0
+
+    assert "unknown or incomplete field set" in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_issue"),
+    [
+        (
+            lambda observation: observation.update(schema="obsolete"),
+            ".schema is not",
+        ),
+        (
+            lambda observation: observation.update(schedule_period=5),
+            "schedule_period is not four",
+        ),
+        (
+            lambda observation: observation.update(alpha_round_remainder=0),
+            "alpha_round_remainder is not three",
+        ),
+        (
+            lambda observation: observation.update(observed=False),
+            "observed disagrees with optimizer invocations",
+        ),
+        (
+            lambda observation: observation.update(effective_alpha_step=None),
+            "effective policy completeness disagrees with observation",
+        ),
+        (
+            lambda observation: observation.update(eligible_invocations=2),
+            "eligible_invocations exceeds optimizer invocations",
+        ),
+        (
+            lambda observation: observation.update(eligible_invocations=0),
+            "eligible iterations without an eligible invocation",
+        ),
+        (
+            lambda observation: observation.update(
+                fourth_iteration_opportunities=3
+            ),
+            "fourth-round opportunities are not realizable",
+        ),
+        (
+            lambda observation: observation.update(
+                fourth_iteration_opportunities=1
+            ),
+            "fourth-round opportunities are not realizable",
+        ),
+        (
+            lambda observation: observation.update(
+                optimizer_invocations=1 << 63,
+                eligible_invocations=1 << 63,
+                eligible_iterations=0,
+                fourth_iteration_opportunities=0,
+                alpha_rounds_scheduled=0,
+                beta_rounds_scheduled=0,
+                alpha_rounds_completed=0,
+                alpha_updates_applied=0,
+                perturbed_coordinates=0,
+            ),
+            "fourth-round opportunity envelope overflows u64",
+        ),
+        (
+            lambda observation: observation.update(beta_rounds_scheduled=5),
+            "scheduled rounds do not equal eligible iterations",
+        ),
+        (
+            lambda observation: observation.update(alpha_rounds_completed=1),
+            "alpha outcomes do not equal scheduled alpha rounds",
+        ),
+        (
+            lambda observation: observation.update(alpha_updates_applied=1),
+            "applied updates do not equal completed alpha rounds",
+        ),
+        (
+            lambda observation: observation.update(perturbed_coordinates=0),
+            "perturbed coordinates disagree with alpha scheduling",
+        ),
+        (
+            lambda observation: observation.update(perturbed_coordinates=1),
+            "perturbed coordinates are fewer than scheduled rounds",
+        ),
+        (
+            lambda observation: observation.update(perturbed_coordinates=19),
+            "single-invocation coordinates are not divisible by alpha rounds",
+        ),
+        (
+            lambda observation: observation.update(effective_beta_spsa=False),
+            "scheduled work occurred while beta SPSA was disabled",
+        ),
+        (
+            lambda observation: observation.update(
+                alpha_rounds_scheduled=1,
+                beta_rounds_scheduled=7,
+                alpha_rounds_completed=1,
+                alpha_updates_applied=1,
+            ),
+            "enabled alpha schedule missed a fourth round",
+        ),
+        (
+            lambda observation: observation.update(effective_alpha_step=False),
+            "alpha work occurred while alpha stepping was disabled",
+        ),
+        (
+            lambda observation: observation.update(counter_overflow=True),
+            "counter overflow is present",
+        ),
+        (
+            lambda observation: observation.update(attribution_conflict=True),
+            "attribution conflict is present",
+        ),
+    ],
+)
+def test_mo_alpha_step_schema_rejects_unrealizable_aggregate(
+    mutation, expected_issue
+):
+    module = _load_module()
+    document = _live_mo_alpha_step_observations(module)
+    mutation(document["mo_alpha_step"])
+
+    assert expected_issue in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_issue"),
+    [
+        ("observed", 1, "observed is not boolean"),
+        (
+            "effective_alpha_step",
+            1,
+            "effective_alpha_step is not null or boolean",
+        ),
+        ("eligible_iterations", True, "eligible_iterations is not a u64 integer"),
+        ("eligible_iterations", -1, "eligible_iterations is not a u64 integer"),
+        (
+            "eligible_iterations",
+            1 << 64,
+            "eligible_iterations is not a u64 integer",
+        ),
+    ],
+)
+def test_mo_alpha_step_schema_rejects_noncanonical_types(
+    field, value, expected_issue
+):
+    module = _load_module()
+    document = _live_mo_alpha_step_observations(module)
+    document["mo_alpha_step"][field] = value
+
+    assert expected_issue in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+def test_mo_kfsb_schema_accepts_exact_enable_with_zero_leaf_parent():
+    module = _load_module()
+    document = _execution_observations(module)
+    document["mo_kfsb"].update(
+        observed=True,
+        canonical_master="exact_enable",
+        legacy_childsim=False,
+        configured_master=False,
+        configured_candidates=7,
+        effective_candidates=7,
+        configured_reduce_op="max",
+        effective_reduce_op="max",
+        heuristic_eligible=True,
+        branch_opportunities=1,
+        offered_domains=2,
+        nonempty_domain_opportunities=1,
+        candidate_eligible_opportunities=1,
+        typed_select_opportunities=0,
+        lower_master_opportunities=0,
+        effective_master_opportunities=1,
+        route_eligible_opportunities=1,
+        selector_waves=1,
+        selector_domains=2,
+        committed_waves=1,
+        committed_parents=1,
+        committed_leaves=0,
+        force_on_binding_waves=1,
+    )
+
+    assert module._execution_observations_structure_issues(document) == []
+
+
+def test_mo_kfsb_schema_rejects_full_selector_wave_with_unselected_domains():
+    module = _load_module()
+    document = _configured_mo_kfsb_observations(module, True)
+    document["mo_kfsb"]["selector_domains"] = 1
+
+    assert "full selector coverage omits offered domains" in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+def test_mo_kfsb_schema_rejects_effective_mean_without_configured_mean():
+    module = _load_module()
+    document = _configured_mo_kfsb_observations(module, True)
+    document["mo_kfsb"]["effective_reduce_op"] = "mean"
+
+    assert "effective mean lacks configured-mean authority" in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+def test_mo_kfsb_schema_rejects_typed_select_under_non_min_reducer():
+    module = _load_module()
+    document = _configured_mo_kfsb_observations(module, True)
+    document["mo_kfsb"]["typed_select_opportunities"] = 1
+
+    assert "typed Select requires effective min reduction" in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_issue"),
+    [
+        (
+            {
+                "nonempty_domain_opportunities": 0,
+                "route_eligible_opportunities": 0,
+                "selector_waves": 0,
+                "selector_domains": 0,
+                "committed_waves": 0,
+                "committed_parents": 0,
+                "force_on_binding_waves": 0,
+            },
+            "nonempty opportunities do not equal branches",
+        ),
+        (
+            {"route_eligible_opportunities": 0},
+            "selector domains exist without route eligibility",
+        ),
+        (
+            {
+                "branch_opportunities": 2,
+                "nonempty_domain_opportunities": 2,
+                "candidate_eligible_opportunities": 2,
+                "effective_master_opportunities": 2,
+                "route_eligible_opportunities": 2,
+                "selector_waves": 2,
+                "committed_waves": 2,
+            },
+            "committed waves exceed committed parents",
+        ),
+        (
+            {
+                "selector_domains": 0,
+                "committed_waves": 0,
+                "committed_parents": 0,
+                "force_on_binding_waves": 0,
+            },
+            "selector waves exceed selector domains",
+        ),
+        (
+            {
+                "effective_candidates": 0,
+                "candidate_eligible_opportunities": 0,
+                "typed_select_opportunities": 1,
+                "lower_master_opportunities": 1,
+                "route_eligible_opportunities": 0,
+                "selector_waves": 0,
+                "selector_domains": 0,
+                "committed_waves": 0,
+                "committed_parents": 0,
+                "force_on_binding_waves": 0,
+            },
+            "typed Select exceeds candidate eligibility",
+        ),
+        (
+            {
+                "heuristic_eligible": False,
+                "typed_select_opportunities": 1,
+                "lower_master_opportunities": 1,
+                "route_eligible_opportunities": 0,
+                "selector_waves": 0,
+                "selector_domains": 0,
+                "committed_waves": 0,
+                "committed_parents": 0,
+                "force_on_binding_waves": 0,
+            },
+            "typed Select ran under an ineligible heuristic",
+        ),
+        (
+            {
+                "branch_opportunities": 2,
+                "nonempty_domain_opportunities": 2,
+                "candidate_eligible_opportunities": 2,
+                "effective_master_opportunities": 2,
+                "route_eligible_opportunities": 1,
+                "selector_waves": 2,
+            },
+            "selector waves exceed gate prerequisites",
+        ),
+        (
+            {
+                "branch_opportunities": 2,
+                "nonempty_domain_opportunities": 2,
+                "candidate_eligible_opportunities": 2,
+                "effective_master_opportunities": 2,
+                "route_eligible_opportunities": 1,
+                "selector_waves": 2,
+                "committed_waves": 2,
+                "committed_parents": 2,
+                "force_on_binding_waves": 2,
+            },
+            "committed waves exceed routed nonempty waves",
+        ),
+        (
+            {"committed_leaves": 1025},
+            "committed leaves exceed the per-parent bound",
+        ),
+        (
+            {
+                "offered_domains": (1 << 64) - 1,
+                "selector_domains": (1 << 64) - 1,
+                "committed_parents": ((1 << 64) - 1) // 1024 + 1,
+            },
+            "committed leaves exceed the per-parent bound",
+        ),
+        (
+            {
+                "canonical_master": "absent",
+                "branch_opportunities": 2,
+                "offered_domains": 2,
+                "nonempty_domain_opportunities": 2,
+                "candidate_eligible_opportunities": 2,
+                "typed_select_opportunities": 1,
+                "lower_master_opportunities": 1,
+                "effective_master_opportunities": 1,
+                "route_eligible_opportunities": 2,
+                "selector_waves": 0,
+                "selector_domains": 0,
+                "committed_waves": 0,
+                "committed_parents": 0,
+                "force_on_binding_waves": 0,
+            },
+            "selector waves miss a required routed wave",
+        ),
+        (
+            {
+                "canonical_master": "exact_disable",
+                "configured_master": True,
+                "branch_opportunities": 2,
+                "offered_domains": 2,
+                "nonempty_domain_opportunities": 2,
+                "candidate_eligible_opportunities": 2,
+                "lower_master_opportunities": 2,
+                "effective_master_opportunities": 0,
+                "route_eligible_opportunities": 1,
+                "selector_waves": 0,
+                "selector_domains": 0,
+                "committed_waves": 0,
+                "committed_parents": 0,
+                "force_on_binding_waves": 0,
+                "master_binding_refusals": 0,
+            },
+            "exact-disable master refusals are incomplete",
+        ),
+        (
+            {
+                "branch_opportunities": 2,
+                "offered_domains": 2,
+                "nonempty_domain_opportunities": 2,
+                "candidate_eligible_opportunities": 2,
+                "typed_select_opportunities": 1,
+                "lower_master_opportunities": 1,
+                "effective_master_opportunities": 2,
+                "route_eligible_opportunities": 2,
+                "selector_waves": 2,
+                "selector_domains": 2,
+                "committed_waves": 2,
+                "committed_parents": 2,
+                "force_on_binding_waves": 0,
+            },
+            "exact-enable force-on bindings are incomplete",
+        ),
+        (
+            {
+                "branch_opportunities": 2,
+                "offered_domains": 3,
+                "nonempty_domain_opportunities": 2,
+                "candidate_eligible_opportunities": 2,
+                "effective_master_opportunities": 2,
+                "route_eligible_opportunities": 1,
+                "selector_waves": 1,
+                "selector_domains": 3,
+                "committed_waves": 1,
+                "committed_parents": 1,
+                "force_on_binding_waves": 1,
+            },
+            "selector domains exceed the selected-wave capacity",
+        ),
+        (
+            {
+                "branch_opportunities": 2,
+                "offered_domains": 2,
+                "nonempty_domain_opportunities": 2,
+                "candidate_eligible_opportunities": 2,
+                "effective_master_opportunities": 2,
+                "route_eligible_opportunities": 2,
+                "selector_waves": 2,
+                "selector_domains": 2,
+                "committed_waves": 1,
+                "committed_parents": 2,
+                "force_on_binding_waves": 1,
+            },
+            "committed parents exceed the selector partition",
+        ),
+    ],
+)
+def test_mo_kfsb_schema_rejects_impossible_domain_and_commit_aggregates(
+    overrides, expected_issue
+):
+    module = _load_module()
+    document = _execution_observations(module)
+    document["mo_kfsb"].update(
+        observed=True,
+        canonical_master="exact_enable",
+        legacy_childsim=False,
+        configured_master=False,
+        configured_candidates=7,
+        effective_candidates=7,
+        configured_reduce_op="max",
+        effective_reduce_op="max",
+        heuristic_eligible=True,
+        branch_opportunities=1,
+        offered_domains=2,
+        nonempty_domain_opportunities=1,
+        candidate_eligible_opportunities=1,
+        typed_select_opportunities=0,
+        lower_master_opportunities=0,
+        effective_master_opportunities=1,
+        route_eligible_opportunities=1,
+        selector_waves=1,
+        selector_domains=2,
+        committed_waves=1,
+        committed_parents=1,
+        committed_leaves=0,
+        force_on_binding_waves=1,
+    )
+    document["mo_kfsb"].update(overrides)
+
+    assert expected_issue in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_issue"),
+    [
+        (
+            lambda mo_kfsb: mo_kfsb.pop("offered_domains"),
+            "unknown or incomplete field set",
+        ),
+        (
+            lambda mo_kfsb: mo_kfsb.pop("effective_reduce_op"),
+            "unknown or incomplete field set",
+        ),
+        (
+            lambda mo_kfsb: mo_kfsb.update(invented=0),
+            "unknown or incomplete field set",
+        ),
+        (
+            lambda mo_kfsb: mo_kfsb.update(attribution_conflict=True),
+            "MO-kFSB attribution conflict is present",
+        ),
+        (
+            lambda mo_kfsb: mo_kfsb.update(counter_overflow=True),
+            "MO-kFSB counter overflow is present",
+        ),
+        (
+            lambda mo_kfsb: mo_kfsb.update(offered_domains=1 << 64),
+            "offered_domains is not a u64 integer",
+        ),
+        (
+            lambda mo_kfsb: mo_kfsb.update(configured_reduce_op="MAX"),
+            "configured_reduce_op is not null or an exact reduce operation",
+        ),
+        (
+            lambda mo_kfsb: mo_kfsb.update(effective_reduce_op={"max": True}),
+            "effective_reduce_op is not null or an exact reduce operation",
+        ),
+    ],
+)
+def test_mo_kfsb_schema_rejects_incomplete_conflicting_or_overflowed_sections(
+    mutation, expected_issue
+):
+    module = _load_module()
+    document = _execution_observations(module)
+    mutation(document["mo_kfsb"])
+
+    assert expected_issue in json.dumps(
+        module._execution_observations_structure_issues(document)
+    )
+
+
+def test_mo_kfsb_schema_rejects_binding_without_exact_authority():
+    module = _load_module()
+    document = _execution_observations(module)
+    document["mo_kfsb"].update(
+        observed=True,
+        canonical_master="rejected",
+        legacy_childsim=False,
+        configured_master=True,
+        configured_candidates=7,
+        effective_candidates=7,
+        configured_reduce_op="max",
+        effective_reduce_op="max",
+        heuristic_eligible=True,
+        branch_opportunities=1,
+        offered_domains=2,
+        nonempty_domain_opportunities=1,
+        candidate_eligible_opportunities=1,
+        lower_master_opportunities=1,
+        route_eligible_opportunities=1,
+        master_binding_refusals=1,
+    )
+
+    issues = json.dumps(module._execution_observations_structure_issues(document))
+    assert "effective-master opportunities contradict policy" not in issues
+    assert "master refusal lacks exact-disable authority" in issues
+
+
+def test_mo_kfsb_schema_accepts_exact_disable_binding_refusal():
+    module = _load_module()
+    document = _execution_observations(module)
+    document["mo_kfsb"].update(
+        observed=True,
+        canonical_master="exact_disable",
+        legacy_childsim=False,
+        configured_master=True,
+        configured_candidates=7,
+        effective_candidates=7,
+        configured_reduce_op="max",
+        effective_reduce_op="max",
+        heuristic_eligible=True,
+        branch_opportunities=1,
+        offered_domains=2,
+        nonempty_domain_opportunities=1,
+        candidate_eligible_opportunities=1,
+        lower_master_opportunities=1,
+        route_eligible_opportunities=1,
+        master_binding_refusals=1,
+    )
+
+    assert module._execution_observations_structure_issues(document) == []
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_mo_kfsb_configured_runtime_gate_accepts_causal_on_and_off(configured):
+    module = _load_module()
+    document = _configured_mo_kfsb_observations(module, configured)
+
+    assessment = module._assess_execution_observation_evidence(
+        [_execution_evidence(module, document)],
+        _configured_mo_kfsb_expectation(configured),
+    )
+
+    assert module._execution_observations_structure_issues(document) == []
+    assert assessment["observed_execution_evidence_complete"] is True
+
+
+def test_mo_kfsb_configured_runtime_gate_authenticates_min_reducer_work():
+    module = _load_module()
+    document = _configured_mo_kfsb_observations(
+        module, True, candidates=10, reduce_op="min"
+    )
+
+    assessment = module._assess_execution_observation_evidence(
+        [_execution_evidence(module, document)],
+        _configured_mo_kfsb_expectation(
+            True, candidates=10, reduce_op="min"
+        ),
+    )
+
+    assert module._execution_observations_structure_issues(document) == []
+    assert assessment["observed_execution_evidence_complete"] is True
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_mo_kfsb_configured_runtime_gate_rejects_honest_inactive_section(configured):
+    module = _load_module()
+    document = _execution_observations(module)
+
+    assessment = module._assess_execution_observation_evidence(
+        [_execution_evidence(module, document)],
+        _configured_mo_kfsb_expectation(configured),
+    )
+
+    assert module._execution_observations_structure_issues(document) == []
+    assert assessment["observed_execution_evidence_complete"] is False
+    assert "did not reach a branch-selection seam" in json.dumps(
+        assessment["execution_observation_mismatches"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured", "mutation", "expected_issue"),
+    [
+        (
+            True,
+            lambda mo_kfsb: mo_kfsb.update(
+                effective_reduce_op="min",
+                typed_select_opportunities=1,
+            ),
+            "round-typed alternate authority",
+        ),
+        (
+            True,
+            lambda mo_kfsb: mo_kfsb.update(canonical_master="exact_enable"),
+            "lacks canonical-absence authority",
+        ),
+        (
+            True,
+            lambda mo_kfsb: mo_kfsb.update(legacy_childsim=True),
+            "legacy alternate authority",
+        ),
+        (
+            True,
+            lambda mo_kfsb: mo_kfsb.update(
+                committed_waves=0, committed_parents=0
+            ),
+            "no committed selector wave",
+        ),
+        (
+            False,
+            lambda mo_kfsb: mo_kfsb.update(route_eligible_opportunities=0),
+            "has no eligible route",
+        ),
+        (
+            False,
+            lambda mo_kfsb: mo_kfsb.update(canonical_master="exact_disable"),
+            "lacks canonical-absence authority",
+        ),
+        (
+            False,
+            lambda mo_kfsb: mo_kfsb.update(
+                effective_reduce_op="min",
+                typed_select_opportunities=1,
+                lower_master_opportunities=1,
+                effective_master_opportunities=1,
+                selector_waves=1,
+                selector_domains=2,
+                committed_waves=1,
+                committed_parents=1,
+            ),
+            "round-typed alternate authority",
+        ),
+        (
+            True,
+            lambda mo_kfsb: mo_kfsb.update(configured_candidates=10),
+            "configured candidate count does not match",
+        ),
+        (
+            True,
+            lambda mo_kfsb: mo_kfsb.update(effective_candidates=10),
+            "effective candidate count does not match",
+        ),
+        (
+            True,
+            lambda mo_kfsb: mo_kfsb.update(configured_reduce_op="min"),
+            "configured reduce op does not match",
+        ),
+        (
+            True,
+            lambda mo_kfsb: mo_kfsb.update(effective_reduce_op="min"),
+            "effective reduce op does not match",
+        ),
+    ],
+)
+def test_mo_kfsb_configured_runtime_gate_rejects_alternate_or_vacuous_evidence(
+    configured, mutation, expected_issue
+):
+    module = _load_module()
+    document = _configured_mo_kfsb_observations(module, configured)
+    mutation(document["mo_kfsb"])
+
+    assessment = module._assess_execution_observation_evidence(
+        [_execution_evidence(module, document)],
+        _configured_mo_kfsb_expectation(configured),
+    )
+
+    assert module._execution_observations_structure_issues(document) == []
+    assert assessment["observed_execution_evidence_complete"] is False
+    assert expected_issue in json.dumps(
+        assessment["execution_observation_mismatches"]
+    )
+
+
+def test_execution_observation_v8_requires_patches_materialization_section():
     module = _load_module()
     document = _execution_observations(module)
     document.pop("patches_materialization")
@@ -1773,6 +2706,114 @@ def test_arm_cannot_combine_independently_gated_runtime_treatments():
         )
 
 
+@pytest.mark.parametrize("configured", [False, True])
+def test_kfsb_multi_override_requires_runtime_execution_evidence(configured):
+    module = _load_module()
+
+    assert module._expected_execution_evidence(
+        {
+            "overrides": {
+                "bab.branching.kfsb_multi": configured,
+                "bab.branching.kfsb_multi_candidates": 7,
+                "bab.branching.kfsb_multi_reduceop": "max",
+            },
+            "env": {},
+        }
+    ) == _configured_mo_kfsb_expectation(configured)
+
+
+def test_kfsb_multi_override_execution_evidence_requires_boolean_value():
+    module = _load_module()
+
+    with pytest.raises(module.ManifestError, match="must be boolean"):
+        module._expected_execution_evidence(
+            {
+                "overrides": {
+                    "bab.branching.kfsb_multi": 1,
+                    "bab.branching.kfsb_multi_candidates": 7,
+                    "bab.branching.kfsb_multi_reduceop": "max",
+                },
+                "env": {},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"bab.branching.kfsb_multi": True},
+        {
+            "bab.branching.kfsb_multi_candidates": 7,
+            "bab.branching.kfsb_multi_reduceop": "max",
+        },
+        {
+            "bab.branching.kfsb_multi": True,
+            "bab.branching.kfsb_multi_candidates": 7,
+        },
+    ],
+)
+def test_kfsb_multi_treatment_requires_explicit_dedicated_parameter_trio(overrides):
+    module = _load_module()
+
+    with pytest.raises(module.ManifestError, match="must explicitly pin"):
+        module._expected_execution_evidence({"overrides": overrides, "env": {}})
+
+
+@pytest.mark.parametrize(
+    ("candidates", "reduce_op", "expected_issue"),
+    [
+        (0, "max", "positive u64 integer"),
+        (True, "max", "positive u64 integer"),
+        (7, "median", "must be min, max, or mean"),
+    ],
+)
+def test_kfsb_multi_treatment_rejects_ambiguous_dedicated_parameters(
+    candidates, reduce_op, expected_issue
+):
+    module = _load_module()
+    overrides = {
+        "bab.branching.kfsb_multi": True,
+        "bab.branching.kfsb_multi_candidates": candidates,
+        "bab.branching.kfsb_multi_reduceop": reduce_op,
+    }
+
+    with pytest.raises(module.ManifestError, match=expected_issue):
+        module._expected_execution_evidence({"overrides": overrides, "env": {}})
+
+
+def test_kfsb_multi_dedicated_parameters_authenticate_effective_wave_projection():
+    module = _load_module()
+    checks, unsupported = module._expected_treatment_authentication(
+        {
+            "overrides": {
+                "bab.branching.kfsb_multi": True,
+                "bab.branching.kfsb_multi_candidates": 7,
+                "bab.branching.kfsb_multi_reduceop": "MAX",
+            },
+            "env": {},
+        }
+    )
+
+    assert unsupported == []
+    assert checks == [
+        {
+            "source": "bab.branching.kfsb_multi",
+            "path": ["branching", "kfsb_multi_configured"],
+            "expected": True,
+        },
+        {
+            "source": "bab.branching.kfsb_multi_candidates",
+            "path": ["branching", "effective_wave_candidates"],
+            "expected": 7,
+        },
+        {
+            "source": "bab.branching.kfsb_multi_reduceop",
+            "path": ["branching", "effective_wave_reduce_op"],
+            "expected": "max",
+        },
+    ]
+
+
 def test_requested_but_inert_split_lift_is_not_promotion_complete():
     module = _load_module()
     checks, unsupported = module._expected_treatment_authentication(
@@ -2445,7 +3486,7 @@ def test_committed_manifest_dry_run_materializes_every_arm(tmp_path):
     assert process.returncode == 0, process.stderr
     execution = json.loads((tmp_path / "execution.json").read_text(encoding="utf-8"))
     assert execution["dry_run"] is True
-    assert len(execution["arms"]) == 46
+    assert len(execution["arms"]) == 48
     assert {arm["experiment"] for arm in execution["arms"]} == {
         "cgan_recipe",
         "cgan_nch1_prop1_backend_route",
@@ -2675,6 +3716,43 @@ def test_committed_manifest_dry_run_materializes_every_arm(tmp_path):
     )
     assert sum(len(arm["resolved_row_bindings"]) for arm in fresh_clip_arms) == 6
 
+    reducer_arms = [
+        arm
+        for arm in execution["arms"]
+        if arm["experiment"] == "tinyimagenet_recipe"
+        and arm["arm"] in {"kfsb_multi_reduce_max", "kfsb_multi_reduce_min"}
+    ]
+    assert [arm["arm"] for arm in reducer_arms] == [
+        "kfsb_multi_reduce_max",
+        "kfsb_multi_reduce_min",
+    ]
+    for arm, reduce_op, disposition in zip(
+        reducer_arms,
+        ("max", "min"),
+        ("default_off_execution_control", "default_off_execution_treatment"),
+        strict=True,
+    ):
+        assert arm["overrides"] == {
+            "bab.branching.kfsb_multi": True,
+            "bab.branching.kfsb_multi_candidates": 10,
+            "bab.branching.kfsb_multi_reduceop": reduce_op,
+        }
+        assert arm["disposition"] == disposition
+        assert arm["expected_execution_evidence"] == {
+            "treatment": "mo_kfsb_configured",
+            "configured": True,
+            "configured_candidates": 10,
+            "effective_candidates": 10,
+            "configured_reduce_op": reduce_op,
+            "effective_reduce_op": reduce_op,
+        }
+        generated = yaml.safe_load(
+            Path(arm["generated_preset"]).read_text(encoding="utf-8")
+        )
+        assert generated["bab"]["branching"]["kfsb_multi"] is True
+        assert generated["bab"]["branching"]["kfsb_multi_candidates"] == 10
+        assert generated["bab"]["branching"]["kfsb_multi_reduceop"] == reduce_op
+
     upstream_bundle = next(
         arm
         for arm in execution["arms"]
@@ -2687,6 +3765,8 @@ def test_committed_manifest_dry_run_materializes_every_arm(tmp_path):
         "bab.branching.candidates": 7,
         "bab.branching.reduceop": "max",
         "bab.branching.kfsb_multi": True,
+        "bab.branching.kfsb_multi_candidates": 7,
+        "bab.branching.kfsb_multi_reduceop": "max",
         "bab.alpha_crown.lr_alpha": 0.25,
         "bab.alpha_crown.iterations": 20,
         "bab.beta_crown.lr_alpha": 0.1,
@@ -2696,11 +3776,42 @@ def test_committed_manifest_dry_run_materializes_every_arm(tmp_path):
         "bab.clip.interm_topk": 20,
         "bab.clip.in_alpha_crown": False,
     }
+    assert upstream_bundle["expected_execution_evidence"] == {
+        "treatment": "mo_kfsb_configured",
+        "configured": True,
+        "configured_candidates": 7,
+        "effective_candidates": 7,
+        "configured_reduce_op": "max",
+        "effective_reduce_op": "max",
+    }
+    assert [
+        check
+        for check in upstream_bundle["expected_treatment_checks"]
+        if check["source"].startswith("bab.branching.kfsb_multi")
+    ] == [
+        {
+            "source": "bab.branching.kfsb_multi",
+            "path": ["branching", "kfsb_multi_configured"],
+            "expected": True,
+        },
+        {
+            "source": "bab.branching.kfsb_multi_candidates",
+            "path": ["branching", "effective_wave_candidates"],
+            "expected": 7,
+        },
+        {
+            "source": "bab.branching.kfsb_multi_reduceop",
+            "path": ["branching", "effective_wave_reduce_op"],
+            "expected": "max",
+        },
+    ]
     generated_bundle = yaml.safe_load(
         Path(upstream_bundle["generated_preset"]).read_text(encoding="utf-8")
     )
     assert generated_bundle["bab"]["branching"]["method"] == "kfsb"
     assert generated_bundle["bab"]["branching"]["kfsb_multi"] is True
+    assert generated_bundle["bab"]["branching"]["kfsb_multi_candidates"] == 7
+    assert generated_bundle["bab"]["branching"]["kfsb_multi_reduceop"] == "max"
     assert generated_bundle["bab"]["alpha_crown"]["lr_alpha"] == 0.25
     assert generated_bundle["bab"]["clip"] == {
         "interm_domain": True,

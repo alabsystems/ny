@@ -32,13 +32,56 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import _portable_file_lock as _file_lock  # noqa: E402
+import ny_measurement_provenance as provenance  # noqa: E402
+from ny_measurement_provenance import (  # noqa: E402
+    EXECUTION_EVIDENCE_PROFILE,
+    JOINT_EXECUTION_EVIDENCE_PROFILE,
+    ExecutionPredicateError,
+    ProvenanceError,
+    flight_build_stamp_for_binary_build_id,
+    parse_execution_predicate_requirement,
+    validate_binary_build_id,
+    validate_execution_predicate_requirement,
+)
 
 
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 MAX_FLIGHT_RECORD_BYTES = 16 * 1024 * 1024
 FLIGHT_SCHEMA_VERSION = 3
 SUPPORTED_FLIGHT_SCHEMA_VERSIONS = frozenset({2, FLIGHT_SCHEMA_VERSION})
-LEVER_RECEIPT_SCHEMA = "ny-levers/receipt/v2"
+FLIGHT_RECORD_BASE_KEYS = frozenset(
+    {
+        "ambient_env",
+        "ambient_env_schema",
+        "backend_kind",
+        "backend_summary",
+        "build_id",
+        "budget_secs",
+        "category",
+        "events",
+        "host",
+        "schema_version",
+    }
+)
+FLIGHT_RECORD_OPTIONAL_KEYS = frozenset(
+    {"load_avg_at_begin", "load_avg_at_end"}
+)
+FLIGHT_RECORD_PARTIAL_KEY = "record_status"
+FLIGHT_RECORD_STATUS_KEYS = frozenset(
+    {"status", "reason", "flushed_at_secs"}
+)
+FLIGHT_HOST_KEYS = frozenset(
+    {"cpu_model", "hostname", "logical_cores", "ram_bytes"}
+)
+FLIGHT_EVENT_KEYS = frozenset({"method", "status"})
+FLIGHT_EVENT_OPTIONAL_KEYS = frozenset({"at_secs", "reason"})
+FLIGHT_AMBIENT_WORKER_KEYS = frozenset(
+    {"OMP_NUM_THREADS", "RAYON_NUM_THREADS", "RAYON_RS_NUM_CPUS"}
+)
+LEVER_RECEIPT_SCHEMA = "ny-levers/receipt/v3"
+SUPPORTED_LEVER_RECEIPT_SCHEMAS = frozenset(
+    {"ny-levers/receipt/v2", LEVER_RECEIPT_SCHEMA}
+)
 LEVER_SOURCES = frozenset(
     {"default", "config", "legacy_env", "legacy_env_rejected"}
 )
@@ -716,7 +759,7 @@ def _valid_v3_lever_state(
         return False
 
     receipt = value["receipt"]
-    expected_fields = {
+    base_fields = {
         "schema",
         "lever_count",
         "env_present",
@@ -724,16 +767,22 @@ def _valid_v3_lever_state(
         "env_rejected",
         "levers",
     }
+    if not isinstance(receipt, dict):
+        return False
+    schema = receipt.get("schema")
+    if schema not in SUPPORTED_LEVER_RECEIPT_SCHEMAS:
+        return False
+    expected_fields = base_fields | ({"env_ignored"} if schema == LEVER_RECEIPT_SCHEMA else set())
     if not isinstance(receipt, dict) or set(receipt) != expected_fields:
         return False
-    if receipt["schema"] != LEVER_RECEIPT_SCHEMA:
-        return False
-    count_fields = (
+    count_fields = [
         "lever_count",
         "env_present",
         "env_accepted",
         "env_rejected",
-    )
+    ]
+    if schema == LEVER_RECEIPT_SCHEMA:
+        count_fields.append("env_ignored")
     if any(
         type(receipt[field]) is not int or receipt[field] < 0
         for field in count_fields
@@ -759,6 +808,9 @@ def _valid_v3_lever_state(
         "provenance",
     }
     optional_entry_fields = {"rejected_raw", "env_utf8"}
+    if schema == LEVER_RECEIPT_SCHEMA:
+        optional_entry_fields.add("ignored_raw")
+    ignored = 0
     for entry in levers:
         if (
             not isinstance(entry, dict)
@@ -797,11 +849,23 @@ def _valid_v3_lever_state(
             return False
         if not _valid_lever_value(entry["value"]):
             return False
-        env_backed = source in source_counts
+        has_ignored_raw = "ignored_raw" in entry
+        env_backed = source in source_counts or has_ignored_raw
         if env_backed != (name in ambient_env):
             return False
-        if source == "legacy_env":
-            if set(entry) & {"rejected_raw"} or type(entry.get("env_utf8")) is not bool:
+        if has_ignored_raw:
+            if (
+                schema != LEVER_RECEIPT_SCHEMA
+                or source not in {"default", "config"}
+                or "rejected_raw" in entry
+                or not isinstance(entry.get("ignored_raw"), str)
+                or type(entry.get("env_utf8")) is not bool
+                or entry["ignored_raw"] != ambient_env[name]
+            ):
+                return False
+            ignored += 1
+        elif source == "legacy_env":
+            if set(entry) & {"rejected_raw", "ignored_raw"} or type(entry.get("env_utf8")) is not bool:
                 return False
         elif source == "legacy_env_rejected":
             if (
@@ -818,10 +882,103 @@ def _valid_v3_lever_state(
 
     accepted = source_counts["legacy_env"]
     rejected = source_counts["legacy_env_rejected"]
+    expected_ignored = receipt.get("env_ignored", 0)
     return (
         receipt["env_accepted"] == accepted
         and receipt["env_rejected"] == rejected
-        and receipt["env_present"] == accepted + rejected
+        and expected_ignored == ignored
+        and receipt["env_present"] == accepted + rejected + ignored
+    )
+
+
+def _valid_current_flight_shape(record: dict[str, object]) -> bool:
+    """Require the closed v3 record/event envelope used for current credit."""
+    expected_record_keys = set(FLIGHT_RECORD_BASE_KEYS)
+    expected_record_keys.update(set(record) & FLIGHT_RECORD_OPTIONAL_KEYS)
+    expected_record_keys.add("levers")
+    if FLIGHT_RECORD_PARTIAL_KEY in record:
+        expected_record_keys.add(FLIGHT_RECORD_PARTIAL_KEY)
+    if set(record) != expected_record_keys:
+        return False
+    if FLIGHT_RECORD_PARTIAL_KEY in record:
+        record_status = record.get(FLIGHT_RECORD_PARTIAL_KEY)
+        if (
+            not isinstance(record_status, dict)
+            or set(record_status) != FLIGHT_RECORD_STATUS_KEYS
+        ):
+            return False
+    host = record.get("host")
+    if not isinstance(host, dict) or set(host) != FLIGHT_HOST_KEYS:
+        return False
+    events = record.get("events")
+    if not isinstance(events, list):
+        return False
+    for event in events:
+        if not isinstance(event, dict):
+            return False
+        expected_event_keys = set(FLIGHT_EVENT_KEYS)
+        expected_event_keys.update(set(event) & FLIGHT_EVENT_OPTIONAL_KEYS)
+        if set(event) != expected_event_keys:
+            return False
+    return True
+
+
+def _finite_nonnegative_flight_time(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    )
+
+
+def _valid_partial_v3_flight_lifecycle(record: dict[str, object]) -> bool:
+    """Validate Rust's exact prefix record emitted before a hard stop.
+
+    The listed nonterminal events remain truthful execution evidence.  What a
+    partial record cannot claim is that an absent lane was skipped or that the
+    verifier reached its ordinary terminal path, so the envelope and final
+    ``run_incomplete`` event must agree exactly.
+    """
+    record_status = record.get(FLIGHT_RECORD_PARTIAL_KEY)
+    if (
+        not isinstance(record_status, dict)
+        or set(record_status) != FLIGHT_RECORD_STATUS_KEYS
+        or record_status.get("status") != "partial_hard_stop"
+        or not isinstance(record_status.get("reason"), str)
+        or not record_status["reason"]
+        or not _finite_nonnegative_flight_time(
+            record_status.get("flushed_at_secs")
+        )
+    ):
+        return False
+    events = record.get("events")
+    if not isinstance(events, list) or not events:
+        return False
+    previous_at = -1.0
+    for event in events[:-1]:
+        if (
+            not isinstance(event, dict)
+            or event.get("method") in {"run_complete", "run_incomplete"}
+            or event.get("status") not in {"ran", "skipped", "not_reached"}
+            or "at_secs" not in event
+            or not _finite_nonnegative_flight_time(event.get("at_secs"))
+            or float(event["at_secs"]) < previous_at
+        ):
+            return False
+        previous_at = float(event["at_secs"])
+    terminal = events[-1]
+    if not isinstance(terminal, dict):
+        return False
+    terminal_at = terminal.get("at_secs")
+    return (
+        terminal.get("method") == "run_incomplete"
+        and terminal.get("status") == "incomplete"
+        and terminal.get("reason") == record_status["reason"]
+        and "at_secs" in terminal
+        and _finite_nonnegative_flight_time(terminal_at)
+        and float(terminal_at) >= previous_at
+        and float(terminal_at) == float(record_status["flushed_at_secs"])
     )
 
 
@@ -854,13 +1011,28 @@ def _capture_flight_record(
     if not isinstance(record, dict):
         raise ValueError(f"flight record is not a JSON object: {path}")
     schema_version = record.get("schema_version")
+    partial_v3 = (
+        schema_version == FLIGHT_SCHEMA_VERSION
+        and FLIGHT_RECORD_PARTIAL_KEY in record
+    )
     schema_valid = (
         type(schema_version) is int
         and schema_version in SUPPORTED_FLIGHT_SCHEMA_VERSIONS
         and (
+            schema_version == FLIGHT_SCHEMA_VERSION
+            or FLIGHT_RECORD_PARTIAL_KEY not in record
+        )
+        and (
             schema_version != FLIGHT_SCHEMA_VERSION
-            or _valid_v3_lever_state(
-                record.get("levers"), ambient_env=record.get("ambient_env")
+            or (
+                _valid_current_flight_shape(record)
+                and (
+                    not partial_v3
+                    or _valid_partial_v3_flight_lifecycle(record)
+                )
+                and _valid_v3_lever_state(
+                    record.get("levers"), ambient_env=record.get("ambient_env")
+                )
             )
         )
     )
@@ -868,6 +1040,14 @@ def _capture_flight_record(
     events = record.get("events")
     if (
         not schema_valid
+        or (
+            schema_version == FLIGHT_SCHEMA_VERSION
+            and (
+                record.get("ambient_env_schema") != "ny-cli/ambient-env/v3"
+                or not isinstance(record.get("build_id"), str)
+                or not record.get("build_id")
+            )
+        )
         or not isinstance(record.get("backend_kind"), str)
         or not isinstance(record.get("backend_summary"), str)
         or not isinstance(record.get("host"), dict)
@@ -878,14 +1058,19 @@ def _capture_flight_record(
         or not all(
             isinstance(name, str)
             and isinstance(value, str)
-            and (name.startswith("NY_") or name == "OMP_NUM_THREADS")
+            and (name.startswith("NY_") or name in FLIGHT_AMBIENT_WORKER_KEYS)
             for name, value in ambient_env.items()
         )
         or not isinstance(events, list)
         or not all(
             isinstance(event, dict)
             and isinstance(event.get("method"), str)
-            and event.get("status") in {"ran", "skipped", "not_reached", "complete"}
+            and event.get("status")
+            in (
+                {"ran", "skipped", "not_reached", "incomplete"}
+                if partial_v3
+                else {"ran", "skipped", "not_reached", "complete"}
+            )
             and (event.get("reason") is None or isinstance(event.get("reason"), str))
             and (
                 event.get("at_secs") is None
@@ -897,6 +1082,21 @@ def _capture_flight_record(
         )
     ):
         raise ValueError(f"flight record identity is invalid: {path}")
+    if partial_v3:
+        # `_valid_partial_v3_flight_lifecycle` above owns the terminal prefix
+        # contract.  In particular, a partial timeout has no `run_complete`
+        # verdict to compare with the result token.
+        if solver_verdict != "timeout":
+            raise ValueError(
+                "partial hard-stop flight record requires the committed "
+                f"timeout verdict, not {solver_verdict!r}: {path}"
+            )
+        return {
+            "status": "captured",
+            "source_sha256": hashlib.sha256(data).hexdigest(),
+            "size_bytes": len(data),
+            "record": record,
+        }
     terminal = [
         event
         for event in events
@@ -921,6 +1121,206 @@ def _capture_flight_record(
     }
 
 
+def _parse_required_flight_event(raw: str) -> dict[str, object]:
+    """Parse one current versioned execution predicate via the shared API."""
+    try:
+        return parse_execution_predicate_requirement(raw)
+    except ExecutionPredicateError as error:
+        raise ValueError(
+            f"required flight event must be a current predicate: {error}"
+        ) from error
+
+
+def _enforce_required_flight_events(
+    flight_record: dict[str, object], requirements: tuple[str, ...],
+    *,
+    expected_build_stamp: str | None = None,
+    sealed_requirement: str | None = None,
+    execution_assignment: object = None,
+) -> None:
+    """Reject a measurement whose requested treatment did not actually engage."""
+    if not requirements:
+        return
+    for raw in requirements:
+        _parse_required_flight_event(raw)
+    if flight_record.get("status") != "captured":
+        raise ValueError(
+            "required flight event cannot be verified because the flight record "
+            f"is {flight_record.get('status', 'invalid')!r}"
+        )
+    record = flight_record.get("record")
+    if not isinstance(record, dict):
+        raise ValueError("required flight event cannot be verified")
+    if expected_build_stamp is not None and record.get("build_id") != expected_build_stamp:
+        raise ValueError(
+            "required flight event was emitted by a different solver build stamp"
+        )
+    for raw in requirements:
+        try:
+            validate_execution_predicate_requirement(
+                record,
+                raw,
+                assignment=(
+                    execution_assignment
+                    if raw == sealed_requirement
+                    else None
+                ),
+            )
+        except ExecutionPredicateError as error:
+            raise ValueError(
+                f"required flight event did not engage for {raw!r}: {error}"
+            ) from error
+
+
+def _required_flight_events_from_start(start: dict[str, object]) -> tuple[str, ...]:
+    """Recover the predicate required by the current evidence profile.
+
+    Pre-profile manifests remain readable as historical artifacts, but they do
+    not acquire current execution credit merely because their environment
+    happens to contain the retired bare METHOD=STATUS transport.
+    """
+    measurement = start.get("measurement")
+    profile = (
+        measurement.get("execution_evidence_profile")
+        if isinstance(measurement, dict)
+        else None
+    )
+    if profile is None:
+        return ()
+    if profile not in {
+        provenance.LEGACY_EXECUTION_EVIDENCE_PROFILE,
+        provenance.LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        EXECUTION_EVIDENCE_PROFILE,
+        JOINT_EXECUTION_EVIDENCE_PROFILE,
+    }:
+        raise ValueError("start manifest execution-evidence profile is unsupported")
+    environment = start.get("environment")
+    if not isinstance(environment, dict):
+        raise ValueError("start manifest environment section is invalid")
+    values = environment.get("values")
+    if not isinstance(values, dict):
+        raise ValueError("start manifest environment values are invalid")
+    raw = values.get("NY_MEASURE_REQUIRE_FLIGHT_EVENT")
+    if not isinstance(raw, str):
+        raise ValueError(
+            "current execution-evidence profile requires a sealed execution "
+            "predicate"
+        )
+    # Parse now so a malformed sealed manifest fails even if no flight record
+    # was emitted. The provenance writer normally guarantees this shape.
+    parsed = _parse_required_flight_event(raw)
+    expected_requirement_schema = (
+        provenance.JOINT_EXECUTION_PREDICATE_SCHEMA
+        if profile in {
+            provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+            JOINT_EXECUTION_EVIDENCE_PROFILE,
+        }
+        else provenance.EXECUTION_PREDICATE_SCHEMA
+    )
+    if parsed.get("schema") != expected_requirement_schema:
+        raise ValueError(
+            "start manifest execution predicate does not match its evidence profile"
+        )
+    typed_values = environment.get("typed_values")
+    if not isinstance(typed_values, dict) or typed_values.get(
+        "NY_MEASURE_REQUIRE_FLIGHT_EVENT"
+    ) != parsed:
+        raise ValueError(
+            "start manifest required execution predicate is not bound to its "
+            "current typed declaration"
+        )
+    return (raw,)
+
+
+def _execution_predicate_assignment_from_start(
+    start: dict[str, object],
+) -> object:
+    """Validate the exact causal assignment sealed by the start producer."""
+    measurement = start.get("measurement")
+    profile = (
+        measurement.get("execution_evidence_profile")
+        if isinstance(measurement, dict)
+        else None
+    )
+    if profile in {None, provenance.LEGACY_EXECUTION_EVIDENCE_PROFILE}:
+        return None
+    assignment_schema_by_profile = {
+        provenance.LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE: (
+            provenance.LEGACY_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        ),
+        provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE: (
+            provenance.LEGACY_JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        ),
+        EXECUTION_EVIDENCE_PROFILE: (
+            provenance.EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        ),
+        JOINT_EXECUTION_EVIDENCE_PROFILE: (
+            provenance.JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        ),
+    }
+    expected_assignment_schema = assignment_schema_by_profile.get(profile)
+    if expected_assignment_schema is None or not isinstance(measurement, dict):
+        raise ValueError("start manifest execution-evidence profile is unsupported")
+    try:
+        search_space_contract = provenance.validate_start_search_space_contract(
+            start, reprobe_sealed_binary=False
+        )
+        preset_docs = provenance.execution_predicate_preset_docs_from_start(start)
+        validated = provenance.validate_execution_predicate_assignment(
+            measurement.get("execution_predicate_assignment"),
+            environment=start.get("environment"),
+            search_space_contract=search_space_contract,
+            preset_docs=preset_docs,
+            preset_expected=preset_docs is not None,
+        )
+        assignment = measurement.get("execution_predicate_assignment")
+        if (
+            not isinstance(assignment, dict)
+            or assignment.get("schema") != expected_assignment_schema
+        ):
+            raise ExecutionPredicateError(
+                "execution predicate assignment does not match its evidence profile"
+            )
+        return validated
+    except (ExecutionPredicateError, ProvenanceError) as error:
+        raise ValueError(
+            f"start manifest execution-predicate assignment is invalid: {error}"
+        ) from error
+
+
+def _current_build_stamp_from_start(start: dict[str, object]) -> str | None:
+    """Bind current row execution to the full binary identity sealed at start."""
+    measurement = start.get("measurement")
+    profile = (
+        measurement.get("execution_evidence_profile")
+        if isinstance(measurement, dict)
+        else None
+    )
+    if profile is None:
+        return None
+    if profile not in {
+        provenance.LEGACY_EXECUTION_EVIDENCE_PROFILE,
+        provenance.LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        EXECUTION_EVIDENCE_PROFILE,
+        JOINT_EXECUTION_EVIDENCE_PROFILE,
+    }:
+        raise ValueError("start manifest execution-evidence profile is unsupported")
+    solver = start.get("solver_binary")
+    if not isinstance(solver, dict) or not isinstance(solver.get("sha256"), str):
+        raise ValueError("current start manifest solver identity is incomplete")
+    try:
+        validate_binary_build_id(
+            solver.get("build_id"),
+            expected_executable_sha256=solver["sha256"],
+            declared_features=solver.get("declared_build_features"),
+        )
+        return flight_build_stamp_for_binary_build_id(solver["build_id"])
+    except ProvenanceError as error:
+        raise ValueError(f"current start manifest build identity is invalid: {error}") from error
+
+
 def archive_result(
     *,
     result_file: Path,
@@ -941,6 +1341,7 @@ def archive_result(
     start_manifest: Path,
     preflight_manifest: Path,
     flight_file: Path | None = None,
+    required_flight_events: tuple[str, ...] = (),
 ) -> Path:
     """Archive one complete raw result and return its result-artifact path."""
     for label, component in (("run ID", run_id), ("category", category)):
@@ -989,6 +1390,19 @@ def archive_result(
         ) from error
     start, start_manifest_data, start_manifest_digest, _ = _read_start_manifest(
         start_manifest, artifact_root, run_id
+    )
+    sealed_requirements = _required_flight_events_from_start(start)
+    execution_assignment = _execution_predicate_assignment_from_start(start)
+    expected_build_stamp = _current_build_stamp_from_start(start)
+    all_requirements = tuple(
+        dict.fromkeys((*sealed_requirements, *required_flight_events))
+    )
+    _enforce_required_flight_events(
+        flight_record,
+        all_requirements,
+        expected_build_stamp=expected_build_stamp,
+        sealed_requirement=(sealed_requirements[0] if sealed_requirements else None),
+        execution_assignment=execution_assignment,
     )
     config_inputs = _config_inputs_identity(start)
     preflight, preflight_digest = validate_input_preflight(
@@ -1189,6 +1603,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-manifest", type=Path, required=True)
     parser.add_argument("--preflight-manifest", type=Path, required=True)
     parser.add_argument("--flight-file", type=Path)
+    parser.add_argument(
+        "--require-flight-event",
+        action="append",
+        default=[],
+        metavar="VERSIONED_PREDICATE",
+        help=(
+            "fail before archiving unless the current lever receipt and strict "
+            "runtime schema prove this versioned execution predicate; repeatable"
+        ),
+    )
     return parser
 
 
@@ -1213,6 +1637,7 @@ def main() -> int:
         start_manifest=args.start_manifest,
         preflight_manifest=args.preflight_manifest,
         flight_file=args.flight_file,
+        required_flight_events=tuple(args.require_flight_event),
     )
     print(archived)
     return 0

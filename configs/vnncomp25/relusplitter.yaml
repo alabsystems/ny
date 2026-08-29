@@ -74,6 +74,9 @@ bab:
     method: kfsb
     candidates: 10
     reduceop: max
+    # Exact wave-selector mirrors for governed search; runtime is unchanged.
+    kfsb_multi_candidates: 10
+    kfsb_multi_reduceop: max
   cuts:
     # Fail closed until proof-derived cuts are folded through backward CROWN.
     enabled: false
@@ -147,3 +150,18 @@ bab:
     # base-mnist_fc rows at 30s are untouched; the cap binds only at 60/90/180s.
     # Pinned by `relusplitter_pgd_cap_reclaims_at_official_budgets`.
     disjunctive_pgd_max_secs: 5
+    # #proof-tail (measured 2026-08-21 at HEAD 9281be4e0, full official 220
+    # sweep): the post-BaB tail is dead weight on this category. Every one of
+    # the 20 GT-sat rows lands via the UPFRONT lanes far inside the cap
+    # (biasfield sat rows at 0.3s; the sweep's slowest sat well under its
+    # budget), and the post tail converted ZERO rows anywhere in the sweep —
+    # while holding ~10s of every 60s row (runs end at 45.0s) and ~21s of
+    # every 180s row (runs end at 149.2-149.6s) that the bound phases could
+    # spend. Zeroing the engine fraction plus explicitly disabling the outer
+    # wrapper lane arms the router's PresetProofTail route (the cersyve
+    # precedent): the solver keeps everything but the fixed 5s publication
+    # margin. Sound by construction: an attack can only mint `sat`; no
+    # `unsat` is ever concluded from a failed attack, so removing a
+    # never-converting attack window cannot cost a proof and cannot mint one.
+    post_bab_pgd_fraction: 0.0
+    vnncomp_post_bab_attack: false

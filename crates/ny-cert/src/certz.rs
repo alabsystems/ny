@@ -46,7 +46,7 @@
 //!
 //! The two emitters agree on contents:
 //!
-//! * [`entailment_to_certz_json`] — a `serde_json::Value` with
+//! * [`entailment_to_certz_json`] — a [`crate::json::Json`] value with
 //!   `{ "premises": [LinConZ…], "multipliers": [[num,den]…], "conclusion": LinConZ }`,
 //!   each `LinConZ` being
 //!   `{ "coeffs": [[name,[num,den]]…], "kind": "le"|"ge"|"eq", "const": [num,den] }`.
@@ -54,30 +54,77 @@
 //!   `CertRealZ_node10.lean` style, ready to elaborate against the pinned checker and
 //!   discharge with `by decide`.
 
+use crate::json::{Json, Map};
 use crate::rational::{Rat, RatError};
 use crate::schema::{ConstraintKind, EntailmentCertificate, LinearConstraint};
 
 /// Why a certificate cannot be emitted as a kernel-checkable `CertZ`.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CertZError {
     /// A constraint used a *strict* relation (`<` / `>`). Clean's proven
     /// checker's `Kind` is `le | ge | eq` only — it has no strict forms — so
     /// strict constraints cannot be transcribed into a `CertZ`.
-    #[error("strict relation ({0}) has no CertZ encoding (Lean Kind is le|ge|eq)")]
     StrictRelation(&'static str),
     /// The conclusion relation is `eq`. The checker requires the conclusion be
     /// `le`/`ge` (`normalizeConclusionZ` returns `none` on `eq`, so
     /// `checkEntailmentZ` would reject it).
-    #[error("conclusion kind must be le|ge for CertZ (got eq)")]
     EqConclusion,
     /// The requested Lean declaration name was empty or outside the
     /// injection-safe ASCII subset. Valid names are emitted with Lean's escaped
     /// identifier syntax, so keywords are accepted safely.
-    #[error("invalid Lean declaration name: {0}")]
     InvalidLeanName(String),
     /// Exact rational extraction failed (including a poisoned arena).
-    #[error(transparent)]
-    Rat(#[from] RatError),
+    Rat(RatError),
+}
+
+// The `Display`/`Error`/`From` impls below are hand-written transcriptions of
+// what `#[derive(thiserror::Error)]` expanded to. The derive was removed so
+// ny-cert carries no proc-macro dependency (`thiserror` pulls in
+// `thiserror-impl`), which is what lets the bignum stack be *verified* rather
+// than assumed as an absent callee. The messages are byte-identical to the
+// former `#[error("...")]` strings — they appear in certificates and test
+// assertions and must not be reworded.
+impl core::fmt::Display for CertZError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CertZError::StrictRelation(relation) => write!(
+                f,
+                "strict relation ({relation}) has no CertZ encoding (Lean Kind is le|ge|eq)"
+            ),
+            CertZError::EqConclusion => {
+                write!(f, "conclusion kind must be le|ge for CertZ (got eq)")
+            }
+            CertZError::InvalidLeanName(name) => {
+                write!(f, "invalid Lean declaration name: {name}")
+            }
+            // `#[error(transparent)]`: forward `Display` straight through to the
+            // wrapped error, adding no message of its own.
+            CertZError::Rat(inner) => core::fmt::Display::fmt(inner, f),
+        }
+    }
+}
+
+impl core::error::Error for CertZError {
+    /// `#[error(transparent)]` also forwards `source()`: the derived arm was
+    /// `Error::source(inner)` — the *inner* error's source, not `Some(inner)`.
+    /// Every other variant carried no `#[from]`/`#[source]` field, so its
+    /// derived `source()` was `None`.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            CertZError::Rat(inner) => core::error::Error::source(inner),
+            CertZError::StrictRelation(_)
+            | CertZError::EqConclusion
+            | CertZError::InvalidLeanName(_) => None,
+        }
+    }
+}
+
+/// Derived from the `#[from]` on `CertZError::Rat`, which the `?` operator uses
+/// to lift a [`RatError`] out of exact-rational extraction.
+impl From<RatError> for CertZError {
+    fn from(source: RatError) -> Self {
+        CertZError::Rat(source)
+    }
 }
 
 /// Validate the conservative ASCII subset of Lean identifiers accepted by the
@@ -117,15 +164,15 @@ fn certz_kind(kind: ConstraintKind) -> Result<&'static str, CertZError> {
 /// precision). `den` is always positive, discharging `allDenPos` by
 /// construction.
 #[allow(clippy::vec_init_then_push)] // deliberate: avoids the vec! macro (see below)
-fn qpair_json(r: Rat) -> Result<serde_json::Value, CertZError> {
+fn qpair_json(r: Rat) -> Result<Json, CertZError> {
     // `Vec::new()` + push (not a `vec![…]` literal): the macro's internal
     // boxed-slice `into_vec` inlines hardened alloc/arith obligations into this
     // fn; the pushes build the identical `[num, den]` pair.
     let (num, den) = r.checked_parts()?;
     let mut pair = Vec::new();
-    pair.push(serde_json::Value::String(num.to_string()));
-    pair.push(serde_json::Value::String(den.to_string()));
-    Ok(serde_json::Value::Array(pair))
+    pair.push(Json::Str(num.to_string()));
+    pair.push(Json::Str(den.to_string()));
+    Ok(Json::Arr(pair))
 }
 
 /// Emit one [`LinearConstraint`] as a `LinConZ` JSON object.
@@ -133,24 +180,21 @@ fn qpair_json(r: Rat) -> Result<serde_json::Value, CertZError> {
 /// `coeffs` are emitted in the constraint's [`BTreeMap`](std::collections::BTreeMap)
 /// order, which is deterministic (lexicographic by variable name).
 #[allow(clippy::vec_init_then_push)] // deliberate: avoids the vec! macro (see qpair_json)
-fn lincon_json(c: &LinearConstraint) -> Result<serde_json::Value, CertZError> {
+fn lincon_json(c: &LinearConstraint) -> Result<Json, CertZError> {
     let mut coeffs = Vec::new();
     for (name, coeff) in &c.coefficients {
         // `Vec::new()` + push (not a `vec![…]` literal): same macro-internal
         // alloc/arith rationale as `qpair_json`; identical `[name, qpair]`.
         let mut pair = Vec::new();
-        pair.push(serde_json::Value::String(name.clone()));
+        pair.push(Json::Str(name.clone()));
         pair.push(qpair_json(*coeff)?);
-        coeffs.push(serde_json::Value::Array(pair));
+        coeffs.push(Json::Arr(pair));
     }
-    let mut lincon = serde_json::Map::new();
-    lincon.insert("coeffs".to_owned(), serde_json::Value::Array(coeffs));
-    lincon.insert(
-        "kind".to_owned(),
-        serde_json::Value::String(certz_kind(c.kind)?.to_owned()),
-    );
+    let mut lincon = Map::new();
+    lincon.insert("coeffs".to_owned(), Json::Arr(coeffs));
+    lincon.insert("kind".to_owned(), Json::Str(certz_kind(c.kind)?.to_owned()));
     lincon.insert("const".to_owned(), qpair_json(c.constant)?);
-    Ok(serde_json::Value::Object(lincon))
+    Ok(Json::Obj(lincon))
 }
 
 /// Serialize an [`EntailmentCertificate`] into the **kernel-checkable** `CertZ`
@@ -181,9 +225,7 @@ fn lincon_json(c: &LinearConstraint) -> Result<serde_json::Value, CertZError> {
 /// (the proven `Kind` is `le|ge|eq` only), [`CertZError::EqConclusion`] if the
 /// conclusion is `eq` (the checker requires a `le`/`ge` conclusion), or
 /// [`CertZError::Rat`] when rational extraction fails.
-pub fn entailment_to_certz_json(
-    cert: &EntailmentCertificate,
-) -> Result<serde_json::Value, CertZError> {
+pub fn entailment_to_certz_json(cert: &EntailmentCertificate) -> Result<Json, CertZError> {
     if cert.conclusion.kind == ConstraintKind::Eq {
         return Err(CertZError::EqConclusion);
     }
@@ -199,14 +241,11 @@ pub fn entailment_to_certz_json(
     for m in &cert.multipliers {
         multipliers.push(qpair_json(*m)?);
     }
-    let mut certz = serde_json::Map::new();
-    certz.insert("premises".to_owned(), serde_json::Value::Array(premises));
-    certz.insert(
-        "multipliers".to_owned(),
-        serde_json::Value::Array(multipliers),
-    );
+    let mut certz = Map::new();
+    certz.insert("premises".to_owned(), Json::Arr(premises));
+    certz.insert("multipliers".to_owned(), Json::Arr(multipliers));
     certz.insert("conclusion".to_owned(), lincon_json(&cert.conclusion)?);
-    Ok(serde_json::Value::Object(certz))
+    Ok(Json::Obj(certz))
 }
 
 /// Emit a [`Rat`] as the Lean `QPair` literal `(num, den)`.
@@ -358,7 +397,7 @@ mod tests {
     }
 
     /// Helper: read a `QPair` `[num, den]` array's denominator string.
-    fn den_str(qpair: &serde_json::Value) -> &str {
+    fn den_str(qpair: &Json) -> &str {
         qpair.as_array().unwrap()[1].as_str().unwrap()
     }
 

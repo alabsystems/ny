@@ -20,6 +20,14 @@ use super::super::tensor_ext::{has_inverted_output_bounds, BoundedTensorExt};
 use super::super::BetaCrownVerifier;
 use super::clip::has_infeasible_layer_bounds;
 
+/// #bab-warm-start diagnostics: how often the monotone floor actually fires
+/// (child bound regressed below its parent) vs children created. Read by the
+/// `NY_ACASXU_PROF` tick in `engine/core.rs`.
+pub(in crate::beta_crown) static MONOTONE_CLAMP_FIRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(in crate::beta_crown) static CHILDREN_CREATED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl BetaCrownVerifier {
     /// Create a child domain with an additional constraint.
     // Justification: Child domain creation needs network, input, parent domain, split
@@ -115,16 +123,24 @@ impl BetaCrownVerifier {
             new_layer_bounds[layer_idx - 1] = Arc::new(BoundedTensor::new(lower_new, upper_new)?);
         }
 
-        // Initialize beta state from history
-        let mut beta_state = BetaState::from_history(&new_history)?;
+        // WARM-START from the parent's optimized state (#bab-warm-start, the
+        // verified=0 root-cause fix): inherited constraints keep the parent's
+        // β; inherited unstable neurons keep the parent's α (+ optimizer
+        // moments). Cold-starting both at every split kept every domain's
+        // bound at root quality regardless of depth (measured: zero closures
+        // at depth 22-31 on `mnist_fc 256x4`). Soundness: initialization
+        // affects only the optimizer's starting point — any β ≥ 0 / α ∈ [0,1]
+        // yields a valid bound.
+        let mut beta_state = BetaState::from_history_warm(&new_history, &parent.beta_state)?;
 
-        // Initialize domain-specific alpha state for joint optimization
         let mut domain_alpha_state = if self.config.use_alpha_crown {
-            DomainAlphaState::from_layer_bounds_and_constraints(
+            let mut state = DomainAlphaState::from_layer_bounds_and_constraints(
                 network,
                 &new_layer_bounds,
                 &new_history,
-            )
+            );
+            state.warm_start_from(&parent.domain_alpha_state);
+            state
         } else {
             DomainAlphaState::empty()
         };
@@ -211,8 +227,52 @@ impl BetaCrownVerifier {
             new_layer_bounds
         };
 
-        let new_lower = output_bounds.lower_scalar();
+        let mut new_lower = output_bounds.lower_scalar();
         let new_upper = output_bounds.upper_scalar();
+        // MONOTONE LOWER-BOUND INHERITANCE (#bab-warm-start companion). The
+        // child's feasible region is a subset of the parent's, so any sound
+        // parent lower bound is a sound lower bound for the child — the
+        // subset-containment argument already shipped for the graph lanes at
+        // `graph/multi_objective/shared.rs` (`inherit_parent_lower_only`).
+        // Without the floor, children whose per-child optimizer is weaker
+        // than the engine that produced the parent bound REGRESS below it and
+        // every split's gain first repays that gap. Lower (proof) side only;
+        // skipped when it would invert against the child's upper bound so
+        // violation detection is untouched.
+        // #bab-warm-start trace (NY_BAB_CHILD_TRACE=1): sampled raw child
+        // bounds BEFORE the monotone floor, against depth and the parent's
+        // bound — distinguishes "splits improve the joint bound from below
+        // the root baseline" (strategy converging, floor hides it) from
+        // "splits are inert in the bound computation" (wiring bug).
+        {
+            static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let on = *TRACE_ON.get_or_init(|| {
+                ny_levers::read_raw(&ny_levers::decls::bab_diagnostics::BAB_CHILD_TRACE).as_deref()
+                    == Some("1")
+            });
+            if on {
+                let n = CHILDREN_CREATED.load(std::sync::atomic::Ordering::Relaxed);
+                if n.is_multiple_of(97) {
+                    eprintln!(
+                        "[child-trace] depth={} preclamp_lower={:.6} parent_lower={:.6} upper={:.6}",
+                        new_history.depth(),
+                        new_lower,
+                        parent.lower_bound,
+                        new_upper,
+                    );
+                }
+            }
+        }
+        if parent.lower_bound.is_finite() {
+            let clamped = new_lower.max(parent.lower_bound);
+            if clamped <= new_upper {
+                if clamped > new_lower {
+                    MONOTONE_CLAMP_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                new_lower = clamped;
+            }
+        }
+        CHILDREN_CREATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // #2950: Prune domains with inverted output bounds (lower > upper for any element).
         // BaB splits can make the constraint set infeasible — these domains can never

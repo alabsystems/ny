@@ -248,17 +248,6 @@ fn direct_normalization_enforces_operator_versions_and_main_domain() {
     assert_normalization_rejected(&normalization_node("LayerNormalization"), 16);
     assert_normalization_rejected(&normalization_node("RMSNormalization"), 22);
 
-    let simplified = normalization_node("SimplifiedLayerNormalization");
-    let layer = convert_node_to_layer(
-        &simplified,
-        &CustomOpRegistry::default(),
-        &main_opset(1),
-        None,
-    )
-    .expect("legacy SimplifiedLayerNormalization v1 should convert")
-    .expect("SimplifiedLayerNormalization should produce a layer");
-    assert_eq!(layer.layer_type, LayerType::RMSNorm);
-
     let mut wrong_domain = normalization_node("LayerNormalization");
     wrong_domain.domain = "ai.onnx.ml".to_string();
     let opsets = HashMap::from([("ai.onnx.ml".to_string(), 17)]);
@@ -280,17 +269,35 @@ fn core_operator_lookalikes_in_ai_onnx_ml_require_explicit_registration() {
     assert!(matches!(error, NyError::UnsupportedConfiguration(_)));
 }
 
+/// `SimplifiedLayerNormalization` is NOT a main-domain ONNX operator.
+///
+/// `parse::schema_preflight::validate_standard_schemas` refuses it by name on
+/// every real load ("is not a registered main-domain operator; use an
+/// explicitly imported and registered vendor domain"), and a vendor-domain
+/// spelling is short-circuited earlier by the custom-op registry /
+/// missing-registration gate. Its `op_map` arm was therefore unreachable in
+/// both directions and has been deleted so the table stops overstating its
+/// coverage; the versioned `validate_direct_normalization_schema` branch that
+/// still names it is likewise shadowed and kept only so the two spellings stay
+/// side by side.
+///
+/// This pins the conversion-level half of that refusal. The load-path half is
+/// pinned end to end in `tests/core/native_ops.rs`.
 #[test]
-fn direct_simplified_layer_norm_canonicalizes_empty_statistic_output() {
+fn legacy_simplified_layer_normalization_is_refused_at_conversion() {
     let mut node = normalization_node("SimplifiedLayerNormalization");
     node.output.push(String::new());
-    let layer = convert_node_to_layer(&node, &CustomOpRegistry::default(), &main_opset(1), None)
-        .expect("empty optional inv_std_var should be accepted")
-        .expect("SimplifiedLayerNormalization should produce a layer");
-    assert_eq!(layer.outputs, ["y"]);
+    let error = convert_node_to_layer(&node, &CustomOpRegistry::default(), &main_opset(1), None)
+        .expect_err("a non-main-domain op type must not convert from the standard domain");
+    assert!(matches!(error, NyError::UnsupportedOp(_)), "{error}");
 
-    node.output[1] = "inv_std_var".to_string();
-    assert_normalization_rejected(&node, 1);
+    // The standard main-domain spelling of the same function stays supported.
+    let rms = normalization_node("RMSNormalization");
+    let layer = convert_node_to_layer(&rms, &CustomOpRegistry::default(), &main_opset(23), None)
+        .expect("RMSNormalization is a real main-domain operator")
+        .expect("RMSNormalization should produce a layer");
+    assert_eq!(layer.layer_type, LayerType::RMSNorm);
+    assert_eq!(layer.outputs, ["y"]);
 }
 
 #[test]

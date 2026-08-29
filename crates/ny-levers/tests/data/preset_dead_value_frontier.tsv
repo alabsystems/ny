@@ -1,0 +1,51 @@
+# PRESET DEAD-VALUE FRONTIER — armed settings that are known no-ops, and armed
+# settings whose delivered value is not their configured value.
+#
+# Columns:  yaml-file <TAB> dotted-key <TAB> value <TAB> count <TAB> class <TAB> note
+#
+# Classes:
+#   dead-value          a legal value that disables the mechanism it appears to
+#                       configure. The note must say what the mechanism does at
+#                       this value, and what value would work.
+#   capped-adjudicated  a DELIVERY_CAPPED key that IS armed, together with the
+#                       measurement of what the lane actually received. Required
+#                       before the arming is allowed to stand, because a
+#                       measurement taken through an un-adjudicated capped key
+#                       cannot be told apart from a null.
+#
+# A row here is a RECEIPT, not an endorsement. Additions and removals both fail
+# the gate, so fixing one of these is a deliberate edit in the same commit.
+#
+# ---------------------------------------------------------------------------
+# alpha_iteration: 1 — SIX shipped presets, ZERO optimizer steps
+#
+# `crates/ny-propagate/src/network/graph_alpha/bounds/warm_start.rs` runs
+# `for iter in 0..config.iterations` and breaks on `iter == config.iterations - 1`
+# BEFORE the SPSA gradient below it. At `iterations == 1` that fires at
+# `iter == 0`, so the loop performs no gradient evaluation and no alpha update:
+# every child in the tree is bounded with the parent's frozen alphas, re-masked.
+#
+# The value is delivered by `input_split/shared.rs::warm_start_alpha_config`,
+# which overwrites `alpha_config.iterations` with
+# `config.input_split_alpha_iteration` on every input-split warm-start child —
+# see the `runtime-clear` row for that site in preset_override_frontier.tsv.
+#
+# This is NOT a general property of ny's alpha loops. The non-warm loops were
+# fixed with the shared `alpha_crown_loop::alpha_iteration_needs_gradient`
+# helper; `warm_start.rs` never adopted it. So `2` works and `1` does not, which
+# is exactly the shape that survives review.
+#
+# `alpha_iteration: 0` is NOT listed: zero is honestly off (the `> 0` gates skip
+# the path entirely), and linearizenn_2024 sets it deliberately. ONE is the only
+# value that claims refinement and delivers none.
+#
+# The in-tree workaround `#cgan-polish` raises the count at runtime, and is
+# armed by no shipped yaml.
+configs/vnncomp25/cgan_2023.yaml	bab.branching.input_split.alpha_iteration	1	1	dead-value	the scored cgan preset. Zero SPSA steps on every warm-start child; the eager screen runs on the root's frozen alphas. 2 would buy one real step.
+configs/vnncomp25/cgan_2023_abcrown_parity_canary.yaml	bab.branching.input_split.alpha_iteration	1	1	dead-value	canary that mirrors the scored preset, so it inherits the same zero-step warm start; a parity claim measured through it is measuring frozen alphas in both arms.
+configs/vnncomp25/cgan_2023_forward_alpha_surrogate_canary.yaml	bab.branching.input_split.alpha_iteration	1	1	dead-value	the forward-alpha surrogate canary. The surrogate is compared against a warm start that takes no steps.
+configs/vnncomp25/cgan_2023_reorder_warm_parallel_canary.yaml	bab.branching.input_split.alpha_iteration	1	1	dead-value	the reorder/warm-parallel canary. Its subject is the WARM path, which at this value does no optimization at all.
+configs/vnncomp25/cgan_2023_sparse_target_complete_canary.yaml	bab.branching.input_split.alpha_iteration	1	1	dead-value	the sparse-target-complete canary; same zero-step warm start.
+configs/vnncomp26/cgan2026.yaml	bab.branching.input_split.alpha_iteration	1	1	dead-value	the 2026 cgan preset. NOTE configs/vnncomp26 SHADOWS configs/vnncomp25, so on a 2026 resolve this is the file that decides.
+configs/vnncomp26/cgan2026_narrow_target_canary.yaml	bab.branching.input_split.alpha_iteration	1	1	dead-value	the #cgan-narrow-target-budget measurement canary, kept byte-aligned with cgan2026.yaml except its one key; inherits the parent's zero-step warm start verbatim so the A/B stays single-variable.
+configs/vnncomp26/cgan2026_target_cost_weight_canary.yaml	bab.branching.input_split.alpha_iteration	1	1	dead-value	the #target-cost-weight measurement canary, byte-aligned with cgan2026.yaml except its two keys; inherits the parent's zero-step warm start verbatim so the A/B stays single-variable.

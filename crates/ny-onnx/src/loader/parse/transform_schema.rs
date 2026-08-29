@@ -37,7 +37,7 @@ pub(super) fn validate_transform_schemas(
     {
         if !matches!(
             node.op_type.as_str(),
-            "Pad" | "Resize" | "Upsample" | "ScatterND"
+            "Pad" | "Resize" | "Upsample" | "ScatterND" | "ScatterElements"
         ) {
             continue;
         }
@@ -48,6 +48,7 @@ pub(super) fn validate_transform_schemas(
             "Resize" => validate_resize(node, opset, &mut dtypes)?,
             "Upsample" => validate_upsample(node, opset, &mut dtypes)?,
             "ScatterND" => validate_scatter_nd(node, opset, &mut dtypes)?,
+            "ScatterElements" => validate_scatter_elements(node, opset, &mut dtypes)?,
             _ => unreachable!("operator filtered above"),
         }
     }
@@ -224,6 +225,30 @@ fn validate_scatter_nd(
     }
     require_dtype(node, dtypes, &node.input[0], "data", &[FLOAT])?;
     require_dtype(node, dtypes, &node.input[1], "indices", &[INT64])?;
+    require_dtype(node, dtypes, &node.input[2], "updates", &[FLOAT])
+}
+
+/// Authenticate `ScatterElements`' element types at the RAW protobuf boundary.
+///
+/// `LayerType::ScatterAdd` accumulates FLOAT32 activations and reads the index
+/// tensor as exact discrete i64. ONNX admits many more element types for
+/// `data`/`updates`, and constant folding normalizes authored integer payloads
+/// into `WeightStore`'s f32 view — after which an INT64 `data` path is no
+/// longer distinguishable from ordinary FLOAT arithmetic. Check it here, while
+/// the authored dtype is still visible.
+///
+/// The `reduction` and `axis` semantics are NOT checked here: they belong to
+/// `convert::native_ops::canonicalize_standard_scatter_elements`, which owns
+/// the single named refusal for every non-additive reduction.
+fn validate_scatter_elements(
+    node: &NodeProto,
+    opset: i64,
+    dtypes: &mut RawDtypeResolver<'_>,
+) -> Result<()> {
+    require_minimum_opset(node, opset, 11)?;
+    require_exact_io(node, 3, 1)?;
+    require_dtype(node, dtypes, &node.input[0], "data", &[FLOAT])?;
+    require_dtype(node, dtypes, &node.input[1], "indices", &[INT32, INT64])?;
     require_dtype(node, dtypes, &node.input[2], "updates", &[FLOAT])
 }
 

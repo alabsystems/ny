@@ -130,10 +130,13 @@ where
 /// and the kill switch if a category ever needs the old shape. Only the exact
 /// string `"0"` disarms; unset, empty and malformed keep the default, matching
 /// `NY_GRAPH_MIP_LEAF`'s own parse.
+///
+/// DELIVERY SEAM (#lever-reachability): because the shipped default is ON, the
+/// typed `bab.graph_mip_leaf_sat` key is a per-category KILL SWITCH — the
+/// pre-change advisory arm, previously reachable only from a shell the scored
+/// harness never writes. `NY_GRAPH_MIP_LEAF_SAT` still wins in both directions.
 pub(super) fn leaf_sat_return_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::graph_mip::GRAPH_MIP_LEAF_SAT)
-        .value
-        .as_bool()
+    crate::preset_gates::graph_mip_leaf_sat_enabled()
 }
 
 /// Does the leaf oracle's graph-forward-confirmed witness violate EVERY

@@ -5,14 +5,98 @@
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{NyError, Result};
 use ny_propagate::layers::{
-    AddConstantLayer, AddLayer, DivConstantLayer, DivLayer, MaxBinaryLayer, MinBinaryLayer,
-    MulBinaryLayer, MulConstantLayer, PowConstantLayer, SubConstantLayer, SubLayer,
+    AddConstantLayer, AddLayer, Atan2Layer, ClipLayer, DivConstantLayer, DivLayer,
+    IntervalConstLayer, MaxBinaryLayer, MinBinaryLayer, MulBinaryLayer, MulConstantLayer,
+    PowConstantLayer, SubConstantLayer, SubLayer,
 };
 use ny_propagate::network::broadcast_shapes;
 use ny_propagate::Layer;
 use tracing::{debug, warn};
 
 use super::{i64_to_f32_checked, AttributeValue, ConvertContext, LayerSpec};
+
+/// Which end of the output range a *constant* operand of ONNX `Max`/`Min` pins.
+///
+/// `max(x, c)` and `min(x, c)` against a constant `c` are not binary ops at all
+/// — they are one-sided clamps, and they differ only in which end they clamp.
+/// [`ConvertContext::convert_extremum`] is therefore written once, over this
+/// distinction, instead of twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Extremum {
+    /// `max(x, c)`: `c` is a FLOOR — the output never falls below it.
+    Max,
+    /// `min(x, c)`: `c` is a CEILING — the output never rises above it.
+    Min,
+}
+
+impl Extremum {
+    /// The ONNX op name, for diagnostics.
+    fn op_name(self) -> &'static str {
+        match self {
+            Extremum::Max => "Max",
+            Extremum::Min => "Min",
+        }
+    }
+
+    /// The genuine binary layer, for the both-operands-are-activations case.
+    fn binary_layer(self) -> Layer {
+        match self {
+            Extremum::Max => Layer::MaxBinary(MaxBinaryLayer),
+            Extremum::Min => Layer::MinBinary(MinBinaryLayer),
+        }
+    }
+
+    /// The `(min, max)` pair for [`ClipLayer`] that reproduces this extremum
+    /// against the scalar constant `c` — EXACTLY, not as a relaxation.
+    ///
+    /// `clip(x, lo, hi) = max(lo, min(hi, x))`, so the two identities are
+    ///
+    /// ```text
+    /// max(x, c) == clip(x,    c, +inf)   // upper end left open
+    /// min(x, c) == clip(x, -inf,    c)   // lower end left open
+    /// ```
+    ///
+    /// # Why the open end is a true infinity and not a finite sentinel
+    ///
+    /// 1. `validate_clip_bounds` (ny-propagate `layers/activations/validate.rs`)
+    ///    rejects only NaN and `min > max`. ±Inf is explicitly admitted.
+    /// 2. It is already a live, exercised path: `convert_clip` in
+    ///    `elementwise.rs` defaults a *missing* ONNX `Clip` bound to exactly
+    ///    `f32::NEG_INFINITY` / `f32::INFINITY` and hands it to this same
+    ///    constructor, so every one-sided ONNX `Clip` in the corpus already
+    ///    builds this layer shape.
+    /// 3. A sentinel would be the *unsound* option, not the safe one. Any
+    ///    finite stand-in for `+inf` is a real clamp, so an input above it gets
+    ///    silently pulled DOWN and the layer bounds a smaller function than
+    ///    `max(x, c)` — an under-approximation of the upper bound, i.e. a false
+    ///    proof. No finite f32 is safe for every reachable input, because the
+    ///    reachable range is precisely what verification is trying to establish.
+    ///
+    /// # Soundness against `ClipLayer`'s two propagation paths
+    ///
+    /// * **IBP** (`ClipLayer::propagate_ibp`) is `f32::clamp` per endpoint.
+    ///   `clamp` is pure comparison, never arithmetic, so none of the
+    ///   NaN-producing infinity patterns (`inf - inf`, `0 * inf`, `inf / inf`)
+    ///   can arise; `clamp(v, c, +inf) == max(v, c)` and
+    ///   `clamp(v, -inf, c) == min(v, c)` hold exactly for every `v`, finite or
+    ///   not. The layer builds its result with
+    ///   `BoundedTensor::new_allow_infinite`, which is what makes an infinite
+    ///   endpoint legal there in the first place.
+    /// * **CROWN** (`clip_linear_relaxation`) never lets the open end reach the
+    ///   arithmetic. Its entry point is guarded by `non_finite_domain_guard`,
+    ///   so `l` and `u` are finite. With `max = +inf` every branch that reads
+    ///   `max_val` (`l >= max_val`, the crosses-both-boundaries case, and the
+    ///   crosses-upper-only case) needs `l >= +inf` or `u > +inf` and is
+    ///   unreachable — leaving the exact `u <= min_val` constant branch, the
+    ///   exact identity branch, and the crosses-lower-only chord, none of which
+    ///   mentions `max_val`. `min = -inf` is the mirror image.
+    fn clip_bounds(self, constant: f32) -> (f32, f32) {
+        match self {
+            Extremum::Max => (constant, f32::INFINITY),
+            Extremum::Min => (f32::NEG_INFINITY, constant),
+        }
+    }
+}
 
 impl ConvertContext<'_> {
     pub(crate) fn convert_add(&self, spec: &LayerSpec) -> Result<Layer> {
@@ -41,6 +125,16 @@ impl ConvertContext<'_> {
         // was not pre-evaluated — fall through to binary in that case.
         let a_value = self.constant_value(input_a);
         let b_value = self.constant_value(input_b);
+
+        // An interval-valued constant addend is a pure additive ENCLOSURE, so it
+        // lowers to the offset form of the interval carrier. Only the
+        // `activation + interval` shape is admitted; anything else refuses and
+        // degrades to a sound unbounded skip.
+        if let Some(layer) =
+            self.try_convert_interval_offset(spec, input_a, input_b, false, "Add")?
+        {
+            return Ok(layer);
+        }
 
         match (a_value, b_value) {
             (Some(_), Some(_)) => {
@@ -135,6 +229,16 @@ impl ConvertContext<'_> {
 
         let a_value = self.constant_value(input_a);
         let b_value = self.constant_value(input_b);
+
+        // `activation - interval` is an additive enclosure with the constant
+        // negated (negation is exact in binary32). `interval - activation` is
+        // NOT carried: it negates the coefficient as well, which the offset form
+        // does not do — it refuses inside the helper.
+        if let Some(layer) =
+            self.try_convert_interval_offset(spec, input_a, input_b, true, "Sub")?
+        {
+            return Ok(layer);
+        }
 
         match (a_value, b_value) {
             (Some(_), Some(_)) => {
@@ -265,6 +369,79 @@ impl ConvertContext<'_> {
             out.push(dim as usize);
         }
         Some(out)
+    }
+
+    /// Lower `activation +- interval_constant` to the offset form of
+    /// [`Layer::IntervalConst`], or refuse.
+    ///
+    /// Returns `Ok(None)` when neither operand is interval-valued, so the
+    /// caller's existing point logic runs untouched. Returns
+    /// `Err(UnsupportedOp)` — a sound unbounded skip — for every interval shape
+    /// this carrier does not handle: the constant on the LEFT (which would have
+    /// to negate the activation's coefficient too, for `Sub`), or both operands
+    /// interval-valued (which the const-folder should have folded).
+    fn try_convert_interval_offset(
+        &self,
+        spec: &LayerSpec,
+        input_a: &str,
+        input_b: &str,
+        subtract: bool,
+        op: &str,
+    ) -> Result<Option<Layer>> {
+        let a_interval = self.weights.get_interval(input_a).is_some();
+        let b_interval = self.weights.get_interval(input_b).is_some();
+        if !a_interval && !b_interval {
+            return Ok(None);
+        }
+        if a_interval || (b_interval && self.constant_value(input_a).is_some()) {
+            warn!(
+                "{op} {} has an interval-valued constant in a position the carrier does not \
+                 support (a_interval={a_interval}, b_interval={b_interval}); failing closed \
+                 to a sound skip",
+                spec.name
+            );
+            return Err(NyError::UnsupportedOp(format!(
+                "{op} {} has an interval-valued constant operand in an unsupported position",
+                spec.name
+            )));
+        }
+        let (lower, upper) = self.weights.get_interval(input_b).ok_or_else(|| {
+            NyError::ModelLoad(format!(
+                "{op} {} missing interval constant input '{input_b}'",
+                spec.name
+            ))
+        })?;
+        let context = format!("{op} {}", spec.name);
+        let (center, radius) = super::interval_const::center_and_radius(lower, upper, &context)?;
+        // `x - c` is `x + (-c)`; negation is exact and leaves the radius alone.
+        let center = if subtract { -center } else { center };
+        // The carrier's backward step keeps the coefficients unchanged, which is
+        // an identity only if the constant broadcasts INTO the activation. Pin
+        // the activation's flat width here, from its declared shape, and refuse
+        // when that shape is unknown — a guess would be a silent expansion.
+        let input_len = self
+            .tensor_shapes
+            .get(input_a)
+            .and_then(|shape| {
+                shape.iter().try_fold(1usize, |acc, &d| {
+                    usize::try_from(d).ok().map(|d| acc * d.max(1))
+                })
+            })
+            .ok_or_else(|| {
+                NyError::UnsupportedOp(format!(
+                    "{op} {} reads an interval-valued constant but the activation's shape is \
+                     not statically known; refusing rather than guessing the broadcast",
+                    spec.name
+                ))
+            })?;
+        let layer = IntervalConstLayer::try_new_offset(center, radius, input_len)?;
+        debug!(
+            "{op} {} with an interval-valued constant converted to {} (max radius {:e})",
+            spec.name,
+            layer.kind_name(),
+            layer.max_radius()
+        );
+        Ok(Some(Layer::IntervalConst(layer)))
     }
 
     fn add_constant_layer(
@@ -463,61 +640,84 @@ impl ConvertContext<'_> {
         }
     }
 
-    /// Convert ONNX Min to MinBinaryLayer.
+    /// Convert an Atan2 spec to [`Atan2Layer`].
     ///
-    /// ONNX Min is variadic (can take 2+ inputs), but conversion currently emits
-    /// exactly one binary `MinBinaryLayer`.
-    pub(crate) fn convert_min(&self, spec: &LayerSpec) -> Result<Layer> {
+    /// Inputs are `(y, x)` — the `f32::atan2` / nn tracer order, which
+    /// `ny-trace-bridge`'s `translate_atan2` emits.
+    ///
+    /// Without this arm the layer was UNREACHABLE from any front end that
+    /// builds through `GraphModel`: `convert_layer` fell through to its
+    /// catch-all `UnsupportedOp`, which `graph::builder` then swallows into a
+    /// conservative `OpaqueSkip` — so an Atan2 node silently produced
+    /// `[-inf, +inf]` instead of `Atan2Layer`'s quadrant-aware enclosure, with
+    /// no error anywhere to say verification had gone vacuous. Found by the
+    /// 2026-08-26 wiring audit; the bridge test that "covered" it only asserted
+    /// the graph BUILT, which an OpaqueSkip substitution satisfies.
+    pub(crate) fn convert_atan2(&self, spec: &LayerSpec) -> Result<Layer> {
         if spec.inputs.len() != 2 {
             return Err(NyError::ModelLoad(format!(
-                "Min {} requires exactly 2 inputs (got {})",
+                "Atan2 {} requires exactly 2 inputs (y, x), got {}",
                 spec.name,
                 spec.inputs.len()
             )));
         }
-
-        let input_a = &spec.inputs[0];
-        let input_b = &spec.inputs[1];
-
-        // Check if both inputs are constants (should be constant folded upstream)
-        let a_is_const = self.weights.get(input_a).is_some();
-        let b_is_const = self.weights.get(input_b).is_some();
-
-        if a_is_const && b_is_const {
-            // Both constants - should be constant folded upstream.
-            // Returning MinBinaryLayer here is unsound: it takes min of the
-            // input activation and one constant, ignoring the other (#3021).
-            return Err(NyError::UnsupportedOp(format!(
-                "Min {} has both constant inputs — should be constant-folded \
-                 by the ONNX optimizer before verification",
-                spec.name
-            )));
-        }
-
-        // Check broadcast compatibility if shapes are known
-        let shape_a = self.tensor_shape_usize(input_a);
-        let shape_b = self.tensor_shape_usize(input_b);
-        if let (Some(a), Some(b)) = (&shape_a, &shape_b) {
-            if broadcast_shapes(a, b).is_none() {
-                return Err(NyError::ModelLoad(format!(
-                    "Min {} inputs are not broadcast-compatible: {:?} vs {:?}",
-                    spec.name, a, b
-                )));
-            }
-        }
-
-        debug!("Min {} is binary minimum of two activations", spec.name);
-        Ok(Layer::MinBinary(MinBinaryLayer))
+        Ok(Layer::Atan2(Atan2Layer))
     }
 
-    /// Convert ONNX Max to MaxBinaryLayer.
-    ///
-    /// ONNX Max is variadic (can take 2+ inputs), but conversion currently emits
-    /// exactly one binary `MaxBinaryLayer`.
+    /// Convert ONNX `Min` — see [`ConvertContext::convert_extremum`].
+    pub(crate) fn convert_min(&self, spec: &LayerSpec) -> Result<Layer> {
+        self.convert_extremum(spec, Extremum::Min)
+    }
+
+    /// Convert ONNX `Max` — see [`ConvertContext::convert_extremum`].
     pub(crate) fn convert_max(&self, spec: &LayerSpec) -> Result<Layer> {
+        self.convert_extremum(spec, Extremum::Max)
+    }
+
+    /// Convert a 2-input ONNX `Max`/`Min` node.
+    ///
+    /// Three operand shapes are handled, in this order:
+    ///
+    /// * **both operands constant** — refused (#3021). Emitting a binary layer
+    ///   would take the extremum of one constant against whatever activation
+    ///   the graph builder wired in the other slot, silently ignoring the
+    ///   second constant. Constant-folding is the ONNX optimizer's job.
+    /// * **one operand constant** — lowered to [`Layer::Clip`], a one-sided
+    ///   clamp. `maximum(x, eps)` is a real and common op: it is how models
+    ///   floor a value before a `sqrt` or a `log` for numerical stability
+    ///   (ECAPA-TDNN's attentive-stat-pooling variance does exactly this). See
+    ///   [`Extremum::clip_bounds`] for the identity and its soundness argument,
+    ///   and [`ConvertContext::extremum_clamp_scalar`] for the two conditions
+    ///   the constant must meet before it may be absorbed.
+    /// * **neither operand constant** — the genuine binary extremum.
+    ///
+    /// # Why the constant test is `constant_value`, not `weights` alone
+    ///
+    /// It has to agree with `find_graph_input_nodes` (`graph/inputs.rs`), which
+    /// drops an operand from a layer's activation-input list when EITHER
+    /// `weights` OR `evaluated_constants` holds it. A converter that consults
+    /// only `weights` can emit a *binary* layer whose second operand the graph
+    /// builder then removes, and the load dies downstream with "expects 2
+    /// activation inputs for binary op, got 1" — an error that names the graph
+    /// builder rather than the converter that actually mis-classified the
+    /// operand. `inputs.rs` states the contract in its own comment: the
+    /// converter "should have already created unary variants for binary ops
+    /// with constant tensor inputs via constant_value()".
+    ///
+    /// A constant tensor whose value could NOT be materialized still yields
+    /// `None` here, and that is correct rather than a gap: `inputs.rs` keeps
+    /// such an operand as an activation (its producing node stays in the graph
+    /// and propagates bounds), so the binary lowering is the matching one.
+    /// Interval-valued frozen constants likewise stay `None` — `WeightStore`
+    /// keeps point and interval maps disjoint — and so keep their existing
+    /// behaviour untouched by this lowering.
+    ///
+    /// ONNX `Max`/`Min` are variadic; conversion still admits exactly 2 inputs.
+    fn convert_extremum(&self, spec: &LayerSpec, extremum: Extremum) -> Result<Layer> {
+        let op = extremum.op_name();
         if spec.inputs.len() != 2 {
             return Err(NyError::ModelLoad(format!(
-                "Max {} requires exactly 2 inputs (got {})",
+                "{op} {} requires exactly 2 inputs (got {})",
                 spec.name,
                 spec.inputs.len()
             )));
@@ -526,35 +726,176 @@ impl ConvertContext<'_> {
         let input_a = &spec.inputs[0];
         let input_b = &spec.inputs[1];
 
-        // Check if both inputs are constants (should be constant folded upstream)
-        let a_is_const = self.weights.get(input_a).is_some();
-        let b_is_const = self.weights.get(input_b).is_some();
+        let a_value = self.constant_value(input_a);
+        let b_value = self.constant_value(input_b);
 
-        if a_is_const && b_is_const {
-            // Both constants - should be constant folded upstream.
-            // Returning MaxBinaryLayer here is unsound: it takes max of the
-            // input activation and one constant, ignoring the other (#3021).
+        if a_value.is_some() && b_value.is_some() {
             return Err(NyError::UnsupportedOp(format!(
-                "Max {} has both constant inputs — should be constant-folded \
+                "{op} {} has both constant inputs — should be constant-folded \
                  by the ONNX optimizer before verification",
                 spec.name
             )));
         }
 
-        // Check broadcast compatibility if shapes are known
+        // Broadcast compatibility, checked before committing to a lowering so a
+        // malformed node is reported as malformed rather than as an
+        // unsupported clamp.
         let shape_a = self.tensor_shape_usize(input_a);
         let shape_b = self.tensor_shape_usize(input_b);
         if let (Some(a), Some(b)) = (&shape_a, &shape_b) {
             if broadcast_shapes(a, b).is_none() {
                 return Err(NyError::ModelLoad(format!(
-                    "Max {} inputs are not broadcast-compatible: {:?} vs {:?}",
+                    "{op} {} inputs are not broadcast-compatible: {:?} vs {:?}",
                     spec.name, a, b
                 )));
             }
         }
 
-        debug!("Max {} is binary maximum of two activations", spec.name);
-        Ok(Layer::MaxBinary(MaxBinaryLayer))
+        // `max`/`min` are commutative, so which side carries the constant does
+        // not change the clamp — only which operand remains an activation.
+        let constant_operand = match (&a_value, &b_value) {
+            (Some(value), None) => Some((value, input_a.as_str(), input_b.as_str())),
+            (None, Some(value)) => Some((value, input_b.as_str(), input_a.as_str())),
+            _ => None,
+        };
+
+        if let Some((value, constant_name, activation_name)) = constant_operand {
+            let threshold =
+                self.extremum_clamp_scalar(spec, op, value, constant_name, activation_name)?;
+            let (min, max) = extremum.clip_bounds(threshold);
+            let layer = ClipLayer::try_new(min, max).map_err(|error| {
+                NyError::ModelLoad(format!(
+                    "{op} {} could not be lowered to a one-sided clamp at {threshold}: {error}",
+                    spec.name
+                ))
+            })?;
+            debug!(
+                "{op} {} is a one-sided clamp against constant '{constant_name}' = {threshold} \
+                 (lowered to Clip[{min}, {max}])",
+                spec.name
+            );
+            return Ok(Layer::Clip(layer));
+        }
+
+        debug!("{op} {} is a binary extremum of two activations", spec.name);
+        Ok(extremum.binary_layer())
+    }
+
+    /// Reduce a constant `Max`/`Min` operand to the single scalar threshold a
+    /// [`ClipLayer`] can carry — or refuse.
+    ///
+    /// `ClipLayer` holds SCALAR `min`/`max`, so this collapse is admissible only
+    /// when it is exact. Two independent conditions must hold, and both are
+    /// checked rather than assumed: this is a bound-propagation path, where
+    /// bounding the wrong function is a false proof, not merely a loose bound.
+    ///
+    /// 1. **Every element of the constant is the same value.** A genuinely
+    ///    elementwise constant — a per-channel floor, say — has no scalar
+    ///    representative at all. Collapsing it to one value (a mean, a min, the
+    ///    first element) would clamp every channel against the wrong threshold
+    ///    and bound a DIFFERENT function, so it is refused, never approximated.
+    ///
+    /// 2. **The constant cannot enlarge the activation's shape.** ONNX
+    ///    `Max`/`Min` broadcast, so `max(x[4], c[8])` legitimately produces an
+    ///    `[8]` output, whereas `ClipLayer` is elementwise and would keep `[4]`.
+    ///    Condition 1 does not imply this one — an all-equal `c[8]` still
+    ///    expands — so the broadcast of the two operand shapes is required to
+    ///    equal the ACTIVATION's shape.
+    ///
+    ///    A rank-0 constant is exempt and needs no shape lookup at all: `[]`
+    ///    broadcasts against every shape to that same shape, by definition.
+    ///    Otherwise both shapes must be statically known and the broadcast must
+    ///    be shape-preserving. An unknown shape is refused rather than guessed,
+    ///    because a wrong guess here is a silent shape change — the same stance
+    ///    [`ConvertContext::try_convert_interval_offset`] takes above.
+    ///
+    /// Non-finite constants are refused as well. `validate_clip_bounds` would
+    /// admit ±Inf, and `max(x, -inf) = x` is even exact, but a non-finite
+    /// threshold in a real model signals a broken export rather than an intended
+    /// clamp, and `max(x, +inf)` would emit an all-`+inf` layer output that
+    /// poisons every downstream bound. Failing closed keeps that out of the
+    /// graph; the caller's refusal degrades to a sound skip.
+    fn extremum_clamp_scalar(
+        &self,
+        spec: &LayerSpec,
+        op: &str,
+        constant: &ArrayD<f32>,
+        constant_name: &str,
+        activation_name: &str,
+    ) -> Result<f32> {
+        let Some(&threshold) = constant.iter().next() else {
+            return Err(NyError::ModelLoad(format!(
+                "{op} {} constant input '{constant_name}' is empty, so it carries no \
+                 clamp threshold",
+                spec.name
+            )));
+        };
+
+        if !threshold.is_finite() || constant.iter().any(|value| !value.is_finite()) {
+            return Err(NyError::UnsupportedOp(format!(
+                "{op} {} clamps against non-finite constant '{constant_name}'; refusing \
+                 rather than admitting a threshold that cannot soundly bound anything",
+                spec.name
+            )));
+        }
+
+        // Condition 1. Plain value equality, not bitwise: `-0.0` and `0.0` are
+        // the same clamp, and NaN — the only value where `!=` would misbehave —
+        // is already excluded by the finiteness check above.
+        if constant.iter().any(|&value| value != threshold) {
+            return Err(NyError::UnsupportedOp(format!(
+                "{op} {} has an elementwise constant operand '{constant_name}' (shape \
+                 {:?}, elements are not all equal); ny can only absorb a UNIFORM \
+                 threshold into the scalar-bounded Clip layer, and collapsing distinct \
+                 per-element thresholds to one value would bound a different function",
+                spec.name,
+                constant.shape()
+            )));
+        }
+
+        // Condition 2. `tensor_shapes` is the authoritative ONNX shape record
+        // and is the convention the activation's shape is read in too, so both
+        // sides of the broadcast comparison come from it. Fall back to the
+        // materialized array only to recognise rank-0, where no comparison is
+        // needed.
+        let constant_shape = self.tensor_shape_usize(constant_name);
+        let is_rank_zero = match &constant_shape {
+            Some(shape) => shape.is_empty(),
+            None => constant.ndim() == 0,
+        };
+        if is_rank_zero {
+            return Ok(threshold);
+        }
+
+        let (Some(constant_shape), Some(activation_shape)) =
+            (constant_shape, self.tensor_shape_usize(activation_name))
+        else {
+            return Err(NyError::UnsupportedOp(format!(
+                "{op} {} clamps against non-scalar constant '{constant_name}', but the \
+                 operand shapes are not both statically known; refusing rather than \
+                 guessing whether the broadcast enlarges the activation",
+                spec.name
+            )));
+        };
+
+        let broadcast = broadcast_shapes(&activation_shape, &constant_shape).ok_or_else(|| {
+            NyError::ModelLoad(format!(
+                "{op} {} inputs are not broadcast-compatible: {activation_shape:?} vs \
+                 {constant_shape:?}",
+                spec.name
+            ))
+        })?;
+        if broadcast != activation_shape {
+            return Err(NyError::UnsupportedOp(format!(
+                "{op} {} broadcasts activation '{activation_name}' {activation_shape:?} \
+                 against constant '{constant_name}' {constant_shape:?} to {broadcast:?}, \
+                 but the elementwise Clip lowering would keep {activation_shape:?}; \
+                 refusing rather than silently reshaping the graph",
+                spec.name
+            )));
+        }
+
+        Ok(threshold)
     }
 }
 
@@ -562,7 +903,10 @@ impl ConvertContext<'_> {
 mod tests {
     use super::*;
     use crate::WeightStore;
+    use ndarray::arr1;
     use ny_core::LayerType;
+    use ny_propagate::BoundPropagation;
+    use ny_tensor::BoundedTensor;
     use std::collections::{HashMap, HashSet};
 
     fn make_context() -> (WeightStore, HashMap<String, Vec<i64>>, HashSet<String>) {
@@ -629,7 +973,7 @@ mod tests {
         // Insert a non-scalar exponent with different values per element
         weights.insert(
             "exp".to_string(),
-            ndarray::arr1(&[2.0f32, 3.0, 4.0]).into_dyn(),
+            arr1(&[2.0f32, 3.0, 4.0]).into_dyn(),
         );
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["input", "exp"]);
@@ -654,7 +998,7 @@ mod tests {
         // Insert a non-scalar exponent where all values are the same
         weights.insert(
             "exp".to_string(),
-            ndarray::arr1(&[2.0f32, 2.0, 2.0]).into_dyn(),
+            arr1(&[2.0f32, 2.0, 2.0]).into_dyn(),
         );
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["input", "exp"]);
@@ -675,7 +1019,7 @@ mod tests {
         let (mut weights, shapes, constants) = make_context();
         weights.insert(
             "exp".to_string(),
-            ndarray::arr1(&[2.0f32, 2.0, 2.0]).into_dyn(),
+            arr1(&[2.0f32, 2.0, 2.0]).into_dyn(),
         );
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["input", "exp"]);
@@ -698,7 +1042,7 @@ mod tests {
     #[test]
     fn convert_pow_accepts_scalar_exponent() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert("exp".to_string(), ndarray::arr1(&[2.0f32]).into_dyn());
+        weights.insert("exp".to_string(), arr1(&[2.0f32]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["input", "exp"]);
 
@@ -714,7 +1058,7 @@ mod tests {
     #[test]
     fn convert_pow_rejects_non_finite_exponent_4307() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert("exp".to_string(), ndarray::arr1(&[f32::NAN]).into_dyn());
+        weights.insert("exp".to_string(), arr1(&[f32::NAN]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["input", "exp"]);
 
@@ -737,8 +1081,8 @@ mod tests {
     #[test]
     fn convert_pow_rejects_both_constant_inputs_2956() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert("base".to_string(), ndarray::arr1(&[4.0f32]).into_dyn());
-        weights.insert("exp".to_string(), ndarray::arr1(&[0.5f32]).into_dyn());
+        weights.insert("base".to_string(), arr1(&[4.0f32]).into_dyn());
+        weights.insert("exp".to_string(), arr1(&[0.5f32]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Pow, &["base", "exp"]);
 
@@ -759,8 +1103,8 @@ mod tests {
     #[test]
     fn convert_add_rejects_both_constant_inputs_3021() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert("a".to_string(), ndarray::arr1(&[1.0f32]).into_dyn());
-        weights.insert("b".to_string(), ndarray::arr1(&[2.0f32]).into_dyn());
+        weights.insert("a".to_string(), arr1(&[1.0f32]).into_dyn());
+        weights.insert("b".to_string(), arr1(&[2.0f32]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Add, &["a", "b"]);
 
@@ -781,8 +1125,8 @@ mod tests {
     #[test]
     fn convert_min_rejects_both_constant_inputs_3021() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert("a".to_string(), ndarray::arr1(&[3.0f32]).into_dyn());
-        weights.insert("b".to_string(), ndarray::arr1(&[5.0f32]).into_dyn());
+        weights.insert("a".to_string(), arr1(&[3.0f32]).into_dyn());
+        weights.insert("b".to_string(), arr1(&[5.0f32]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Min, &["a", "b"]);
 
@@ -803,8 +1147,8 @@ mod tests {
     #[test]
     fn convert_max_rejects_both_constant_inputs_3021() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert("a".to_string(), ndarray::arr1(&[3.0f32]).into_dyn());
-        weights.insert("b".to_string(), ndarray::arr1(&[5.0f32]).into_dyn());
+        weights.insert("a".to_string(), arr1(&[3.0f32]).into_dyn());
+        weights.insert("b".to_string(), arr1(&[5.0f32]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Max, &["a", "b"]);
 
@@ -820,13 +1164,228 @@ mod tests {
         );
     }
 
+    /// Sample points spanning each element's interval, for enclosure checks.
+    fn interval_samples(lower: f32, upper: f32) -> [f32; 3] {
+        [lower, 0.5 * (lower + upper), upper]
+    }
+
+    /// `max(x, eps)` with a scalar constant lowers to a one-sided clamp, and the
+    /// resulting layer's IBP ENCLOSES the concrete `max(x, eps)`.
+    ///
+    /// Before this lowering existed, one constant operand still produced
+    /// `Layer::MaxBinary`; `find_graph_input_nodes` then filtered the constant
+    /// out of the activation list and failed the whole load with "expects 2
+    /// activation inputs for binary op, got 1". ECAPA-TDNN hits this with the
+    /// `maximum(x, 1e-7)` that floors its pooled variance before a `sqrt`.
+    #[test]
+    fn convert_max_with_scalar_constant_lowers_to_one_sided_clip_and_encloses() {
+        let (mut weights, shapes, constants) = make_context();
+        // Rank-0, exactly as the ECAPA trace serializes it.
+        weights.insert("eps".to_string(), ArrayD::from_elem(IxDyn(&[]), 1e-7f32));
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = make_spec(LayerType::Max, &["input", "eps"]);
+
+        let layer = context
+            .convert_max(&spec)
+            .expect("max(x, eps) must lower to a clamp, not a binary op");
+        let Layer::Clip(clip) = &layer else {
+            panic!("expected a one-sided Clip, got {layer:?}");
+        };
+        assert_eq!(clip.min, 1e-7f32, "max(x, c) floors the output at c");
+        assert_eq!(
+            clip.max,
+            f32::INFINITY,
+            "max(x, c) must leave the UPPER end open; any finite ceiling would \
+             clamp values the true function passes through unchanged, bounding \
+             a smaller function than max(x, c)"
+        );
+
+        // Enclosure: intervals that sit below, across, and above the threshold.
+        let lower = arr1(&[-2.0f32, -1.0, -1e-9, 1.0]).into_dyn();
+        let upper = arr1(&[-1.0f32, 0.5, 1e-9, 3.0]).into_dyn();
+        let input = BoundedTensor::new(lower.clone(), upper.clone()).expect("input bounds");
+        let output = clip.propagate_ibp(&input).expect("Clip IBP");
+
+        let (lower, upper) = (
+            lower.as_slice().expect("contiguous lower"),
+            upper.as_slice().expect("contiguous upper"),
+        );
+        let out_lower = output.lower().as_slice().expect("contiguous out lower");
+        let out_upper = output.upper().as_slice().expect("contiguous out upper");
+        for index in 0..lower.len() {
+            for sample in interval_samples(lower[index], upper[index]) {
+                let concrete = sample.max(1e-7f32);
+                assert!(
+                    out_lower[index] <= concrete && concrete <= out_upper[index],
+                    "IBP bound [{}, {}] at index {index} must enclose \
+                     max({sample}, 1e-7) = {concrete}",
+                    out_lower[index],
+                    out_upper[index]
+                );
+            }
+        }
+    }
+
+    /// The `min` mirror: `min(x, c)` lowers to `Clip(-inf, c)` and encloses.
+    #[test]
+    fn convert_min_with_scalar_constant_lowers_to_one_sided_clip_and_encloses() {
+        let (mut weights, shapes, constants) = make_context();
+        weights.insert("ceiling".to_string(), ArrayD::from_elem(IxDyn(&[]), 0.5f32));
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = make_spec(LayerType::Min, &["input", "ceiling"]);
+
+        let layer = context
+            .convert_min(&spec)
+            .expect("min(x, c) must lower to a clamp, not a binary op");
+        let Layer::Clip(clip) = &layer else {
+            panic!("expected a one-sided Clip, got {layer:?}");
+        };
+        assert_eq!(clip.max, 0.5f32, "min(x, c) caps the output at c");
+        assert_eq!(
+            clip.min,
+            f32::NEG_INFINITY,
+            "min(x, c) must leave the LOWER end open"
+        );
+
+        let lower = arr1(&[-2.0f32, 0.0, 0.5, 1.0]).into_dyn();
+        let upper = arr1(&[-1.0f32, 1.0, 0.5, 3.0]).into_dyn();
+        let input = BoundedTensor::new(lower.clone(), upper.clone()).expect("input bounds");
+        let output = clip.propagate_ibp(&input).expect("Clip IBP");
+
+        let (lower, upper) = (
+            lower.as_slice().expect("contiguous lower"),
+            upper.as_slice().expect("contiguous upper"),
+        );
+        let out_lower = output.lower().as_slice().expect("contiguous out lower");
+        let out_upper = output.upper().as_slice().expect("contiguous out upper");
+        for index in 0..lower.len() {
+            for sample in interval_samples(lower[index], upper[index]) {
+                let concrete = sample.min(0.5f32);
+                assert!(
+                    out_lower[index] <= concrete && concrete <= out_upper[index],
+                    "IBP bound [{}, {}] at index {index} must enclose \
+                     min({sample}, 0.5) = {concrete}",
+                    out_lower[index],
+                    out_upper[index]
+                );
+            }
+        }
+    }
+
+    /// The constant test must agree with `find_graph_input_nodes`, which filters
+    /// on `weights` OR `evaluated_constants`. A constant reachable only through
+    /// `evaluated_constants` must therefore lower to a clamp too — consulting
+    /// `weights` alone would emit a binary layer whose operand the graph builder
+    /// then deletes.
+    #[test]
+    fn convert_max_absorbs_a_constant_that_lives_only_in_evaluated_constants() {
+        let (weights, shapes, constants) = make_context();
+        let evaluated =
+            HashMap::from([("folded".to_string(), ArrayD::from_elem(IxDyn(&[]), 2.0f32))]);
+        let context =
+            ConvertContext::with_evaluated_constants(&weights, &shapes, &constants, &evaluated);
+        let spec = make_spec(LayerType::Max, &["input", "folded"]);
+
+        let layer = context
+            .convert_max(&spec)
+            .expect("a const-folded operand must lower to a clamp");
+        let Layer::Clip(clip) = &layer else {
+            panic!("expected a one-sided Clip, got {layer:?}");
+        };
+        assert_eq!(clip.min, 2.0f32);
+    }
+
+    /// A genuinely ELEMENTWISE constant has no scalar representative, so it must
+    /// be refused rather than collapsed. Collapsing it would clamp every element
+    /// against the wrong threshold — a different function, i.e. a false proof.
+    #[test]
+    fn convert_max_refuses_an_elementwise_constant_rather_than_collapsing_it() {
+        let (mut weights, shapes, constants) = make_context();
+        weights.insert(
+            "per_channel_floor".to_string(),
+            arr1(&[0.0f32, 1.0, 2.0]).into_dyn(),
+        );
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = make_spec(LayerType::Max, &["input", "per_channel_floor"]);
+
+        let error = context
+            .convert_max(&spec)
+            .expect_err("a non-uniform constant must be refused");
+        assert!(
+            matches!(&error, NyError::UnsupportedOp(msg) if msg.contains("elementwise")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// An all-equal constant is still refused when broadcasting would ENLARGE
+    /// the activation: `ClipLayer` is elementwise and would silently keep the
+    /// smaller shape. Uniform values are not sufficient — the shape must be too.
+    #[test]
+    fn convert_max_refuses_a_constant_that_broadcasts_the_activation_larger() {
+        let (mut weights, mut shapes, constants) = make_context();
+        // Activation "input" is [1]; an all-equal [4] constant broadcasts the
+        // ONNX output to [4], which the Clip lowering could not reproduce.
+        weights.insert(
+            "wide".to_string(),
+            arr1(&[2.0f32, 2.0, 2.0, 2.0]).into_dyn(),
+        );
+        shapes.insert("wide".to_string(), vec![4]);
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = make_spec(LayerType::Max, &["input", "wide"]);
+
+        let error = context
+            .convert_max(&spec)
+            .expect_err("a shape-enlarging constant must be refused");
+        assert!(
+            matches!(&error, NyError::UnsupportedOp(msg) if msg.contains("broadcasts")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// A non-finite threshold is refused. `validate_clip_bounds` would admit it,
+    /// but `max(x, +inf)` emits an all-`+inf` output that poisons every
+    /// downstream bound, and a non-finite constant signals a broken export.
+    #[test]
+    fn convert_max_refuses_a_non_finite_constant() {
+        let (mut weights, shapes, constants) = make_context();
+        weights.insert(
+            "inf".to_string(),
+            ArrayD::from_elem(IxDyn(&[]), f32::INFINITY),
+        );
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = make_spec(LayerType::Max, &["input", "inf"]);
+
+        let error = context
+            .convert_max(&spec)
+            .expect_err("a non-finite threshold must be refused");
+        assert!(
+            matches!(&error, NyError::UnsupportedOp(msg) if msg.contains("non-finite")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// Two ACTIVATION operands must still produce the genuine binary layer —
+    /// the clamp lowering must not swallow the ordinary case.
+    #[test]
+    fn convert_max_with_two_activations_stays_binary() {
+        let (weights, shapes, constants) = make_context();
+        let context = ConvertContext::new(&weights, &shapes, &constants);
+        let spec = make_spec(LayerType::Max, &["input", "output"]);
+
+        let layer = context.convert_max(&spec).expect("binary max must lower");
+        assert!(
+            matches!(layer, Layer::MaxBinary(_)),
+            "expected MaxBinary, got {layer:?}"
+        );
+    }
+
     /// Regression test for #3021: Div with both constant inputs must return error,
     /// not DivConstantLayer (which ignores the constant numerator).
     #[test]
     fn convert_div_rejects_both_constant_inputs_3021() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert("a".to_string(), ndarray::arr1(&[10.0f32]).into_dyn());
-        weights.insert("b".to_string(), ndarray::arr1(&[2.0f32]).into_dyn());
+        weights.insert("a".to_string(), arr1(&[10.0f32]).into_dyn());
+        weights.insert("b".to_string(), arr1(&[2.0f32]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Div, &["a", "b"]);
 
@@ -847,7 +1406,7 @@ mod tests {
         let (mut weights, shapes, constants) = make_context();
         weights.insert(
             "const".to_string(),
-            ndarray::arr1(&[1.0f32, f32::NAN]).into_dyn(),
+            arr1(&[1.0f32, f32::NAN]).into_dyn(),
         );
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Add, &["input", "const"]);
@@ -869,7 +1428,7 @@ mod tests {
     #[test]
     fn convert_div_rejects_near_zero_constant_4307() {
         let (mut weights, shapes, constants) = make_context();
-        weights.insert("divisor".to_string(), ndarray::arr1(&[0.0f32]).into_dyn());
+        weights.insert("divisor".to_string(), arr1(&[0.0f32]).into_dyn());
         let context = ConvertContext::new(&weights, &shapes, &constants);
         let spec = make_spec(LayerType::Div, &["input", "divisor"]);
 
@@ -1099,7 +1658,7 @@ mod tests {
     #[test]
     fn convert_add_mixed_constant_tensor_and_weight_uses_available_value_3186() {
         let (mut weights, shapes, _) = make_context();
-        weights.insert("bias".to_string(), ndarray::arr1(&[1.0f32]).into_dyn());
+        weights.insert("bias".to_string(), arr1(&[1.0f32]).into_dyn());
         let constant_tensors = HashSet::from(["const_input".to_string()]);
         let context = ConvertContext::new(&weights, &shapes, &constant_tensors);
 

@@ -2371,3 +2371,529 @@ fn linear_ibp_zero_contraction_finite_deadline_traverses_output_cells() -> Resul
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #pollable-faer: bounded (deadline-facade) batched Linear CROWN host arm.
+// Ship-fix for the 6f49a660 deadline-GEMM cliff class (dist_shift index5291 /
+// cgan row 7): under `NY_POLLABLE_FAER=1` the historical "no pollable host
+// implementation" refusal becomes a row-block-chunked faer host path, polled
+// between blocks, BIT-IDENTICAL to the unbounded host path and to the scalar
+// (single-domain) path.
+// ---------------------------------------------------------------------------
+
+/// A bounded host facade mock: forbids unbounded CPU fallback, provides the
+/// pollable host-GEMM capability, counts polls, and (optionally) surfaces the
+/// facade's typed deadline error after a fixed number of successful polls —
+/// the exact error shape `DeadlineCpuGemmEngine`'s scalar per-MAC GEMM
+/// surfaces in production today.
+struct PollingBoundedHostEngine {
+    polls: AtomicUsize,
+    fail_after: Option<usize>,
+}
+
+impl PollingBoundedHostEngine {
+    fn live() -> Self {
+        Self {
+            polls: AtomicUsize::new(0),
+            fail_after: None,
+        }
+    }
+
+    fn expiring_after(successful_polls: usize) -> Self {
+        Self {
+            polls: AtomicUsize::new(0),
+            fail_after: Some(successful_polls),
+        }
+    }
+}
+
+impl GemmEngine for PollingBoundedHostEngine {
+    fn gemm_f32(
+        &self,
+        _m: usize,
+        _k: usize,
+        _n: usize,
+        _a: &[f32],
+        _b: &[f32],
+    ) -> Result<Vec<f32>> {
+        panic!("the #pollable-faer arm must never route GEMM through the facade's scalar loop")
+    }
+
+    fn poll_crown_backward_deadline(&self) -> Result<()> {
+        let observed = self.polls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_after.is_some_and(|limit| observed > limit) {
+            return Err(NyError::DeadlineExceeded(
+                "bounded shared-executor CPU GEMM deadline exceeded".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn forbids_unbounded_cpu_fallback(&self) -> bool {
+        true
+    }
+
+    fn provides_deadline_pollable_host_gemm(&self) -> bool {
+        true
+    }
+}
+
+/// Deterministic pseudo-random f32 in roughly [-1, 1] (LCG; no test-only deps).
+fn pollable_faer_pseudo(state: &mut u32) -> f32 {
+    *state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    ((*state >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+}
+
+/// Layer for the batched pollable tests: weight (mid_dim=5, in_dim=6) + bias.
+fn make_pollable_test_layer() -> LinearLayer {
+    let mut state = 0xC0FF_EE01u32;
+    let weight = Array2::from_shape_fn((5, 6), |_| pollable_faer_pseudo(&mut state));
+    let bias = Array1::from_shape_fn(5, |_| pollable_faer_pseudo(&mut state));
+    LinearLayer::new(weight, Some(bias)).expect("valid pollable test layer")
+}
+
+/// Batched bounds [total_batch=3, out_dim=7, mid_dim=5], optionally carrying
+/// incoming certified coefficient error (exercises the composition lane).
+fn make_pollable_test_bounds(with_incoming_err: bool) -> BatchedLinearBounds {
+    let mut state = 0xDEAD_BEEFu32;
+    let lower_a = ArrayD::from_shape_fn(IxDyn(&[3, 7, 5]), |_| pollable_faer_pseudo(&mut state));
+    let upper_a = ArrayD::from_shape_fn(IxDyn(&[3, 7, 5]), |_| pollable_faer_pseudo(&mut state));
+    let lower_b = ArrayD::from_shape_fn(IxDyn(&[3, 7]), |_| pollable_faer_pseudo(&mut state));
+    let upper_b = ArrayD::from_shape_fn(IxDyn(&[3, 7]), |_| pollable_faer_pseudo(&mut state));
+    let mut bounds = BatchedLinearBounds::from_parts_unchecked(
+        lower_a,
+        lower_b,
+        upper_a,
+        upper_b,
+        vec![5],
+        vec![7],
+    );
+    if with_incoming_err {
+        let lower_err = ArrayD::from_shape_fn(IxDyn(&[3, 7, 5]), |_| {
+            pollable_faer_pseudo(&mut state).abs() * 1e-5
+        });
+        let upper_err = ArrayD::from_shape_fn(IxDyn(&[3, 7, 5]), |_| {
+            pollable_faer_pseudo(&mut state).abs() * 1e-5
+        });
+        bounds.set_coeff_err(lower_err, upper_err);
+        assert!(
+            bounds.has_coeff_err(),
+            "test bounds must carry incoming err"
+        );
+    }
+    bounds
+}
+
+fn assert_bits_eq_f32<'a>(
+    actual: impl Iterator<Item = &'a f32>,
+    expected: impl Iterator<Item = &'a f32>,
+    label: &str,
+) {
+    let mut count = 0usize;
+    let mut actual = actual;
+    let mut expected = expected;
+    loop {
+        match (actual.next(), expected.next()) {
+            (Some(a), Some(e)) => {
+                assert!(
+                    a.to_bits() == e.to_bits(),
+                    "{label}: bitwise mismatch at flat index {count}: actual={a} ({:#010x}), \
+                     expected={e} ({:#010x})",
+                    a.to_bits(),
+                    e.to_bits()
+                );
+                count += 1;
+            }
+            (None, None) => break,
+            _ => panic!("{label}: length mismatch after {count} elements"),
+        }
+    }
+    assert!(count > 0, "{label}: empty comparison is vacuous");
+}
+
+/// Three-way bit-identity: the #pollable-faer bounded arm vs the unbounded
+/// host (CPU/faer) path vs the scalar single-domain path — coefficients,
+/// certified errors, and biases. A tiny block quantum forces one output row
+/// per faer block (7 blocks per side per batch element), so the row-blocked
+/// accumulation-order claim is actually exercised, and both the fresh-error
+/// and incoming-error (composition) lanes are covered.
+#[test]
+fn pollable_faer_batched_bit_identical_to_cpu_and_scalar() -> Result<()> {
+    let layer = make_pollable_test_layer();
+    // mid_dim * in_dim = 30 MACs per output row: block quantum 30 = 1 row/block.
+    let one_row_block_macs = 30usize;
+
+    for with_incoming_err in [false, true] {
+        let bounds = make_pollable_test_bounds(with_incoming_err);
+
+        // (b) unbounded host path — today's production truth for this entry.
+        let cpu = layer.propagate_linear_batched_maybe_engine(&bounds, None)?;
+
+        // (a) bounded #pollable-faer arm, forced multi-block.
+        let facade = PollingBoundedHostEngine::live();
+        let pollable = crown_batched::propagate_linear_batched_maybe_engine_with_pollable(
+            &layer,
+            &bounds,
+            Some(&facade),
+            true,
+            one_row_block_macs,
+        )?;
+        let polls = facade.polls.load(Ordering::SeqCst);
+        assert!(
+            polls >= 3 * 7 * 2 * 3,
+            "multi-block dispatch must poll between blocks (err={with_incoming_err}, \
+             observed {polls} polls)"
+        );
+
+        let label = |name: &str| format!("err={with_incoming_err} {name}");
+        assert_bits_eq_f32(
+            pollable.lower_a.iter(),
+            cpu.lower_a.iter(),
+            &label("lower_a"),
+        );
+        assert_bits_eq_f32(
+            pollable.upper_a.iter(),
+            cpu.upper_a.iter(),
+            &label("upper_a"),
+        );
+        assert_bits_eq_f32(
+            pollable.lower_b.iter(),
+            cpu.lower_b.iter(),
+            &label("lower_b"),
+        );
+        assert_bits_eq_f32(
+            pollable.upper_b.iter(),
+            cpu.upper_b.iter(),
+            &label("upper_b"),
+        );
+        let (pl_err, cl_err) = (
+            pollable.lower_a_err.as_ref().expect("pollable lower err"),
+            cpu.lower_a_err.as_ref().expect("cpu lower err"),
+        );
+        assert_bits_eq_f32(pl_err.iter(), cl_err.iter(), &label("lower_a_err"));
+        let (pu_err, cu_err) = (
+            pollable.upper_a_err.as_ref().expect("pollable upper err"),
+            cpu.upper_a_err.as_ref().expect("cpu upper err"),
+        );
+        assert_bits_eq_f32(pu_err.iter(), cu_err.iter(), &label("upper_a_err"));
+
+        // (c) scalar single-domain path per batch element.
+        for batch in 0..3usize {
+            let take2 = |a: &ArrayD<f32>, rows: usize, cols: usize| -> Array2<f32> {
+                Array2::from_shape_fn((rows, cols), |(i, j)| a[[batch, i, j]])
+            };
+            let take1 = |a: &ArrayD<f32>, rows: usize| -> Array1<f32> {
+                Array1::from_shape_fn(rows, |i| a[[batch, i]])
+            };
+            let mut lb = LinearBounds::new(
+                take2(&bounds.lower_a, 7, 5),
+                take1(&bounds.lower_b, 7),
+                take2(&bounds.upper_a, 7, 5),
+                take1(&bounds.upper_b, 7),
+            )?;
+            if with_incoming_err {
+                lb.set_coeff_err(
+                    take2(bounds.lower_a_err.as_ref().unwrap(), 7, 5),
+                    take2(bounds.upper_a_err.as_ref().unwrap(), 7, 5),
+                );
+            }
+            let scalar = layer.propagate_linear_with_engine(&lb, None)?;
+            let batch_label =
+                |name: &str| format!("err={with_incoming_err} batch={batch} scalar {name}");
+            let pollable_lower: Vec<f32> = (0..7)
+                .flat_map(|i| (0..6).map(move |j| (i, j)))
+                .map(|(i, j)| pollable.lower_a[[batch, i, j]])
+                .collect();
+            let scalar_lower: Vec<f32> = scalar.lower_a().iter().copied().collect();
+            assert_bits_eq_f32(
+                pollable_lower.iter(),
+                scalar_lower.iter(),
+                &batch_label("lower_a"),
+            );
+            let pollable_upper: Vec<f32> = (0..7)
+                .flat_map(|i| (0..6).map(move |j| (i, j)))
+                .map(|(i, j)| pollable.upper_a[[batch, i, j]])
+                .collect();
+            let scalar_upper: Vec<f32> = scalar.upper_a().iter().copied().collect();
+            assert_bits_eq_f32(
+                pollable_upper.iter(),
+                scalar_upper.iter(),
+                &batch_label("upper_a"),
+            );
+            let pollable_lb: Vec<f32> = (0..7).map(|i| pollable.lower_b[[batch, i]]).collect();
+            let scalar_lb: Vec<f32> = scalar.lower_b().iter().copied().collect();
+            assert_bits_eq_f32(
+                pollable_lb.iter(),
+                scalar_lb.iter(),
+                &batch_label("lower_b"),
+            );
+            let pollable_ub: Vec<f32> = (0..7).map(|i| pollable.upper_b[[batch, i]]).collect();
+            let scalar_ub: Vec<f32> = scalar.upper_b().iter().copied().collect();
+            assert_bits_eq_f32(
+                pollable_ub.iter(),
+                scalar_ub.iter(),
+                &batch_label("upper_b"),
+            );
+            let pollable_lerr: Vec<f32> = (0..7)
+                .flat_map(|i| (0..6).map(move |j| (i, j)))
+                .map(|(i, j)| pl_err[[batch, i, j]])
+                .collect();
+            let scalar_lerr: Vec<f32> = scalar
+                .lower_a_err()
+                .expect("scalar lower err")
+                .iter()
+                .copied()
+                .collect();
+            assert_bits_eq_f32(
+                pollable_lerr.iter(),
+                scalar_lerr.iter(),
+                &batch_label("lower_a_err"),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The chunked poll-closure core is bitwise identical to the unchunked faer
+/// arm of `aw_f64_with_abssum` across block-size edge cases: rows < block
+/// (single block), rows an exact block multiple, a ragged final block, and
+/// one-row blocks. This pins the faer row-count-independence premise (the
+/// `aw_batched_matches_per_domain_bit_for_bit` property) for this entry.
+#[test]
+fn pollable_chunked_aw_matches_unchunked_faer_bitwise() -> Result<()> {
+    let mut state = 0x5EED_0001u32;
+    for &(m, k, p) in &[
+        (1usize, 4usize, 3usize),
+        (8, 16, 8),
+        (13, 7, 5),
+        (64, 32, 16),
+    ] {
+        let a = Mat::<f32>::from_fn(m, k, |_, _| pollable_faer_pseudo(&mut state));
+        let w = Mat::<f32>::from_fn(k, p, |_, _| pollable_faer_pseudo(&mut state));
+        let (ref_a64, ref_s) = crown_single::aw_f64_with_abssum(&a, &w);
+
+        let row_macs = k * p;
+        for &(chunk_macs, expected_blocks) in &[
+            (row_macs, m),                 // one row per block
+            (row_macs * 3, m.div_ceil(3)), // ragged final block
+            (row_macs * m, 1usize),        // rows == block
+            (row_macs * m * 16, 1usize),   // rows < block (single block)
+        ] {
+            let mut polls = 0usize;
+            let mut poll = || {
+                polls += 1;
+                Ok(())
+            };
+            let (a64, s, blocks) =
+                crown_single::aw_f64_with_abssum_chunked_poll(&a, &w, chunk_macs, &mut poll)?
+                    .unwrap_or_else(|| {
+                        panic!("shape ({m},{k},{p}) must admit chunk_macs={chunk_macs}")
+                    });
+            assert_eq!(
+                blocks, expected_blocks,
+                "block count for ({m},{k},{p}) at chunk_macs={chunk_macs}"
+            );
+            assert!(
+                polls >= 3 * blocks,
+                "polls must run between blocks: {polls} polls for {blocks} blocks"
+            );
+            for (idx, (actual, expected)) in a64.iter().zip(ref_a64.iter()).enumerate() {
+                assert!(
+                    actual.to_bits() == expected.to_bits(),
+                    "a64 mismatch ({m},{k},{p}) chunk_macs={chunk_macs} flat={idx}: \
+                     {actual} vs {expected}"
+                );
+            }
+            for (idx, (actual, expected)) in s.iter().zip(ref_s.iter()).enumerate() {
+                assert!(
+                    actual.to_bits() == expected.to_bits(),
+                    "s mismatch ({m},{k},{p}) chunk_macs={chunk_macs} flat={idx}: \
+                     {actual} vs {expected}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Expiry mid-GEMM: the facade's typed `DeadlineExceeded` propagates unchanged
+/// (the exact error shape its scalar per-MAC path surfaces today) from every
+/// poll ordinal — before the first block, between row blocks, and during the
+/// tail folds — and no partial result is ever published (the entry returns
+/// `Err`, never a value).
+#[test]
+fn pollable_faer_expiry_mid_gemm_returns_typed_deadline() {
+    let layer = make_pollable_test_layer();
+    let bounds = make_pollable_test_bounds(true);
+    // Establish the full poll count of a successful run, then expire at
+    // representative ordinals inside it.
+    let live = PollingBoundedHostEngine::live();
+    let _ = crown_batched::propagate_linear_batched_maybe_engine_with_pollable(
+        &layer,
+        &bounds,
+        Some(&live),
+        true,
+        30,
+    )
+    .expect("live facade run must succeed");
+    let total_polls = live.polls.load(Ordering::SeqCst);
+    assert!(
+        total_polls > 8,
+        "test needs a multi-poll run, got {total_polls}"
+    );
+
+    for successful_polls in [0, 1, total_polls / 2, total_polls - 1] {
+        let facade = PollingBoundedHostEngine::expiring_after(successful_polls);
+        let error = crown_batched::propagate_linear_batched_maybe_engine_with_pollable(
+            &layer,
+            &bounds,
+            Some(&facade),
+            true,
+            30,
+        )
+        .expect_err("an expired facade deadline must abort the pollable-faer arm");
+        assert!(
+            error.is_deadline_exceeded(),
+            "poll ordinal {successful_polls} surfaced the wrong error: {error}"
+        );
+    }
+}
+
+/// Gate OFF (the shipped default) and capability-incomplete facades keep the
+/// historical refusal byte-for-byte; a shape whose single output row exceeds
+/// the block budget refuses instead of running an unboundable dispatch.
+#[test]
+fn pollable_faer_gate_off_or_incapable_keeps_historical_refusal() {
+    let layer = make_pollable_test_layer();
+    let bounds = make_pollable_test_bounds(false);
+
+    // Gate OFF, capable facade.
+    let facade = PollingBoundedHostEngine::live();
+    let error = crown_batched::propagate_linear_batched_maybe_engine_with_pollable(
+        &layer,
+        &bounds,
+        Some(&facade),
+        false,
+        crown_batched::POLLABLE_FAER_BLOCK_MACS,
+    )
+    .expect_err("gate off must keep the historical refusal");
+    assert!(
+        matches!(&error, NyError::UnsupportedOp(msg)
+            if msg.contains("no pollable host implementation")),
+        "unexpected gate-off error: {error}"
+    );
+
+    // Production default entry (NY_POLLABLE_FAER unset in the test env).
+    let facade = PollingBoundedHostEngine::live();
+    let error = layer
+        .propagate_linear_batched_maybe_engine(&bounds, Some(&facade))
+        .expect_err("default gate state is OFF");
+    assert!(
+        matches!(&error, NyError::UnsupportedOp(msg)
+            if msg.contains("no pollable host implementation")),
+        "unexpected default-entry error: {error}"
+    );
+
+    // Gate ON, facade WITHOUT the pollable host-GEMM capability: fail closed.
+    let error = crown_batched::propagate_linear_batched_maybe_engine_with_pollable(
+        &layer,
+        &bounds,
+        Some(&BoundedMemoryRefusalEngine),
+        true,
+        crown_batched::POLLABLE_FAER_BLOCK_MACS,
+    )
+    .expect_err("a facade without the pollable capability must be refused");
+    assert!(
+        matches!(&error, NyError::UnsupportedOp(msg)
+            if msg.contains("no pollable host implementation")),
+        "unexpected incapable-facade error: {error}"
+    );
+
+    // Gate ON, capable facade, but one output row (mid_dim*in_dim = 30 MACs)
+    // exceeds the block budget: refuse, never dispatch unboundable work.
+    let facade = PollingBoundedHostEngine::live();
+    let error = crown_batched::propagate_linear_batched_maybe_engine_with_pollable(
+        &layer,
+        &bounds,
+        Some(&facade),
+        true,
+        29,
+    )
+    .expect_err("an over-quantum row must refuse");
+    assert!(
+        matches!(&error, NyError::UnsupportedOp(msg) if msg.contains("block budget")),
+        "unexpected over-quantum error: {error}"
+    );
+}
+
+/// The gate's truthy predicate IS the spec of its arming rule (the ny-levers
+/// declaration is `LeverKind::Text` so that THIS parser stays authoritative,
+/// not an exact-"1" Boolean). Pin the exact truthy set: trimmed non-empty,
+/// not exact `0`, not case-insensitive `false`.
+#[test]
+fn pollable_faer_gate_preserves_legacy_truthy_parser() {
+    use crown_batched::pollable_faer_token_arms;
+    for armed in ["1", "true", "TRUE", "yes", "2", " 1 ", "on"] {
+        assert!(
+            pollable_faer_token_arms(Some(armed)),
+            "{armed:?} must arm the pollable-faer gate"
+        );
+    }
+    for dark in [
+        None,
+        Some(""),
+        Some("  "),
+        Some("0"),
+        Some("false"),
+        Some("FALSE"),
+    ] {
+        assert!(
+            !pollable_faer_token_arms(dark),
+            "{dark:?} must leave the pollable-faer gate dark"
+        );
+    }
+    // " 0" trims to exact "0": dark — the trim applies before every token test.
+    assert!(!pollable_faer_token_arms(Some(" 0")));
+    assert!(!pollable_faer_token_arms(Some(" False ")));
+}
+
+/// Timing probe for the production block quantum (informational; run with
+/// `cargo test --release -p ny-propagate pollable_faer_block_timing_probe -- \
+/// --nocapture`). The release-only configuration keeps this measurement out
+/// of ordinary debug unit runs without hiding it behind an ignored test. Pins
+/// the 10-50ms-per-block sizing claim with a
+/// measured number on this host.
+#[cfg(not(debug_assertions))]
+#[test]
+fn pollable_faer_block_timing_probe() -> Result<()> {
+    let (m, k, p) = (768usize, 512usize, 512usize);
+    let mut state = 0x7157_0001u32;
+    let a = Mat::<f32>::from_fn(m, k, |_, _| pollable_faer_pseudo(&mut state));
+    let w = Mat::<f32>::from_fn(k, p, |_, _| pollable_faer_pseudo(&mut state));
+    let mut poll = || Ok(());
+    // Warm-up (allocator, faer thread pool).
+    let _ = crown_single::aw_f64_with_abssum_chunked_poll(
+        &a,
+        &w,
+        crown_batched::POLLABLE_FAER_BLOCK_MACS,
+        &mut poll,
+    )?;
+    let start = std::time::Instant::now();
+    let (_, _, blocks) = crown_single::aw_f64_with_abssum_chunked_poll(
+        &a,
+        &w,
+        crown_batched::POLLABLE_FAER_BLOCK_MACS,
+        &mut poll,
+    )?
+    .expect("production quantum admits (768,512,512)");
+    let elapsed = start.elapsed();
+    println!(
+        "[pollable-faer timing] shape=({m},{k},{p}) blocks={blocks} total={:.1}ms \
+         per_block={:.1}ms (block quantum {} MACs, A·W + |A|·|W| pair)",
+        elapsed.as_secs_f64() * 1e3,
+        elapsed.as_secs_f64() * 1e3 / blocks as f64,
+        crown_batched::POLLABLE_FAER_BLOCK_MACS,
+    );
+    assert!(blocks >= 3, "probe shape must span multiple blocks");
+    Ok(())
+}

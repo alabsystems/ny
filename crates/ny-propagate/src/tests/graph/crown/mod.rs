@@ -41,6 +41,7 @@ mod regression_4146;
 mod regression_4243;
 mod spec_guided;
 mod truncated_backward_3813;
+mod where_alpha_tightness;
 mod where_parity;
 
 use crate::types::{BoundsProvenance, CrownIbpFallbackReason};

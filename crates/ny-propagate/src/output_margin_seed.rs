@@ -135,21 +135,40 @@ impl Drop for MarginOutputSeedGuard {
 ///   (an index out of range means the node is NOT the spec's output vector —
 ///   engaging there would scatter rows to wrong coordinates; fail closed).
 pub(crate) fn margin_subset_indices(output_dim: usize) -> Option<Arc<[usize]>> {
+    let published = published_margin_indices();
+    margin_subset_indices_from_published(published.as_ref(), output_dim)
+}
+
+/// Snapshot the exact objective-row publication for cache identity and
+/// per-collection runtime authority.
+///
+/// The returned indices are already sorted and deduplicated by the publishing
+/// guard. Callers that cache quality decisions must key the raw publication,
+/// not merely whether it happens to engage for one node width: the same rows
+/// also seed intermediate influence cones.
+pub(crate) fn published_margin_indices() -> Option<Arc<[usize]>> {
+    PUBLISHED.with(|slot| slot.borrow().as_ref().map(Arc::clone))
+}
+
+/// Resolve a previously snapshotted publication for one candidate node width.
+/// This is the pure counterpart of [`margin_subset_indices`]; collection code
+/// uses it so lookup identity and execution cannot observe different scopes.
+pub(crate) fn margin_subset_indices_from_published(
+    published: Option<&Arc<[usize]>>,
+    output_dim: usize,
+) -> Option<Arc<[usize]>> {
     if output_dim < MARGIN_SUBSET_MIN_OUTPUT_DIM {
         return None;
     }
-    PUBLISHED.with(|slot| {
-        let published = slot.borrow();
-        let indices = published.as_ref()?;
-        if indices.is_empty() || indices.len() >= output_dim {
-            return None;
-        }
-        // Sorted on publish: the last index is the maximum.
-        if *indices.last()? >= output_dim {
-            return None;
-        }
-        Some(Arc::clone(indices))
-    })
+    let indices = published?;
+    if indices.is_empty() || indices.len() >= output_dim {
+        return None;
+    }
+    // Sorted on publish: the last index is the maximum.
+    if *indices.last()? >= output_dim {
+        return None;
+    }
+    Some(Arc::clone(indices))
 }
 
 /// Whether ANY margin publication exists on this thread, regardless of node
@@ -170,6 +189,7 @@ pub(crate) fn margin_subset_indices(output_dim: usize) -> Option<Arc<[usize]>> {
 ///
 /// `publish(vec![])` stores `None` (subset seeding disengaged), so an empty
 /// publication correctly reads as "nothing published".
+#[cfg(test)]
 pub(crate) fn margin_subset_published() -> bool {
     PUBLISHED.with(|slot| slot.borrow().is_some())
 }

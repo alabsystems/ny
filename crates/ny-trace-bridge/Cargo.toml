@@ -18,6 +18,9 @@ workspace = true
 [dependencies]
 ny-core = { path = "../ny-core" }
 ny-build = { path = "../ny-build" }
+# Directed-rounding helpers (sub_up_f32) for the Embedding surrogate's
+# outward-rounded half-spread epsilons; also the test-side BoundedTensor.
+ny-tensor = { path = "../ny-tensor" }
 ndarray = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -37,5 +40,4 @@ serde_json = { workspace = true }
 # exists, so a bare no-default-features build of ny-onnx does not compile.
 ny-onnx = { path = "../ny-onnx", default-features = false, features = ["onnx-value-info"] }
 ny-propagate = { path = "../ny-propagate" }
-ny-tensor = { path = "../ny-tensor" }
 prost = { workspace = true }

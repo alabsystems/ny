@@ -437,6 +437,14 @@ impl GraphNetwork {
                 | Layer::Topk(_) | Layer::ArgMax(_) | Layer::ArgMin(_) | Layer::ArgSort(_)
                 // Linear / convolutions:
                 | Layer::Linear(_) | Layer::Conv1d(_) | Layer::Conv2d(_)
+                // Interval-valued frozen constant: its batched CROWN backward
+                // refuses, so this routes to the partial-CROWN fallback, which
+                // concretizes through the (sound, enclosure-widened) IBP.
+                | Layer::IntervalConst(_)
+                // Conv3d: same story — no batched (or scalar) CROWN backward,
+                // so it refuses and the partial-CROWN fallback concretizes
+                // through its certified IBP forward.
+                | Layer::Conv3d(_)
                 | Layer::ConvTranspose1d(_) | Layer::ConvTranspose2d(_)
                 // Shape transforms:
                 | Layer::Flatten(_) | Layer::Reshape(_) | Layer::Transpose(_)
@@ -446,6 +454,7 @@ impl GraphNetwork {
                 | Layer::Squeeze(_)
                 | Layer::Unsqueeze(_)
                 | Layer::QdqPerturbation(_)
+                | Layer::EpsilonExpand(_)
                 // Pooling:
                 | Layer::AveragePool(_) | Layer::MaxPool2d(_)
                 // Positional encoding:

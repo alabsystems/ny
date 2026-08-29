@@ -31,7 +31,9 @@ use super::batching::{
 use super::build_batches::compute_crown_or_ibp_bounds_in_build_batches;
 use super::loop_batch_size::InputSplitLoopBatchDecision;
 use super::mul_binary::maybe_optimize_mul_binary_alphas;
-use super::root_bounds::collect_input_split_root_node_bounds;
+use super::root_bounds::{
+    collect_input_split_root_node_bounds, input_split_root_authority_deadline,
+};
 use super::shared::{
     build_child_input_owned, compute_crown_or_ibp_bounds_with_node_bounds, extract_obj_bounds,
     multi_dim_split_boxes, multi_obj_domain_priority, multi_obj_domain_verified,
@@ -350,6 +352,10 @@ impl BetaCrownVerifier {
             &self.config,
             engine,
             initial_deadline,
+            input_split_root_authority_deadline(
+                crown_deadline,
+                self.config.input_split_scored_wall,
+            ),
             "multi-objective input splitting",
             None,
         )?;
@@ -408,6 +414,7 @@ impl BetaCrownVerifier {
                     crown_bkwd,
                     self.config.input_split_ibp_enhancement,
                     false,
+                    self.config.input_split_nested_deadline,
                 )
             };
         let compute_bounds = |input_bounds: &BoundedTensor,
@@ -442,7 +449,9 @@ impl BetaCrownVerifier {
                                    node_bounds: Option<&HashMap<String, BoundedTensor>>,
                                    parent_alpha: &GraphAlphaState|
          -> Result<screen_child::WarmMultiObjBoundsResult> {
-            let (bounds, linear, refined_alpha) =
+            // `_anchors` (warm-refined node bounds + box) are consumed only by
+            // the disjunctive f64-tail hook; this conjunctive lane drops them.
+            let (bounds, linear, refined_alpha, _anchors) =
                 super::shared::compute_warm_start_crown_bounds_with_refined_alpha(
                     graph,
                     input_bounds,

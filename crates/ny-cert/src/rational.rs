@@ -18,8 +18,8 @@
 //! `Rat` by value and use `*r`), `Rat` is a small `Copy` **handle** (a `u32`
 //! index) into a thread-local interning arena of canonicalised `BigRational`
 //! values. Interning deduplicates structurally-equal values, so handle equality
-//! coincides exactly with value equality — making the derived `PartialEq`/`Eq`/
-//! `Hash` semantically correct. All arithmetic is performed in true bignum; the
+//! coincides exactly with value equality — making the derived `PartialEq`/`Eq`
+//! semantically correct. All arithmetic is performed in true bignum; the
 //! former `i64` emission guard is gone, so `to_clean_string` emits the full
 //! (possibly very large) `n/d` string. The only remaining refusal is the
 //! fail-closed arena-poison guard described below.
@@ -40,26 +40,22 @@ use trust as _;
 /// The `Overflow` and `NotI64` variants are retained as legacy named variants
 /// for callers that still reference them, but arbitrary-precision arithmetic
 /// no longer produces either one.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RatError {
     /// An impossible arena fallback was reached. A fallback substitutes `0/1`
     /// to keep the low-level accessor total, so no value from this thread may
     /// cross a proof/check/emission boundary after the flag is set.
-    #[error("rational arena is poisoned; refusing a potentially substituted value")]
     Poisoned,
     /// A denominator of zero was requested.
-    #[error("rational denominator cannot be zero")]
     ZeroDenominator,
     /// An intermediate computation overflowed a fixed-width integer.
     ///
     /// Unreachable with bignum arithmetic; kept for source compatibility.
-    #[error("exact rational arithmetic overflowed")]
     Overflow,
     /// A value cannot be represented in Clean's `i64` rational encoding.
     ///
     /// Unreachable now that certificates carry full bignum strings; kept for
     /// source compatibility with the i64-era schema code.
-    #[error("rational {num}/{den} does not fit Clean's i64 certificate encoding")]
     NotI64 {
         /// Reduced numerator (decimal).
         num: String,
@@ -72,13 +68,45 @@ pub enum RatError {
     /// the strict verifier without an unprovable interprocedural length
     /// precondition). Unreachable for every in-repo caller (all build `x` with
     /// exactly `input_dim()` entries).
-    #[error("dimension mismatch: expected {expected}, got {got}")]
     Dimension {
         /// Expected length (`input_dim()`).
         expected: usize,
         /// Actual length supplied.
         got: usize,
     },
+}
+
+// Hand-written replacements for the `thiserror::Error` derive (removed so that
+// ny-cert carries no proc-macro dependency and the bignum stack can itself be
+// verified rather than assumed). The `Display` messages below are byte-identical
+// to the former `#[error("...")]` strings; they appear in certificates and test
+// assertions and must not be reworded.
+impl core::fmt::Display for RatError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            RatError::Poisoned => write!(
+                f,
+                "rational arena is poisoned; refusing a potentially substituted value"
+            ),
+            RatError::ZeroDenominator => write!(f, "rational denominator cannot be zero"),
+            RatError::Overflow => write!(f, "exact rational arithmetic overflowed"),
+            RatError::NotI64 { num, den } => write!(
+                f,
+                "rational {num}/{den} does not fit Clean's i64 certificate encoding"
+            ),
+            RatError::Dimension { expected, got } => {
+                write!(f, "dimension mismatch: expected {expected}, got {got}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for RatError {
+    /// No variant of `RatError` carried a `#[from]`/`#[source]` field, so the
+    /// derived `source()` was `None` for every variant.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +154,53 @@ struct Arena {
     dedup: HashMap<DedupKey, u32>,
 }
 
+#[cfg(test)]
+thread_local! {
+    // Const and non-Drop so it remains available while the drop-bearing ARENA
+    // value is being destroyed.
+    static ARENA_TEARDOWN_PROBE_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+static ARENA_TEARDOWN_RESULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+impl Drop for Arena {
+    fn drop(&mut self) {
+        let armed = ARENA_TEARDOWN_PROBE_ARMED
+            .try_with(|probe| probe.replace(false))
+            .unwrap_or(false);
+        if !armed {
+            return;
+        }
+
+        // std marks a lazy TLS key destroyed before dropping its value. This
+        // makes each call below take ARENA.try_with's outer Err arm without
+        // relying on destruction order between separate keys.
+        let mut observed = 0_u8;
+
+        set_poisoned_for_test(false);
+        let _ = intern(BigRational::zero());
+        if poisoned() {
+            observed |= 1;
+        }
+
+        set_poisoned_for_test(false);
+        let _ = val(0);
+        if poisoned() {
+            observed |= 2;
+        }
+
+        set_poisoned_for_test(false);
+        let _ = Rat::ZERO.cmp(&Rat::ONE);
+        if poisoned() {
+            observed |= 4;
+        }
+
+        ARENA_TEARDOWN_RESULT.store(observed, std::sync::atomic::Ordering::Release);
+    }
+}
+
 thread_local! {
     // `vec_init_then_push` is reported at block scope, so the allow must sit on
     // the item; the reason lives with the `Vec::new()` + push comment below.
@@ -162,10 +237,22 @@ thread_local! {
 /// Mark this thread's arena poisoned (a fallback arm was reached).
 ///
 /// Free fn so each fallback arm is a single call; its only closure `|p|` is
-/// concrete and `LocalKey::with` is total (see `val` for the rationale), and
-/// `Cell::set` cannot panic — `poison` is TOTAL.
+/// concrete, `Cell::set` cannot panic, and `LocalKey::try_with` is TOTAL
+/// (returns `Result`, never panics) — so `poison` is TOTAL. `LocalKey::with` is
+/// NOT total: it panics (`panic_access_error`) when the thread-local is touched
+/// during its own destruction, a panic boundary the strict verifier cannot
+/// discharge (same rationale as `intern`/`val` below).
+///
+/// The `Err` (thread-local already destroyed) arm deliberately does NOTHING,
+/// and that is the fail-SAFE choice rather than a convenient one: if `POISONED`
+/// is no longer writable then [`poisoned`] can no longer read it either, and
+/// its own `Err` arm answers `true`. So the instant the flag becomes
+/// inaccessible the thread is LATCHED poisoned — a mark can never be silently
+/// lost by discarding it here.
 fn poison() {
-    POISONED.with(|p| p.set(true));
+    // Result deliberately discarded; see the fn doc — an unwritable flag already
+    // reads back as poisoned, so there is nothing to recover on the `Err` arm.
+    let _ = POISONED.try_with(|p| p.set(true));
 }
 
 /// True when any arena fallback arm has been reached on THIS thread.
@@ -175,9 +262,39 @@ fn poison() {
 /// `0/1`), so certificate producers must fail CLOSED: check this at entry and
 /// again before returning a built certificate. The flag is thread-local (like
 /// the arena itself) and is never cleared on non-test paths.
+///
+/// `try_with` is TOTAL (returns `Result`, never panics), unlike `with`, which
+/// panics (`panic_access_error`) if the thread-local is accessed during its own
+/// destruction — a panic boundary the strict verifier cannot discharge.
+///
+/// The `Err` (thread-local already destroyed) arm answers `true`, i.e.
+/// POISONED. That is the SEMANTICALLY conservative answer, not merely the one
+/// that verifies: during TLS teardown there is no live arena, so `intern`/`val`/
+/// `cmp` can only take their `Err`/`None` arms and substitute the `0/1` ZERO
+/// value for an arbitrary rational — precisely the silent wrong-value condition
+/// this flag exists to report. Answering `false` there would let a certificate
+/// boundary accept values no arena backs; answering `true` can at worst refuse
+/// a certificate on a thread that is already dying. Fail-CLOSED, so `true`.
+///
+/// Written as an explicit `match` rather than `.unwrap_or(true)`. The two are
+/// semantically identical — `Result::unwrap_or` IS this match, and `true` is a
+/// constant, so eager-vs-lazy does not arise — but the generic
+/// `Result::<T, E>::unwrap_or` drops a CALLER-CHOSEN `E`, and some `E` has a
+/// panicking `Drop`, so the verifier must treat the call as may-panic. Spelling
+/// the match here monomorphises `E` to `AccessError`, a unit struct with no drop
+/// glue, and the obligation is still emitted but now discharges. This is the
+/// head of the arena cascade: `ensure_healthy` and ~30 further functions have
+/// this call as their only unproved row.
 #[must_use]
+#[allow(
+    clippy::manual_unwrap_or,
+    reason = "the explicit match is what makes this function verifiable; see above"
+)]
 pub fn poisoned() -> bool {
-    POISONED.with(|p| p.get())
+    match POISONED.try_with(|p| p.get()) {
+        Ok(v) => v,
+        Err(_) => true,
+    }
 }
 
 /// Refuse use of a thread whose arena has taken a totalizing fallback.
@@ -192,17 +309,30 @@ pub(crate) fn ensure_healthy() -> Result<(), RatError> {
     }
 }
 
-/// Test-only override of the poison flag, to exercise the fail-closed paths
-/// (the real fallback arms are unreachable by construction and cannot be
-/// forced from safe code).
+/// Test-only override of the poison flag, to exercise the fail-closed paths.
+/// Inner live-arena fallbacks are unreachable by construction; the teardown
+/// regression deterministically exercises the outer key-unavailable arms.
 #[cfg(test)]
 pub(crate) fn set_poisoned_for_test(v: bool) {
-    POISONED.with(|p| p.set(v));
+    // `try_with` for the same totality reason as `poison`/`poisoned` above. A
+    // dropped write cannot hide a failure: `poisoned()` reads an inaccessible
+    // flag as `true`, so a lost `set(false)` reset makes tests fail loudly.
+    let _ = POISONED.try_with(|p| p.set(v));
 }
 
 /// Intern a canonicalised `BigRational`, returning its handle id.
 fn intern(v: BigRational) -> u32 {
-    ARENA.with(|a| {
+    // `try_with` is TOTAL (returns `Result`, never panics), unlike `with` which
+    // panics (`panic_access_error`) if the thread-local is accessed during its own
+    // destruction — a panic boundary the strict verifier cannot discharge. The
+    // `Err` (arena already destroyed) arm IS REACHABLE: the `cfg(test)` teardown
+    // probe in `Arena::drop` re-enters `intern` after std has marked this key
+    // destroyed, which is exactly what `destroyed_arena_outer_fallbacks_latch_poison`
+    // pins. It therefore POISON-MARKS before returning the `0/1` ZERO handle, so the
+    // wrong-value substitution is fail-CLOSED at certificate boundaries instead of
+    // silent. The INNER `try_borrow_mut` arm below does stay unreachable, by the
+    // arena's non-reentrancy argument, and is poison-marked for the same reason.
+    let result = ARENA.try_with(|a| {
         // `try_borrow_mut` is TOTAL (returns `Result`, never panics), unlike
         // `borrow_mut` which panics on a concurrent outstanding borrow. Arena
         // access is strictly scoped and non-reentrant, so the `Err` arm is
@@ -238,7 +368,16 @@ fn intern(v: BigRational) -> u32 {
         a.values.push(key.0.clone());
         a.dedup.insert(key, id);
         id
-    })
+    });
+    match result {
+        Ok(id) => id,
+        Err(_) => {
+            // Returning ZERO without this latch would be fail-wrong: callers
+            // could not distinguish a destroyed arena from a genuine zero.
+            poison();
+            0
+        }
+    }
 }
 
 /// Checked wrapper around [`intern`]. The second gate is essential: `intern`
@@ -262,12 +401,23 @@ fn checked_intern(v: BigRational) -> Result<u32, RatError> {
 /// generic args — every caller minted a distinct `with_val::<R, {closure}>`
 /// absent-callee row (~45 runtime-checked rows, one per monomorphization). This
 /// concrete accessor has NO type-parameter dispatch: its only closure `|a|` is
-/// concrete (bundled; `LocalKey::with` is total), and `try_borrow` / slice `get`
-/// / `BigRational::zero` / `Clone::clone` are each recognized-total — so `val`
+/// concrete (bundled; `LocalKey::try_with` is total — `with` is NOT, see the
+/// body), and `try_borrow` / slice `get` / `BigRational::zero` / `Clone::clone`
+/// are each recognized-total — so `val`
 /// verifies fully and every accessor routed through it discharges concretely.
 /// It trusts NO closure.
 fn val(id: u32) -> BigRational {
-    ARENA.with(|a| {
+    // `try_with` is TOTAL (returns `Result`, never panics), unlike `with` which
+    // panics if the thread-local is accessed during its own destruction — a panic
+    // boundary the strict verifier cannot discharge. The `Err` (arena already
+    // destroyed) arm IS REACHABLE: the `cfg(test)` teardown probe in `Arena::drop`
+    // re-enters `val` from the destructor, which
+    // `destroyed_arena_outer_fallbacks_latch_poison` pins. It POISON-MARKS before
+    // falling back to a fresh `0/1`, exactly like the `try_borrow`/`None` arms
+    // inside — those two INNER arms do stay unreachable, by non-reentrancy and by
+    // `intern` only ever handing out in-range ids. Binding `result` first (rather
+    // than `unwrap_or`) keeps the fallback `BigRational::zero()` LAZY.
+    let result = ARENA.try_with(|a| {
         // `try_borrow` is TOTAL (never panics); the `Err` (reentrant-borrow)
         // arm is UNREACHABLE for the strictly-scoped, non-reentrant arena and,
         // if ever reached, is POISON-MARKED (see `poisoned`) before returning
@@ -291,7 +441,16 @@ fn val(id: u32) -> BigRational {
                 BigRational::zero()
             }
         }
-    })
+    });
+    match result {
+        Ok(value) => value,
+        Err(_) => {
+            // Preserve the same poison-before-fallback invariant as every
+            // inner borrow/index failure.
+            poison();
+            BigRational::zero()
+        }
+    }
 }
 
 /// An exact arbitrary-precision rational, represented as a `Copy` handle into a
@@ -309,11 +468,16 @@ fn val(id: u32) -> BigRational {
 /// compile error rather than a silent wrong value. To cross a thread
 /// boundary, marshal values as strings (`to_clean_string`/`fmt`) instead, as
 /// `certify_onnx`'s leaf workers do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// `Hash` intentionally NOT derived: `Rat` is never used as a hash-map/set key
+// anywhere in the workspace (the arena dedup keys on `BigRational`; `Rat` appears
+// only as a `BTreeMap` value via `Ord`), so the derived `<Rat as Hash>::hash<H>`
+// was dead code whose panic-freedom is unprovable for a generic `H: Hasher`
+// (`H::write_*` is arbitrary user code). Re-add `Hash` only if a hashed use appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rat {
     id: u32,
     // `*const ()` is `!Send`/`!Sync` while `PhantomData` of it stays
-    // zero-sized and `Copy`/`Eq`/`Hash`-compatible — it exists solely to strip
+    // zero-sized and `Copy`/`Eq`-compatible — it exists solely to strip
     // the auto-traits (see the thread-locality contract above).
     _not_send: PhantomData<*const ()>,
 }
@@ -365,12 +529,14 @@ impl Rat {
         })
     }
 
-    /// Construct a reduced rational from arbitrary-precision integers for an
-    /// `Option`-returning caller.
+    /// Construct a reduced rational from arbitrary-precision integers, yielding
+    /// `None` for a zero denominator instead of an `Err`.
     ///
-    /// This is exactly [`Rat::from_bigints`] with its error mapped to `None`,
-    /// expressed without a generic `Result::ok` boundary so the certificate
-    /// verifier can follow the complete construction path.
+    /// The `Option`-returning twin of [`Rat::from_bigints`] — behaviourally identical to
+    /// `Rat::from_bigints(num, den).ok()` (returns `None` iff `den` is zero, else `Some`
+    /// of the identical reduced rational). Callers that already produce `Option<Self>`
+    /// (the exact float conversions, where the denominator is nonzero by construction)
+    /// use it to avoid a spurious `Result::ok()` error-discard boundary.
     #[must_use]
     pub fn from_bigints_opt(num: BigInt, den: BigInt) -> Option<Self> {
         ensure_healthy().ok()?;
@@ -455,15 +621,20 @@ impl Rat {
             mantissa
         });
         if e2 >= 0 {
-            // On this branch e2 = exp_field - 150 is in 0..=105, so the cast
-            // is exact for every finite binary32 input.
+            // Finite f32 exponents keep the shift far below BigInt limits. On this
+            // branch e2 = exp_field − 150 with exp_field ∈ [0,255] and e2 ≥ 0, so
+            // e2 ∈ [0,105] and `e2 as u32` is exact and total for every finite f32 —
+            // the same total-cast idiom `crown_deep::f64_to_rat_exact` uses; the old
+            // `u32::try_from(e2).ok()?` None path was unreachable here.
             let num = signed << (e2 as u32);
+            // `from_bigints_opt` == `from_bigints(..).ok()`, den = 1 (literal) ≠ 0.
             Rat::from_bigints_opt(num, BigInt::from(1))
         } else {
             // e2 < 0 on this branch, so `unsigned_abs` equals -e2 exactly;
             // unlike `-e2` it is total (no Neg-overflow VC). e2 is in
             // [-149, -1] here, so the u64 shift amount is tiny.
             let den = BigInt::from(1) << e2.unsigned_abs();
+            // den = 1 << |e2| ≥ 1 ≠ 0, so `from_bigints_opt` never yields None here.
             Rat::from_bigints_opt(signed, den)
         }
     }
@@ -740,8 +911,10 @@ impl Rat {
         let t = isqrt_floor(&scaled);
         let num = if &t * &t == scaled { t } else { t + 1_u32 };
         let den = &d << (precision_bits as usize);
-        // `d` is the positive denominator of a nonzero rational, so this
-        // shifted denominator is nonzero by construction.
+        // den = `&d << precision_bits` with `d = self.den().to_biguint() >= 1` (self is
+        // positive-nonzero by the guards above), so den >= 1 ≠ 0 and `from_bigints_opt`
+        // (== `from_bigints(..).ok()`) never yields None here — removes the Result::ok
+        // error-discard boundary without changing any value.
         let r = Rat::from_bigints_opt(BigInt::from(num), BigInt::from(den))?;
         debug_assert!(r.mul(r).is_ok_and(|sq| sq >= self));
         ensure_healthy().ok()?;
@@ -811,9 +984,13 @@ fn isqrt_floor(n: &BigUint) -> BigUint {
         x = y;
     }
     while &x * &x > *n {
-        // The loop invariant gives x >= 2 here. Use a checked operation so
-        // the implementation remains total even when that invariant is not
-        // available to a local verifier.
+        // `x >= 1` is a loop invariant here (x enters the loop `>= 1`, and the guard
+        // `x*x > n` with `n >= 1` cannot hold at `x <= 1` — `1*1 = 1 <= n` — so this
+        // body runs only for `x >= 2` and the decrement never underflows). The
+        // verifier cannot discharge that BigUint loop invariant, so use the same
+        // fail-soft idiom as `checked_div` above: `checked_sub` is TOTAL, its `None`
+        // arm is UNREACHABLE and fails safe to `0` (still terminates: `0*0 = 0 <= n`).
+        // Value identical for every real input; removes the SubAssign underflow panic.
         x = x.checked_sub(&BigUint::one()).unwrap_or(BigUint::zero());
     }
     while (&x + 1_u32) * (&x + 1_u32) <= *n {
@@ -839,7 +1016,15 @@ impl Ord for Rat {
         // panic-free and free of a slice-bounds obligation on the opaque
         // interned ids (see `with_val`). A reached arm can never silently
         // order a certificate: `poisoned()` refuses emission.
-        ARENA.with(|a| {
+        // `try_with` is TOTAL (returns `Result`, never panics), unlike `with` which
+        // panics if the thread-local is accessed during its own destruction. The
+        // `Err` (arena already destroyed) arm IS REACHABLE from the `cfg(test)`
+        // teardown probe in `Arena::drop`, which re-enters `cmp` from the
+        // destructor — see `destroyed_arena_outer_fallbacks_latch_poison`. It
+        // POISON-MARKS before falling back to `Equal`, mirroring the `try_borrow`
+        // fail-soft below (that INNER arm does stay unreachable for the
+        // non-reentrant arena).
+        let result = ARENA.try_with(|a| {
             let zero = BigRational::zero();
             // `try_borrow` is TOTAL; the `Err` (reentrant-borrow) arm is
             // UNREACHABLE for the non-reentrant arena — poison-marked, then
@@ -863,13 +1048,42 @@ impl Ord for Rat {
                 }
             };
             lhs.cmp(rhs)
-        })
+        });
+        match result {
+            Ok(ordering) => ordering,
+            Err(_) => {
+                // Equal is only a totalizing value; poison makes it impossible
+                // for a certificate boundary to accept this substituted order.
+                poison();
+                Ordering::Equal
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destroyed_arena_outer_fallbacks_latch_poison() {
+        ARENA_TEARDOWN_RESULT.store(0, std::sync::atomic::Ordering::Relaxed);
+        std::thread::spawn(|| {
+            ARENA_TEARDOWN_PROBE_ARMED.with(|probe| probe.set(true));
+            set_poisoned_for_test(false);
+            // Initialize the lazy, drop-bearing arena. Its cfg(test) Drop probe
+            // runs after std has marked this LocalKey destroyed.
+            let _ = intern(BigRational::one());
+        })
+        .join()
+        .expect("arena teardown probe thread must not panic");
+
+        assert_eq!(
+            ARENA_TEARDOWN_RESULT.load(std::sync::atomic::Ordering::Acquire),
+            0b111,
+            "intern, val, and cmp outer fallbacks must each latch poison"
+        );
+    }
 
     /// Keep the thread-local poison flag from leaking when an assertion panics.
     struct PoisonReset;

@@ -137,17 +137,42 @@ fn first_backtick(cell: &str) -> Option<String> {
 /// variant is drift by definition: the drift-guard callers `?`-propagate the
 /// parse error, turning each into the same fail-loud test failure the old
 /// panics produced.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecTcbError {
     /// `SPEC.md` has no `## TCB manifest` heading.
-    #[error("SPEC.md is missing its `## TCB manifest` section")]
     MissingSection,
     /// The `Row | Status | Retired by` header was renamed or reordered.
-    #[error("SPEC.md TCB manifest table header changed: {0:?}")]
     HeaderChanged(Vec<String>),
     /// No header row was found before the section ended.
-    #[error("SPEC.md TCB manifest table header row not found")]
     HeaderRowNotFound,
+}
+
+// Hand-written `Display`/`Error` (previously `#[derive(thiserror::Error)]`): the
+// proc-macro dependency is excluded from the verification TCB, so the generated
+// impls are written out here verbatim. The message strings are byte-identical to
+// the former `#[error("…")]` attributes.
+impl core::fmt::Display for SpecTcbError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MissingSection => {
+                write!(f, "SPEC.md is missing its `## TCB manifest` section")
+            }
+            Self::HeaderChanged(header) => {
+                write!(f, "SPEC.md TCB manifest table header changed: {header:?}")
+            }
+            Self::HeaderRowNotFound => {
+                write!(f, "SPEC.md TCB manifest table header row not found")
+            }
+        }
+    }
+}
+
+impl core::error::Error for SpecTcbError {
+    /// No variant carried a `#[from]`/`#[source]` field, so every variant is a
+    /// chain root — exactly what the derived impl produced.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        None
+    }
 }
 
 /// The line beginning at byte `pos` of `spec`, plus the cursor for the line
@@ -272,6 +297,7 @@ pub fn spec_tcb_rows(spec: &str) -> Result<Vec<SpecTcbRow>, SpecTcbError> {
 mod tests {
     use super::*;
     use crate::cite_check::contains_token;
+    use crate::json::Json;
     use std::collections::BTreeMap;
 
     // All fallible helpers/tests below return `Result<_, String>` and `?`-propagate
@@ -279,10 +305,10 @@ mod tests {
     // is an `Err`, which the test harness reports as a FAILURE — same fail-loud
     // outcome, no may-panic boundary for the strict verifier.
 
-    fn manifest() -> Result<serde_json::Value, String> {
+    fn manifest() -> Result<Json, String> {
         let raw = std::fs::read_to_string(tcb_manifest_path())
             .map_err(|e| format!("read tcb.json: {e}"))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse tcb.json: {e}"))
+        crate::json::from_str(&raw).map_err(|e| format!("parse tcb.json: {e}"))
     }
 
     fn spec() -> Result<String, String> {
@@ -290,7 +316,7 @@ mod tests {
     }
 
     /// `id -> status` for every manifest row.
-    fn manifest_id_status(v: &serde_json::Value) -> Result<BTreeMap<String, String>, String> {
+    fn manifest_id_status(v: &Json) -> Result<BTreeMap<String, String>, String> {
         v["rows"]
             .as_array()
             .ok_or("rows array")?
@@ -305,10 +331,7 @@ mod tests {
     }
 
     /// The single manifest row with the given id.
-    fn manifest_row<'a>(
-        v: &'a serde_json::Value,
-        id: &str,
-    ) -> Result<&'a serde_json::Value, String> {
+    fn manifest_row<'a>(v: &'a Json, id: &str) -> Result<&'a Json, String> {
         v["rows"]
             .as_array()
             .ok_or("rows array")?

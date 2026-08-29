@@ -198,12 +198,16 @@ mod load;
 mod matmul;
 mod merge_linear;
 mod mul;
+mod native_ops;
+mod onnx_fixture;
 mod probabilistic_integration;
 mod propagate;
 mod reduce_batch_axis;
 mod reshape;
 #[cfg_attr(not(feature = "external-vnncomp"), allow(dead_code, unused_imports))]
 mod resize;
+mod resize_linear;
 mod scatter_nd;
 mod shape_inference_policy;
 mod slice_batch_axis;
+mod slice_reverse;

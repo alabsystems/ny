@@ -110,7 +110,39 @@ margin_row:
   # SHIP GATE (zero regressions): cifar moat 3/arm unsat + 2 sat sentinels;
   # tiny at-risk 11 rows x3 unsat + 3 sat sentinels. Shrink-only by
   # construction; parity mode refuses; a wrong bound costs tightness only.
+  # MEASURED 2026-08-22, 64 banked-timeout resnet_large rows + 7-row moat:
+  # at the shipped 20s default this phase is TRUNCATED (exhausted=true) on
+  # 10/10 resnet_LARGE rows and 0/9 resnet_MEDIUM. resnet_large needs 24-35s; medium finishes in 6.6-8.4s so this is a no-op there.
+  # Raising it converts idx_9883 (unknown 3/3 -> unsat 3/3), de-randomises
+  # idx_5308, SHRINKS the tree on large unsat rows (idx_5410 39->28 exp,
+  # idx_496 2->1) at no wall cost, and is byte-identical on medium. Moat 7/7
+  # preserved; no row converts at 20 and fails at 40. Effective value is
+  # min(secs, 0.4*remaining) = ~37.2s at the scored 100s budget, and 63/64
+  # rows then finish inside it — there is no headroom left above this.
+  bi_secs: 40
   backward_interm: true
+  # #alpha-opt-adam: the margin-row ROOT alpha ascent. One key arms the MEASURED
+  # default configuration (Adam lr=0.1/decay 0.98, K=8 worst-column steering,
+  # 20 iterations, published-frame guard) -- the five tuning keys stay absent
+  # deliberately, so this is not a hand-tuned point.
+  # WHY: docs/ABC_ROOT_GAP_ON_WINNABLE_ROWS_2026-08-24.md -- ny's root equals
+  # abc's PRE-alpha root (median gap -0.0019) on the rows ny fails; abc's 20
+  # Adam iterations then buy a median +0.163, and that is the ENTIRE difference
+  # on 14/14 rows (idx_2993 abc proves at the root with zero domains).
+  # MEASURED (see docs/ALPHA_OPT_MARGIN_ROW_ROOT_2026-08-18.md results section):
+  #   gap rows: published root gain median +0.0328 vs the legacy ascent's
+  #   +0.0061 -- 5.4x, and 27% of abc's +0.1218; idx_9502 timeout -> unsat.
+  #   moat: idx_6659 / idx_8762 / idx_8600 unsat 3/3 each, walls 34-41s of 100s,
+  #   roots +0.043..+0.062 -- the ascent SHRINKS these trees.
+  # Cost ~10-16s of the ~93s lane, paid once before the tree. The guard keeps
+  # the published root = max(binary, optimized) by selection, so arming this
+  # cannot publish a looser root than the ascent-free lane.
+  # tinyimagenet is NOT armed: its conv-dominated root build truncates the
+  # ascent at 9 of 20 iterations (still climbing when cut) and the pre-tree cost
+  # then competes with the tree for a lane that needs it -- measured on
+  # idx_5451, where root build 46.6s + ascent 25.2s left the tree ~21s against
+  # the ~42s its proof needs, and the row did NOT convert.
+  alpha_opt: true
 
 bab:
   # #root-cap-100s: hard-cap the ROOT alpha-CROWN warmup (and the
@@ -159,6 +191,9 @@ bab:
     # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
     candidates: 7
     reduceop: max
+    # Exact wave-selector mirrors for governed search; runtime is unchanged.
+    kfsb_multi_candidates: 7
+    kfsb_multi_reduceop: max
     # #kfsb-multi: arm the wave-batched multi-objective kFSB selector. Measured
     # Pareto on cifar100 (9/9 instances strictly better bound trajectory, 0
     # verdict regressions, wall never extended). Kill switch: NY_MO_KFSB=0.
@@ -170,7 +205,7 @@ bab:
     # NY_MO_KFSB_CERT_REUSE=0 (every other present non-1 value also disables).
     kfsb_cert_reuse: true
   # --- Row-chunked comprehensive sound-GPU root intermediate sweep ---
-  # DELIVERY: the scored entry point exports exactly one NY_* variable, so the
+  # DELIVERY: the scored entry point exports no NY_* variables, so the
   # env lever this was measured through cannot fire in competition. These typed
   # keys are how the result actually reaches a scored run
   # (crates/ny-cli/tests/measured_gate_delivery.rs).

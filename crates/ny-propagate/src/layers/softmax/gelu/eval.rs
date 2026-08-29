@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use ny_tensor::{next_down_f32, next_up_f32};
+use ny_tensor::{cast_f64_to_f32_down, cast_f64_to_f32_up, next_down_f32, next_up_f32};
 
 use super::GeluApproximation;
 use crate::bounds::{nan_propagating_max, nan_propagating_min};
@@ -387,13 +387,26 @@ pub(crate) fn gelu_infinite_bounds_relaxation(
         return Some((0.0, f32::NEG_INFINITY, 0.0, f32::INFINITY));
     }
 
-    let fu = gelu_eval(u, approximation);
-    let f_crit = gelu_eval(gelu_critical_point(approximation), approximation);
+    // DIRECTED ROUNDING, both directions, from f64 witnesses. `fu` is published
+    // as a certified constant in BOTH directions at once — it feeds `min_val`
+    // (the lower intercept) and `max_val` (the upper) — so a single
+    // round-to-NEAREST f32 is unsound on whichever side it lands, and NO single
+    // f32 can be sound for both. `gelu_bound_interval` (:322) already rounds
+    // each candidate before min/max selection; this infinite-endpoint branch
+    // was the one path in this file that did not. Same defect and same fix as
+    // `elu_family.rs`'s l=-inf branch; latent for the same reason
+    // (`non_finite_domain_guard`, gelu/crown.rs:36, rejects every non-finite
+    // endpoint first). Widening only ever loosens, by at most one f32 ULP.
+    let fu64 = gelu_eval_f64(f64::from(u), approximation);
+    let f_crit64 = gelu_eval_f64(f64::from(gelu_critical_point(approximation)), approximation);
 
     // Lower bound: min of function value at critical point, endpoint, and 0 (GELU(-∞))
-    let min_val = nan_propagating_min(nan_propagating_min(f_crit, fu), 0.0);
+    let min_val = nan_propagating_min(
+        nan_propagating_min(cast_f64_to_f32_down(f_crit64), cast_f64_to_f32_down(fu64)),
+        0.0,
+    );
     // Upper bound: max of function value at endpoint and 0 (GELU(-∞))
-    let max_val = nan_propagating_max(fu, 0.0);
+    let max_val = nan_propagating_max(cast_f64_to_f32_up(fu64), 0.0);
 
     Some((0.0, min_val, 0.0, max_val))
 }

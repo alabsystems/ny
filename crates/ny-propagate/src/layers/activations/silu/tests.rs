@@ -2,9 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use super::math::{silu_critical_point, silu_inflection_points, silu_min_max};
+use super::math::{silu_inflection_points, silu_min_max, SILU_TRUE_ARGMIN, SILU_TRUE_MIN};
 use super::*;
 use crate::layers::activations::LinearRelaxation;
+use crate::tests::assert_relaxation_sound_exact;
 use crate::LinearBounds;
 use proptest::prelude::*;
 
@@ -79,8 +80,22 @@ fn test_negative_infinity_returns_constant_bounds() {
     } = silu_sound_linear_relaxation(f32::NEG_INFINITY, 0.0);
     assert_eq!(ls, 0.0);
     assert_eq!(us, 0.0);
-    // Lower bound should be at most the SiLU minimum (~-0.278)
-    assert!(li <= silu_eval(silu_critical_point()) + 1e-6);
+    // ZERO tolerance, against an INDEPENDENTLY derived minimum.
+    //
+    // The old form was `li <= silu_eval(silu_critical_point()) + 1e-6`, which
+    // failed in both directions at once. It SAMPLED THE CODE UNDER TEST, so it
+    // drifted with the very defect it should catch; and 1e-6 is 33.55 f32 ULP
+    // of slack at |0.2784| (one ULP there is 2.9802e-08) pointing in the
+    // UNSOUND direction, so a lower bound wrong by 33 ULP passed it. The
+    // shipped value clears the assertion below by +1.435512 ULP; see the
+    // derivation of SILU_TRUE_MIN in math.rs.
+    assert!(
+        f64::from(li) <= SILU_TRUE_MIN,
+        "[-inf, 0] lower intercept {:.17e} EXCEEDS the true SiLU minimum \
+         {:.17e} — this certifies a bound SiLU goes BELOW",
+        f64::from(li),
+        SILU_TRUE_MIN
+    );
     // Upper bound should be at least 0 (SiLU(0) = 0, SiLU(-∞) = 0)
     assert!(ui >= -1e-6);
 }
@@ -485,6 +500,105 @@ fn silu_f64_reference(x: f64) -> f64 {
         ex / (1.0 + ex)
     };
     x * sigmoid
+}
+
+/// ZERO-tolerance f64 pin on SiLU's CONSTANT / SATURATING branch — and the
+/// positive control for the whole family.
+///
+/// `silu_min_max` (math.rs) is the one implementation in this family that
+/// already does it right, and says why: it computes each candidate with
+/// `silu_eval_f64` and applies `next_down_f32` / `next_up_f32` to EACH
+/// intermediate BEFORE the min/max selection (#3245, #3336). Since
+/// `next_up_f32(f32_RN(v)) > v` and `next_down_f32(f32_RN(v)) < v` strictly, the
+/// published constants carry at least one f32 ULP of one-sided margin, so this
+/// test must pass with room to spare. If it ever fails, the failure is in the
+/// directed-rounding discipline itself, not in a marginal constant.
+///
+/// That contrast is the point. This case and Mish's `l = -inf` case are the same
+/// shape of branch — constant bounds over a half-infinite domain — and the only
+/// difference between them is whether the endpoint witness was rounded
+/// outward. So `u > 0` IS covered here (`[-inf, 2]`, where the upper intercept
+/// is `next_up_f32` of the endpoint value) while it is deliberately not covered
+/// for Mish and GELU.
+///
+/// Neither the 102-point f32 grid helper nor the strict proptests
+/// (`l in -10.0..10.0`, then `prop_assume!` finite coefficients) can reach this
+/// branch: it requires `l == -inf`.
+#[test]
+fn silu_saturating_branch_is_exact_in_f64() {
+    // The interior minimiser. Inside [-inf, 0] and [-inf, 2] it is a candidate
+    // in `silu_min_max`, so it is where the lower intercept binds.
+    //
+    // Taken from the mpmath derivation (math.rs SILU_TRUE_MIN), NOT from
+    // `silu_critical_point()`. Sampling the code under test made this case
+    // evaluate the relaxation at whatever point the f32 Newton iteration
+    // happened to return, so a drifting minimiser moved the sample with it and
+    // the check could never see the drift. The two differ by 1.297928e-08
+    // today; the helper's own comparison is exact in f64, so this sample is
+    // now an independent witness.
+    let minimiser = SILU_TRUE_ARGMIN;
+
+    let cases: [(f32, f32, &[f64], &str); 3] = [
+        (
+            f32::NEG_INFINITY,
+            -5.0,
+            &[-1000.0, -100.0, -50.0, -20.0, -5.0],
+            "SiLU [-inf, -5]",
+        ),
+        (
+            f32::NEG_INFINITY,
+            0.0,
+            &[-1000.0, -100.0, -50.0, -20.0, -5.0, -1.0, 0.0],
+            "SiLU [-inf, 0]",
+        ),
+        (
+            f32::NEG_INFINITY,
+            2.0,
+            &[-1000.0, -100.0, -50.0, -20.0, -5.0, 0.0, 1.0, 2.0],
+            "SiLU [-inf, 2]",
+        ),
+    ];
+
+    for (l, u, samples, label) in cases {
+        let r = silu_sound_linear_relaxation(l, u);
+        // Non-vacuity: the helper deliberately does not assert it, and the
+        // (0, -inf, 0, +inf) fallback this very function returns for u = +inf
+        // would otherwise pass every sample.
+        assert_eq!(
+            r.lower_slope, 0.0,
+            "{label}: expected a CONSTANT lower bound"
+        );
+        assert_eq!(
+            r.upper_slope, 0.0,
+            "{label}: expected a CONSTANT upper bound"
+        );
+        assert!(
+            r.lower_intercept.is_finite() && r.upper_intercept.is_finite(),
+            "{label}: relaxation went vacuous ({r:?})"
+        );
+
+        // Include the minimiser only where it is actually inside [l, u]; a
+        // sample outside the interval is a test bug, and the helper says so.
+        let mut all = samples.to_vec();
+        if minimiser <= f64::from(u) {
+            all.push(minimiser);
+        }
+        assert_relaxation_sound_exact(l, u, r, silu_f64_reference, &all, label);
+    }
+
+    // u = +inf is the deliberate vacuous fallback: SiLU(x) -> x, so no finite
+    // affine upper envelope exists. Pin the SHAPE, since soundness is trivial.
+    let r = silu_sound_linear_relaxation(-1.0, f32::INFINITY);
+    assert!(
+        r.lower_intercept.is_infinite() && r.lower_intercept.is_sign_negative(),
+        "SiLU [-1, +inf]: expected the vacuous -inf lower plane, got {}",
+        r.lower_intercept
+    );
+    assert!(
+        r.upper_intercept.is_infinite() && r.upper_intercept.is_sign_positive(),
+        "SiLU [-1, +inf]: expected the vacuous +inf upper plane, got {}",
+        r.upper_intercept
+    );
 }
 
 /// ULP distance between two f32 values, handling sign correctly.

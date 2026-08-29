@@ -360,6 +360,27 @@ pub trait GemmEngine: Sync + Send {
         ))
     }
 
+    /// The dispatch granularity this engine would PREFER for its
+    /// deadline-bounded methods, given the granularity the caller `requested`.
+    ///
+    /// `max_dispatch_macs` is fundamentally a CANCELLATION-LATENCY bound: it
+    /// caps how much work one non-interruptible dispatch may contain. The
+    /// right cap therefore depends on the engine — an accelerator queue wants
+    /// small dispatches (a cuBLAS launch is the unit of cancellation), while
+    /// an in-process CPU engine polls between tiles and can run far larger
+    /// tiles at the same responsiveness, gaining blocking and threading
+    /// efficiency (measured: the 1<<24 cap sliced a 245 G-MAC certified conv
+    /// recompute into ~14,700 tiles on `cifar_bias_field_46`).
+    ///
+    /// Callers that hold a per-call cap constant SHOULD pass it through this
+    /// hint and use the result; the engine still honors whatever cap is
+    /// actually passed to the deadline methods. Implementations MUST return a
+    /// value that keeps a single dispatch within their own cancellation-
+    /// latency envelope, and MUST NOT return 0 for nonzero `requested`.
+    fn deadline_dispatch_macs_hint(&self, requested: usize) -> usize {
+        requested
+    }
+
     /// Compute a full row-major IEEE-f64 product under an authoritative
     /// wall-clock deadline.
     ///

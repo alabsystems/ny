@@ -35,7 +35,7 @@ fn main() {
         };
         std::fs::write(
             format!("{out_dir}/sbar_s{seed}.json"),
-            serde_json::to_string_pretty(&json).unwrap(),
+            ny_cert::json::to_string_pretty(&json),
         )
         .unwrap();
         emitted += 1;

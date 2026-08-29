@@ -17,13 +17,46 @@ use crate::beta_crown::engine::BetaCrownVerifier;
 use crate::BranchingHeuristic;
 use ny_core::NaiveCpuGemmEngine;
 
+use crate::layers::linear::crown_single_gamma_n_f64;
+
+use super::lane_gap::{
+    assert_linear_bounds_within_gap, box_magnitudes, cross_lane_gap, LaneGap, LaneStep,
+};
+
+/// The child-parity fixture's weights, in ONE place: the graph builder and the
+/// DERIVED cross-lane tolerance ([`child_parity_lane_gap_4116`]) both read them,
+/// so a fixture edit cannot silently invalidate the derivation.
+fn child_parity_w1_4116() -> Array2<f32> {
+    arr2(&[[1.2, -0.8], [-0.6, 1.1], [0.9, 0.7], [-0.7, 0.4]])
+}
+
+fn child_parity_w2_4116() -> Array2<f32> {
+    arr2(&[[0.8, -0.5, 0.6, -0.2], [-0.3, 0.9, -0.4, 0.7]])
+}
+
+fn child_parity_w3_4116() -> Array2<f32> {
+    arr2(&[[1.0, -0.2], [-0.4, 0.9]])
+}
+
+fn child_parity_b1_4116() -> Array1<f32> {
+    arr1(&[0.1, -0.05, 0.0, 0.12])
+}
+
+fn child_parity_b2_4116() -> Array1<f32> {
+    arr1(&[0.05, -0.08])
+}
+
+fn child_parity_b3_4116() -> Array1<f32> {
+    arr1(&[0.02, -0.03])
+}
+
 pub(super) fn build_multi_objective_child_parity_graph() -> GraphNetwork {
-    let w1 = arr2(&[[1.2, -0.8], [-0.6, 1.1], [0.9, 0.7], [-0.7, 0.4]]);
-    let b1 = arr1(&[0.1, -0.05, 0.0, 0.12]);
-    let w2 = arr2(&[[0.8, -0.5, 0.6, -0.2], [-0.3, 0.9, -0.4, 0.7]]);
-    let b2 = arr1(&[0.05, -0.08]);
-    let w3 = arr2(&[[1.0, -0.2], [-0.4, 0.9]]);
-    let b3 = arr1(&[0.02, -0.03]);
+    let w1 = child_parity_w1_4116();
+    let b1 = child_parity_b1_4116();
+    let w2 = child_parity_w2_4116();
+    let b2 = child_parity_b2_4116();
+    let w3 = child_parity_w3_4116();
+    let b3 = child_parity_b3_4116();
 
     let mut graph = GraphNetwork::new();
     graph.add_node(GraphNode::from_input(
@@ -119,6 +152,199 @@ fn assert_flat_bounds_close(label: &str, actual: &BoundedTensor, expected: &Boun
             "{label}: upper bound changed at index {idx}: actual={actual}, expected={expected}"
         );
     }
+}
+
+/// DERIVED cross-lane tolerance for the child-parity fixture over one domain.
+///
+/// Chain, output-first: `linear3` (contraction width `n = rows(W3) = 2`, input
+/// node `relu2`) → `relu2` → `linear2` (`n = rows(W2) = 2`, input node `relu1`)
+/// → `relu1` → `linear1` (`n = rows(W1) = 4`, input node = the network input).
+/// The ReLU steps carry relaxation slopes in `[0, 1]` and so contribute no
+/// growth. See [`super::lane_gap`] for the `γ_n^{f32}` vs `γ_n^{f64}` algebra;
+/// this function only supplies this fixture's `|W|` matrices and box magnitudes.
+///
+/// `node_bounds` are the bounds the run itself used for the intermediate nodes
+/// (the callers pass root/alpha node bounds to BOTH lanes, so those are the boxes
+/// the relaxations were built from).
+fn child_parity_lane_gap_4116(
+    spec_matrix: &Array2<f32>,
+    node_bounds: &HashMap<String, BoundedTensor>,
+    domain: &BoundedTensor,
+) -> LaneGap {
+    let mag = |name: &str| {
+        box_magnitudes(
+            node_bounds
+                .get(name)
+                .unwrap_or_else(|| panic!("fixture must expose a '{name}' node")),
+        )
+    };
+    let spec_abs = spec_matrix.mapv(|v| f64::from(v.abs()));
+    cross_lane_gap(
+        &spec_abs,
+        &[
+            LaneStep::new(&child_parity_w3_4116(), &mag("relu2")),
+            LaneStep::new(&child_parity_w2_4116(), &mag("relu1")),
+            LaneStep::new(&child_parity_w1_4116(), &box_magnitudes(domain)),
+        ],
+    )
+}
+
+/// Independent f64 forward evaluation of the child-parity fixture, built from
+/// the same weight/bias accessors as the graph and touching NONE of the code
+/// under test.
+fn child_parity_forward_4116(x: &[f64; 2]) -> Vec<f64> {
+    let layer = |w: &Array2<f32>, b: &Array1<f32>, input: &[f64]| -> Vec<f64> {
+        (0..w.nrows())
+            .map(|i| {
+                (0..w.ncols())
+                    .map(|j| f64::from(w[[i, j]]) * input[j])
+                    .sum::<f64>()
+                    + f64::from(b[i])
+            })
+            .collect()
+    };
+    let relu = |v: Vec<f64>| -> Vec<f64> { v.into_iter().map(|t| t.max(0.0)).collect() };
+
+    let h1 = relu(layer(&child_parity_w1_4116(), &child_parity_b1_4116(), x));
+    let h2 = relu(layer(&child_parity_w2_4116(), &child_parity_b2_4116(), &h1));
+    layer(&child_parity_w3_4116(), &child_parity_b3_4116(), &h2)
+}
+
+/// Assert a certified spec box contains the network's actual spec outputs on a
+/// deterministic grid over the domain.
+///
+/// This is NECESSARY, not sufficient: a grid cannot prove soundness. It is here
+/// because the tolerance comparisons around it are two-lane AGREEMENT checks,
+/// and two lanes can agree while both being wrong. A bound that has drifted onto
+/// the wrong side of a reachable output fails here regardless of how well the
+/// lanes agree with each other.
+fn assert_spec_box_contains_forward_grid_4116(
+    label: &str,
+    bounds: &BoundedTensor,
+    spec_matrix: &Array2<f32>,
+    domain: &BoundedTensor,
+) {
+    let flat = bounds.flatten();
+    let lower: Vec<f32> = flat.lower().iter().copied().collect();
+    let upper: Vec<f32> = flat.upper().iter().copied().collect();
+    assert_eq!(
+        lower.len(),
+        spec_matrix.nrows(),
+        "{label}: one certified interval per spec row"
+    );
+
+    let dl: Vec<f64> = domain.lower().iter().map(|&v| f64::from(v)).collect();
+    let du: Vec<f64> = domain.upper().iter().map(|&v| f64::from(v)).collect();
+    assert_eq!(dl.len(), 2, "the grid is written for a 2-D domain");
+
+    // f64 evaluation slack: at most 4 layers x (2 products + 1 sum) roundings on
+    // magnitudes bounded by `scale` (Higham Thm 3.1 at u = 2^-53).
+    let scale: f64 = 64.0;
+    let slack = crown_single_gamma_n_f64(16) * scale;
+
+    const STEPS: usize = 20;
+    let mut failures = Vec::new();
+    for i in 0..=STEPS {
+        for j in 0..=STEPS {
+            let t0 = i as f64 / STEPS as f64;
+            let t1 = j as f64 / STEPS as f64;
+            let x = [dl[0] + t0 * (du[0] - dl[0]), dl[1] + t1 * (du[1] - dl[1])];
+            let out = child_parity_forward_4116(&x);
+            for row in 0..spec_matrix.nrows() {
+                let value: f64 = (0..spec_matrix.ncols())
+                    .map(|c| f64::from(spec_matrix[[row, c]]) * out[c])
+                    .sum();
+                if value < f64::from(lower[row]) - slack {
+                    failures.push(format!(
+                        "{label}: spec row {row} at x={x:?} evaluates to {value}, BELOW the \
+                         certified lower bound {} (slack {slack:e}) — FALSE PROOF",
+                        lower[row]
+                    ));
+                }
+                if value > f64::from(upper[row]) + slack {
+                    failures.push(format!(
+                        "{label}: spec row {row} at x={x:?} evaluates to {value}, ABOVE the \
+                         certified upper bound {} (slack {slack:e}) — FALSE PROOF",
+                        upper[row]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} grid violations, first few:\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for row in 0..spec_matrix.nrows() {
+        assert!(
+            upper[row] - lower[row] > 0.0 && lower[row].is_finite() && upper[row].is_finite(),
+            "{label}: spec row {row} certified a degenerate box [{}, {}] — the comparisons \
+             around this check would be vacuous",
+            lower[row],
+            upper[row]
+        );
+    }
+}
+
+/// Bound comparison at an explicitly supplied tolerance, COLLECTING every
+/// divergence. `assert_flat_bounds_close`'s flat `1e-6` aborts at the first
+/// element, which leaves the rest of the vector unverified.
+fn assert_flat_bounds_within(
+    label: &str,
+    actual: &BoundedTensor,
+    expected: &BoundedTensor,
+    tol: f32,
+) {
+    let actual = actual.flatten();
+    let expected = expected.flatten();
+    assert_eq!(
+        actual.lower().shape(),
+        expected.lower().shape(),
+        "{label}: lower-bound shape changed"
+    );
+    assert_eq!(
+        actual.upper().shape(),
+        expected.upper().shape(),
+        "{label}: upper-bound shape changed"
+    );
+
+    let mut failures = Vec::new();
+    for (idx, (a, e)) in actual
+        .lower()
+        .iter()
+        .zip(expected.lower().iter())
+        .enumerate()
+    {
+        if (a - e).abs() > tol {
+            failures.push(format!(
+                "{label}: lower bound at {idx}: actual={a}, expected={e}, diff {} exceeds \
+                 derived tolerance {tol:e}",
+                (a - e).abs()
+            ));
+        }
+    }
+    for (idx, (a, e)) in actual
+        .upper()
+        .iter()
+        .zip(expected.upper().iter())
+        .enumerate()
+    {
+        if (a - e).abs() > tol {
+            failures.push(format!(
+                "{label}: upper bound at {idx}: actual={a}, expected={e}, diff {} exceeds \
+                 derived tolerance {tol:e}",
+                (a - e).abs()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 fn direct_mul_binary_bounds_4284(
@@ -271,8 +497,10 @@ fn test_multi_objective_child_joint_spec_helper_matches_direct_crown_3870() {
 /// rejects multi-row specs, while this test proves the new dense-spec helper
 /// accepts them and produces identical bounds.
 ///
-/// Checks three-way equality:
-///   direct joint-spec CROWN == single-domain helper == dense-spec batched helper
+/// Checks, for the two lanes:
+///   * agreement within the DERIVED cross-lane certificate gap (bounds and
+///     linear bounds), and
+///   * soundness of each against an independent f64 forward evaluation.
 ///
 /// Part of #4116 Packet A Step 5.
 #[test]
@@ -293,14 +521,29 @@ fn test_dense_spec_batched_helper_matches_direct_crown_4116() {
         .expect("root node bounds should succeed");
     let spec_matrix = arr2(&[[1.0_f32, -0.35_f32], [-0.6_f32, 1.0_f32]]);
 
-    // Both paths use the SAME GEMM engine so this is a true algorithm-equivalence
-    // check, not a backend comparison. The direct path defaults (engine = None) to
-    // f64 CPU accumulation; the dense-spec batched path runs the f32 GEMM backward.
-    // Both are sound (each carries its accumulation-appropriate certified error per
-    // commit 5de589a), but they legitimately differ by the f32-vs-f64 certified
-    // error (~1 ULP per coefficient, depth-amplified to ~1e-6 in the bias). Pinning
-    // both to NaiveCpuGemmEngine (f32 GEMM) makes the linear bounds match
-    // bit-exactly — a strictly stronger parity check than the prior 1e-6 tolerance.
+    // The two lanes no longer share one arithmetic, and the tolerance below says
+    // so explicitly.
+    //
+    // The rationale this test used to carry ("both paths use the SAME GEMM engine
+    // ... pinning both to NaiveCpuGemmEngine makes the linear bounds match
+    // bit-exactly") was a measurement claim with no expiry, and `9f06e35b2`
+    // falsified it: that commit moved the DOMAIN-BATCHED Linear arm onto
+    // `propagate_linear_pollable_cpu` (certified f64 contraction, `γ_n^{f64}·S`),
+    // while the direct joint-spec CROWN below still runs
+    // `propagate_linear_with_engine` (round-to-nearest f32 GEMM, `γ_n^{f32}·S`).
+    // Pinning the engine no longer puts them on one arithmetic, because the
+    // batched lane does not call the engine at all. The observed failure was
+    // `lower_b max diff 1.4305115e-6` against the old flat `1e-6` — ~12 ULP on the
+    // bias, exactly the `γ^{f32}`-vs-`γ^{f64}` scale at this depth.
+    //
+    // What the two lanes owe each other is therefore NOT ULP equality: it is
+    // structural equivalence (same shapes, same spec composition, same bias
+    // presence) and agreement within the certificate gap their two `γ_n`
+    // factors imply. That gap is DERIVED in `child_parity_lane_gap_4116` from
+    // this fixture's `|W|` matrices, its node boxes and the SAME `γ_n`
+    // functions the production code uses — never fitted to the diff above. Do
+    // not reinstate a "bit-exact" claim without first putting both lanes back on
+    // one arithmetic.
     let engine = NaiveCpuGemmEngine;
 
     // Baseline: direct joint-spec CROWN (ground truth), same engine as the batched path.
@@ -327,6 +570,7 @@ fn test_dense_spec_batched_helper_matches_direct_crown_4116() {
         crown_backward_layers: None,
         ibp_enhancement: false,
         stacked_rebound: false,
+        nested_deadline: None,
     })
     .expect("dense-spec batched helper should accept multi-row spec matrices");
 
@@ -336,16 +580,43 @@ fn test_dense_spec_batched_helper_matches_direct_crown_4116() {
         "one domain should produce one result"
     );
 
-    // Verify output bounds match.
-    assert_flat_bounds_close(
+    let gap = child_parity_lane_gap_4116(&spec_matrix, &root_node_bounds, &child_input);
+
+    // SOUNDNESS FIRST. An agreement check between two lanes cannot see a defect
+    // that moved BOTH of them, and if it runs first it also masks the soundness
+    // check behind it: a tightening defect is a disagreement too, so the
+    // agreement assertion fires and the soundness assertion is never reached.
+    // Both lanes must be SOUND, not merely in agreement.
+    assert_spec_box_contains_forward_grid_4116(
+        "dense-spec batched",
+        &spec_result.bounds[0],
+        &spec_matrix,
+        &child_input,
+    );
+    assert_spec_box_contains_forward_grid_4116(
+        "direct joint-spec CROWN",
+        &baseline_bounds,
+        &spec_matrix,
+        &child_input,
+    );
+
+    // Verify output bounds agree within the derived cross-lane certificate gap.
+    assert_flat_bounds_within(
         "dense-spec batched vs direct joint-spec CROWN",
         &spec_result.bounds[0],
         &baseline_bounds,
+        gap.affine,
     );
 
     // Verify linear bounds match when both are present.
     match (&spec_result.linear_bounds[0], &baseline_linear) {
-        (Some(actual), Some(expected)) => assert_linear_bounds_match(actual, expected),
+        (Some(actual), Some(expected)) => assert_linear_bounds_within_gap(
+            "dense-spec batched vs direct joint-spec CROWN",
+            actual,
+            expected,
+            &gap,
+            &child_input,
+        ),
         (None, None) => {}
         (actual, expected) => panic!(
             "dense-spec batched/direct linear bound availability diverged: batched={} direct={}",
@@ -471,6 +742,7 @@ fn test_dense_spec_batched_two_domains_match_independent_calls_4116() {
         crown_backward_layers: None,
         ibp_enhancement: false,
         stacked_rebound: false,
+        nested_deadline: None,
     })
     .expect("dense-spec batched helper with two domains should succeed");
 
@@ -514,6 +786,7 @@ fn test_dense_spec_batched_mul_binary_alphas_two_domains_match_independent_calls
         crown_backward_layers: None,
         ibp_enhancement: false,
         stacked_rebound: false,
+        nested_deadline: None,
     })
     .expect("dense-spec batched helper should support shared mulbinary alphas");
 

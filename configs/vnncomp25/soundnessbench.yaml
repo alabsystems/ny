@@ -54,6 +54,9 @@ bab:
     method: kfsb
     candidates: 5
     reduceop: max
+    # Exact wave-selector mirrors for governed search; runtime is unchanged.
+    kfsb_multi_candidates: 5
+    kfsb_multi_reduceop: max
   clip:
     relaxed: true
   alpha_crown:

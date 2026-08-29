@@ -144,7 +144,7 @@ impl PgdAttacker<'_> {
             .map(|dim| (hi[dim] - lo[dim]) / (per_dim - 1) as f32)
             .collect();
         for _round in 0..REFINE_MAX_ROUNDS {
-            if evals >= budget || self.config.past_deadline() {
+            if evals >= budget || self.past_deadline() {
                 break;
             }
             let centers: Vec<Vec<f32>> = best.iter().map(|p| p.coords.clone()).collect();
@@ -212,7 +212,7 @@ impl PgdAttacker<'_> {
         };
 
         for chunk in coords_list.chunks(SWEEP_CHUNK) {
-            if self.config.past_deadline() {
+            if self.past_deadline() {
                 return Ok(None);
             }
             let mut batch_shape = vec![chunk.len()];

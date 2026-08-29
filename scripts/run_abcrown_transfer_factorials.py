@@ -17,6 +17,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -37,7 +38,7 @@ DEFAULT_OUTPUT_ROOT = REPO_ROOT / "reports" / "abcrown_transfer_factorials"
 BOUNDED_RUNNER = REPO_ROOT / "scripts" / "benchmark_vnncomp_preset_bounded.py"
 EXPECTED_EFFECTIVE_CONFIG_SCHEMA = "ny_beta_crown_effective_treatment_v1"
 EXPECTED_EXECUTION_OBSERVATIONS_SCHEMA = (
-    "ny_beta_crown_execution_observations_v5"
+    "ny_beta_crown_execution_observations_v8"
 )
 SUPPORTED_MEASURED_RESULTS = frozenset(
     {"verified", "falsified", "unknown", "timeout"}
@@ -185,6 +186,151 @@ FRESH_DOMAIN_CLIP_COUNTER_FIELDS = frozenset(
         "tightened_dimensions",
     }
 )
+ROOT_JOINT_INTERM_ALPHA_SCHEMA = (
+    "ny_beta_crown_root_joint_interm_alpha_observations_v1"
+)
+ROOT_JOINT_INTERM_ALPHA_BOOLEAN_FIELDS = frozenset(
+    {"observed", "attribution_conflict", "counter_overflow"}
+)
+ROOT_JOINT_INTERM_ALPHA_NULLABLE_BOOLEAN_FIELDS = frozenset(
+    {
+        "configured_master",
+        "configured_deadline_ascent",
+        "configured_frozen_stop",
+        "configured_pure_chain",
+        "configured_bn_gpu_extract",
+    }
+)
+ROOT_JOINT_INTERM_ALPHA_NULLABLE_INTEGER_FIELDS = frozenset(
+    {
+        "configured_max_dim_override",
+        "input_split_configured_max_dim",
+        "multi_objective_configured_max_dim",
+        "configured_secs",
+        "configured_iters",
+        "configured_lr_bits",
+        "configured_min_remaining_secs",
+        "configured_max_sel",
+    }
+)
+ROOT_JOINT_INTERM_ALPHA_COUNTER_FIELDS = frozenset(
+    {
+        "invocations",
+        "input_split_invocations",
+        "multi_objective_invocations",
+        "target_count",
+        "available_budget_ms",
+        "effective_slice_ms",
+        "configured_slice_work_invocations",
+        "configured_iters_binding_invocations",
+        "lowered_min_remaining_work_invocations",
+        "raised_min_remaining_binding_refusals",
+        "max_effective_iters",
+        "work_started",
+        "attempts",
+        "completed",
+        "tightened_count",
+        "target_attempts",
+        "base_folds_completed",
+        "ascent_iterations_attempted",
+        "max_ascent_iterations_attempted",
+        "optimizer_steps",
+        "ascent_folds_completed",
+        "max_selected_rows",
+        "selection_cap_bound_targets",
+        "frozen_stop_targets",
+        "pure_chain_targets",
+        "bn_extract_targets",
+        "master_disabled",
+        "admission_floor_refusals",
+        "deadline_route_refusals",
+        "slice_refusals",
+        "no_target_refusals",
+        "capability_refusals",
+        "execution_refusals",
+    }
+)
+ROOT_JOINT_INTERM_ALPHA_FIELDS = frozenset(
+    {"schema"}
+    | ROOT_JOINT_INTERM_ALPHA_BOOLEAN_FIELDS
+    | ROOT_JOINT_INTERM_ALPHA_NULLABLE_BOOLEAN_FIELDS
+    | ROOT_JOINT_INTERM_ALPHA_NULLABLE_INTEGER_FIELDS
+    | ROOT_JOINT_INTERM_ALPHA_COUNTER_FIELDS
+)
+MO_KFSB_SCHEMA = "ny_beta_crown_mo_kfsb_observations_v1"
+MO_KFSB_MAX_LEAVES_PER_PARENT = 1024
+MO_KFSB_BOOLEAN_FIELDS = frozenset(
+    {"observed", "attribution_conflict", "counter_overflow"}
+)
+MO_KFSB_NULLABLE_BOOLEAN_FIELDS = frozenset(
+    {"legacy_childsim", "configured_master", "heuristic_eligible"}
+)
+MO_KFSB_NULLABLE_INTEGER_FIELDS = frozenset(
+    {"configured_candidates", "effective_candidates"}
+)
+MO_KFSB_NULLABLE_REDUCE_OP_FIELDS = frozenset(
+    {"configured_reduce_op", "effective_reduce_op"}
+)
+MO_KFSB_REDUCE_OP_VALUES = frozenset({"min", "max", "mean"})
+MO_KFSB_COUNTER_FIELDS = frozenset(
+    {
+        "branch_opportunities",
+        "offered_domains",
+        "nonempty_domain_opportunities",
+        "candidate_eligible_opportunities",
+        "typed_select_opportunities",
+        "lower_master_opportunities",
+        "effective_master_opportunities",
+        "route_eligible_opportunities",
+        "selector_waves",
+        "selector_domains",
+        "committed_waves",
+        "committed_parents",
+        "committed_leaves",
+        "force_on_binding_waves",
+        "master_binding_refusals",
+    }
+)
+MO_KFSB_CANONICAL_MASTER_VALUES = frozenset(
+    {"absent", "exact_enable", "exact_disable", "rejected"}
+)
+MO_KFSB_FIELDS = frozenset(
+    {"schema", "canonical_master"}
+    | MO_KFSB_BOOLEAN_FIELDS
+    | MO_KFSB_NULLABLE_BOOLEAN_FIELDS
+    | MO_KFSB_NULLABLE_INTEGER_FIELDS
+    | MO_KFSB_NULLABLE_REDUCE_OP_FIELDS
+    | MO_KFSB_COUNTER_FIELDS
+)
+MO_ALPHA_STEP_SCHEMA = "ny_beta_crown_mo_alpha_step_observations_v1"
+MO_ALPHA_STEP_BOOLEAN_FIELDS = frozenset(
+    {"observed", "attribution_conflict", "counter_overflow"}
+)
+MO_ALPHA_STEP_NULLABLE_BOOLEAN_FIELDS = frozenset(
+    {"effective_alpha_step", "effective_beta_spsa"}
+)
+MO_ALPHA_STEP_COUNTER_FIELDS = frozenset(
+    {
+        "schedule_period",
+        "alpha_round_remainder",
+        "optimizer_invocations",
+        "eligible_invocations",
+        "eligible_iterations",
+        "fourth_iteration_opportunities",
+        "alpha_rounds_scheduled",
+        "beta_rounds_scheduled",
+        "alpha_rounds_completed",
+        "alpha_rounds_refused",
+        "alpha_updates_applied",
+        "perturbed_coordinates",
+    }
+)
+MO_ALPHA_STEP_FIELDS = frozenset(
+    {"schema"}
+    | MO_ALPHA_STEP_BOOLEAN_FIELDS
+    | MO_ALPHA_STEP_NULLABLE_BOOLEAN_FIELDS
+    | MO_ALPHA_STEP_COUNTER_FIELDS
+)
 PATCHES_MATERIALIZATION_BOOLEAN_FIELDS = frozenset(
     {"observed", "attribution_conflict", "counter_overflow"}
 )
@@ -289,6 +435,14 @@ def _expected_treatment_authentication(
         "bab.branching.kfsb_multi": (
             ("branching", "kfsb_multi_configured"),
             None,
+        ),
+        "bab.branching.kfsb_multi_candidates": (
+            ("branching", "effective_wave_candidates"),
+            None,
+        ),
+        "bab.branching.kfsb_multi_reduceop": (
+            ("branching", "effective_wave_reduce_op"),
+            "lower",
         ),
         "bab.branching.input_split.sb_coeff_thresh": (
             ("branching", "input_split_coeff_threshold"),
@@ -495,6 +649,59 @@ def _expected_execution_evidence(arm: dict[str, Any]) -> dict[str, Any] | None:
             }
         )
 
+    mo_kfsb_field = "bab.branching.kfsb_multi"
+    mo_kfsb_candidates_field = "bab.branching.kfsb_multi_candidates"
+    mo_kfsb_reduceop_field = "bab.branching.kfsb_multi_reduceop"
+    mo_kfsb_fields = {
+        mo_kfsb_field,
+        mo_kfsb_candidates_field,
+        mo_kfsb_reduceop_field,
+    }
+    present_mo_kfsb_fields = mo_kfsb_fields.intersection(overrides)
+    if present_mo_kfsb_fields and present_mo_kfsb_fields != mo_kfsb_fields:
+        missing = ", ".join(sorted(mo_kfsb_fields - present_mo_kfsb_fields))
+        raise ManifestError(
+            "typed MO-kFSB treatments must explicitly pin master, dedicated "
+            f"candidate count, and dedicated reduce op; missing: {missing}"
+        )
+    if present_mo_kfsb_fields:
+        configured = overrides[mo_kfsb_field]
+        if not isinstance(configured, bool):
+            raise ManifestError(
+                f"{mo_kfsb_field} must be boolean for execution evidence"
+            )
+        candidates = overrides[mo_kfsb_candidates_field]
+        if (
+            isinstance(candidates, bool)
+            or not isinstance(candidates, int)
+            or candidates <= 0
+            or candidates > (1 << 64) - 1
+        ):
+            raise ManifestError(
+                f"{mo_kfsb_candidates_field} must be a positive u64 integer "
+                "for execution evidence"
+            )
+        reduce_op = overrides[mo_kfsb_reduceop_field]
+        if not isinstance(reduce_op, str) or reduce_op.lower() not in {
+            "min",
+            "max",
+            "mean",
+        }:
+            raise ManifestError(
+                f"{mo_kfsb_reduceop_field} must be min, max, or mean for "
+                "execution evidence"
+            )
+        expectations.append(
+            {
+                "treatment": "mo_kfsb_configured",
+                "configured": configured,
+                "configured_candidates": candidates,
+                "effective_candidates": candidates,
+                "configured_reduce_op": reduce_op.lower(),
+                "effective_reduce_op": reduce_op.lower(),
+            }
+        )
+
     env = arm.get("env", {})
     if isinstance(env, dict):
         if "NY_ROOT_SPEC_PRUNE" in env:
@@ -585,6 +792,576 @@ def _canonical_json(value: object) -> str:
 
 def _is_nonnegative_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _mo_kfsb_issues(observation: Any) -> list[str]:
+    """Validate the closed MO-kFSB policy/work aggregate without inferring work."""
+    if not isinstance(observation, dict):
+        return ["execution_observations.mo_kfsb is not an object"]
+    issues: list[str] = []
+    prefix = "execution_observations.mo_kfsb"
+    if set(observation) != MO_KFSB_FIELDS:
+        issues.append(f"{prefix} has an unknown or incomplete field set")
+        return issues
+    if observation.get("schema") != MO_KFSB_SCHEMA:
+        issues.append(f"{prefix}.schema is not {MO_KFSB_SCHEMA!r}")
+    types_valid = True
+    for field in MO_KFSB_BOOLEAN_FIELDS:
+        if not isinstance(observation.get(field), bool):
+            issues.append(f"{prefix}.{field} is not boolean")
+            types_valid = False
+    for field in MO_KFSB_NULLABLE_BOOLEAN_FIELDS:
+        value = observation.get(field)
+        if value is not None and not isinstance(value, bool):
+            issues.append(f"{prefix}.{field} is not null or boolean")
+            types_valid = False
+    u64_max = (1 << 64) - 1
+    for field in MO_KFSB_NULLABLE_INTEGER_FIELDS:
+        value = observation.get(field)
+        if value is not None and (
+            not _is_nonnegative_int(value) or value > u64_max
+        ):
+            issues.append(f"{prefix}.{field} is not null or a u64 integer")
+            types_valid = False
+    for field in MO_KFSB_NULLABLE_REDUCE_OP_FIELDS:
+        value = observation.get(field)
+        if value is not None and (
+            not isinstance(value, str) or value not in MO_KFSB_REDUCE_OP_VALUES
+        ):
+            issues.append(
+                f"{prefix}.{field} is not null or an exact reduce operation"
+            )
+            types_valid = False
+    for field in MO_KFSB_COUNTER_FIELDS:
+        value = observation.get(field)
+        if not _is_nonnegative_int(value) or value > u64_max:
+            issues.append(f"{prefix}.{field} is not a u64 integer")
+            types_valid = False
+    canonical = observation.get("canonical_master")
+    if canonical is not None and canonical not in MO_KFSB_CANONICAL_MASTER_VALUES:
+        issues.append(f"{prefix}.canonical_master is not null or canonical")
+        types_valid = False
+    if not types_valid:
+        return issues
+
+    branch = observation["branch_opportunities"]
+    common_fields = (
+        "canonical_master",
+        *MO_KFSB_NULLABLE_BOOLEAN_FIELDS,
+        *MO_KFSB_NULLABLE_INTEGER_FIELDS,
+        *MO_KFSB_NULLABLE_REDUCE_OP_FIELDS,
+    )
+    common_complete = all(observation[field] is not None for field in common_fields)
+    common_present = any(observation[field] is not None for field in common_fields)
+    if observation["observed"] != (branch > 0):
+        issues.append(f"{prefix}.observed disagrees with branch opportunities")
+    if (branch > 0 and not common_complete) or (branch == 0 and common_present):
+        issues.append(f"{prefix} common policy completeness disagrees with observation")
+    if branch == 0 and any(
+        observation[field] != 0 for field in MO_KFSB_COUNTER_FIELDS
+    ):
+        issues.append(f"{prefix} has counters without a branch opportunity")
+    if observation["attribution_conflict"]:
+        issues.append("MO-kFSB attribution conflict is present")
+    if observation["counter_overflow"]:
+        issues.append("MO-kFSB counter overflow is present")
+    if branch == 0 or not common_complete:
+        return issues
+
+    if (
+        observation["effective_reduce_op"] == "mean"
+        and observation["configured_reduce_op"] != "mean"
+    ):
+        issues.append(f"{prefix} effective mean lacks configured-mean authority")
+
+    offered = observation["offered_domains"]
+    nonempty = observation["nonempty_domain_opportunities"]
+    candidate = observation["candidate_eligible_opportunities"]
+    typed_select = observation["typed_select_opportunities"]
+    lower = observation["lower_master_opportunities"]
+    effective = observation["effective_master_opportunities"]
+    route = observation["route_eligible_opportunities"]
+    selector_waves = observation["selector_waves"]
+    selector_domains = observation["selector_domains"]
+    committed_waves = observation["committed_waves"]
+    committed_parents = observation["committed_parents"]
+    committed_leaves = observation["committed_leaves"]
+    force_on = observation["force_on_binding_waves"]
+    refused = observation["master_binding_refusals"]
+
+    for field in (
+        "nonempty_domain_opportunities",
+        "candidate_eligible_opportunities",
+        "typed_select_opportunities",
+        "lower_master_opportunities",
+        "effective_master_opportunities",
+        "route_eligible_opportunities",
+        "selector_waves",
+    ):
+        if observation[field] > branch:
+            issues.append(f"{prefix}.{field} exceeds branch opportunities")
+    if nonempty > offered:
+        issues.append(f"{prefix} has more nonempty waves than offered domains")
+    if nonempty != branch:
+        issues.append(f"{prefix} nonempty opportunities do not equal branches")
+    expected_candidate = branch if observation["effective_candidates"] > 0 else 0
+    if candidate != expected_candidate:
+        issues.append(f"{prefix} candidate eligibility disagrees with effective width")
+    expected_lower = branch if observation["configured_master"] else typed_select
+    if lower != expected_lower:
+        issues.append(f"{prefix} lower-master opportunities contradict policy")
+
+    canonical = observation["canonical_master"]
+    if canonical == "absent":
+        expected_effective = (
+            branch if observation["legacy_childsim"] else lower
+        )
+    elif canonical == "exact_enable":
+        expected_effective = branch
+    else:
+        expected_effective = 0
+    if effective != expected_effective:
+        issues.append(f"{prefix} effective-master opportunities contradict policy")
+    if canonical != "absent" and observation["legacy_childsim"]:
+        issues.append(f"{prefix} canonical presence did not suppress legacy childsim")
+
+    if route > nonempty or route > candidate:
+        issues.append(f"{prefix} route eligibility exceeds its prerequisites")
+    if typed_select > candidate:
+        issues.append(f"{prefix} typed Select exceeds candidate eligibility")
+    if typed_select > 0 and observation["effective_reduce_op"] != "min":
+        issues.append(f"{prefix} typed Select requires effective min reduction")
+    if not observation["heuristic_eligible"] and typed_select > 0:
+        issues.append(f"{prefix} typed Select ran under an ineligible heuristic")
+    if not observation["heuristic_eligible"] and route > 0:
+        issues.append(f"{prefix} route eligible under an ineligible heuristic")
+    if (
+        selector_waves > candidate
+        or selector_waves > effective
+        or selector_waves > route
+    ):
+        issues.append(f"{prefix} selector waves exceed gate prerequisites")
+    selector_floor = max(0, route - (branch - effective))
+    if selector_waves < selector_floor:
+        issues.append(f"{prefix} selector waves miss a required routed wave")
+    if not observation["heuristic_eligible"] and selector_waves > 0:
+        issues.append(f"{prefix} selector ran under an ineligible heuristic")
+    if selector_domains > offered:
+        issues.append(f"{prefix} selector domains exceed offered domains")
+    if selector_waves == branch and selector_domains != offered:
+        issues.append(f"{prefix} full selector coverage omits offered domains")
+    selector_domain_capacity = offered - (branch - selector_waves)
+    if selector_domains > selector_domain_capacity:
+        issues.append(
+            f"{prefix} selector domains exceed the selected-wave capacity"
+        )
+    if selector_waves > selector_domains:
+        issues.append(f"{prefix} selector waves exceed selector domains")
+    if selector_domains > 0 and selector_waves == 0:
+        issues.append(f"{prefix} selector domains exist without a selector wave")
+    if selector_domains > 0 and route == 0:
+        issues.append(f"{prefix} selector domains exist without route eligibility")
+    if committed_waves > selector_waves:
+        issues.append(f"{prefix} committed waves exceed selector waves")
+    if committed_waves > route or committed_waves > nonempty:
+        issues.append(f"{prefix} committed waves exceed routed nonempty waves")
+    if committed_waves > committed_parents:
+        issues.append(f"{prefix} committed waves exceed committed parents")
+    if (committed_waves > 0) != (committed_parents > 0):
+        issues.append(f"{prefix} committed wave/parent counts disagree")
+    if committed_parents > selector_domains:
+        issues.append(f"{prefix} committed parents exceed selector domains")
+    if committed_waves <= selector_waves:
+        noncommitting_waves = selector_waves - committed_waves
+        if (
+            noncommitting_waves > selector_domains
+            or committed_parents > selector_domains - noncommitting_waves
+        ):
+            issues.append(
+                f"{prefix} committed parents exceed the selector partition"
+            )
+    if committed_leaves > 0 and committed_parents == 0:
+        issues.append(f"{prefix} committed leaves exist without a parent")
+    leaf_capacity_overflows = committed_parents > (
+        ((1 << 64) - 1) // MO_KFSB_MAX_LEAVES_PER_PARENT
+    )
+    if leaf_capacity_overflows or (
+        committed_leaves > MO_KFSB_MAX_LEAVES_PER_PARENT * committed_parents
+    ):
+        issues.append(f"{prefix} committed leaves exceed the per-parent bound")
+    if force_on > committed_waves or force_on > branch - lower:
+        issues.append(f"{prefix} force-on bindings exceed live counterfactual waves")
+    if canonical == "exact_enable" and force_on < max(0, committed_waves - lower):
+        issues.append(f"{prefix} exact-enable force-on bindings are incomplete")
+    if force_on > 0 and canonical != "exact_enable":
+        issues.append(f"{prefix} force-on binding lacks exact-enable authority")
+    if refused > route or refused > lower:
+        issues.append(f"{prefix} master refusals exceed live counterfactual routes")
+    refusal_floor = max(0, route - (branch - lower))
+    if canonical == "exact_disable" and refused < refusal_floor:
+        issues.append(f"{prefix} exact-disable master refusals are incomplete")
+    if refused > 0 and canonical != "exact_disable":
+        issues.append(f"{prefix} master refusal lacks exact-disable authority")
+    if canonical != "exact_enable" and force_on != 0:
+        issues.append(f"{prefix} non-enable policy has force-on bindings")
+    if canonical != "exact_disable" and refused != 0:
+        issues.append(f"{prefix} non-disable policy has master refusals")
+    return issues
+
+
+def _mo_alpha_step_issues(observation: Any) -> list[str]:
+    """Validate the closed every-fourth MO alpha schedule aggregate."""
+    if not isinstance(observation, dict):
+        return ["execution_observations.mo_alpha_step is not an object"]
+    issues: list[str] = []
+    prefix = "execution_observations.mo_alpha_step"
+    if set(observation) != MO_ALPHA_STEP_FIELDS:
+        issues.append(f"{prefix} has an unknown or incomplete field set")
+        return issues
+    if observation.get("schema") != MO_ALPHA_STEP_SCHEMA:
+        issues.append(f"{prefix}.schema is not {MO_ALPHA_STEP_SCHEMA!r}")
+
+    types_valid = True
+    for field in MO_ALPHA_STEP_BOOLEAN_FIELDS:
+        if not isinstance(observation.get(field), bool):
+            issues.append(f"{prefix}.{field} is not boolean")
+            types_valid = False
+    for field in MO_ALPHA_STEP_NULLABLE_BOOLEAN_FIELDS:
+        value = observation.get(field)
+        if value is not None and not isinstance(value, bool):
+            issues.append(f"{prefix}.{field} is not null or boolean")
+            types_valid = False
+    u64_max = (1 << 64) - 1
+    for field in MO_ALPHA_STEP_COUNTER_FIELDS:
+        value = observation.get(field)
+        if not _is_nonnegative_int(value) or value > u64_max:
+            issues.append(f"{prefix}.{field} is not a u64 integer")
+            types_valid = False
+    if not types_valid:
+        return issues
+
+    if observation["schedule_period"] != 4:
+        issues.append(f"{prefix}.schedule_period is not four")
+    if observation["alpha_round_remainder"] != 3:
+        issues.append(f"{prefix}.alpha_round_remainder is not three")
+
+    invocations = observation["optimizer_invocations"]
+    eligible = observation["eligible_invocations"]
+    iterations = observation["eligible_iterations"]
+    fourth = observation["fourth_iteration_opportunities"]
+    alpha_scheduled = observation["alpha_rounds_scheduled"]
+    beta_scheduled = observation["beta_rounds_scheduled"]
+    alpha_completed = observation["alpha_rounds_completed"]
+    alpha_refused = observation["alpha_rounds_refused"]
+    updates = observation["alpha_updates_applied"]
+    coordinates = observation["perturbed_coordinates"]
+
+    observed = observation["observed"]
+    if observed != (invocations > 0):
+        issues.append(f"{prefix}.observed disagrees with optimizer invocations")
+    policy_complete = (
+        observation["effective_alpha_step"] is not None
+        and observation["effective_beta_spsa"] is not None
+    )
+    policy_present = (
+        observation["effective_alpha_step"] is not None
+        or observation["effective_beta_spsa"] is not None
+    )
+    if (observed and not policy_complete) or (not observed and policy_present):
+        issues.append(f"{prefix} effective policy completeness disagrees with observation")
+    if eligible > invocations:
+        issues.append(f"{prefix}.eligible_invocations exceeds optimizer invocations")
+    if iterations > 0 and eligible == 0:
+        issues.append(f"{prefix} has eligible iterations without an eligible invocation")
+
+    # Each eligible invocation contributes floor(iterations / 4) fourth-round
+    # opportunities. Aggregation retains an exact realizability envelope: the
+    # uncounted remainders are at most three per eligible invocation.
+    fourth_floor = 4 * fourth
+    fourth_ceiling = fourth_floor + 3 * eligible
+    if fourth_floor > u64_max or fourth_ceiling > u64_max:
+        issues.append(f"{prefix} fourth-round opportunity envelope overflows u64")
+    elif fourth_floor > iterations or iterations > fourth_ceiling:
+        issues.append(f"{prefix} fourth-round opportunities are not realizable")
+    if alpha_scheduled + beta_scheduled != iterations:
+        issues.append(f"{prefix} scheduled rounds do not equal eligible iterations")
+    if alpha_completed + alpha_refused != alpha_scheduled:
+        issues.append(f"{prefix} alpha outcomes do not equal scheduled alpha rounds")
+    if updates != alpha_completed:
+        issues.append(f"{prefix} applied updates do not equal completed alpha rounds")
+    if (alpha_scheduled == 0) != (coordinates == 0):
+        issues.append(f"{prefix} perturbed coordinates disagree with alpha scheduling")
+    if coordinates < alpha_scheduled:
+        issues.append(f"{prefix} perturbed coordinates are fewer than scheduled rounds")
+    if eligible == 1 and alpha_scheduled > 0 and coordinates % alpha_scheduled != 0:
+        issues.append(
+            f"{prefix} single-invocation coordinates are not divisible by alpha rounds"
+        )
+
+    if observation["effective_beta_spsa"] is False and any(
+        observation[field] != 0
+        for field in (
+            "eligible_invocations",
+            "eligible_iterations",
+            "fourth_iteration_opportunities",
+            "alpha_rounds_scheduled",
+            "beta_rounds_scheduled",
+        )
+    ):
+        issues.append(f"{prefix} scheduled work occurred while beta SPSA was disabled")
+    if observation["effective_alpha_step"] is True:
+        if alpha_scheduled != fourth:
+            issues.append(f"{prefix} enabled alpha schedule missed a fourth round")
+    elif observation["effective_alpha_step"] is False and any(
+        observation[field] != 0
+        for field in (
+            "alpha_rounds_scheduled",
+            "alpha_rounds_completed",
+            "alpha_rounds_refused",
+            "alpha_updates_applied",
+            "perturbed_coordinates",
+        )
+    ):
+        issues.append(f"{prefix} alpha work occurred while alpha stepping was disabled")
+
+    if observation["counter_overflow"]:
+        issues.append("MO alpha-step counter overflow is present")
+    if observation["attribution_conflict"]:
+        issues.append("MO alpha-step attribution conflict is present")
+    return issues
+
+
+def _root_joint_interm_alpha_issues(root: Any) -> list[str]:
+    """Validate the closed v1 root-alpha observation without config credit."""
+    if not isinstance(root, dict):
+        return [
+            "execution_observations.root_joint_interm_alpha is not an object"
+        ]
+    issues: list[str] = []
+    prefix = "execution_observations.root_joint_interm_alpha"
+    if set(root) != ROOT_JOINT_INTERM_ALPHA_FIELDS:
+        issues.append(f"{prefix} has an unknown or incomplete field set")
+    if root.get("schema") != ROOT_JOINT_INTERM_ALPHA_SCHEMA:
+        issues.append(f"{prefix}.schema is not {ROOT_JOINT_INTERM_ALPHA_SCHEMA!r}")
+    types_valid = True
+    for field in ROOT_JOINT_INTERM_ALPHA_BOOLEAN_FIELDS:
+        if not isinstance(root.get(field), bool):
+            issues.append(f"{prefix}.{field} is not boolean")
+            types_valid = False
+    for field in ROOT_JOINT_INTERM_ALPHA_NULLABLE_BOOLEAN_FIELDS:
+        value = root.get(field)
+        if value is not None and not isinstance(value, bool):
+            issues.append(f"{prefix}.{field} is not null or boolean")
+            types_valid = False
+    u64_max = (1 << 64) - 1
+    for field in ROOT_JOINT_INTERM_ALPHA_NULLABLE_INTEGER_FIELDS:
+        value = root.get(field)
+        if value is not None and (
+            not _is_nonnegative_int(value) or value > u64_max
+        ):
+            issues.append(
+                f"{prefix}.{field} is not null or a u64 integer"
+            )
+            types_valid = False
+    for field in ROOT_JOINT_INTERM_ALPHA_COUNTER_FIELDS:
+        value = root.get(field)
+        if not _is_nonnegative_int(value) or value > u64_max:
+            issues.append(f"{prefix}.{field} is not a u64 integer")
+            types_valid = False
+    if not types_valid:
+        return issues
+
+    invocations = root["invocations"]
+    common_config_fields = (
+        *ROOT_JOINT_INTERM_ALPHA_NULLABLE_BOOLEAN_FIELDS,
+        "configured_secs",
+        "configured_iters",
+        "configured_lr_bits",
+        "configured_min_remaining_secs",
+        "configured_max_sel",
+    )
+    configuration_complete = all(
+        root[field] is not None for field in common_config_fields
+    )
+    configuration_present = any(
+        root[field] is not None for field in common_config_fields
+    )
+    if root["observed"] != (invocations > 0):
+        issues.append(f"{prefix}.observed disagrees with invocations")
+    if (invocations > 0 and not configuration_complete) or (
+        invocations == 0 and configuration_present
+    ):
+        issues.append(f"{prefix} configuration completeness disagrees with invocations")
+    routes = root["input_split_invocations"] + root["multi_objective_invocations"]
+    if routes != invocations:
+        issues.append(f"{prefix} route total does not equal invocations")
+    input_max_dim = root["input_split_configured_max_dim"]
+    multi_max_dim = root["multi_objective_configured_max_dim"]
+    if (root["input_split_invocations"] > 0) != (input_max_dim is not None) or (
+        root["multi_objective_invocations"] > 0
+    ) != (multi_max_dim is not None):
+        issues.append(f"{prefix} contextual max-dim fields disagree with routes")
+    if input_max_dim == 0 or multi_max_dim == 0:
+        issues.append(f"{prefix} has a zero route-effective max dimension")
+    max_dim_override = root["configured_max_dim_override"]
+    if max_dim_override == 0 or (
+        max_dim_override is not None
+        and any(
+            value is not None and value != max_dim_override
+            for value in (input_max_dim, multi_max_dim)
+        )
+    ):
+        issues.append(f"{prefix} explicit max-dim override is contradictory")
+    if max_dim_override is None:
+        expected_multi_max = (
+            32_768
+            if root["configured_master"] is True
+            and root["configured_deadline_ascent"] is True
+            else 2_048
+        )
+        if input_max_dim not in (None, 32_768) or multi_max_dim not in (
+            None,
+            expected_multi_max,
+        ):
+            issues.append(f"{prefix} contextual max dimension is contradictory")
+    classified = sum(
+        root[field]
+        for field in (
+            "completed",
+            "master_disabled",
+            "admission_floor_refusals",
+            "deadline_route_refusals",
+            "slice_refusals",
+            "no_target_refusals",
+            "capability_refusals",
+            "execution_refusals",
+        )
+    )
+    if classified != invocations:
+        issues.append(f"{prefix} outcome total does not equal invocations")
+    if invocations == 0:
+        if any(root[field] != 0 for field in ROOT_JOINT_INTERM_ALPHA_COUNTER_FIELDS):
+            issues.append(f"{prefix} has counters without invocations")
+    else:
+        lr_bits = root["configured_lr_bits"]
+        lr = (
+            struct.unpack("!f", struct.pack("!I", lr_bits))[0]
+            if lr_bits <= (1 << 32) - 1
+            else float("nan")
+        )
+        if not math.isfinite(lr):
+            issues.append(f"{prefix} has an invalid common configuration")
+
+    target_attempts = root["target_attempts"]
+    effective_iters = root["max_effective_iters"]
+    ascent_attempts = root["ascent_iterations_attempted"]
+    max_ascent = root["max_ascent_iterations_attempted"]
+    if root["attempts"] != root["completed"] or root["attempts"] > invocations:
+        issues.append(f"{prefix} dispatch counts contradict outcomes")
+    if root["work_started"] > invocations or (
+        (root["work_started"] > 0) != (target_attempts > 0)
+    ):
+        issues.append(f"{prefix} work-start count contradicts target attempts")
+    if target_attempts > root["target_count"]:
+        issues.append(f"{prefix} target attempts exceed selected targets")
+    if (
+        root["configured_slice_work_invocations"] > root["work_started"]
+        or root["configured_iters_binding_invocations"] > root["work_started"]
+        or root["lowered_min_remaining_work_invocations"] > root["work_started"]
+    ):
+        issues.append(f"{prefix} parameter-binding counts exceed work invocations")
+    if (
+        root["raised_min_remaining_binding_refusals"]
+        > root["admission_floor_refusals"]
+    ):
+        issues.append(f"{prefix} raised-floor bindings exceed admission refusals")
+    if root["base_folds_completed"] > target_attempts:
+        issues.append(f"{prefix} base folds exceed target attempts")
+    if root["tightened_count"] > root["base_folds_completed"]:
+        issues.append(f"{prefix} tightenings exceed completed base folds")
+    if effective_iters and target_attempts > u64_max // effective_iters:
+        issues.append(f"{prefix} ascent opportunity count overflows")
+    elif ascent_attempts > target_attempts * effective_iters:
+        issues.append(f"{prefix} ascent attempts exceed opportunities")
+    if (
+        max_ascent > effective_iters
+        or max_ascent > ascent_attempts
+        or root["optimizer_steps"] > ascent_attempts
+        or root["ascent_folds_completed"] > root["optimizer_steps"]
+    ):
+        issues.append(f"{prefix} optimizer work counters are contradictory")
+    if effective_iters == 0 and any(
+        root[field] > 0
+        for field in (
+            "ascent_iterations_attempted",
+            "max_ascent_iterations_attempted",
+            "optimizer_steps",
+            "ascent_folds_completed",
+        )
+    ):
+        issues.append(f"{prefix} ascent work exists with zero effective iterations")
+    if root["tightened_count"] > root["target_count"]:
+        issues.append(f"{prefix} tightenings exceed targets")
+    if root["effective_slice_ms"] > root["available_budget_ms"]:
+        issues.append(f"{prefix} effective slice exceeds available budget")
+    if root["attempts"] > 0 and (
+        root["configured_master"] is not True
+        or root["target_count"] == 0
+        or root["effective_slice_ms"] == 0
+    ):
+        issues.append(f"{prefix} dispatched without an armed nonempty slice")
+    if root["configured_master"] is False and (
+        target_attempts > 0 or root["tightened_count"] > 0
+    ):
+        issues.append(f"{prefix} work occurred while master was disabled")
+    effect_fields = (
+        "selection_cap_bound_targets",
+        "frozen_stop_targets",
+        "pure_chain_targets",
+        "bn_extract_targets",
+    )
+    if any(root[field] > target_attempts for field in effect_fields):
+        issues.append(f"{prefix} authenticated effects exceed target attempts")
+    if root["max_selected_rows"] > (root["configured_max_sel"] or 0):
+        issues.append(f"{prefix} selected rows exceed configured cap")
+    if root["selection_cap_bound_targets"] > 0 and (
+        root["max_selected_rows"] != root["configured_max_sel"]
+    ):
+        issues.append(f"{prefix} cap-binding targets do not reach configured cap")
+    for configured, effect in (
+        ("configured_frozen_stop", "frozen_stop_targets"),
+        ("configured_pure_chain", "pure_chain_targets"),
+        ("configured_bn_gpu_extract", "bn_extract_targets"),
+    ):
+        if root[configured] is False and root[effect] > 0:
+            issues.append(f"{prefix}.{effect} exists while {configured} is false")
+    if root["configured_slice_work_invocations"] > 0 and (
+        root["configured_secs"] == 0
+        or root["configured_secs"] > u64_max // 1_000
+        or root["effective_slice_ms"] < root["configured_secs"] * 1_000
+    ):
+        issues.append(f"{prefix} slice-binding count lacks a full configured slice")
+    if root["configured_iters_binding_invocations"] > 0 and (
+        root["configured_iters"] == 0
+        or effective_iters != root["configured_iters"]
+        or max_ascent != root["configured_iters"]
+    ):
+        issues.append(f"{prefix} iteration-binding count lacks the configured cap")
+    if root["lowered_min_remaining_work_invocations"] > 0 and (
+        root["multi_objective_invocations"] == 0
+        or root["configured_min_remaining_secs"] >= 240
+    ):
+        issues.append(f"{prefix} lowered-floor work lacks its counterfactual route")
+    if root["raised_min_remaining_binding_refusals"] > 0 and (
+        root["multi_objective_invocations"] == 0
+        or root["configured_min_remaining_secs"] <= 240
+    ):
+        issues.append(f"{prefix} raised-floor refusal lacks its counterfactual route")
+    if root["counter_overflow"]:
+        issues.append(f"{prefix} counter overflow is present")
+    if root["attribution_conflict"]:
+        issues.append(f"{prefix} attribution conflict is present")
+    return issues
 
 
 def _exact_c_multi_iteration_aggregate_issues(exact_c: dict[str, Any]) -> list[str]:
@@ -1207,6 +1984,14 @@ def _execution_observations_structure_issues(document: Any) -> list[str]:
             if fresh_clip["route_conflict"]:
                 issues.append("fresh-domain clip route conflict is present")
 
+    issues.extend(
+        _root_joint_interm_alpha_issues(
+            document.get("root_joint_interm_alpha")
+        )
+    )
+    issues.extend(_mo_kfsb_issues(document.get("mo_kfsb")))
+    issues.extend(_mo_alpha_step_issues(document.get("mo_alpha_step")))
+
     patches = document.get("patches_materialization")
     if not isinstance(patches, dict):
         issues.append(
@@ -1653,6 +2438,77 @@ def _execution_treatment_issues(
             or fresh_clip.get("tightened_dimensions") != 0
         ):
             issues.append("fresh-domain clip OFF arm executed clipping work")
+    elif treatment == "mo_kfsb_configured":
+        mo_kfsb = document.get("mo_kfsb")
+        if not isinstance(mo_kfsb, dict):
+            issues.append("MO-kFSB runtime observations are absent")
+            return list(dict.fromkeys(issues))
+
+        configured = expected["configured"]
+        if mo_kfsb.get("observed") is not True:
+            issues.append("MO-kFSB arm did not reach a branch-selection seam")
+        if mo_kfsb.get("canonical_master") != "absent":
+            issues.append("MO-kFSB typed treatment lacks canonical-absence authority")
+        if mo_kfsb.get("legacy_childsim") is not False:
+            issues.append("MO-kFSB typed treatment has legacy alternate authority")
+        if mo_kfsb.get("configured_master") is not configured:
+            issues.append("MO-kFSB configured state does not match the arm")
+        if mo_kfsb.get("configured_candidates") != expected["configured_candidates"]:
+            issues.append("MO-kFSB configured candidate count does not match the arm")
+        if mo_kfsb.get("effective_candidates") != expected["effective_candidates"]:
+            issues.append("MO-kFSB effective candidate count does not match the arm")
+        if mo_kfsb.get("configured_reduce_op") != expected["configured_reduce_op"]:
+            issues.append("MO-kFSB configured reduce op does not match the arm")
+        if mo_kfsb.get("effective_reduce_op") != expected["effective_reduce_op"]:
+            issues.append("MO-kFSB effective reduce op does not match the arm")
+
+        typed_select = mo_kfsb.get("typed_select_opportunities")
+        if typed_select != 0:
+            issues.append("MO-kFSB typed treatment has round-typed alternate authority")
+        branch = mo_kfsb.get("branch_opportunities")
+        candidate = mo_kfsb.get("candidate_eligible_opportunities")
+        route = mo_kfsb.get("route_eligible_opportunities")
+        if not _is_nonnegative_int(branch) or branch == 0:
+            issues.append("MO-kFSB typed treatment has no branch opportunity")
+        if not _is_nonnegative_int(candidate) or candidate == 0:
+            issues.append(
+                "MO-kFSB typed treatment has no candidate-eligible opportunity"
+            )
+        if not _is_nonnegative_int(route) or route == 0:
+            issues.append("MO-kFSB typed treatment has no eligible route")
+
+        lower = mo_kfsb.get("lower_master_opportunities")
+        effective = mo_kfsb.get("effective_master_opportunities")
+        selector_waves = mo_kfsb.get("selector_waves")
+        selector_domains = mo_kfsb.get("selector_domains")
+        committed_waves = mo_kfsb.get("committed_waves")
+        committed_parents = mo_kfsb.get("committed_parents")
+        if configured:
+            if lower != branch or effective != branch:
+                issues.append(
+                    "MO-kFSB ON arm did not own every effective master opportunity"
+                )
+            if not _is_nonnegative_int(selector_waves) or selector_waves == 0:
+                issues.append("MO-kFSB ON arm has no selector wave")
+            if not _is_nonnegative_int(selector_domains) or selector_domains == 0:
+                issues.append("MO-kFSB ON arm has no selector domain")
+            if not _is_nonnegative_int(committed_waves) or committed_waves == 0:
+                issues.append("MO-kFSB ON arm has no committed selector wave")
+            if not _is_nonnegative_int(committed_parents) or committed_parents == 0:
+                issues.append("MO-kFSB ON arm has no committed parent proof")
+        elif any(
+            mo_kfsb.get(field) != 0
+            for field in (
+                "lower_master_opportunities",
+                "effective_master_opportunities",
+                "selector_waves",
+                "selector_domains",
+                "committed_waves",
+                "committed_parents",
+                "committed_leaves",
+            )
+        ):
+            issues.append("MO-kFSB OFF arm executed lower-policy selector work")
     else:
         issues.append(f"unknown execution-evidence treatment {treatment!r}")
     return list(dict.fromkeys(issues))

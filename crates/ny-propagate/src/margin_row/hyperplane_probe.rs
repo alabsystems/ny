@@ -184,6 +184,7 @@ fn run_inner(net: &TwinNet, root: &RootGates, t: usize, adv: &[usize]) -> Result
         .layers
         .iter()
         .map(|lg| RetainedLayer {
+            eligible: lg.n,
             idx: (0..lg.n).collect(),
             unst_pos: Vec::new(),
             a_l: Vec::new(),

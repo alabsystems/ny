@@ -1924,14 +1924,20 @@ fn batched_bwd_sub_boxes(n: usize) -> Vec<([f32; 2], [f32; 2])> {
     boxes
 }
 
-/// #lsnc-batched-bwd (S3) full-pipeline parity: the SoA batched-tensor
-/// backward must be BIT-IDENTICAL to the per-domain reference loop — raw f32
-/// bits of the certified output bounds, the input `LinearBounds` coefficient
-/// matrices and biases, AND the certified coefficient-error matrices
-/// (presence + bits, I-D5) — across a 44-domain lsnc-shaped batch whose
-/// contributions exercise the Linear SoA kernel, the shared ReLU body, the
-/// generic-dispatch Binary/Nary bias carriers, and repeated NETWORK_INPUT
-/// merges. Engagement probes assert which leg actually ran.
+/// #lsnc-batched-bwd (S3) full-pipeline parity across a 44-domain lsnc-shaped
+/// batch whose contributions exercise the Linear SoA arm, the shared ReLU
+/// body, the generic-dispatch Binary/Nary bias carriers, and repeated
+/// NETWORK_INPUT merges. Engagement probes assert which leg actually ran.
+///
+/// Two properties, in order of severity:
+///
+///  - CONTAINMENT: the SoA lane's output bounds must never be TIGHTER than the
+///    per-domain reference's. That is the soundness-critical direction.
+///  - BIT-IDENTITY: raw f32 bits of the certified output bounds, the input
+///    `LinearBounds` coefficient matrices and biases, and the certified
+///    coefficient-error matrices (presence + bits, I-D5). That is the lane's
+///    advertised contract, and it holds because every arithmetic step is a
+///    CALL INTO a shared reference kernel rather than a copy of one.
 #[ntest::timeout(120000)]
 #[test]
 fn test_input_split_batched_bwd_full_pipeline_bit_identical_lsnc_s3() {
@@ -2021,80 +2027,230 @@ fn test_input_split_batched_bwd_full_pipeline_bit_identical_lsnc_s3() {
 
     assert_eq!(on.len(), n);
     assert_eq!(off.len(), n);
+
+    // Parity is checked in TWO layers, and the distinction is the whole point.
+    //
+    //  1. CONTAINMENT (soundness). The gate-ON lane may never publish a bound
+    //     TIGHTER than the reference loop it replaces: elementwise
+    //     `on.lower <= off.lower` and `on.upper >= off.upper`. Tighter-than-
+    //     reference on a lower bound used to discharge a property is exactly
+    //     how a false proof is minted, so this layer must never be relaxed,
+    //     re-scoped, or turned into a symmetric tolerance (a symmetric
+    //     tolerance passes the dangerous direction as happily as the safe one).
+    //  2. BIT-IDENTITY (contract). The lane is sold as "strictly a performance
+    //     transform, never a bound change" (batched_bwd.rs module docs) and it
+    //     delegates every arithmetic step to shared reference kernels, so
+    //     equality is both owed and achievable. Do NOT downgrade this to a
+    //     tolerance to get green: the 8-ULP window it caught was an entire
+    //     Linear arm still transcribing `propagate_linear_batched_with_engine`
+    //     after that function had lost its last production caller.
+    //
+    // Divergences are COLLECTED rather than asserted one at a time. The
+    // historical form used `assert_eq!` per element and aborted on the first
+    // mismatch, so on a failing tree the coefficient matrices, biases and
+    // certified-error planes below were never actually reached — the test
+    // claimed coverage it was not delivering. Keep the collecting shape.
+    const MAX_REPORTED: usize = 12;
+    let mut unsound: Vec<String> = Vec::new();
+    let mut divergent: Vec<String> = Vec::new();
+    fn note(sink: &mut Vec<String>, message: String) {
+        if sink.len() < MAX_REPORTED {
+            sink.push(message);
+        }
+    }
+    // Bit-equal (including NaN payloads) counts as contained; otherwise the ON
+    // value must sit on the WIDE side of the OFF value.
+    fn contains(on: f32, off: f32, wider_is_larger: bool) -> bool {
+        on.to_bits() == off.to_bits()
+            || if wider_is_larger {
+                on >= off
+            } else {
+                on <= off
+            }
+    }
+    fn compare_plane(
+        sink: &mut Vec<String>,
+        label: &str,
+        i: usize,
+        a: &Array2<f32>,
+        b: &Array2<f32>,
+    ) {
+        if a.shape() != b.shape() {
+            note(
+                sink,
+                format!(
+                    "domain {i}: {label} shape {:?} vs {:?}",
+                    a.shape(),
+                    b.shape()
+                ),
+            );
+            return;
+        }
+        for (k, (on, off)) in a.iter().zip(b.iter()).enumerate() {
+            if on.to_bits() != off.to_bits() {
+                note(
+                    sink,
+                    format!(
+                        "domain {i}: {label}[{k}] bits differ: on={} ({on}) off={} ({off})",
+                        on.to_bits(),
+                        off.to_bits()
+                    ),
+                );
+            }
+        }
+    }
     let mut input_linear_present = 0usize;
     for i in 0..n {
-        for (a, b) in on[i]
+        for (k, (on, off)) in on[i]
             .output_bounds
             .lower()
             .iter()
             .zip(off[i].output_bounds.lower().iter())
+            .enumerate()
         {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "domain {i}: output LOWER bits differ"
-            );
+            if !contains(*on, *off, false) {
+                note(
+                    &mut unsound,
+                    format!(
+                        "domain {i}: output LOWER[{k}] is TIGHTER than the reference \
+                         (on={on} > off={off}) — the batched lane is claiming more than \
+                         the per-domain reference can justify"
+                    ),
+                );
+            }
+            if on.to_bits() != off.to_bits() {
+                note(
+                    &mut divergent,
+                    format!(
+                        "domain {i}: output LOWER[{k}] bits differ: on={} ({on}) off={} ({off})",
+                        on.to_bits(),
+                        off.to_bits()
+                    ),
+                );
+            }
         }
-        for (a, b) in on[i]
+        for (k, (on, off)) in on[i]
             .output_bounds
             .upper()
             .iter()
             .zip(off[i].output_bounds.upper().iter())
+            .enumerate()
         {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "domain {i}: output UPPER bits differ"
-            );
+            if !contains(*on, *off, true) {
+                note(
+                    &mut unsound,
+                    format!(
+                        "domain {i}: output UPPER[{k}] is TIGHTER than the reference \
+                         (on={on} < off={off}) — the batched lane is claiming more than \
+                         the per-domain reference can justify"
+                    ),
+                );
+            }
+            if on.to_bits() != off.to_bits() {
+                note(
+                    &mut divergent,
+                    format!(
+                        "domain {i}: output UPPER[{k}] bits differ: on={} ({on}) off={} ({off})",
+                        on.to_bits(),
+                        off.to_bits()
+                    ),
+                );
+            }
         }
         match (&on[i].input_linear, &off[i].input_linear) {
             (None, None) => {}
             (Some(on_lb), Some(off_lb)) => {
                 input_linear_present += 1;
-                let bits2 =
-                    |x: &Array2<f32>| -> Vec<u32> { x.iter().map(|v| v.to_bits()).collect() };
-                assert_eq!(
-                    bits2(on_lb.lower_a()),
-                    bits2(off_lb.lower_a()),
-                    "domain {i}: lower_a bits differ"
+                compare_plane(
+                    &mut divergent,
+                    "lower_a",
+                    i,
+                    on_lb.lower_a(),
+                    off_lb.lower_a(),
                 );
-                assert_eq!(
-                    bits2(on_lb.upper_a()),
-                    bits2(off_lb.upper_a()),
-                    "domain {i}: upper_a bits differ"
+                compare_plane(
+                    &mut divergent,
+                    "upper_a",
+                    i,
+                    on_lb.upper_a(),
+                    off_lb.upper_a(),
                 );
-                let bits1: Vec<u32> = on_lb.lower_b().iter().map(|v| v.to_bits()).collect();
-                let bits1_off: Vec<u32> = off_lb.lower_b().iter().map(|v| v.to_bits()).collect();
-                assert_eq!(bits1, bits1_off, "domain {i}: lower_b bits differ");
-                let ubits: Vec<u32> = on_lb.upper_b().iter().map(|v| v.to_bits()).collect();
-                let ubits_off: Vec<u32> = off_lb.upper_b().iter().map(|v| v.to_bits()).collect();
-                assert_eq!(ubits, ubits_off, "domain {i}: upper_b bits differ");
-                // Certified error: presence AND bits (a bounds-only compare
-                // passes while the certificate silently loosens — I-D5).
-                assert_eq!(
-                    on_lb.lower_a_err().is_some(),
-                    off_lb.lower_a_err().is_some(),
-                    "domain {i}: lower_a_err presence differs"
-                );
-                assert_eq!(
-                    on_lb.upper_a_err().is_some(),
-                    off_lb.upper_a_err().is_some(),
-                    "domain {i}: upper_a_err presence differs"
-                );
+                for (k, (on, off)) in on_lb
+                    .lower_b()
+                    .iter()
+                    .zip(off_lb.lower_b().iter())
+                    .enumerate()
+                {
+                    if on.to_bits() != off.to_bits() {
+                        note(
+                            &mut divergent,
+                            format!("domain {i}: lower_b[{k}] bits differ: {on} vs {off}"),
+                        );
+                    }
+                }
+                for (k, (on, off)) in on_lb
+                    .upper_b()
+                    .iter()
+                    .zip(off_lb.upper_b().iter())
+                    .enumerate()
+                {
+                    if on.to_bits() != off.to_bits() {
+                        note(
+                            &mut divergent,
+                            format!("domain {i}: upper_b[{k}] bits differ: {on} vs {off}"),
+                        );
+                    }
+                }
+                // Certified error: presence AND bits. A bounds-only compare
+                // passes while the certificate silently loosens (I-D5), and a
+                // certificate present on one leg and absent on the other is a
+                // different proof object even when the coefficients agree.
+                if on_lb.lower_a_err().is_some() != off_lb.lower_a_err().is_some() {
+                    note(
+                        &mut divergent,
+                        format!("domain {i}: lower_a_err presence differs"),
+                    );
+                }
+                if on_lb.upper_a_err().is_some() != off_lb.upper_a_err().is_some() {
+                    note(
+                        &mut divergent,
+                        format!("domain {i}: upper_a_err presence differs"),
+                    );
+                }
                 if let (Some(a), Some(b)) = (on_lb.lower_a_err(), off_lb.lower_a_err()) {
-                    assert_eq!(bits2(a), bits2(b), "domain {i}: lower_a_err bits differ");
+                    compare_plane(&mut divergent, "lower_a_err", i, a, b);
                 }
                 if let (Some(a), Some(b)) = (on_lb.upper_a_err(), off_lb.upper_a_err()) {
-                    assert_eq!(bits2(a), bits2(b), "domain {i}: upper_a_err bits differ");
+                    compare_plane(&mut divergent, "upper_a_err", i, a, b);
                 }
             }
-            (a, b) => panic!(
-                "domain {i}: input_linear presence differs (on={}, off={})",
-                a.is_some(),
-                b.is_some()
+            (a, b) => note(
+                &mut divergent,
+                format!(
+                    "domain {i}: input_linear presence differs (on={}, off={})",
+                    a.is_some(),
+                    b.is_some()
+                ),
             ),
         }
     }
+
+    assert!(
+        unsound.is_empty(),
+        "SOUNDNESS: the SoA batched backward published bounds TIGHTER than its own \
+         per-domain reference. That is the false-proof direction; do not \"fix\" it by \
+         loosening this assertion.\n{}",
+        unsound.join("\n")
+    );
+    assert!(
+        divergent.is_empty(),
+        "the SoA batched backward is not bit-identical to the per-domain reference. \
+         Containment held, so these are conservative-direction divergences — but the \
+         lane's contract is equality, and the last drift of this shape meant its Linear \
+         arm was mirroring a function with zero production callers. Showing at most \
+         {MAX_REPORTED}:\n{}",
+        divergent.join("\n")
+    );
     assert!(
         input_linear_present > 0,
         "fixture must produce captured input_linear rows (otherwise the merge \

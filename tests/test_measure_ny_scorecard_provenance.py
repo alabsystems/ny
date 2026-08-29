@@ -499,7 +499,15 @@ def external_scorecard_rejects_self_erasing_bash_env_from_initial_snapshot(
     assert not guard_log.exists(), "initial environment rejection must precede guard"
 
 
-def _fixture_repo(tmp_path: Path, *, expected_cpus: int = 10) -> Path:
+def _fixture_repo(
+    tmp_path: Path,
+    *,
+    expected_cpus: int = 10,
+    checked_in_bank: str | None = None,
+    checked_in_bank_category: str = "demo",
+    runtime_dirty_bank_flag: str | None = None,
+    instances_path_drift: str | None = None,
+) -> Path:
     repo = tmp_path / "ny"
     repo.mkdir()
     _init_git_repo(repo)
@@ -521,9 +529,11 @@ def _fixture_repo(tmp_path: Path, *, expected_cpus: int = 10) -> Path:
     scripts = repo / "scripts"
     scripts.mkdir()
     for name in (
+        "_portable_file_lock.py",
         "archive_vnncomp_sat_result.py",
         "measure_ny_scorecard.sh",
         "ny_measurement_provenance.py",
+        "ny_search.py",
         "seal_ny_measurement_inputs.py",
     ):
         shutil.copyfile(REPO_ROOT / "scripts" / name, scripts / name)
@@ -566,6 +576,85 @@ def _fixture_repo(tmp_path: Path, *, expected_cpus: int = 10) -> Path:
         scripts,
         expected_cpus=expected_cpus,
     )
+    if instances_path_drift is not None:
+        fixture_sweep = scripts / "measure_ny_scorecard.sh"
+        fixture_sweep_source = fixture_sweep.read_text(encoding="utf-8")
+        drift_anchor = (
+            "\n# Recover the sealed loader directory without consulting the caller's "
+            "library\n"
+        )
+        drift_actions = {
+            "missing": '/bin/rm -f "$BROOT/demo/2.0/instances.csv"\n',
+            "replacement": (
+                '/bin/mkdir -p "$BROOT/demo/1.0"\n'
+                '/bin/mv "$BROOT/demo/2.0/instances.csv" '
+                '"$BROOT/demo/1.0/instances.csv"\n'
+            ),
+        }
+        assert instances_path_drift in drift_actions
+        assert fixture_sweep_source.count(drift_anchor) == 1
+        fixture_sweep.write_text(
+            fixture_sweep_source.replace(
+                drift_anchor,
+                "\n" + drift_actions[instances_path_drift] + drift_anchor,
+                1,
+            ),
+            encoding="utf-8",
+        )
+    if runtime_dirty_bank_flag is not None:
+        flag_pairs = {
+            "assume-unchanged": ("--assume-unchanged", "--no-assume-unchanged"),
+            "skip-worktree": ("--skip-worktree", "--no-skip-worktree"),
+        }
+        if runtime_dirty_bank_flag == "replace-ref":
+            set_index_flag = ""
+            clear_index_flag = ""
+        else:
+            set_flag, clear_flag = flag_pairs[runtime_dirty_bank_flag]
+            set_index_flag = (
+                f'    "$NY_MEASURE_GIT_BIN" --literal-pathspecs -C "$PWD" '
+                f'update-index {set_flag} -- "reports/measured-2026/demo.csv"\n'
+            )
+            clear_index_flag = (
+                f'    "$NY_MEASURE_GIT_BIN" --literal-pathspecs -C "$PWD" '
+                f'update-index {clear_flag} -- "reports/measured-2026/demo.csv"\n'
+            )
+        fixture_sweep = scripts / "measure_ny_scorecard.sh"
+        fixture_sweep_source = fixture_sweep.read_text(encoding="utf-8")
+        mutation_anchor = (
+            '    checked_in_bank="${CHECKED_IN_BANK_DIR:+'
+            '$CHECKED_IN_BANK_DIR/$cat.csv}"\n'
+        )
+        cleanup_anchor = (
+            '      echo "================================================================" >&2\n'
+            "    fi\n"
+            "  done\n"
+        )
+        assert fixture_sweep_source.count(mutation_anchor) == 1
+        assert fixture_sweep_source.count(cleanup_anchor) == 1
+        mutation = set_index_flag + (
+            "    /usr/bin/printf '%s\\n' "
+            "'demo,shared.onnx,violated.vnnlib,0,sat,0' "
+            '> "reports/measured-2026/demo.csv"\n'
+        )
+        cleanup = (
+            '    GIT_NO_REPLACE_OBJECTS=1 "$NY_MEASURE_GIT_BIN" -C "$PWD" show '
+            '"HEAD:reports/measured-2026/demo.csv" '
+            '> "reports/measured-2026/demo.csv"\n'
+            + clear_index_flag
+        )
+        fixture_sweep.write_text(
+            fixture_sweep_source.replace(
+                mutation_anchor,
+                mutation + mutation_anchor,
+                1,
+            ).replace(
+                cleanup_anchor,
+                cleanup_anchor.replace("  done\n", cleanup + "  done\n"),
+                1,
+            ),
+            encoding="utf-8",
+        )
 
     fake_cuda_dir = repo / ".test-cuda-runtime"
     fake_cuda_dir.mkdir()
@@ -709,6 +798,25 @@ if argument == "--version":
     print("ny 0.1.0-test")
 elif argument == "--build-info":
     print("ny 0.1.0-test cuda=on mip=on")
+elif argument == "--build-id":
+    self_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    build_id_digest = hashlib.sha256(
+        (
+            "NY_BUILD_ID_V1\\n"
+            + "2" * 64
+            + "\\n"
+            + self_sha256
+            + "\\n"
+        ).encode("ascii")
+    ).hexdigest()
+    print(
+        "NY_BUILD_ID_V1 version=0.3.4745 features=mip,cuda "
+        "backend=cuda+wgpu markers=margin-row-gpu-eft-impl-v9 "
+        "commit=1111111111111111111111111111111111111111 dirty=false "
+        "revision=4745 source=clean profile=release "
+        "target=x86_64-unknown-linux-gnu rustc=1.95.0 "
+        f"stamp={'2' * 64} exe={self_sha256} id={build_id_digest}"
+    )
 elif argument == "--cuda-runtime-info":
     runtime_report()
 elif argument == "--cuda-selfcheck":
@@ -727,10 +835,163 @@ elif argument == "--cuda-selfcheck":
         driver = runtime / "libcuda.so"
         driver.chmod(0o644)
         driver.write_bytes(b"tampered sealed driver\\n")
+elif sys.argv[1:] == ["benchmarks", "space", "--json"]:
+    print(
+        json.dumps(
+            {
+                "schema": "ny-levers/search-space/v6",
+                "axes": [
+                    {
+                        "name": "NY_PGD_FAST_GRAD",
+                        "domain": "bool",
+                        "values": ["0", "1"],
+                        "class": "VerdictAffecting",
+                        "deliver": "preset:attack.pgd_fast_grad",
+                        "why": "fixture execution-predicate axis",
+                        "absence_baseline": {"kind": "declaration_default"},
+                        "category_prefixes": [],
+                        "preset_baseline_keys": ["attack.pgd_fast_grad"],
+                    },
+                    *[
+                        {
+                            "name": name,
+                            "domain": "bool",
+                            "values": ["0", "1"],
+                            "class": "VerdictAffecting",
+                            "deliver": f"preset:attack.{name.lower()}",
+                            "why": "fixture joint execution prerequisite",
+                            "absence_baseline": {"kind": "declaration_default"},
+                            "category_prefixes": [],
+                            "preset_baseline_keys": [f"attack.{name.lower()}"],
+                        }
+                        for name in ("NY_PGD_EXACT_BATCHED", "NY_PGD_VJP_BATCH")
+                    ],
+                    *[
+                        {
+                            "name": name,
+                            "domain": "grid",
+                            "values": values,
+                            "class": "VerdictAffecting",
+                            "deliver": f"preset:attack.{name.lower()}",
+                            "why": "fixture joint execution treatment",
+                            "absence_baseline": {"kind": "contextual"},
+                            "category_prefixes": [],
+                            "preset_baseline_keys": [f"attack.{name.lower()}"],
+                        }
+                        for name, values in (
+                            ("NY_PGD_VJP_K", ["8", "52", "128"]),
+                            ("NY_PGD_VJP_STEPS", ["100", "250", "1000"]),
+                        )
+                    ],
+                ],
+                "edges": [
+                    {
+                        "child": child,
+                        "kind": "armed",
+                        "parent": parent,
+                        "parents": None,
+                        "bound": None,
+                        "token": None,
+                        "site": "fixture joint execution dependency",
+                    }
+                    for child, parent in (
+                        ("NY_PGD_VJP_K", "NY_PGD_VJP_BATCH"),
+                        ("NY_PGD_VJP_STEPS", "NY_PGD_VJP_BATCH"),
+                        ("NY_PGD_VJP_STEPS", "NY_PGD_EXACT_BATCHED"),
+                    )
+                ],
+                "unsafe": [],
+                "instrument_only": [],
+                "test_only": [],
+                "declarations": {
+                    "NY_PGD_FAST_GRAD": {
+                        "kind": "Bool",
+                        "default": "1",
+                        "min": None,
+                        "max": None,
+                        "members": None,
+                    },
+                    **{
+                        name: {
+                            "kind": "Bool",
+                            "default": "0",
+                            "min": None,
+                            "max": None,
+                            "members": None,
+                        }
+                        for name in ("NY_PGD_EXACT_BATCHED", "NY_PGD_VJP_BATCH")
+                    },
+                    **{
+                        name: {
+                            "kind": "UsizeTrimmed",
+                            "default": None,
+                            "min": None,
+                            "max": None,
+                            "members": None,
+                        }
+                        for name in ("NY_PGD_VJP_K", "NY_PGD_VJP_STEPS")
+                    },
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 else:
+    configs_dir = None
+    if "--configs-dir" in sys.argv:
+        configs_index = sys.argv.index("--configs-dir")
+        configs_dir = Path(sys.argv[configs_index + 1])
+    preset = None
+    if configs_dir is not None:
+        suffix = configs_dir.name.removeprefix("vnncomp")
+        if (
+            configs_dir.name.startswith("vnncomp")
+            and len(suffix) == 2
+            and suffix.isdigit()
+        ):
+            year_dirs = [configs_dir]
+        else:
+            year_dirs = sorted(
+                (
+                    path
+                    for path in configs_dir.iterdir()
+                    if path.is_dir() and path.name.startswith("vnncomp")
+                ),
+                key=lambda path: path.name,
+                reverse=True,
+            )
+        category = sys.argv[3].lower()
+        candidates = [category]
+        if (
+            len(category) >= 5
+            and category[-5:-3] == "_2"
+            and category[-3] == "0"
+            and category[-2:].isdigit()
+        ):
+            candidates.append(category[:-5])
+        for year_dir in year_dirs:
+            preset = next(
+                (
+                    year_dir / f"{candidate}.yaml"
+                    for candidate in candidates
+                    if (year_dir / f"{candidate}.yaml").is_file()
+                ),
+                None,
+            )
+            if preset is not None:
+                break
     print(f"solver combined log for {sys.argv[5]}")
     print(f"solver ld_library_path:{os.environ.get('LD_LIBRARY_PATH', '')}")
     print(f"solver ny_no_cuda:{os.environ.get('NY_NO_CUDA', '')}")
+    print(
+        "solver preset:"
+        + (
+            "<missing>"
+            if preset is None
+            else preset.read_text(encoding="utf-8").strip()
+        )
+    )
     print("solver argv:" + "".join(f" <{value}>" for value in sys.argv[1:]))
     result_file = Path(sys.argv[6])
     if sys.argv[5].endswith("/violated.vnnlib"):
@@ -739,21 +1000,145 @@ else:
     else:
         verdict = "unsat"
         result_file.write_text("unsat\\n", encoding="utf-8")
+    if os.environ.get("NY_PGD_VJP_K") == "52":
+        lever_receipt_entries = [
+            {
+                "name": name,
+                "value": value,
+                "source": "legacy_env",
+                "bucket": "debug",
+                "moat": "high",
+                "provenance": "unmeasured",
+                "env_utf8": True,
+            }
+            for name, value in (
+                ("NY_PGD_EXACT_BATCHED", True),
+                ("NY_PGD_VJP_BATCH", True),
+                ("NY_PGD_VJP_K", 52),
+                ("NY_PGD_VJP_STEPS", 250),
+            )
+        ]
+        exact_vjp_fields = {
+            "schema": "ny-cli/exact-vjp-execution/v1",
+            "phase": "terminal",
+            "route": "conjunctive",
+            "outcome": "exhausted",
+            "inactive_reason": "none",
+            "prefer_exact_batched": "true",
+            "batch_enabled": "true",
+            "work_started": "true",
+            "exploit_enabled": "true",
+            "width_source": "configured",
+            "width_configured": "52",
+            "width_default": "64",
+            "width_initial": "52",
+            "width_final": "52",
+            "width_max_active": "52",
+            "width_binding": "requested",
+            "width_retries": "0",
+            "total_restarts": "104",
+            "restarts_started": "104",
+            "waves": "2",
+            "wave_steps_configured": "250",
+            "wave_steps_default": "1000",
+            "wave_steps_effective": "250",
+            "vjp_steps": "300",
+            "odi_steps_configured": "4",
+            "odi_eta": "0.5",
+            "odi_vjp_steps": "4",
+            "odi_completed_phase_count": "1",
+            "odi_move_count": "100",
+            "legacy_lanes_configured": "20",
+            "legacy_lanes_used": "20",
+            "lane_window": "50",
+            "recycle_count": "3",
+            "exploit_opportunity_count": "2",
+            "exploit_count": "2",
+            "hinge_tau": "0.001",
+            "hinge_extra_count": "5",
+        }
+        execution_events = [
+            {
+                "method": "exact_vjp_execution",
+                "status": "ran",
+                "reason": " ".join(
+                    f"{name}={value}" for name, value in exact_vjp_fields.items()
+                ),
+                "at_secs": 0.0,
+            }
+        ]
+    else:
+        lever_receipt_entries = [
+            {
+                "name": "NY_PGD_FAST_GRAD",
+                "value": False,
+                "source": "legacy_env",
+                "bucket": "debug",
+                "moat": "high",
+                "provenance": "unmeasured",
+                "env_utf8": True,
+            }
+        ]
+        execution_events = [
+            {
+                "method": "pgd_fast_gradient_execution",
+                "status": "ran",
+                "reason": (
+                    "schema=ny-cli/pgd-fast-gradient-execution/v1 "
+                    "phase=terminal route=conjunctive configured=false "
+                    "decisions=1 fast_attempts=0 fast_selected=0 "
+                    "certified_selected=1 spsa_selected=0"
+                ),
+                "at_secs": 0.0,
+            }
+        ]
     Path(f"{result_file}.flight.json").write_text(
         json.dumps(
             {
-                "schema_version": 2,
+                "schema_version": 3,
+                "build_id": (
+                    "NY_BUILD_STAMP_V1 version=0.3.4745 features=mip,cuda "
+                    "backend=cuda+wgpu markers=margin-row-gpu-eft-impl-v9 "
+                    "commit=1111111111111111111111111111111111111111 "
+                    "dirty=false revision=4745 source=clean profile=release "
+                    "target=x86_64-unknown-linux-gnu rustc=1.95.0 "
+                    f"stamp={'2' * 64}"
+                ),
                 "backend_kind": "cuda",
                 "backend_summary": "synthetic fixture",
-                "host": {},
+                "host": {
+                    "hostname": "fixture-host",
+                    "cpu_model": "fixture-cpu",
+                    "logical_cores": 1,
+                    "ram_bytes": 1_073_741_824,
+                },
                 "category": sys.argv[3],
                 "budget_secs": int(sys.argv[7]),
+                "ambient_env_schema": "ny-cli/ambient-env/v3",
                 "ambient_env": {
                     name: value
                     for name, value in os.environ.items()
-                    if name.startswith("NY_") or name == "OMP_NUM_THREADS"
+                    if name.startswith("NY_")
+                    or name
+                    in {
+                        "OMP_NUM_THREADS",
+                        "RAYON_NUM_THREADS",
+                        "RAYON_RS_NUM_CPUS",
+                    }
                 },
-                "events": [
+                "levers": {
+                    "status": "resolved",
+                    "receipt": {
+                        "schema": "ny-levers/receipt/v3",
+                        "lever_count": len(lever_receipt_entries),
+                        "env_present": len(lever_receipt_entries),
+                        "env_accepted": len(lever_receipt_entries),
+                        "env_rejected": 0,
+                        "env_ignored": 0,
+                        "levers": lever_receipt_entries,
+                    },
+                },
+                "events": execution_events + [
                     {
                         "method": "run_complete",
                         "status": "complete",
@@ -775,7 +1160,22 @@ else:
         encoding="utf-8",
     )
     binary.chmod(0o755)
+    if checked_in_bank is not None:
+        measured = repo / "reports/measured-2026"
+        measured.mkdir(parents=True)
+        (measured / f"{checked_in_bank_category}.csv").write_text(
+            checked_in_bank,
+            encoding="utf-8",
+        )
     _run("git", "add", ".", cwd=repo)
+    if checked_in_bank is not None:
+        _run(
+            "git",
+            "add",
+            "-f",
+            f"reports/measured-2026/{checked_in_bank_category}.csv",
+            cwd=repo,
+        )
     _run("git", "commit", "-qm", "fixture", cwd=repo)
 
     # Git records commit times with one-second resolution.  On a second
@@ -844,6 +1244,59 @@ else:
         "https://example.invalid/vnncomp-benchmarks.git",
         cwd=benchmark,
     )
+    if runtime_dirty_bank_flag == "replace-ref":
+        assert checked_in_bank is not None
+        assert checked_in_bank_category == "demo"
+        bank_path = "reports/measured-2026/demo.csv"
+        replacement_index = tmp_path / "replacement-index"
+        replacement_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        replacement_environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_INDEX_FILE": str(replacement_index),
+                "GIT_NO_REPLACE_OBJECTS": "1",
+            }
+        )
+
+        def replacement_git(*arguments: str, input_text: str | None = None) -> str:
+            completed = subprocess.run(
+                ["git", *arguments],
+                cwd=repo,
+                env=replacement_environment,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return completed.stdout.strip()
+
+        original_head = replacement_git("rev-parse", "--verify", "HEAD")
+        replacement_blob = replacement_git(
+            "hash-object",
+            "-w",
+            "--stdin",
+            input_text="demo,shared.onnx,violated.vnnlib,0,sat,0\n",
+        )
+        replacement_git("read-tree", original_head)
+        replacement_git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "100644",
+            replacement_blob,
+            bank_path,
+        )
+        replacement_tree = replacement_git("write-tree")
+        replacement_commit = replacement_git(
+            "commit-tree",
+            replacement_tree,
+            input_text="replacement bank fixture\n",
+        )
+        replacement_git("replace", original_head, replacement_commit)
     return repo
 
 
@@ -966,8 +1419,13 @@ def _measurement_environment(
             "NY_BUILD_FEATURES": "mip,cuda",
             "NY_MEASURE_CAP": "2",
             "NY_MEASURE_CATS": "demo",
+            "NY_MEASURE_REQUIRE_FLIGHT_EVENT": (
+                "ny-exec-v1.pgd-fast-gradient-parameter-engaged."
+                "NY_PGD_FAST_GRAD.0=ran"
+            ),
             "NY_MEASURE_RUN_ID": RUN_ID,
             "NY_MARGIN_ROW_CLASSWISE": "1",
+            "NY_PGD_FAST_GRAD": "0",
             "NY_ROOT": str(repo),
             "NY_SCRATCH": str(tmp_path / "scratch"),
             "LD_LIBRARY_PATH": str(repo / ".test-cuda-runtime"),
@@ -976,6 +1434,124 @@ def _measurement_environment(
     )
     environment.update(overrides)
     return environment
+
+
+def external_same_family_joint_predicate_reaches_sealed_solver_and_archive(
+    tmp_path: Path,
+) -> None:
+    repo = _fixture_repo(tmp_path)
+    run_id = "20260825T120000Z-joint-predicate"
+    isolated = repo / "reports/joint-predicate"
+    requirement = (
+        "ny-exec-v2.exact-vjp-parameter-engaged."
+        "NY_PGD_VJP_K.52,NY_PGD_VJP_STEPS.250=ran"
+    )
+    environment = _measurement_environment(
+        repo,
+        tmp_path,
+        NY_MEASURE_MAX_ROWS_PER_CATEGORY="1",
+        NY_MEASURE_OUTPUT_DIR=str(isolated),
+        NY_MEASURE_REQUIRE_FLIGHT_EVENT=requirement,
+        NY_MEASURE_RUN_ID=run_id,
+        NY_PGD_EXACT_BATCHED="1",
+        NY_PGD_VJP_BATCH="1",
+        NY_PGD_VJP_K="52",
+        NY_PGD_VJP_STEPS="250",
+    )
+    del environment["NY_PGD_FAST_GRAD"]
+
+    result = subprocess.run(
+        ["bash", "scripts/measure_ny_scorecard.sh"],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    start = json.loads(
+        (isolated / f"artifacts/runs/{run_id}/start.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    measurement = start["measurement"]
+    assert measurement["execution_evidence_profile"] == (
+        "ny_measurement_execution_evidence_v5"
+    )
+    assert measurement["execution_predicate_assignment"][
+        "full_assignment"
+    ] == [
+        ["NY_PGD_EXACT_BATCHED", "1"],
+        ["NY_PGD_VJP_BATCH", "1"],
+        ["NY_PGD_VJP_K", "52"],
+        ["NY_PGD_VJP_STEPS", "250"],
+    ]
+    solver_values = measurement["solver_environment"]["values"]
+    assert {
+        name: solver_values.get(name)
+        for name in (
+            "NY_PGD_EXACT_BATCHED",
+            "NY_PGD_VJP_BATCH",
+            "NY_PGD_VJP_K",
+            "NY_PGD_VJP_STEPS",
+        )
+    } == {
+        "NY_PGD_EXACT_BATCHED": "1",
+        "NY_PGD_VJP_BATCH": "1",
+        "NY_PGD_VJP_K": "52",
+        "NY_PGD_VJP_STEPS": "250",
+    }
+    assert "NY_MEASURE_REQUIRE_FLIGHT_EVENT" not in solver_values
+
+    metadata_path = next((isolated / "artifacts/demo").glob(f"*/{run_id}.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    flight = metadata["flight_record"]["record"]
+    assert "NY_MEASURE_REQUIRE_FLIGHT_EVENT" not in flight["ambient_env"]
+    assert {entry["name"] for entry in flight["levers"]["receipt"]["levers"]} == {
+        "NY_PGD_EXACT_BATCHED",
+        "NY_PGD_VJP_BATCH",
+        "NY_PGD_VJP_K",
+        "NY_PGD_VJP_STEPS",
+    }
+
+
+def external_noncanonical_joint_predicate_fails_before_solver_row(
+    tmp_path: Path,
+) -> None:
+    repo = _fixture_repo(tmp_path)
+    environment = _measurement_environment(
+        repo,
+        tmp_path,
+        NY_MEASURE_REQUIRE_FLIGHT_EVENT=(
+            "ny-exec-v2.exact-vjp-parameter-engaged."
+            "NY_PGD_VJP_STEPS.250,NY_PGD_VJP_K.52=ran"
+        ),
+        NY_PGD_EXACT_BATCHED="1",
+        NY_PGD_VJP_BATCH="1",
+        NY_PGD_VJP_K="52",
+        NY_PGD_VJP_STEPS="250",
+    )
+    del environment["NY_PGD_FAST_GRAD"]
+
+    result = subprocess.run(
+        ["bash", "scripts/measure_ny_scorecard.sh"],
+        cwd=repo,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0
+    assert "joint requested assignment is not canonical and unique" in result.stderr
+    invocations = [
+        json.loads(line)
+        for line in (tmp_path / "solver-invocations.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert all(invocation["argument"] != "vnncomp" for invocation in invocations)
 
 
 def external_sweep_rejects_unreviewed_solver_runtime_environment(
@@ -1410,7 +1986,13 @@ def external_sweep_rejects_ld_library_path_with_non_cuda_override(
 
 
 def external_sweep_binds_rows_and_sat_artifact_to_completed_run(tmp_path: Path) -> None:
-    repo = _fixture_repo(tmp_path)
+    repo = _fixture_repo(
+        tmp_path,
+        checked_in_bank=(
+            "demo,shared.onnx,violated.vnnlib,0,timeout,1\n"
+            "demo,shared.onnx,holds.vnnlib,0,unknown,1\n"
+        ),
+    )
     result = subprocess.run(
         ["bash", "scripts/measure_ny_scorecard.sh"],
         cwd=repo,
@@ -1420,6 +2002,18 @@ def external_sweep_binds_rows_and_sat_artifact_to_completed_run(tmp_path: Path) 
         timeout=60,
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert result.stderr.count(
+        "ACTION REQUIRED: decided VNN-COMP result is not materialized"
+    ) == 2
+    assert "measured: sat" in result.stderr
+    assert (
+        f"sealed artifacts: reports/measured-runs/{RUN_ID}/artifacts"
+        in result.stderr
+    )
+    assert "reports/measured-2026/demo.csv still says timeout" in result.stderr
+    assert "measured: unsat" in result.stderr
+    assert "reports/measured-2026/demo.csv still says unknown" in result.stderr
+    assert "use the reviewed 2026 bank evidence workflow" in result.stderr
 
     output_root = repo / f"reports/measured-runs/{RUN_ID}"
     artifact_root = output_root / "artifacts"
@@ -1447,7 +2041,10 @@ def external_sweep_binds_rows_and_sat_artifact_to_completed_run(tmp_path: Path) 
     assert start["measurement"]["output_dir"] == str(output_root.resolve())
     assert start["measurement"]["scratch_dir"] == str((tmp_path / "scratch").resolve())
     assert start["environment"]["values"]["NY_SCRATCH"] == str(tmp_path / "scratch")
-    assert not (repo / "reports/measured/demo.csv").exists()
+    assert (repo / "reports/measured-2026/demo.csv").read_text(encoding="utf-8") == (
+        "demo,shared.onnx,violated.vnnlib,0,timeout,1\n"
+        "demo,shared.onnx,holds.vnnlib,0,unknown,1\n"
+    )
     assert start["solver_binary"]["declared_build_features"] == ["mip", "cuda"]
     sealed_solver = start["solver_binary"]["sealed_execution"]
     assert sealed_solver["path"] != start["solver_binary"]["path"]
@@ -1993,17 +2590,148 @@ def external_completion_write_failure_propagates_nonzero_from_trap(
     assert (run_dir / "start.json").is_file()
 
 
+@pytest.mark.parametrize(
+    ("bank_tail", "expected_notice", "run_suffix"),
+    (
+        (" SAT ,0", "none", "five-column"),
+        ("0,unsat,0", "conflict", "conflict"),
+        ("0,bogus,0", "invalid", "invalid"),
+        ("0,sat,unsat,0", "ambiguous", "ambiguous"),
+        ("0,timeout,0", "dirty", "skip-worktree-dirty"),
+        ("0,timeout,0", "dirty", "assume-unchanged-dirty"),
+        ("0,timeout,0", "dirty", "replace-ref-dirty"),
+    ),
+)
 def external_isolated_output_reruns_legacy_row_and_honors_row_cap(
+    tmp_path: Path,
+    bank_tail: str,
+    expected_notice: str,
+    run_suffix: str,
+) -> None:
+    runtime_dirty_bank_flag = None
+    if expected_notice == "dirty":
+        if run_suffix.startswith("assume-unchanged"):
+            runtime_dirty_bank_flag = "assume-unchanged"
+        elif run_suffix.startswith("replace-ref"):
+            runtime_dirty_bank_flag = "replace-ref"
+        else:
+            runtime_dirty_bank_flag = "skip-worktree"
+    repo = _fixture_repo(
+        tmp_path,
+        checked_in_bank=f"demo,shared.onnx,violated.vnnlib,{bank_tail}\n",
+        runtime_dirty_bank_flag=runtime_dirty_bank_flag,
+    )
+    legacy_dir = repo / "reports/measured-2026"
+    isolated = repo / "reports/isolated-bank"
+    run_id = f"20260718T130000Z-isolated-{run_suffix}"
+    if runtime_dirty_bank_flag == "replace-ref":
+        bank_object = "HEAD:reports/measured-2026/demo.csv"
+        replaced_bank = subprocess.run(
+            ["git", "show", bank_object],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        no_replace_environment = os.environ.copy()
+        no_replace_environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+        original_bank = subprocess.run(
+            ["git", "show", bank_object],
+            cwd=repo,
+            env=no_replace_environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        assert replaced_bank.endswith(",sat,0\n")
+        assert original_bank.endswith(",timeout,0\n")
+    measurement_overrides = {}
+    if runtime_dirty_bank_flag == "replace-ref":
+        # The automatic-binary receipt independently rejects a replacement
+        # tree because its legacy source-diff command intentionally remains
+        # outside this scorecard-guard regression. Use the reviewed explicit
+        # binary escape hatch so this case reaches `_scorecard_source_git`.
+        measurement_overrides["NY_MEASURE_BIN"] = str(repo / "target/release/ny")
+
+    result = subprocess.run(
+        ["bash", "scripts/measure_ny_scorecard.sh"],
+        cwd=repo,
+        env=_measurement_environment(
+            repo,
+            tmp_path,
+            NY_MEASURE_MAX_ROWS_PER_CATEGORY="1",
+            NY_MEASURE_OUTPUT_DIR=str(isolated),
+            NY_MEASURE_RUN_ID=run_id,
+            **measurement_overrides,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    expected_returncode = 1 if expected_notice == "dirty" else 0
+    assert result.returncode == expected_returncode, f"{result.stdout}\n{result.stderr}"
+    if expected_notice == "dirty":
+        # The advisory itself remains nonfatal: the sweep reaches its normal
+        # completion banner after appending the row. The independent immutable
+        # completion trap then correctly rejects the mid-run source mutation.
+        assert "=== ALL BENCHMARKS SWEPT" in result.stdout
+        assert "measurement completion integrity validation failed" in result.stderr
+    if expected_notice == "none":
+        assert "ACTION REQUIRED" not in result.stderr
+    elif expected_notice == "conflict":
+        assert (
+            "ACTION REQUIRED: measured VNN-COMP verdict conflicts with checked-in bank"
+            in result.stderr
+        )
+        assert (
+            "reports/measured-2026/demo.csv says unsat, contradicting sat"
+            in result.stderr
+        )
+        assert "Do not promote either verdict until the conflict is resolved." in result.stderr
+        assert "scripts/promote_regular_bank.py" not in result.stderr
+    elif expected_notice == "invalid":
+        assert "ACTION REQUIRED: decided VNN-COMP result is not materialized" in result.stderr
+        assert "has a malformed row or no verdict token" in result.stderr
+        assert "Audit or repair the malformed bank row before promotion." in result.stderr
+    elif expected_notice == "ambiguous":
+        assert "ACTION REQUIRED: decided VNN-COMP result is not materialized" in result.stderr
+        assert "has multiple protocol verdict tokens" in result.stderr
+        assert "Audit or repair the malformed bank row before promotion." in result.stderr
+    else:
+        assert "ACTION REQUIRED: decided VNN-COMP result is not materialized" in result.stderr
+        assert "reports/measured-2026/demo.csv differs from HEAD" in result.stderr
+
+    with (isolated / "demo.csv").open(newline="", encoding="utf-8") as source:
+        rows = list(csv.reader(source))
+    assert len(rows) == 1
+    _assert_measurement_row(
+        rows[0],
+        ["demo", "shared.onnx", "violated.vnnlib", "0", "sat"],
+        run_id,
+    )
+
+    assert len((legacy_dir / "demo.csv").read_text(encoding="utf-8").splitlines()) == 1
+
+    start = json.loads(
+        (isolated / f"artifacts/runs/{run_id}/start.json").read_text(encoding="utf-8")
+    )
+    assert start["measurement"]["output_dir"] == str(isolated.resolve())
+    assert start["measurement"]["max_rows_per_category"] == 1
+    assert start["environment"]["values"]["NY_MEASURE_OUTPUT_DIR"] == str(isolated)
+    artifacts = list((isolated / "artifacts/demo").glob(f"*/{run_id}.json"))
+    assert len(artifacts) == 1
+
+
+def external_truncated_measurement_row_is_rejected_before_resume(
     tmp_path: Path,
 ) -> None:
     repo = _fixture_repo(tmp_path)
-    legacy_dir = repo / "reports/measured"
-    legacy_dir.mkdir(parents=True)
-    (legacy_dir / "demo.csv").write_text(
-        "demo,shared.onnx,violated.vnnlib,0,sat,0\n", encoding="utf-8"
-    )
-    isolated = repo / "reports/isolated-bank"
-    run_id = "20260718T130000Z-isolated"
+    isolated = repo / "reports/truncated-resume"
+    isolated.mkdir(parents=True)
+    csv_path = isolated / "demo.csv"
+    truncated_row = "demo,shared.onnx,violated.vnnlib\n"
+    csv_path.write_text(truncated_row, encoding="utf-8")
+    run_id = "20260718T130500Z-truncated-resume"
 
     result = subprocess.run(
         ["bash", "scripts/measure_ny_scorecard.sh"],
@@ -2019,34 +2747,83 @@ def external_isolated_output_reruns_legacy_row_and_honors_row_cap(
         text=True,
         timeout=60,
     )
-    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
 
-    with (isolated / "demo.csv").open(newline="", encoding="utf-8") as source:
+    assert result.returncode == 1, f"{result.stdout}\n{result.stderr}"
+    assert "measurement row must have six or seven fields" in result.stderr
+    assert "refusing malformed instance or measurement CSV" in result.stderr
+    assert csv_path.read_text(encoding="utf-8") == truncated_row
+    invocations = [
+        json.loads(line)
+        for line in (tmp_path / "solver-invocations.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert not [item for item in invocations if item["argument"] == "vnncomp"]
+
+
+def external_five_column_cersyve_bank_schema_is_decoded(tmp_path: Path) -> None:
+    repo = _fixture_repo(
+        tmp_path,
+        checked_in_bank=(
+            "cersyve,shared.onnx,violated.vnnlib, SAT ,0\n"
+        ),
+        checked_in_bank_category="cersyve",
+    )
+    benchmark_repo = repo / "benchmarks/vnncomp2026"
+    shutil.copytree(
+        benchmark_repo / "benchmarks/demo",
+        benchmark_repo / "benchmarks/cersyve",
+    )
+    _run("git", "add", "benchmarks/cersyve", cwd=benchmark_repo)
+    _run("git", "commit", "-qm", "fixture cersyve category", cwd=benchmark_repo)
+    isolated = repo / "reports/cersyve-five-column"
+    run_id = "20260718T131500Z-cersyve-five-column"
+
+    result = subprocess.run(
+        ["bash", "scripts/measure_ny_scorecard.sh"],
+        cwd=repo,
+        env=_measurement_environment(
+            repo,
+            tmp_path,
+            NY_MEASURE_CATS="cersyve",
+            NY_MEASURE_MAX_ROWS_PER_CATEGORY="1",
+            NY_MEASURE_OUTPUT_DIR=str(isolated),
+            NY_MEASURE_RUN_ID=run_id,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "ACTION REQUIRED" not in result.stderr
+    with (isolated / "cersyve.csv").open(newline="", encoding="utf-8") as source:
         rows = list(csv.reader(source))
     assert len(rows) == 1
     _assert_measurement_row(
         rows[0],
-        ["demo", "shared.onnx", "violated.vnnlib", "0", "sat"],
+        ["cersyve", "shared.onnx", "violated.vnnlib", "0", "sat"],
         run_id,
     )
-    assert len((legacy_dir / "demo.csv").read_text(encoding="utf-8").splitlines()) == 1
-
-    start = json.loads(
-        (isolated / f"artifacts/runs/{run_id}/start.json").read_text(encoding="utf-8")
-    )
-    assert start["measurement"]["output_dir"] == str(isolated.resolve())
-    assert start["measurement"]["max_rows_per_category"] == 1
-    assert start["environment"]["values"]["NY_MEASURE_OUTPUT_DIR"] == str(isolated)
-    artifacts = list((isolated / "artifacts/demo").glob(f"*/{run_id}.json"))
-    assert len(artifacts) == 1
 
 
-def external_exact_instance_selector_is_provenanced_and_runs_only_that_row(
+def external_decided_measurement_flags_stale_duplicate_bank_occurrence(
     tmp_path: Path,
 ) -> None:
-    repo = _fixture_repo(tmp_path)
-    isolated = repo / "reports/selected-instance"
-    run_id = "20260718T140000Z-selected"
+    repo = _fixture_repo(
+        tmp_path,
+        checked_in_bank="demo,shared.onnx,violated.vnnlib,0,sat,0\n",
+    )
+    benchmark = repo / "benchmarks/vnncomp2026/benchmarks/demo/2.0"
+    (benchmark / "instances.csv").write_text(
+        "shared.onnx,violated.vnnlib,1\n"
+        "shared.onnx,violated.vnnlib,1\n",
+        encoding="utf-8",
+    )
+    _run("git", "add", "benchmarks/demo/2.0/instances.csv", cwd=benchmark.parents[2])
+    _run("git", "commit", "-qm", "duplicate fixture row", cwd=benchmark.parents[2])
+    isolated = repo / "reports/duplicate-stale-bank"
+    run_id = "20260718T133000Z-duplicate-stale-bank"
 
     result = subprocess.run(
         ["bash", "scripts/measure_ny_scorecard.sh"],
@@ -2063,7 +2840,126 @@ def external_exact_instance_selector_is_provenanced_and_runs_only_that_row(
         text=True,
         timeout=60,
     )
+
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "ACTION REQUIRED: decided VNN-COMP result is not materialized" in result.stderr
+    assert "demo row 2 (pair occurrence 2)" in result.stderr
+    assert "measured: sat" in result.stderr
+    assert (
+        "reports/measured-2026/demo.csv has no row for pair occurrence 2"
+        in result.stderr
+    )
+    with (isolated / "demo.csv").open(newline="", encoding="utf-8") as source:
+        rows = list(csv.reader(source))
+    assert len(rows) == 1
+    _assert_measurement_row(
+        rows[0],
+        ["demo", "shared.onnx", "violated.vnnlib", "0", "sat"],
+        run_id,
+    )
+
+    invocation_log = tmp_path / "solver-invocations.jsonl"
+    first_invocations = [
+        json.loads(line)
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+    ]
+    scored_before_resume = sum(
+        item["argument"] == "vnncomp" for item in first_invocations
+    )
+    resume_run_id = "20260718T133100Z-duplicate-stale-bank-resume"
+    resume = subprocess.run(
+        ["bash", "scripts/measure_ny_scorecard.sh"],
+        cwd=repo,
+        env=_measurement_environment(
+            repo,
+            tmp_path,
+            NY_MEASURE_INSTANCE_INDEX="2",
+            NY_MEASURE_OUTPUT_DIR=str(isolated),
+            NY_MEASURE_RUN_ID=resume_run_id,
+            NY_MEASURE_VNNLIB_VERSION="2.0",
+            NY_SCRATCH=str(tmp_path / "resume-scratch"),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert resume.returncode == 1, f"{resume.stdout}\n{resume.stderr}"
+    assert "cannot safely resume duplicated official instance" in resume.stderr
+    assert "existing measurement rows lack occurrence provenance" in resume.stderr
+    assert "use a fresh output/evidence directory" in resume.stderr
+    resumed_invocations = [
+        json.loads(line)
+        for line in invocation_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum(item["argument"] == "vnncomp" for item in resumed_invocations) == (
+        scored_before_resume
+    )
+    with (isolated / "demo.csv").open(newline="", encoding="utf-8") as source:
+        resumed_rows = list(csv.reader(source))
+    assert resumed_rows == rows
+
+
+@pytest.mark.parametrize(
+    ("corpus", "bank_state", "expected_bank"),
+    (
+        ("2026", "missing", "reports/measured-2026/demo.csv"),
+        ("2026", "untracked", "reports/measured-2026/demo.csv"),
+        ("2025", "missing", "reports/measured/demo.csv"),
+    ),
+)
+def external_exact_instance_selector_is_provenanced_and_runs_only_that_row(
+    tmp_path: Path,
+    corpus: str,
+    bank_state: str,
+    expected_bank: str,
+) -> None:
+    repo = _fixture_repo(tmp_path)
+    benchmark_root = repo / f"benchmarks/vnncomp{corpus}/benchmarks"
+    if corpus == "2025":
+        shutil.copytree(
+            repo / "benchmarks/vnncomp2026",
+            repo / "benchmarks/vnncomp2025",
+        )
+    if bank_state == "untracked":
+        untracked_bank = repo / expected_bank
+        untracked_bank.parent.mkdir(parents=True)
+        untracked_bank.write_text(
+            "demo,shared.onnx,holds.vnnlib,0,unsat,0\n",
+            encoding="utf-8",
+        )
+    isolated = repo / "reports/selected-instance"
+    run_id = f"20260718T140000Z-selected-{corpus}-{bank_state}"
+
+    result = subprocess.run(
+        ["bash", "scripts/measure_ny_scorecard.sh"],
+        cwd=repo,
+        env=_measurement_environment(
+            repo,
+            tmp_path,
+            NY_BROOT=str(benchmark_root),
+            NY_MEASURE_INSTANCE_INDEX="2",
+            NY_MEASURE_OUTPUT_DIR=str(isolated),
+            NY_MEASURE_RUN_ID=run_id,
+            NY_MEASURE_VNNLIB_VERSION="2.0",
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "ACTION REQUIRED: decided VNN-COMP result is not materialized" in result.stderr
+    if bank_state == "missing":
+        assert f"checked-in: {expected_bank} is missing" in result.stderr
+    else:
+        assert (
+            f"checked-in: {expected_bank} exists but is not tracked by Git"
+            in result.stderr
+        )
+    if corpus == "2025":
+        assert "scripts/promote_regular_bank.py" in result.stderr
+    else:
+        assert "use the reviewed 2026 bank evidence workflow" in result.stderr
 
     with (isolated / "demo.csv").open(newline="", encoding="utf-8") as source:
         rows = list(csv.reader(source))
@@ -2122,17 +3018,68 @@ def external_multiple_vnnlib_versions_require_explicit_selection(
     assert completion["exit_status"] == 1
     assert completion["completed_successfully"] is False
 
+    # The same selector must remain exact after start.json exists. Exercise
+    # disappearance and replacement inside this already-explicit Linux lane
+    # rather than silently adding another external contract to its manifest.
+    for drift, observed in (
+        ("missing", "observed: <missing>"),
+        ("replacement", "/demo/1.0/instances.csv"),
+    ):
+        drift_root = tmp_path / f"post-start-{drift}"
+        drift_root.mkdir()
+        drift_repo = _fixture_repo(
+            drift_root,
+            instances_path_drift=drift,
+        )
+        drift_output = drift_repo / f"reports/instances-path-{drift}"
+        drift_run_id = f"20260825T170000Z-instances-path-{drift}"
+        drift_result = subprocess.run(
+            ["bash", "scripts/measure_ny_scorecard.sh"],
+            cwd=drift_repo,
+            env=_measurement_environment(
+                drift_repo,
+                drift_root,
+                NY_MEASURE_OUTPUT_DIR=str(drift_output),
+                NY_MEASURE_RUN_ID=drift_run_id,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert drift_result.returncode == 1, (
+            f"{drift_result.stdout}\n{drift_result.stderr}"
+        )
+        assert (
+            "demo instances.csv selection changed after the measurement start "
+            "was sealed"
+        ) in drift_result.stderr
+        assert "/demo/2.0/instances.csv" in drift_result.stderr
+        assert observed in drift_result.stderr
+        assert not (drift_output / "demo.csv").exists()
+
 
 def external_top_level_instances_list_precedes_nested_payload_list(
     tmp_path: Path,
 ) -> None:
-    repo = _fixture_repo(tmp_path)
+    repo = _fixture_repo(
+        tmp_path,
+        checked_in_bank=(
+            'demo,"shared,relational.onnx",violated.vnnlib,0,sat,0\n'
+            "demo,shared.onnx,holds.vnnlib,0,unsat,0\n"
+        ),
+    )
     benchmark = repo / "benchmarks/vnncomp2026/benchmarks/demo"
     top_level = benchmark / "instances.csv"
-    top_level.write_text(
-        "shared.onnx,violated.vnnlib,1\nshared.onnx,holds.vnnlib,1\n",
-        encoding="utf-8",
-    )
+    quoted_onnx = "shared,relational.onnx"
+    with top_level.open("w", newline="", encoding="utf-8") as output:
+        csv.writer(output, lineterminator="\n").writerows(
+            (
+                (quoted_onnx, "violated.vnnlib", "1"),
+                ("shared.onnx", "holds.vnnlib", "1"),
+            )
+        )
+    shutil.copyfile(benchmark / "2.0/shared.onnx", benchmark / quoted_onnx)
     shutil.copyfile(benchmark / "2.0/shared.onnx", benchmark / "shared.onnx")
     shutil.copyfile(benchmark / "2.0/violated.vnnlib", benchmark / "violated.vnnlib")
     shutil.copyfile(benchmark / "2.0/holds.vnnlib", benchmark / "holds.vnnlib")
@@ -2166,8 +3113,11 @@ def external_top_level_instances_list_precedes_nested_payload_list(
         timeout=60,
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert "ACTION REQUIRED" not in result.stderr
     with (isolated / "demo.csv").open(newline="", encoding="utf-8") as source:
         rows = list(csv.reader(source))
+    assert [len(row) for row in rows] == [7, 7]
+    assert [row[1] for row in rows] == [quoted_onnx, "shared.onnx"]
     assert [row[2] for row in rows] == ["violated.vnnlib", "holds.vnnlib"]
 
 
@@ -2208,7 +3158,7 @@ def external_missing_input_fails_without_emitting_unarchived_csv_row(
 def external_configs_dir_is_passed_and_content_addressed(tmp_path: Path) -> None:
     repo = _fixture_repo(tmp_path)
     configs = tmp_path / "experiment-configs"
-    preset_dir = configs / "vnncomp2025"
+    preset_dir = configs / "vnncomp26"
     preset_dir.mkdir(parents=True)
     preset = preset_dir / "demo.yaml"
     preset.write_text("verifier:\n  timeout: 2\n", encoding="utf-8")
@@ -2223,6 +3173,7 @@ def external_configs_dir_is_passed_and_content_addressed(tmp_path: Path) -> None
             repo,
             tmp_path,
             NY_MEASURE_CONFIGS_DIR=str(configs),
+            NY_MEASURE_CATS="absent demo",
             NY_MEASURE_MAX_ROWS_PER_CATEGORY="1",
             NY_MEASURE_OUTPUT_DIR=str(isolated),
             NY_MEASURE_RUN_ID=run_id,
@@ -2235,22 +3186,20 @@ def external_configs_dir_is_passed_and_content_addressed(tmp_path: Path) -> None
 
     start_path = isolated / f"artifacts/runs/{run_id}/start.json"
     start = json.loads(start_path.read_text(encoding="utf-8"))
+    assert "SKIP absent (no instances.csv)" in result.stdout
+    assert start["measurement"]["categories"] == ["demo"]
+    assert start["measurement"]["categories_raw"] == "demo"
     config_inputs = start["measurement"]["config_inputs"]
-    assert start["environment"]["values"]["NY_MEASURE_CONFIGS_DIR"] == str(configs)
-    assert config_inputs["declared_path"] == str(configs)
-    assert config_inputs["resolved_path"] == str(configs.resolve())
-    assert config_inputs["entry_count"] == 3
+    assert start["environment"]["values"]["NY_MEASURE_CONFIGS_DIR"] == str(
+        preset_dir
+    )
+    assert config_inputs["declared_path"] == str(preset_dir)
+    assert config_inputs["resolved_path"] == str(preset_dir.resolve())
+    assert config_inputs["entry_count"] == 1
     assert config_inputs["entries"] == [
         {
             "kind": "file",
-            "path": "README.txt",
-            "sha256": hashlib.sha256(b"experiment A\n").hexdigest(),
-            "size_bytes": len(b"experiment A\n"),
-        },
-        {"kind": "directory", "path": "vnncomp2025"},
-        {
-            "kind": "file",
-            "path": "vnncomp2025/demo.yaml",
+            "path": "demo.yaml",
             "sha256": hashlib.sha256(preset.read_bytes()).hexdigest(),
             "size_bytes": len(preset.read_bytes()),
         },
@@ -2267,6 +3216,7 @@ def external_configs_dir_is_passed_and_content_addressed(tmp_path: Path) -> None
         == hashlib.sha256(expected_manifest_bytes).hexdigest()
     )
     sealed_configs = start["measurement"]["sealed_config_inputs"]
+    assert Path(sealed_configs["resolved_path"]).name == "vnncomp26"
     assert start["measurement"]["solver_command_template"][-2:] == [
         "--configs-dir",
         sealed_configs["resolved_path"],
@@ -2288,6 +3238,143 @@ def external_configs_dir_is_passed_and_content_addressed(tmp_path: Path) -> None
         isolated / "artifacts" / metadata["solver_log"]["artifact"]
     ).read_text(encoding="utf-8")
     assert f" <--configs-dir> <{sealed_configs['resolved_path']}>" in solver_log
+    assert "solver preset:verifier:\n  timeout: 2" in solver_log
+
+
+@pytest.mark.parametrize("corpus", ("2025", "2026"))
+def external_configs_parent_is_pinned_to_selected_corpus_year(
+    tmp_path: Path,
+    corpus: str,
+) -> None:
+    repo = _fixture_repo(tmp_path)
+    if corpus == "2025":
+        shutil.copytree(
+            repo / "benchmarks/vnncomp2026",
+            repo / "benchmarks/vnncomp2025",
+        )
+    benchmark_root = repo / f"benchmarks/vnncomp{corpus}/benchmarks"
+    configs = tmp_path / "multi-year-configs"
+    for suffix in ("25", "26"):
+        year_dir = configs / f"vnncomp{suffix}"
+        year_dir.mkdir(parents=True)
+        (year_dir / "demo.yaml").write_text(
+            f"fixture_year: 20{suffix}\n", encoding="utf-8"
+        )
+    selected = configs / f"vnncomp{corpus[-2:]}"
+    other = configs / ("vnncomp26" if corpus == "2025" else "vnncomp25")
+    isolated = repo / f"reports/config-year-{corpus}"
+    run_id = f"20260718T161000Z-config-year-{corpus}"
+
+    result = subprocess.run(
+        ["bash", "scripts/measure_ny_scorecard.sh"],
+        cwd=repo,
+        env=_measurement_environment(
+            repo,
+            tmp_path,
+            NY_BROOT=str(benchmark_root),
+            NY_MEASURE_CONFIGS_DIR=str(configs),
+            NY_MEASURE_MAX_ROWS_PER_CATEGORY="1",
+            NY_MEASURE_OUTPUT_DIR=str(isolated),
+            NY_MEASURE_RUN_ID=run_id,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+    start = json.loads(
+        (isolated / f"artifacts/runs/{run_id}/start.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert start["environment"]["values"]["NY_MEASURE_CONFIGS_DIR"] == str(
+        selected.resolve()
+    )
+    config_inputs = start["measurement"]["config_inputs"]
+    assert config_inputs["declared_path"] == str(selected.resolve())
+    assert config_inputs["resolved_path"] == str(selected.resolve())
+    assert config_inputs["entries"] == [
+        {
+            "kind": "file",
+            "path": "demo.yaml",
+            "sha256": hashlib.sha256(
+                (selected / "demo.yaml").read_bytes()
+            ).hexdigest(),
+            "size_bytes": len((selected / "demo.yaml").read_bytes()),
+        }
+    ]
+    assert str(other.resolve()) not in json.dumps(start, sort_keys=True)
+    sealed_configs = start["measurement"]["sealed_config_inputs"]
+    assert Path(sealed_configs["resolved_path"]).name == f"vnncomp{corpus[-2:]}"
+    metadata_path = next((isolated / "artifacts/demo").glob(f"*/{run_id}.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    solver_log = (
+        isolated / "artifacts" / metadata["solver_log"]["artifact"]
+    ).read_text(encoding="utf-8")
+    assert f" <--configs-dir> <{sealed_configs['resolved_path']}>" in solver_log
+    assert f"solver preset:fixture_year: {corpus}" in solver_log
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    (
+        ("mismatched", "benchmark corpus requires vnncomp26, not vnncomp25"),
+        ("missing", "config parent has no exact vnncomp26 directory"),
+        (
+            "symlinked",
+            "exact vnncomp26 config directory resolves to vnncomp25",
+        ),
+        (
+            "unknown",
+            "unknown benchmark corpus requires an explicitly scoped vnncompYY",
+        ),
+    ),
+)
+def external_configs_year_selection_fails_closed_before_start(
+    tmp_path: Path,
+    case: str,
+    expected_error: str,
+) -> None:
+    repo = _fixture_repo(tmp_path)
+    configs = tmp_path / f"{case}-configs"
+    (configs / "vnncomp25").mkdir(parents=True)
+    (configs / "vnncomp25/demo.yaml").write_text(
+        "fixture_year: 2025\n", encoding="utf-8"
+    )
+    benchmark_root = repo / "benchmarks/vnncomp2026/benchmarks"
+    selected_configs = configs
+    if case == "mismatched":
+        selected_configs = configs / "vnncomp25"
+    elif case == "symlinked":
+        (configs / "vnncomp26").symlink_to(
+            configs / "vnncomp25", target_is_directory=True
+        )
+    elif case == "unknown":
+        research_root = tmp_path / "research-corpus/benchmarks"
+        shutil.copytree(benchmark_root, research_root)
+        benchmark_root = research_root
+    isolated = repo / f"reports/rejected-config-year-{case}"
+
+    result = subprocess.run(
+        ["bash", "scripts/measure_ny_scorecard.sh"],
+        cwd=repo,
+        env=_measurement_environment(
+            repo,
+            tmp_path,
+            NY_BROOT=str(benchmark_root),
+            NY_MEASURE_CONFIGS_DIR=str(selected_configs),
+            NY_MEASURE_OUTPUT_DIR=str(isolated),
+            NY_MEASURE_RUN_ID=f"20260718T162000Z-config-year-{case}",
+        ),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 2
+    assert expected_error in result.stderr
+    assert not isolated.exists()
 
 
 def external_configs_dir_rejects_relative_or_missing_path(tmp_path: Path) -> None:

@@ -331,6 +331,7 @@ fn test_deferred_disjunctive_rebound_alpha_gate_off_is_bit_identical_f8() {
             &config,
             None,
             0,
+            None,
         )
         .expect("gate-off disjunctive deferred rebound should succeed");
 
@@ -462,6 +463,7 @@ fn test_deferred_disjunctive_rebound_warm_candidate_and_fixed_reference_soundnes
         &warm_config(0),
         None,
         0,
+        None,
     )
     .expect("frozen disjunctive deferred rebound should succeed");
 
@@ -487,6 +489,7 @@ fn test_deferred_disjunctive_rebound_warm_candidate_and_fixed_reference_soundnes
         &warm_config,
         None,
         0,
+        None,
     )
     .expect("warm disjunctive deferred rebound should succeed");
 
@@ -670,6 +673,7 @@ fn test_deferred_disjunctive_parallel_warm_refine_matches_serial_and_is_sound() 
             config,
             None,
             0,
+            None,
         )
     };
 

@@ -2306,9 +2306,14 @@ mod tests {
             100.0,
             "a floor below the fraction slice cannot shrink it"
         );
+        // Compared against `None`, not against a typed 2.5: the slice is a
+        // `Duration::mul_f32`, and 25s * 0.10f32 is 2.500000037s — the decimal
+        // this reads as is not a value this path can produce. Stating inertness
+        // as "same answer as no floor at all" is what the claim actually is,
+        // and it cannot drift with the f32 representation.
         assert_eq!(
             planned_disjunctive_pgd_slice_secs(25, 0.10, None, Some(0), false),
-            2.5,
+            planned_disjunctive_pgd_slice_secs(25, 0.10, None, None, false),
             "an explicit zero floor is inert"
         );
     }

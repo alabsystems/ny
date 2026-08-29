@@ -55,6 +55,9 @@ fn tile_l() -> Layer {
 fn expand_like_l() -> Layer {
     Layer::ExpandLikeLastAxis(ExpandLikeLastAxisLayer::new())
 }
+fn epsilon_expand_l() -> Layer {
+    Layer::EpsilonExpand(EpsilonExpandLayer::uniform(0.5).expect("test: valid epsilon"))
+}
 fn reduce_sum() -> Layer {
     Layer::ReduceSum(ReduceSumLayer::new(vec![-1], true))
 }
@@ -382,6 +385,30 @@ fn test_supports_batched_crown_includes_expected_layers() {
     )
     .unwrap();
     assert_layer_supports_batched_crown(Layer::BatchNorm(bn), true);
+    // EpsilonExpand: identity coefficients + outward bias widening
+    assert_layer_supports_batched_crown(epsilon_expand_l(), true);
+}
+
+// -- EpsilonExpand classification --
+
+#[test]
+fn test_epsilon_expand_classifies_as_plain_unary() {
+    use crate::layers::common::BoundPropagation;
+
+    let layer = epsilon_expand_l();
+    assert_eq!(layer.layer_type(), "EpsilonExpand");
+    assert!(!layer.is_binary());
+    assert!(!layer.is_ternary());
+    assert_eq!(layer.min_inputs(), 1);
+    // Not an elementwise activation (no relaxation surface), and its CROWN
+    // backward is bounds-free — it must not demand pre-activation tightening.
+    assert!(!layer.is_elementwise_activation());
+    assert!(!layer.requires_pre_activation_bounds());
+    assert!(layer.required_input_bound_indices().is_empty());
+    // It rebuilds LinearBounds without the certified coefficient-error
+    // matrices, so it must NOT claim to carry them (fail closed to IBP).
+    assert!(!layer.propagates_coeff_err());
+    assert!(!layer.is_exact_linear_coeff_err_carrier());
 }
 
 #[test]

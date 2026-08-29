@@ -2,7 +2,7 @@ cora_2024,./onnx/mnist-point.onnx,vnnlib/mnist-img0.vnnlib,prepared,sat,0.52,l1a
 cora_2024,./onnx/mnist-trades.onnx,vnnlib/mnist-img0.vnnlib,prepared,sat,0.53,l1audit-20260804-d1282d23
 cora_2024,./onnx/mnist-set.onnx,vnnlib/mnist-img0.vnnlib,prepared,unsat,7.66,l1audit-20260804-d1282d23
 cora_2024,./onnx/mnist-point.onnx,vnnlib/mnist-img1.vnnlib,prepared,sat,0.47,l1audit-20260804-d1282d23
-cora_2024,./onnx/mnist-trades.onnx,vnnlib/mnist-img1.vnnlib,prepared,timeout,105.09
+cora_2024,./onnx/mnist-trades.onnx,vnnlib/mnist-img1.vnnlib,prepared,timeout,28,rebank-20260824-deadprobe-6510094b-true-30s-budget
 cora_2024,./onnx/mnist-set.onnx,vnnlib/mnist-img1.vnnlib,prepared,unsat,6.22,l1audit-20260804-d1282d23
 cora_2024,./onnx/mnist-point.onnx,vnnlib/mnist-img2.vnnlib,prepared,sat,0.54,l1audit-20260804-d1282d23
 cora_2024,./onnx/mnist-trades.onnx,vnnlib/mnist-img2.vnnlib,prepared,timeout,105.09
@@ -171,7 +171,7 @@ cora_2024,./onnx/cifar10-trades.onnx,vnnlib/cifar10-img386.vnnlib,prepared,sat,0
 cora_2024,./onnx/cifar10-set.onnx,vnnlib/cifar10-img386.vnnlib,prepared,sat,0.62,l1audit-20260804-d1282d23
 cora_2024,./onnx/cifar10-point.onnx,vnnlib/cifar10-img398.vnnlib,prepared,sat,0.62,l1audit-20260804-d1282d23
 cora_2024,./onnx/cifar10-trades.onnx,vnnlib/cifar10-img398.vnnlib,prepared,timeout,84.62
-cora_2024,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,prepared,timeout,27.91,mergewave-ab-20260806-5fbaed4c
+cora_2024,./onnx/cifar10-set.onnx,vnnlib/cifar10-img398.vnnlib,prepared,unsat,6.5,session-20260820-tail-3perarm
 cora_2024,./onnx/cifar10-point.onnx,vnnlib/cifar10-img440.vnnlib,0,sat,0.61,l1audit-20260804-d1282d23
 cora_2024,./onnx/cifar10-trades.onnx,vnnlib/cifar10-img440.vnnlib,prepared,sat,0.55,l1audit-20260804-d1282d23
 cora_2024,./onnx/cifar10-set.onnx,vnnlib/cifar10-img440.vnnlib,prepared,timeout,84.61

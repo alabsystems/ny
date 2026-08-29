@@ -81,6 +81,27 @@ impl DenseBiasAdmission {
     }
 }
 
+/// Unforgeable proof that ONE node is the sole remaining carrier of every
+/// output row's dependence on the network input.
+///
+/// #gpu-suffix-frontier (soundness). The DAG alpha-CROWN backward walk may only
+/// be TRUNCATED — a concretized suffix result returned as the final output
+/// bound — when no other branch still holds a pending relation. Truncating with
+/// a non-empty frontier silently assigns ZERO coefficients and ZERO bias to
+/// every output row that reaches the input through an abandoned branch. Those
+/// rows concretize to +/-(floating-point residue) and are published as a tiny
+/// symmetric CERTIFIED interval: a false proof (see the regression test
+/// `gpu_suffix_shortcut_refuses_with_a_pending_sibling_branch`).
+///
+/// The inner field is private to this module, so this token CANNOT be
+/// constructed anywhere else in the workspace. Any present or future shortcut
+/// that ends the walk early must obtain it from
+/// [`CrownMergeAccumulator::sole_carrier_witness`], which issues it only when
+/// the frontier is provably empty. This is the compiler-enforced replacement
+/// for "remember to check the frontier".
+#[derive(Debug)]
+pub(crate) struct SoleCarrierWitness(());
+
 /// Keeps single-parent nodes in their original carrier while merge points
 /// accumulate dense bounds in f64 until the node is consumed.
 ///
@@ -167,6 +188,21 @@ impl CrownMergeAccumulator {
             }
         }
         self.pending.contains_key(key) || self.merged_dense.contains_key(key)
+    }
+
+    /// Issue a [`SoleCarrierWitness`] iff truncating the walk here is sound.
+    ///
+    /// The caller must have ALREADY taken the current node's own entry (the
+    /// walk does this via `take_by_idx_with_deadline`), so an empty accumulator
+    /// means no sibling branch is still pending. `input_accumulated` covers the
+    /// other half: coefficients that already reached NETWORK_INPUT directly are
+    /// held outside this accumulator, and a truncating shortcut would drop them
+    /// too.
+    pub(crate) fn sole_carrier_witness(
+        &self,
+        input_accumulated: bool,
+    ) -> Option<SoleCarrierWitness> {
+        (self.is_empty() && !input_accumulated).then_some(SoleCarrierWitness(()))
     }
 
     pub(crate) fn is_empty(&self) -> bool {

@@ -13,7 +13,7 @@ use crate::bounds::LinearBounds;
 use crate::NETWORK_INPUT;
 
 use super::helpers::preserve_structured_error;
-use super::types::{BackwardDispatchResult, DispatchContext};
+use super::types::{BackwardDispatchResult, DispatchContext, NaryInputBounds};
 
 /// Concat dispatch: N-ary split with separate bias channel (#2617).
 ///
@@ -130,7 +130,11 @@ pub(super) fn dispatch_concat(
         })
         .collect();
     Ok(BackwardDispatchResult::Nary {
-        bounds,
+        // ONNX-ordered: `bounds[i]` is ONNX input i, `None` at every embedded
+        // constant whose `W_i · c_i` was just folded into the bias above. The
+        // newtype is what stops a consumer pairing this against the
+        // dynamic-only `node.inputs` positionally (#nary-zip).
+        bounds: NaryInputBounds::from_onnx_order(bounds),
         bias_lower,
         bias_upper,
     })

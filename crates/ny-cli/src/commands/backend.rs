@@ -574,7 +574,7 @@ pub(crate) struct HonouredBackend {
 /// `preset::backend_capability_tests` walk every shipped preset's declared
 /// `general.device` through this function and fails unless the declaration is
 /// either honoured or covered by a dated waiver in
-/// `configs/backend_capability_waivers.toml`.
+/// `configs/backend_capability_waivers.yaml`.
 #[cfg(test)]
 pub(crate) const fn honour_requested_backend(requested: BackendArg) -> HonouredBackend {
     match requested {

@@ -627,7 +627,7 @@ impl BetaCrownVerifier {
         // verdict. Also emits the root failing-objective set (which of the N disjuncts is
         // still unverified at the root, worst-first) so an A/B can see which constraint BaB
         // must close and whether the queue is shrinking or exploding.
-        let prof = std::env::var("NY_ACASXU_PROF").is_ok();
+        let prof = ny_levers::read_raw(&ny_levers::decls::bab_diagnostics::ACASXU_PROF).is_some();
         if prof {
             let n = root_domain.objective_bounds.len();
             let mut failing: Vec<(usize, f32)> = root_domain
@@ -730,8 +730,32 @@ impl BetaCrownVerifier {
         loop {
             lifecycle.cuts_generated = cut_pool.total_generated;
             if prof && last_tick.elapsed().as_secs_f64() >= 2.0 {
+                // frontier = the queue's best-priority domain (the one
+                // closest to closing): its bounds are what an A/B must
+                // compare, not sampled lineage traces.
+                let (frontier_lower, frontier_depth, frontier_rows) = queue
+                    .peek()
+                    .map(|d| {
+                        // Per-objective frontier readout: the scalar min can
+                        // hide rows that are nearly (or already) closed; the
+                        // per-row lowers tell which objectives still bind.
+                        let rows: Vec<String> = d
+                            .objective_bounds
+                            .iter()
+                            .zip(d.verified.iter())
+                            .map(|(&(l, _), &v)| {
+                                if v {
+                                    "OK".to_string()
+                                } else {
+                                    format!("{l:.2}")
+                                }
+                            })
+                            .collect();
+                        (d.lower_bound(), d.depth, rows.join(","))
+                    })
+                    .unwrap_or((f32::NAN, 0, String::new()));
                 eprintln!(
-                    "[NY_ACASXU_PROF] tick: batch={batch_index} explored={} verified={} queue={} max_depth={} elapsed={:.1}s",
+                    "[NY_ACASXU_PROF] tick: batch={batch_index} explored={} verified={} queue={} max_depth={} elapsed={:.1}s frontier_lower={frontier_lower:.4} frontier_depth={frontier_depth} rows=[{frontier_rows}]",
                     lifecycle.domains_explored,
                     lifecycle.domains_verified,
                     queue.len(),

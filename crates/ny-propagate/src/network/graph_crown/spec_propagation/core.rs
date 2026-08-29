@@ -518,11 +518,7 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
                     // tightness per evaluation, sampled so a deep BaB run stays
                     // readable — first 20 calls, then every 500th. Answers
                     // "how close does the per-domain C-margin get with depth".
-                    if std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_PROBE")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                    {
+                    if crate::preset_gates::root_joint_interm_alpha_probe_enabled() {
                         use std::sync::atomic::{AtomicUsize, Ordering};
                         static CMARGIN_CALLS: AtomicUsize = AtomicUsize::new(0);
                         let n = CMARGIN_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -799,7 +795,14 @@ pub(crate) fn propagate_crown_with_specs_and_engine_with_linear_and_reference_bo
             return ibp_fallback(CrownIbpFallbackReason::DeadlineExceeded);
         }
 
-        if crown_backward_layers.is_some_and(|max_layers| backward_steps >= max_layers) {
+        // `crown_backward_layers` exists to escape the Conv2d backward cost; on a
+        // conv-free graph it only loosens the bound. See `crate::crown_backward_cap`.
+        let effective_backward_layers = crate::crown_backward_cap::effective_backward_cap(
+            crown_backward_layers,
+            graph.has_conv_layers(),
+            "Spec-guided CROWN",
+        );
+        if effective_backward_layers.is_some_and(|max_layers| backward_steps >= max_layers) {
             info!(
                 "Spec-guided CROWN: truncating backward after {} nodes at frontier '{}'",
                 backward_steps, node_name

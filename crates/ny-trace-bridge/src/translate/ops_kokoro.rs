@@ -37,7 +37,7 @@ use crate::schema::{KokoroFusedOp, ResBlockActivation, TraceNode, TraceOp, Weigh
 
 use super::{
     checked_f64_to_f32, dim_as_i64, first_input, insert_payload, insert_scalar_constant, op_name,
-    simple_spec, weight_f32, Ctx, NodeOutput,
+    simple_spec, validate_eps, weight_f32, Ctx, NodeOutput,
 };
 
 /// Translate a `KokoroFused` op (kinds `SnakeTensor`, `AdainSnake`,
@@ -290,12 +290,14 @@ fn translate_ada_layer_norm(
     let gamma_input = input_tensors[1].clone();
     let beta_input = input_tensors[2].clone();
 
-    let eps_f32 = checked_f64_to_f32(eps, "AdaLayerNorm eps")?;
-    if eps_f32 < 0.0 {
-        return Err(NyError::UnsupportedOp(format!(
-            "AdaLayerNorm eps must be non-negative, got {eps}"
-        )));
-    }
+    // AdaLayerNorm lowers to a native `LayerType::LayerNorm`, whose variance
+    // is DATA-dependent — so it takes the shared data-variance gate, not the
+    // historic `eps >= 0` rule. That rule accepted the `eps == 0` nn's own
+    // `validate_eps` permits, and then handed it to `LayerNormLayer::new`,
+    // which refuses anything below `NORMALIZATION_MIN_EPS`: a refusal
+    // deferred out of translation into graph construction. See
+    // `translate::validate_eps` for the full three-gate reconciliation.
+    let eps_f32 = validate_eps(eps, "AdaLayerNorm")?;
 
     let weight_name = format!("{name}_norm_weight");
     let bias_name = format!("{name}_norm_bias");
@@ -383,12 +385,10 @@ fn translate_fused_adain_resblock(
     let x_input = input_tensors[0].clone();
     let style_input = input_tensors[1].clone();
 
-    let eps_f32 = checked_f64_to_f32(eps, "FusedAdainResBlock eps")?;
-    if eps_f32 < 0.0 {
-        return Err(NyError::UnsupportedOp(format!(
-            "FusedAdainResBlock eps must be non-negative, got {eps}"
-        )));
-    }
+    // The fused resblock's eps rides into AdaIN / InstanceNorm layers whose
+    // variance is DATA-dependent: same gate as every other member of that
+    // family (see `translate::validate_eps`).
+    let eps_f32 = validate_eps(eps, "FusedAdainResBlock")?;
 
     // Traced Kokoro resblock tensors are [B, C, T].
     if output_shape.len() < 3 {
@@ -540,16 +540,19 @@ fn infer_num_channels(output_shape: &[usize], context: &str) -> Result<usize> {
     }
 }
 
-/// Validate that eps casts to a finite, non-negative f32 (AdaIN convention:
-/// NN's Adain ops accept eps == 0).
+/// Epsilon gate for the AdaIN family.
+///
+/// This used to be the family's own `eps >= 0` rule, justified by "NN's Adain
+/// ops accept eps == 0". nn does accept it — but AdaIN normalizes by a
+/// DATA-dependent variance (`AdaIN1dLayer` delegates to
+/// `InstanceNorm1dLayer::new(.., eps)`, which divides by `sqrt(var + eps)`),
+/// so `eps == 0` makes the represented function `0/0` on any box containing a
+/// constant vector, and ny-propagate refuses anything below
+/// `NORMALIZATION_MIN_EPS`. Accepting it here only moved the refusal out of
+/// translation and into graph construction. Delegates to the single shared
+/// data-variance gate; see `translate::validate_eps`.
 fn validate_adain_eps(eps: f64, op: &str) -> Result<f32> {
-    let eps_f32 = eps as f32;
-    if !eps_f32.is_finite() || eps_f32 < 0.0 {
-        return Err(NyError::NumericalInstability(format!(
-            "{op}: eps must be finite and non-negative, got {eps}"
-        )));
-    }
-    Ok(eps_f32)
+    validate_eps(eps, op)
 }
 
 /// Validate Snake alpha: finite (via [`weight_f32`]) and non-zero (the Snake

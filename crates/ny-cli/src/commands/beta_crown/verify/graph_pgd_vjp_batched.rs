@@ -19,7 +19,7 @@
 //!
 //! DEFAULT ON when the wide plan builds for the graph shape (pure conv/linear
 //! ReLU chain) and a GPU CROWN engine is present; kill switch
-//! `NY_PGD_VJP_BATCH=0`. Restart width: `NY_PGD_VJP_K` (default 32, aiming
+//! `NY_PGD_VJP_BATCH=0`. Restart width: `NY_PGD_VJP_K` (default 64, aiming
 //! 32–64 parallel deep restarts).
 //!
 //! ATTACK-ONLY: gradients steer PGD; every counterexample candidate still flows
@@ -40,6 +40,9 @@ use super::graph_pgd::{
     add_gama_guidance_to_spec_row, constraint_target, emit_graph_pgd_status, gama_lambda_init,
     gama_reference_softmax, joint_hinge_loss, reset_gama_lane, GraphPgdTarget,
 };
+use super::graph_pgd_exact_vjp_evidence::{
+    ExactVjpExecution, ExactVjpInactiveReason as Inactive, ExactVjpOutcome as EvidenceOutcome,
+};
 use super::graph_pgd_init::{
     initialize_graph_point, revalidate_graph_counterexample, sample_uniform_point, SimpleRng,
 };
@@ -54,22 +57,13 @@ pub(super) enum VjpBatchedOutcome {
     FallbackToSequential,
 }
 
-/// Parallel restart width; override with `NY_PGD_VJP_K` for A/B throughput
-/// probes. Default 64: the wide GPU pass is ~72ms fixed + ~2ms/restart on the
+/// Parallel restart width. Default 64: the wide GPU pass is ~72ms fixed + ~2ms/restart on the
 /// soundnessbench conv chain (measured K=8/16/32/64/128 → 88/108/136/194/318
 /// ms/step), so K=64 costs 3.0ms per restart-step vs 4.3ms at K=32 — 40% more
 /// restart-steps per slice, and twice the ODI basin directions per wave. Needs
 /// the big-bindings device limits (default ON); if the wide pass fails on this
 /// adapter the wave HALVES its width and retries (never the sequential cliff).
-fn vjp_batch_width() -> usize {
-    std::env::var("NY_PGD_VJP_K")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(64)
-}
-
-/// #legacy-lanes (`NY_PGD_LEGACY_LANES`, default 20, 0 disables): in the FIRST
+/// #legacy-lanes (`NY_PGD_LEGACY_LANES`, default 0): in the FIRST
 /// wave, this many trailing lanes are UNIFORM-init "legacy" lanes that REPLAY
 /// the pre-ODI wave's restart seeds (42, 43, …) instead of taking fresh ODI
 /// seeds — so counterexamples that the old uniform wave reached deterministically
@@ -88,13 +82,6 @@ fn vjp_batch_width() -> usize {
 /// the pure-ODI K=64 wave. No configuration keeps both: the legacy replay
 /// needs >=657 steps (=> K<=54 in the 121s slice) while 6/8/30 need the full
 /// 64-direction ODI fan. Kept as an opt-in probe lever.
-fn legacy_lanes() -> usize {
-    std::env::var("NY_PGD_LEGACY_LANES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0)
-}
-
 /// #odi steps: Output Diversified Initialization (Tashiro et al., CVPR 2020).
 /// DEFAULT ON (`NY_PGD_ODI_STEPS=0` disables): before the joint-margin ascent,
 /// each restart lane takes this many signed-gradient steps maximizing `<w_k,
@@ -104,35 +91,12 @@ fn legacy_lanes() -> usize {
 /// with uniform init were measured NEGATIVE). Costs `odi_steps` extra batched
 /// VJP passes per wave (~1s for 8 steps at K=32) out of a ~121s slice.
 /// ATTACK-ONLY: it only moves PGD start points inside the input box.
-fn odi_steps() -> usize {
-    std::env::var("NY_PGD_ODI_STEPS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(8)
-}
-
 /// #odi step size, in units of the per-coordinate half-range `(hi-lo)/2`.
 /// The reference ODI uses the full attack radius (`eta = eps`), i.e. 1.0.
-fn odi_eta() -> f32 {
-    std::env::var("NY_PGD_ODI_ETA")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .unwrap_or(1.0)
-}
-
 /// #odi wave-steps override (`NY_PGD_VJP_STEPS`): cap the joint-margin steps per
 /// wave so MORE waves (more ODI directions) fit the slice — the many-short-
 /// restarts schedule. Unset ⇒ the preset `pgd_steps` (deep waves) is kept.
-fn vjp_wave_steps(config_steps: usize) -> usize {
-    std::env::var("NY_PGD_VJP_STEPS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(config_steps)
-}
-
-/// #lane-recycle window (`NY_PGD_LANE_WINDOW`, 0 disables, default 100 steps):
+/// #lane-recycle window (`NY_PGD_LANE_WINDOW`, default 0; positive enables):
 /// every window, a lane whose joint-margin gap-closing RATE cannot reach 0 by
 /// the remaining budget (`progress_over_window < gap × window / remaining`) is
 /// parked at a wrong-basin local max — resample it (fresh uniform point + fresh
@@ -143,16 +107,6 @@ fn vjp_wave_steps(config_steps: usize) -> usize {
 /// climb). Adaptive many-short-restarts basin coverage without truncating
 /// productive lanes — a plain no-improvement patience never fires here because
 /// Adam keeps making sub-1e-7 micro-improvements at a parked local max.
-fn lane_recycle_window() -> usize {
-    std::env::var("NY_PGD_LANE_WINDOW")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        // Default OFF: measured on soundnessbench model_29, rate-recycling
-        // perturbed the productive lanes (best joint -5e-6 → -1.1e-4) without
-        // flipping anything model 8/29/37. Opt-in probe lever.
-        .unwrap_or(0)
-}
-
 /// Minimum steps a recycled lane needs to be worth starting (ODI + climb).
 const LANE_RECYCLE_MIN_REMAINING: usize = 250;
 
@@ -163,15 +117,12 @@ const LANE_RECYCLE_MIN_REMAINING: usize = 250;
 /// clones of the global best point (uniform noise, scales 1e-3..1e-5 of the
 /// half-range — the measured scale of the near-boundary margin oscillation)
 /// with fresh optimizer state. Breaks the deterministic Adam limit cycle that
-/// parks lanes with 2-3 conjuncts oscillating around 0 (measured flip:
-/// soundnessbench model_37, crossing within 17 steps of an endgame respawn).
+/// parks lanes with 2-3 conjuncts oscillating around 0. The measured internal
+/// crossings were on soundnessbench models 8 and 35; model 37 remained timeout.
 /// ENDGAME-ONLY because deep-basin climber lanes look BAD mid-flight: firing
 /// from step ~300 recycled the very lane that reaches -2e-5 by step 600 on
 /// model_6 (wave stalled at -7e-5 instead — flip lost). By the endgame the
 /// climbers are at the top of the ranking and protected. Attack-only.
-fn exploit_enabled() -> bool {
-    std::env::var("NY_PGD_EXPLOIT").ok().as_deref() != Some("0")
-}
 const EXPLOIT_INTERVAL: usize = 50;
 const EXPLOIT_GAP: f32 = 1e-3;
 // 150/quarter measured best: 200/half respawned the model_6 climber lane at the
@@ -179,7 +130,7 @@ const EXPLOIT_GAP: f32 = 1e-3;
 const EXPLOIT_ENDGAME_STEPS: usize = 150;
 const EXPLOIT_SCALES: [f32; 5] = [1e-3, 3e-4, 1e-4, 3e-5, 1e-5];
 
-/// #tau-hinge (`NY_PGD_HINGE_TAU`, default 1e-3, 0 disables): loss ensemble
+/// #tau-hinge (`NY_PGD_HINGE_TAU`, default 0; positive enables): loss ensemble
 /// across lanes. ODD lanes ascend the tau-hinge `Σ_c min(margin_c, τ)` — every
 /// conjunct with margin < τ stays in the gradient, so barely-positive margins
 /// are HELD while the negatives climb. The plain hinge drops a conjunct from
@@ -188,17 +139,6 @@ const EXPLOIT_SCALES: [f32; 5] = [1e-3, 3e-4, 1e-4, 3e-5, 1e-5];
 /// THREE conjuncts oscillating in ±1.5e-4 around 0 forever. EVEN lanes keep
 /// the plain hinge (interior-seeking can lose razor-thin CE regions whose
 /// tau-interior is empty). Attack-only: the CE screen stays the raw margins.
-fn hinge_tau() -> f32 {
-    std::env::var("NY_PGD_HINGE_TAU")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        // Default OFF: measured on soundnessbench models 8/29, the τ ensemble
-        // did not break the boundary jam and cost plain-hinge lanes (model_8
-        // best -8e-5 → -1.3e-4; model_29 confounded regression). Opt-in lever.
-        .unwrap_or(0.0)
-}
-
 /// Batched exact-VJP joint-margin attack. See the module docs. Returns
 /// `FallbackToSequential` (never `Err`) on any capability miss so the caller's
 /// sequential exact-gradient loop stays the proven fallback.
@@ -212,21 +152,26 @@ pub(super) fn try_graph_pgd_vjp_batched(
 ) -> Result<VjpBatchedOutcome> {
     use VjpBatchedOutcome::{Completed, FallbackToSequential};
 
+    let evidence = ExactVjpExecution::conjunctive(
+        pgd_config.exact_vjp,
+        pgd_config.num_restarts.max(1),
+        pgd_config.num_steps,
+    );
     // A deferred/zero slice must not pay the potentially large exact-VJP plan
     // construction cost before discovering that no attack time exists.
     if exact_vjp_slice_expired(pgd_config.deadline, Instant::now()) {
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::DeadlineBeforeStart);
         return Ok(Completed(None));
     }
-    if std::env::var("NY_PGD_VJP_BATCH").ok().as_deref() == Some("0") {
-        return Ok(FallbackToSequential);
-    }
     let Some(gpu) = gemm_engine.and_then(|e| e.as_gpu_crown_backward()) else {
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::GpuUnavailable);
         return Ok(FallbackToSequential);
     };
     let constraints = &vnnlib.output_constraints;
     let conjunct_targets: Vec<GraphPgdTarget> =
         constraints.iter().filter_map(constraint_target).collect();
     if conjunct_targets.is_empty() {
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::EmptyObjective);
         return Ok(FallbackToSequential);
     }
     let gama_lambda0 = gama_lambda_init(pgd_config);
@@ -235,14 +180,27 @@ pub(super) fn try_graph_pgd_vjp_batched(
     // graph is outside both the pure-chain AND the chain+residual resnet
     // fragments (#batched-vjp-resnet) → sequential loop.
     let Some(plan) = PointVjpWavePlan::build(graph, input) else {
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::UnsupportedPlan);
         return Ok(FallbackToSequential);
     };
+    // A disabled driver is engagement evidence only after every deterministic
+    // counterfactual prerequisite succeeds. Recheck the clock because plan
+    // construction can consume the remaining slice; the disabled route still
+    // performs no attack forward or GPU VJP work.
+    if exact_vjp_slice_expired(pgd_config.deadline, Instant::now()) {
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::DeadlineBeforeStart);
+        return Ok(Completed(None));
+    }
+    if !pgd_config.exact_vjp.batch_enabled {
+        evidence.finish(EvidenceOutcome::BatchDisabled, Inactive::BatchDisabled);
+        return Ok(FallbackToSequential);
+    }
 
     let diag = std::env::var("NY_PGD_DIAG").ok().as_deref() == Some("1");
     let attack_start = Instant::now();
     let deadline_hit = || pgd_config.deadline.is_some_and(|d| Instant::now() >= d);
     let total_restarts = pgd_config.num_restarts.max(1);
-    let mut width = vjp_batch_width();
+    let mut width = pgd_config.exact_vjp.conjunctive_batch_width();
 
     emit_graph_pgd_status(
         json,
@@ -254,8 +212,8 @@ pub(super) fn try_graph_pgd_vjp_batched(
         ),
     );
 
-    let tau = hinge_tau();
-    let exploit = exploit_enabled();
+    let tau = pgd_config.exact_vjp.hinge_tau;
+    let exploit = pgd_config.exact_vjp.exploit;
     let mut best_joint = f32::NEG_INFINITY;
     let mut best_x: Option<ArrayD<f32>> = None;
     let mut lanes_exploited = 0usize;
@@ -264,8 +222,13 @@ pub(super) fn try_graph_pgd_vjp_batched(
     let mut steps_done = 0usize;
 
     let mut restart_base = 0usize;
+    let mut wave_started = false;
     'waves: while restart_base < total_restarts {
         if deadline_hit() {
+            if !wave_started {
+                evidence.finish(EvidenceOutcome::NotStarted, Inactive::DeadlineBeforeStart);
+                return Ok(Completed(None));
+            }
             break;
         }
         let k = width.min(total_restarts - restart_base);
@@ -277,7 +240,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
         // reachable (see `legacy_lanes`); the leading `odi_n` lanes keep the
         // fresh ODI seed sequence.
         let n_legacy = if restart_base == 0 {
-            legacy_lanes().min(k.saturating_sub(1))
+            pgd_config.exact_vjp.legacy_lanes.min(k.saturating_sub(1))
         } else {
             0
         };
@@ -301,6 +264,8 @@ pub(super) fn try_graph_pgd_vjp_batched(
                 gemm_engine,
             )?);
         }
+        evidence.start_wave(restart_base, k, n_legacy);
+        wave_started = true;
         let mut states: Vec<PgdStepState> = (0..k)
             .map(|_| {
                 PgdStepState::from_config(
@@ -319,8 +284,8 @@ pub(super) fn try_graph_pgd_vjp_batched(
         // w_k). Output-space diversity reaches basins uniform input noise misses.
         // Non-fatal on any failure: the lanes keep their uniform inits.
         // `odi_rows` stays alive: lane recycling below re-rolls a lane's row.
-        let n_odi = odi_steps();
-        let eta = odi_eta();
+        let n_odi = pgd_config.exact_vjp.odi_steps;
+        let eta = pgd_config.exact_vjp.odi_eta;
         let mut odi_rows: Vec<f32> = Vec::with_capacity(k * plan.output_dim());
         for rng in rngs.iter_mut() {
             for _ in 0..plan.output_dim() {
@@ -328,6 +293,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
             }
         }
         if n_odi > 0 {
+            let mut successful_odi_steps = 0usize;
             'odi: for odi_step in 0..n_odi {
                 if deadline_hit() {
                     if diag {
@@ -336,6 +302,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
                             attack_start.elapsed().as_secs_f64()
                         );
                     }
+                    evidence.finish(EvidenceOutcome::Deadline, Inactive::None);
                     return Ok(Completed(None));
                 }
                 let points: Vec<Vec<f32>> =
@@ -368,6 +335,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
                                 json,
                                 format_args!("  Graph PGD found counterexample at {ctx}!"),
                             );
+                            evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
                             return Ok(Completed(Some(pair)));
                         }
                     }
@@ -380,6 +348,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
                 }
                 let lower = input.lower();
                 let upper = input.upper();
+                let mut odi_moves = 0usize;
                 // Legacy lanes (kk >= odi_n) sit out the ODI phase: they keep
                 // their uniform init so their old-wave trajectory replays.
                 for kk in 0..odi_n {
@@ -388,10 +357,20 @@ pub(super) fn try_graph_pgd_vjp_batched(
                         .zip(grads[kk].iter())
                         .zip(lower.iter().zip(upper.iter()))
                     {
+                        let before = (*xi).to_bits();
                         let step = eta * 0.5 * (hi - lo) * g.signum();
                         *xi = (*xi + step).clamp(*lo, *hi);
+                        if (*xi).to_bits() != before {
+                            odi_moves = odi_moves.saturating_add(1);
+                        }
                     }
                 }
+                evidence.odi_moved(odi_moves);
+                evidence.successful_vjp(true);
+                successful_odi_steps = successful_odi_steps.saturating_add(1);
+            }
+            if successful_odi_steps == n_odi {
+                evidence.odi_completed_phase();
             }
             if diag {
                 eprintln!(
@@ -410,7 +389,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
 
         // #lane-recycle state: per-lane best joint, previous-window gap snapshot,
         // and remaining per-lane ODI steps (a recycled lane re-runs its own ODI).
-        let window = lane_recycle_window();
+        let window = pgd_config.exact_vjp.lane_window;
         let mut lane_best: Vec<f32> = vec![f32::NEG_INFINITY; k];
         let mut lane_prev_gap: Vec<f32> = vec![f32::INFINITY; k];
         let mut lane_odi_left: Vec<usize> = vec![0; k];
@@ -420,8 +399,13 @@ pub(super) fn try_graph_pgd_vjp_batched(
         // post-BaB jitter is position-sensitive — see `best_margin_export`).
         let mut lane_exploit: Vec<bool> = vec![false; k];
 
-        let wave_steps = vjp_wave_steps(pgd_config.num_steps);
+        let wave_steps = pgd_config
+            .exact_vjp
+            .effective_wave_steps(pgd_config.num_steps);
         for step in 0..wave_steps {
+            let mut recycled_this_step = 0usize;
+            let mut exploit_opportunity_this_step = false;
+            let mut exploited_this_step = 0usize;
             // #lane-recycle: every window, project each lane's gap-closing rate
             // onto the remaining budget; resample lanes that cannot reach 0 in
             // time (fresh uniform point + fresh ODI direction). The wave-best
@@ -466,6 +450,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
                             lane_exploit[kk] = false;
                             reset_gama_lane(&mut gama_p_refs[kk], &mut gama_steps[kk]);
                             lanes_recycled += 1;
+                            recycled_this_step = recycled_this_step.saturating_add(1);
                         } else {
                             lane_prev_gap[kk] = gap_now;
                         }
@@ -486,8 +471,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
                 }
                 remaining <= EXPLOIT_ENDGAME_STEPS
             };
-            if exploit
-                && step > 0
+            if step > 0
                 && step % EXPLOIT_INTERVAL == 0
                 && best_joint > -EXPLOIT_GAP
                 && best_joint < 0.0
@@ -504,22 +488,28 @@ pub(super) fn try_graph_pgd_vjp_batched(
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     let n_exploit = (k / 4).max(1).min(order.len().saturating_sub(1));
-                    let lower = input.lower();
-                    let upper = input.upper();
-                    for (i, &kk) in order.iter().take(n_exploit).enumerate() {
-                        let scale = EXPLOIT_SCALES[i % EXPLOIT_SCALES.len()];
-                        let mut x = bx.clone();
-                        for (xi, (lo, hi)) in x.iter_mut().zip(lower.iter().zip(upper.iter())) {
-                            let s = scale * 0.5 * (hi - lo);
-                            *xi = (*xi + (rngs[kk].next_f32() * 2.0 - 1.0) * s).clamp(*lo, *hi);
+                    if n_exploit > 0 {
+                        exploit_opportunity_this_step = true;
+                    }
+                    if exploit {
+                        let lower = input.lower();
+                        let upper = input.upper();
+                        for (i, &kk) in order.iter().take(n_exploit).enumerate() {
+                            let scale = EXPLOIT_SCALES[i % EXPLOIT_SCALES.len()];
+                            let mut x = bx.clone();
+                            for (xi, (lo, hi)) in x.iter_mut().zip(lower.iter().zip(upper.iter())) {
+                                let s = scale * 0.5 * (hi - lo);
+                                *xi = (*xi + (rngs[kk].next_f32() * 2.0 - 1.0) * s).clamp(*lo, *hi);
+                            }
+                            xs[kk] = x;
+                            states[kk].reset();
+                            lane_best[kk] = f32::NEG_INFINITY;
+                            lane_prev_gap[kk] = f32::INFINITY;
+                            lane_exploit[kk] = true;
+                            reset_gama_lane(&mut gama_p_refs[kk], &mut gama_steps[kk]);
+                            lanes_exploited += 1;
+                            exploited_this_step = exploited_this_step.saturating_add(1);
                         }
-                        xs[kk] = x;
-                        states[kk].reset();
-                        lane_best[kk] = f32::NEG_INFINITY;
-                        lane_prev_gap[kk] = f32::INFINITY;
-                        lane_exploit[kk] = true;
-                        reset_gama_lane(&mut gama_p_refs[kk], &mut gama_steps[kk]);
-                        lanes_exploited += 1;
                     }
                 }
             }
@@ -532,6 +522,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
                         vjp_ms / steps_done.max(1) as f64
                     );
                 }
+                evidence.finish(EvidenceOutcome::Deadline, Inactive::None);
                 return Ok(Completed(None));
             }
 
@@ -545,12 +536,17 @@ pub(super) fn try_graph_pgd_vjp_batched(
                     if diag {
                         eprintln!("[pgd-vjp] forward failed ({e}); sequential fallback");
                     }
+                    evidence.finish(
+                        EvidenceOutcome::FallbackSequential,
+                        Inactive::ForwardFailure,
+                    );
                     return Ok(FallbackToSequential);
                 }
             };
 
             // Counterexample screen + per-restart joint-margin spec rows.
             let mut spec_rows: Vec<f32> = Vec::with_capacity(k * plan.output_dim());
+            let mut hinge_extra_this_step = 0usize;
             // Diag-only: the per-conjunct margins of this step's best lane —
             // tells "one stubborn conjunct" from "several binding surfaces".
             let mut diag_best: Option<(f32, Vec<f32>)> = None;
@@ -604,6 +600,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
                             json,
                             format_args!("  Graph PGD found counterexample at {ctx}!"),
                         );
+                        evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
                         return Ok(Completed(Some(pair)));
                     }
                 }
@@ -635,10 +632,17 @@ pub(super) fn try_graph_pgd_vjp_batched(
                     if m < tau_kk {
                         row += &t.to_spec_row(plan.output_dim());
                         active += 1;
+                        if tau_kk > 0.0 && m >= 0.0 {
+                            hinge_extra_this_step = hinge_extra_this_step.saturating_add(1);
+                        }
                     }
                 }
                 if active == 0 {
                     let Some((_, t)) = worst else {
+                        evidence.finish(
+                            EvidenceOutcome::FallbackSequential,
+                            Inactive::NoAttackTarget,
+                        );
                         return Ok(FallbackToSequential);
                     };
                     row = t.to_spec_row(plan.output_dim());
@@ -656,12 +660,13 @@ pub(super) fn try_graph_pgd_vjp_batched(
                 Ok(g) => g,
                 Err(e) => {
                     // Width fail-safe: if the very first wide pass of the attack
-                    // does not fit this adapter (binding-limit validation), HALVE
-                    // the wave width and rebuild the wave — never pay the
-                    // sequential-loop cliff for a capacity miss. Mid-attack
-                    // failures (device hiccup) keep the sequential fallback.
-                    if steps_done == 0 && restart_base == 0 && width > 1 {
+                    // receives a typed pre-dispatch capacity refusal, HALVE the
+                    // wave width and rebuild it — never pay the sequential-loop
+                    // cliff for that safe-to-retry miss. Every other error, and
+                    // every mid-attack error, keeps the sequential fallback.
+                    if should_retry_wide_vjp(&e, steps_done, restart_base, width) {
                         width = (width / 2).max(1);
+                        evidence.adapter_retry(width);
                         if diag {
                             eprintln!(
                                 "[pgd-vjp] wide VJP failed at K={k} ({e}); retrying wave at K={width}"
@@ -672,12 +677,24 @@ pub(super) fn try_graph_pgd_vjp_batched(
                     if diag {
                         eprintln!("[pgd-vjp] wide VJP failed ({e}); sequential fallback");
                     }
+                    evidence.finish(EvidenceOutcome::FallbackSequential, Inactive::VjpFailure);
                     return Ok(FallbackToSequential);
                 }
             };
             if grads.len() != k {
+                evidence.finish(
+                    EvidenceOutcome::FallbackSequential,
+                    Inactive::GradientCountMismatch,
+                );
                 return Ok(FallbackToSequential);
             }
+            evidence.successful_vjp(false);
+            evidence.recycled(recycled_this_step);
+            if exploit_opportunity_this_step {
+                evidence.exploit_opportunity();
+            }
+            evidence.exploited(exploited_this_step);
+            evidence.hinge_extra(hinge_extra_this_step);
             let t2 = Instant::now();
             fwd_ms += (t1 - t0).as_secs_f64() * 1e3;
             vjp_ms += (t2 - t1).as_secs_f64() * 1e3;
@@ -761,6 +778,7 @@ pub(super) fn try_graph_pgd_vjp_batched(
                             json,
                             format_args!("  Graph PGD found counterexample at {ctx}!"),
                         );
+                        evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
                         return Ok(Completed(Some(pair)));
                     }
                 }
@@ -785,11 +803,56 @@ pub(super) fn try_graph_pgd_vjp_batched(
             attack_start.elapsed().as_secs_f64()
         ),
     );
+    evidence.finish(
+        if deadline_hit() {
+            EvidenceOutcome::Deadline
+        } else {
+            EvidenceOutcome::Exhausted
+        },
+        Inactive::None,
+    );
     Ok(Completed(None))
 }
 
 fn exact_vjp_slice_expired(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|limit| now >= limit)
+}
+
+fn should_retry_wide_vjp(
+    error: &ny_core::NyError,
+    steps_done: usize,
+    restart_base: usize,
+    width: usize,
+) -> bool {
+    steps_done == 0 && restart_base == 0 && width > 1 && error.is_gpu_batch_capacity_exceeded()
+}
+
+#[cfg(test)]
+mod wide_vjp_retry_tests {
+    use super::should_retry_wide_vjp;
+    use ny_core::NyError;
+
+    #[test]
+    fn first_wave_predispatch_capacity_refusal_retries() {
+        let error = NyError::GpuBatchCapacityExceeded {
+            requested: 256,
+            capacity: 128,
+            unit: "bytes",
+            site: "wide-vjp-retry-test",
+        };
+
+        assert!(should_retry_wide_vjp(&error, 0, 0, 64));
+        assert!(!should_retry_wide_vjp(&error, 1, 0, 64));
+        assert!(!should_retry_wide_vjp(&error, 0, 1, 64));
+        assert!(!should_retry_wide_vjp(&error, 0, 0, 1));
+    }
+
+    #[test]
+    fn generic_vjp_failure_does_not_retry() {
+        let error = NyError::DeadlineExceeded("wide VJP deadline".to_owned());
+
+        assert!(!should_retry_wide_vjp(&error, 0, 0, 64));
+    }
 }
 
 #[cfg(test)]

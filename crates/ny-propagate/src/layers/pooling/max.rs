@@ -23,6 +23,26 @@ use super::checked_pool_output_size;
 /// - upper_y = max(upper_x over window) - maximum of upper bounds
 ///
 /// This is exact for IBP because max is monotonically increasing.
+///
+/// # Padding semantics
+///
+/// Padded positions are **excluded from the max**: the window fold starts at
+/// `-inf` and only in-bounds positions are folded in. That is exactly ONNX /
+/// PyTorch `nn.MaxPool2d` `-inf` padding, because `-inf` is the identity of
+/// `max` — folding an explicit `-inf` for each padded position and skipping it
+/// entirely are the same arithmetic, bit for bit.
+///
+/// There is deliberately **no padding-mode flag**. One used to exist
+/// (`use_negative_inf_padding` / `with_padding_mode`); its documented
+/// alternative ("only pool the valid region") is the same computation as
+/// `-inf` padding for `max`, its sole read site was an empty `else if`, and no
+/// caller ever set it. It was removed rather than kept as a knob that reports
+/// as configured and does nothing. A genuinely different mode (e.g. a
+/// count-based rule over valid cells) would need real arithmetic here plus a
+/// converter path in ny-build able to select it — not a boolean.
+///
+/// A window made *entirely* of padding has no defined max and is refused at
+/// [`MaxPool2dLayer::output_size`] rather than bounded.
 #[derive(Debug, Clone)]
 pub struct MaxPool2dLayer {
     /// Kernel size (height, width)
@@ -31,8 +51,6 @@ pub struct MaxPool2dLayer {
     pub stride: (usize, usize),
     /// Padding (height, width)
     pub padding: (usize, usize),
-    /// Padding mode: true = use -inf for padding, false = only pool valid region
-    pub use_negative_inf_padding: bool,
 }
 
 impl MaxPool2dLayer {
@@ -46,22 +64,6 @@ impl MaxPool2dLayer {
             kernel_size,
             stride,
             padding,
-            use_negative_inf_padding: true,
-        }
-    }
-
-    /// Create max pool with explicit padding mode.
-    pub fn with_padding_mode(
-        kernel_size: (usize, usize),
-        stride: (usize, usize),
-        padding: (usize, usize),
-        use_negative_inf_padding: bool,
-    ) -> Self {
-        Self {
-            kernel_size,
-            stride,
-            padding,
-            use_negative_inf_padding,
         }
     }
 
@@ -153,11 +155,11 @@ impl BoundPropagation for MaxPool2dLayer {
                                         nan_propagating_max(max_lower, input.lower()[[c, ih, iw]]);
                                     max_upper =
                                         nan_propagating_max(max_upper, input.upper()[[c, ih, iw]]);
-                                } else if !self.use_negative_inf_padding {
-                                    // If not using -inf padding, skip this position
-                                    // (max over fewer elements)
                                 }
-                                // If using -inf padding, the -inf won't affect max
+                                // Out-of-bounds (padded) positions are skipped: the
+                                // fold started at -inf, and -inf is the identity of
+                                // max, so skipping is bit-identical to folding the
+                                // -inf that ONNX/PyTorch padding supplies.
                             }
                         }
 

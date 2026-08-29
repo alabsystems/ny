@@ -18,7 +18,9 @@ use crate::batched_domain::{CachedLinearBounds, DomainList, DomainListConfig, Do
 use crate::beta_crown::branching::BranchingHeuristic;
 use crate::beta_crown::config::BetaCrownConfig;
 use crate::beta_crown::engine::graph::input_split::mul_binary::maybe_optimize_mul_binary_alphas;
-use crate::beta_crown::engine::graph::input_split::root_bounds::collect_input_split_root_node_bounds;
+use crate::beta_crown::engine::graph::input_split::root_bounds::{
+    collect_input_split_root_node_bounds, input_split_root_authority_deadline,
+};
 use crate::beta_crown::engine::graph::input_split::shared::compute_crown_or_ibp_bounds;
 use crate::beta_crown::engine::graph::shared::init::{
     compute_graph_bab_bootstrap, compute_graph_root_output_bounds,
@@ -118,6 +120,7 @@ pub(crate) fn compute_initial_bounds(
             config,
             engine,
             deadline,
+            input_split_root_authority_deadline(deadline, config.input_split_scored_wall),
             "DomainList BaB input split",
             None,
         )?;

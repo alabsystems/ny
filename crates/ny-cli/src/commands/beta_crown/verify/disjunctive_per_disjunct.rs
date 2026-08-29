@@ -46,6 +46,8 @@ pub(super) fn try_per_disjunct_multi_objective(
         BetaCrownModel::Sequential(network) => {
             let mut g = GraphNetwork::from_sequential(network)?;
             g.set_use_patches_mode(config.use_patches());
+            g.set_chunk_wave_parallel_enabled(config.chunk_wave_parallel_enabled);
+            g.set_frozen_levers(config.frozen_levers.clone());
             std::borrow::Cow::Owned(g)
         }
     };

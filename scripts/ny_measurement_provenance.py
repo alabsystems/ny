@@ -18,10 +18,21 @@ import json
 import math
 import os
 import pathlib
+
+try:  # POSIX only; absent on Windows.
+    import resource
+except ModuleNotFoundError:  # pragma: no cover - platform-selected
+    # Bound to None at MODULE scope rather than imported inside each user:
+    # the provenance contracts monkeypatch `ny_measurement_provenance.resource`,
+    # and a lazy in-function import removed that attribute and failed 15 of
+    # them with AttributeError. Every consumer is Linux containment
+    # attestation, which fails loudly on a host without rlimits.
+    resource = None  # type: ignore[assignment]
 import platform
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 from collections.abc import Callable
@@ -42,6 +53,356 @@ import _portable_file_lock as _file_lock  # noqa: E402
 
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 _GIT_EXECUTABLE_OVERRIDE: str | None = None
+
+# Scorecard execution credit is a versioned predicate, not an arbitrary flight
+# method/status match.  The transport spelling deliberately remains within the
+# shell harness's historical safe ``METHOD=STATUS`` alphabet while the left
+# side names a closed predicate, one governed axis, and its exact requested
+# token.  ``=ran`` is therefore only a compatibility envelope; the archiver
+# evaluates the predicate against the current lever receipt and strict runtime
+# execution schema before granting credit.
+EXECUTION_PREDICATE_SCHEMA = "ny-measure/execution-predicate-requirement/v1"
+JOINT_EXECUTION_PREDICATE_SCHEMA = (
+    "ny-measure/execution-predicate-requirement/v2"
+)
+EXECUTION_PREDICATE_TRANSPORT_STATUS = "ran"
+LEGACY_EXECUTION_EVIDENCE_PROFILE = "ny_measurement_execution_evidence_v1"
+LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE = (
+    "ny_measurement_execution_evidence_v2"
+)
+LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE = (
+    "ny_measurement_execution_evidence_v3"
+)
+EXECUTION_EVIDENCE_PROFILE = "ny_measurement_execution_evidence_v4"
+JOINT_EXECUTION_EVIDENCE_PROFILE = "ny_measurement_execution_evidence_v5"
+LEGACY_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA = (
+    "ny-measure/execution-predicate-assignment/v1"
+)
+LEGACY_JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA = (
+    "ny-measure/execution-predicate-assignment/v2"
+)
+EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA = (
+    "ny-measure/execution-predicate-assignment/v3"
+)
+JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA = (
+    "ny-measure/execution-predicate-assignment/v4"
+)
+SEARCH_SPACE_SCHEMA = "ny-levers/search-space/v6"
+SEARCH_SPACE_CONTRACT_SCHEMA = "ny-measure/search-space-contract/v1"
+SEARCH_SPACE_CONTRACT_IDENTITY_SCHEMA = (
+    "ny-measure/search-space-contract-identity/v1"
+)
+SEARCH_SPACE_PROBE = ("benchmarks", "space", "--json")
+_ROOT_JOINT_INTERM_ALPHA_EXECUTION_AXES = frozenset(
+    {
+        "NY_ROOT_JOINT_INTERM_ALPHA",
+        "NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT",
+        "NY_ROOT_JOINT_INTERM_ALPHA_SECS",
+        "NY_ROOT_JOINT_INTERM_ALPHA_ITERS",
+        "NY_ROOT_JOINT_INTERM_ALPHA_LR",
+        "NY_ROOT_JOINT_MIN_REMAINING_SECS",
+        "NY_ROOT_JOINT_INTERM_ALPHA_MAX_SEL",
+        "NY_ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP",
+        "NY_ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN",
+        "NY_BN_GPU_EXTRACT",
+    }
+)
+_MARGIN_ROW_ROOT_ALPHA_EXECUTION_AXES = frozenset(
+    {
+        "NY_MARGIN_ROW_ALPHA_OPT",
+        "NY_MARGIN_ROW_ALPHA_ITERS",
+        "NY_MARGIN_ROW_ALPHA_SECS",
+        "NY_MARGIN_ROW_ALPHA_LR",
+        "NY_MARGIN_ROW_ALPHA_COLS",
+        "NY_MARGIN_ROW_ALPHA_GUARD",
+        "NY_MARGIN_ROW_REBAKE",
+        "NY_MARGIN_ROW_REBAKE_ROUNDS",
+        "NY_MARGIN_ROW_REBAKE_SECS",
+    }
+)
+_MARGIN_ROW_DOMAIN_ALPHA_EXECUTION_AXES = frozenset(
+    {
+        "NY_MARGIN_ROW_DOMAIN_ALPHA",
+        "NY_MARGIN_ROW_DOMAIN_ALPHA_ITERS",
+        "NY_MARGIN_ROW_DOMAIN_ALPHA_ETA",
+    }
+)
+_MARGIN_ROW_EPOCH_EXECUTION_AXES = frozenset(
+    {
+        "NY_EPOCH_DEPTH",
+        "NY_EPOCH_ATTEMPTS",
+        "NY_EPOCH_TIER0",
+        "NY_EPOCH_UNIVERSE",
+        "NY_EPOCH_RETAIN",
+    }
+)
+_MARGIN_ROW_EPOCH_CONFIGURED_AXES = (
+    _MARGIN_ROW_EPOCH_EXECUTION_AXES
+    | frozenset({"NY_MARGIN_ROW_EPOCH_PARENT_TOPK"})
+)
+_MARGIN_ROW_WIDTH_EXECUTION_AXES = frozenset(
+    {
+        "NY_MARGIN_ROW_K_HEAD",
+        "NY_MARGIN_ROW_K_TRUNK",
+        "NY_MARGIN_ROW_K_ADAPT",
+    }
+)
+_MARGIN_ROW_SCHEDULE_EXECUTION_AXES = frozenset(
+    {"NY_MARGIN_ROW_CONCURRENT"}
+)
+_MARGIN_ROW_SCHEDULE_CONFIGURED_AXES = frozenset(
+    {
+        "NY_MARGIN_ROW_RESERVE_SECS",
+        "NY_MARGIN_ROW_ADAPTIVE_RESERVE",
+        "NY_MARGIN_ROW_RESERVE_MAX_FRAC",
+        "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC",
+        "NY_MARGIN_ROW_CONCURRENT",
+        "NY_MARGIN_ROW_EARLY_EXIT",
+        "NY_VERIFIER_THREADS",
+        "NY_MARGIN_ROW_CONCURRENT_THREADS",
+    }
+)
+_BNN_FALSIFICATION_EXECUTION_AXES = frozenset(
+    {
+        "NY_BNN_SIGN_SPACE",
+        "NY_BNN_SIGN_SPACE_MINIMAL_MOVE",
+        "NY_BNN_SIGN_SPACE_TRUST_REGION",
+        "NY_BNN_STE_PGD",
+    }
+)
+EXECUTION_PREDICATE_SPECS: dict[str, dict[str, object]] = {
+    "ny-exec-v1.bnn-falsification-parameter-engaged": {
+        "validator": "_bnn_falsification_parameter_engagement",
+        "axes": _BNN_FALSIFICATION_EXECUTION_AXES,
+        "configured_axes": _BNN_FALSIFICATION_EXECUTION_AXES,
+    },
+    "ny-exec-v1.upfront-parameter-engaged": {
+        "validator": "_upfront_parameter_engagement",
+        "axes": frozenset(
+            {
+                "NY_UPFRONT_ATTACK",
+                "NY_UPFRONT_ATTACK_CAP",
+                "NY_UPFRONT_ATTACK_AUTO_CAP",
+                "NY_UPFRONT_ATTACK_FRAC",
+                "NY_UPFRONT_ATTACK_PROBE_FIRST",
+                "NY_BNN_ATTACK_CAP",
+                "NY_BNN_ATTACK_FRAC",
+            }
+        ),
+    },
+    "ny-exec-v1.margin-row-frontier-parameter-engaged": {
+        "validator": "_margin_row_frontier_parameter_engagement",
+        "axes": frozenset({"NY_MARGIN_ROW_PARALLEL"}),
+    },
+    "ny-exec-v1.margin-row-policy-parameter-engaged": {
+        "validator": "_margin_row_policy_parameter_engagement",
+        "axes": frozenset(
+            {
+                "NY_MARGIN_ROW_BETA_PERCOL",
+                "NY_MARGIN_ROW_BETA_COLS",
+                "NY_MARGIN_ROW_COL_RETIRE",
+                "NY_MARGIN_ROW_PARALLEL_PREBUILD",
+            }
+        ),
+    },
+    "ny-exec-v1.margin-row-root-precision-parameter-engaged": {
+        "validator": "_margin_row_root_precision_parameter_engagement",
+        "axes": frozenset(
+            {
+                "NY_MARGIN_ROW_ROOT_F32",
+                "NY_MARGIN_ROW_TABLEAU_F32",
+            }
+        ),
+    },
+    "ny-exec-v1.margin-row-root-alpha-parameter-engaged": {
+        "validator": "_margin_row_root_alpha_parameter_engagement",
+        "axes": _MARGIN_ROW_ROOT_ALPHA_EXECUTION_AXES,
+        "configured_axes": _MARGIN_ROW_ROOT_ALPHA_EXECUTION_AXES,
+    },
+    "ny-exec-v1.margin-row-domain-alpha-parameter-engaged": {
+        "validator": "_margin_row_domain_alpha_parameter_engagement",
+        "axes": _MARGIN_ROW_DOMAIN_ALPHA_EXECUTION_AXES,
+        "configured_axes": _MARGIN_ROW_DOMAIN_ALPHA_EXECUTION_AXES,
+    },
+    "ny-exec-v1.margin-row-epoch-parameter-engaged": {
+        "validator": "_margin_row_epoch_parameter_engagement",
+        "axes": _MARGIN_ROW_EPOCH_EXECUTION_AXES,
+        # The incremental parent-frame refresh is intentionally still unsafe.
+        # Seal its frozen value beside the graduated five-axis policy, but do
+        # not admit it into the predicate grammar or searchable T1 registry.
+        "configured_axes": _MARGIN_ROW_EPOCH_CONFIGURED_AXES,
+    },
+    "ny-exec-v1.margin-row-width-parameter-engaged": {
+        "validator": "_margin_row_width_parameter_engagement",
+        "axes": _MARGIN_ROW_WIDTH_EXECUTION_AXES,
+        "configured_axes": _MARGIN_ROW_WIDTH_EXECUTION_AXES,
+    },
+    "ny-exec-v1.margin-row-schedule-parameter-engaged": {
+        "validator": "_margin_row_schedule_parameter_engagement",
+        "axes": _MARGIN_ROW_SCHEDULE_EXECUTION_AXES,
+        # The allocator and its resource partition are one coupled configured
+        # policy. The seven non-concurrency coordinates remain Class::Unsafe,
+        # so they are sealed only as category-preset context and cannot enter
+        # a requested assignment.
+        "configured_axes": _MARGIN_ROW_SCHEDULE_CONFIGURED_AXES,
+    },
+    "ny-exec-v1.margin-row-backward-interm-parameter-engaged": {
+        "validator": "_margin_row_backward_interm_parameter_engagement",
+        "axes": frozenset(
+            {
+                "NY_MARGIN_ROW_BACKWARD_INTERM",
+                "NY_MARGIN_ROW_BI_SECS",
+                "NY_MARGIN_ROW_BI_CHUNK",
+                "NY_MARGIN_ROW_BI_CHUNK_SECS",
+                "NY_MARGIN_ROW_BI_TOPK",
+            }
+        ),
+    },
+    "ny-exec-v1.pgd-fast-gradient-parameter-engaged": {
+        "validator": "_pgd_fast_gradient_parameter_engagement",
+        "axes": frozenset({"NY_PGD_FAST_GRAD"}),
+    },
+    "ny-exec-v1.postbab-reserve-parameter-engaged": {
+        "validator": "_postbab_reserve_parameter_engagement",
+        "axes": frozenset({"NY_POSTBAB_RESERVE_SECS"}),
+    },
+    "ny-exec-v1.mo-kfsb-parameter-engaged": {
+        "validator": "_mo_kfsb_parameter_engagement",
+        "axes": frozenset({"NY_MO_KFSB", "NY_MO_KFSB_REDUCE"}),
+    },
+    "ny-exec-v1.mo-alpha-step-parameter-engaged": {
+        "validator": "_mo_alpha_step_parameter_engagement",
+        "axes": frozenset({"NY_MO_ALPHA_STEP"}),
+        # The search-space dependency repair seals NY_MO_BETA_SPSA=1 as this
+        # treatment's prerequisite. The terminal independently authenticates
+        # its effective value; beta receives no T1 credit from this predicate.
+    },
+    "ny-exec-v1.root-joint-interm-alpha-parameter-engaged": {
+        "validator": "_root_joint_interm_alpha_parameter_engagement",
+        "axes": _ROOT_JOINT_INTERM_ALPHA_EXECUTION_AXES,
+        # MAX_DIM belongs to the same configured root recipe and is consumed by
+        # the terminal contract, but deliberately has no independent T1 credit:
+        # its absent value is contextual.  Keep it out of ``axes`` (the
+        # predicate grammar) while still refusing it as an unsealed configured
+        # treatment coordinate beside another root predicate.
+        "configured_axes": _ROOT_JOINT_INTERM_ALPHA_EXECUTION_AXES
+        | frozenset({"NY_ROOT_JOINT_INTERM_ALPHA_MAX_DIM"}),
+    },
+    "ny-exec-v1.exact-vjp-parameter-engaged": {
+        "validator": "_exact_vjp_parameter_engagement",
+        "axes": frozenset(
+            {
+                "NY_PGD_EXACT_BATCHED",
+                "NY_PGD_VJP_BATCH",
+                "NY_PGD_VJP_K",
+                "NY_PGD_LEGACY_LANES",
+                "NY_PGD_ODI_STEPS",
+                "NY_PGD_ODI_ETA",
+                "NY_PGD_VJP_STEPS",
+                "NY_PGD_LANE_WINDOW",
+                "NY_PGD_EXPLOIT",
+                "NY_PGD_HINGE_TAU",
+            }
+        ),
+    },
+}
+_CONTEXT_BOUND_FULL_POLICY_PREDICATES = frozenset(
+    {
+        "ny-exec-v1.bnn-falsification-parameter-engaged",
+        "ny-exec-v1.margin-row-backward-interm-parameter-engaged",
+        "ny-exec-v1.margin-row-domain-alpha-parameter-engaged",
+        "ny-exec-v1.margin-row-epoch-parameter-engaged",
+        "ny-exec-v1.margin-row-root-alpha-parameter-engaged",
+        "ny-exec-v1.margin-row-root-precision-parameter-engaged",
+        "ny-exec-v1.margin-row-schedule-parameter-engaged",
+        "ny-exec-v1.margin-row-width-parameter-engaged",
+    }
+)
+
+# Configured coordinates intentionally omitted from the searchable Axis list
+# can enter a full-policy assignment only through these exact reviewed preset
+# routes.  The declaration and unsafe-name checks below make this an explicit
+# exception, not a general way to smuggle an unsearchable environment input
+# into a scorecard treatment.
+_UNSAFE_RUNTIME_CONTEXT_SPECS: dict[tuple[str, str], dict[str, object]] = {
+    (
+        "ny-exec-v1.margin-row-epoch-parameter-engaged",
+        "NY_MARGIN_ROW_EPOCH_PARENT_TOPK",
+    ): {
+        "kind": "UsizeTrimmed",
+        "default": "0",
+        "runtime_default": "0",
+        "delivery": "preset:margin_row.epoch_parent_topk",
+    },
+    (
+        "ny-exec-v1.margin-row-schedule-parameter-engaged",
+        "NY_MARGIN_ROW_RESERVE_SECS",
+    ): {
+        "kind": "U64Override",
+        "default": "45",
+        "runtime_default": "45",
+        "delivery": "preset:margin_row.reserve_secs",
+    },
+    (
+        "ny-exec-v1.margin-row-schedule-parameter-engaged",
+        "NY_MARGIN_ROW_ADAPTIVE_RESERVE",
+    ): {
+        "kind": "Bool",
+        "default": "0",
+        "runtime_default": "0",
+        "delivery": "preset:margin_row.adaptive_reserve",
+    },
+    (
+        "ny-exec-v1.margin-row-schedule-parameter-engaged",
+        "NY_MARGIN_ROW_RESERVE_MAX_FRAC",
+    ): {
+        "kind": "F64OpenUnicodeOwned",
+        "default": None,
+        "runtime_default": "none",
+        "delivery": "preset:margin_row.reserve_max_frac",
+        "min": 0.0,
+        "max": 1.0,
+    },
+    (
+        "ny-exec-v1.margin-row-schedule-parameter-engaged",
+        "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC",
+    ): {
+        "kind": "F64OpenOverride",
+        "default": "0.40",
+        "runtime_default": "0.40",
+        "delivery": "preset:margin_row.release_frac",
+        "min": 0.0,
+        "max": 1.0,
+    },
+    (
+        "ny-exec-v1.margin-row-schedule-parameter-engaged",
+        "NY_MARGIN_ROW_EARLY_EXIT",
+    ): {
+        "kind": "TrimmedExactOne",
+        "default": "1",
+        "runtime_default": "1",
+        "delivery": "preset:margin_row.early_exit",
+    },
+    (
+        "ny-exec-v1.margin-row-schedule-parameter-engaged",
+        "NY_VERIFIER_THREADS",
+    ): {
+        "kind": "UsizeTrimmedUnicodeOwned",
+        "default": None,
+        "runtime_default": "none",
+        "delivery": "preset:margin_row.verifier_threads",
+    },
+    (
+        "ny-exec-v1.margin-row-schedule-parameter-engaged",
+        "NY_MARGIN_ROW_CONCURRENT_THREADS",
+    ): {
+        "kind": "UsizeOverride",
+        "default": None,
+        "runtime_default": "none",
+        "delivery": "preset:margin_row.concurrent_threads",
+        "min": 0,
+    },
+}
 V1_INPUT_ASSIGNMENT = re.compile(
     r"\(\s*X_\d+\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?\s*\)"
 )
@@ -293,6 +654,13 @@ ENV_ALLOWLIST = frozenset(
         "NY_BICCOS_BCP_SHADOW",
         "NY_BICCOS_Q_STAGE0",
         "NY_BICCOS_Q_STAGE1_REPLAY",
+        "NY_BNN_ATTACK_CAP",
+        "NY_BNN_ATTACK_FRAC",
+        "NY_BNN_SIGN_SPACE",
+        "NY_BNN_SIGN_SPACE_MINIMAL_MOVE",
+        "NY_BNN_SIGN_SPACE_TRUST_REGION",
+        "NY_BNN_STE_PGD",
+        "NY_BN_GPU_EXTRACT",
         "NY_BN_FOLD_EXT",
         "NY_BRANCH_KFSB_CHILDSIM",
         "NY_BRANCH_RESCORE",
@@ -301,6 +669,7 @@ ENV_ALLOWLIST = frozenset(
         "NY_BRANCH_STEM_NODES",
         "NY_BRANCH_STEM_PROBE",
         "NY_BRANCH_TRACE",
+        "NY_CGAN_INPUT_LEAF",
         "NY_BROOT",
         "NY_BUILD_DISK_PATH",
         "NY_BUILD_FEATURES",
@@ -316,6 +685,7 @@ ENV_ALLOWLIST = frozenset(
         "NY_CUT_CROWN_RESIDENT_SHADOW",
         "NY_CROWN_CUT_SEGMENT",
         "NY_CROWN_CHUNK_AWARE_BUDGET",
+        "NY_CROWN_HONEST_PROVENANCE",
         "NY_CROWN_IBP_COLLECTOR_CAP_SECS",
         "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
         "NY_CROWN_IBP_SPARSE_RELU_ROWS",
@@ -390,6 +760,9 @@ ENV_ALLOWLIST = frozenset(
         "NY_MIP_SAFENLP_SHARED_PREFIX",
         "NY_MIP_SAFENLP_TARGET_FSB_PREFIX",
         "NY_MIP_SERIAL",
+        "NY_NO_CHUNK_ABORT",
+        "NY_NO_CHUNK_GROW",
+        "NY_NO_CHUNK_WAVE_PAR",
         "NY_INTERM_REFINE",
         "NY_INTERM_REFINE_ALPHA",
         "NY_INTERM_REFINE_ALPHA_ITERS",
@@ -411,15 +784,52 @@ ENV_ALLOWLIST = frozenset(
         "NY_INVPROP_OPTIMIZE",
         "NY_INVPROP_SPLIT_LIFT",
         "NY_KFSB_LAYER_QUOTA",
+        "NY_EPOCH_ATTEMPTS",
+        "NY_EPOCH_DEPTH",
+        "NY_EPOCH_RETAIN",
+        "NY_EPOCH_TIER0",
+        "NY_EPOCH_UNIVERSE",
+        "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC",
         "NY_MARGIN_ROW_ADAPTIVE_RESERVE",
+        "NY_MARGIN_ROW_ALPHA_COLS",
+        "NY_MARGIN_ROW_ALPHA_GUARD",
+        "NY_MARGIN_ROW_ALPHA_ITERS",
+        "NY_MARGIN_ROW_ALPHA_LR",
+        "NY_MARGIN_ROW_ALPHA_OPT",
+        "NY_MARGIN_ROW_ALPHA_SECS",
+        "NY_MARGIN_ROW_BACKWARD_INTERM",
+        "NY_MARGIN_ROW_BETA_COLS",
+        "NY_MARGIN_ROW_BETA_PERCOL",
+        "NY_MARGIN_ROW_BI_CHUNK",
+        "NY_MARGIN_ROW_BI_CHUNK_SECS",
+        "NY_MARGIN_ROW_BI_SECS",
+        "NY_MARGIN_ROW_BI_TOPK",
         "NY_MARGIN_ROW_DOMAIN_STACK",
+        "NY_MARGIN_ROW_EPOCH_PARENT_TOPK",
+        "NY_MARGIN_ROW_K_HEAD",
+        "NY_MARGIN_ROW_K_TRUNK",
+        "NY_MARGIN_ROW_K_ADAPT",
         "NY_MARGIN_ROW_LRU",
         "NY_MARGIN_ROW_CLASSWISE",
+        "NY_MARGIN_ROW_COL_RETIRE",
+        "NY_MARGIN_ROW_CONCURRENT",
+        "NY_MARGIN_ROW_CONCURRENT_THREADS",
         "NY_MARGIN_ROW_CONV_BWD_BLOCKED",
+        "NY_MARGIN_ROW_DOMAIN_ALPHA",
+        "NY_MARGIN_ROW_DOMAIN_ALPHA_ETA",
+        "NY_MARGIN_ROW_DOMAIN_ALPHA_ITERS",
+        "NY_MARGIN_ROW_EARLY_EXIT",
         "NY_MARGIN_ROW_PARALLEL",
+        "NY_MARGIN_ROW_PARALLEL_PREBUILD",
         "NY_MARGIN_ROW_PROFILE",
+        "NY_MARGIN_ROW_ROOT_F32",
         "NY_MARGIN_ROW_RESERVE_MAX_FRAC",
         "NY_MARGIN_ROW_RESERVE_SECS",
+        "NY_MARGIN_ROW_REBAKE",
+        "NY_MARGIN_ROW_REBAKE_ROUNDS",
+        "NY_MARGIN_ROW_REBAKE_SECS",
+        "NY_MARGIN_ROW_TABLEAU_F32",
+        "NY_VERIFIER_THREADS",
         "NY_MEASURE_ARTIFACTS",
         "NY_MEASURE_BIN",
         "NY_MEASURE_CAP",
@@ -428,6 +838,7 @@ ENV_ALLOWLIST = frozenset(
         "NY_MEASURE_GIT_BIN",
         "NY_MEASURE_CONTAINMENT_PROFILE",
         "NY_MEASURE_EXPECTED_CPUS",
+        "NY_MEASURE_REQUIRE_FLIGHT_EVENT",
         "NY_MEASURE_INSTANCE_INDEX",
         "NY_MEASURE_MAX_ROWS_PER_CATEGORY",
         "NY_MEASURE_OUTPUT_DIR",
@@ -443,8 +854,10 @@ ENV_ALLOWLIST = frozenset(
         "NY_MO_ADAPTIVE_DEPTH_SELECT",
         "NY_MO_ADAPTIVE_DEPTH_SHADOW",
         "NY_MO_BAB_TRACE",
+        "NY_MO_ALPHA_STEP",
         "NY_MO_BETA_BASELINE_ONLY",
         "NY_MO_BETA_BASELINE_FIRST",
+        "NY_MO_BETA_SPSA",
         "NY_MO_CUDA_BETA_SPSA",
         "NY_MO_CUDA_BOUNDED_SHARED_EXECUTOR",
         "NY_MO_CUDA_FACTORY_ENGINE_HANDOFF",
@@ -482,7 +895,6 @@ ENV_ALLOWLIST = frozenset(
         "NY_PACKED_GRAPH_ALPHA_QUEUE",
         "NY_PATCHES_BUDGET_SECS",
         "NY_PATCHES_DEADLINE_FLAT_BIAS",
-        "NY_PATCHES_DEADLINE_PARALLEL_SCATTER",
         "NY_PATCHES_DEADLINE_RELU",
         "NY_PATCHES_EAGER_ERR",
         "NY_PATCHES_EAGER_ERR_7D",
@@ -490,10 +902,19 @@ ENV_ALLOWLIST = frozenset(
         "NY_PHASE_TELEMETRY",
         "NY_PGD_DIAG",
         "NY_PGD_EXACT_BATCHED",
+        "NY_PGD_EXPLOIT",
+        "NY_PGD_FAST_GRAD",
         "NY_PGD_GAMA",
         "NY_PGD_GAMA_LAMBDA",
         "NY_PGD_GAMA_LIN_FRAC",
+        "NY_PGD_HINGE_TAU",
+        "NY_PGD_LANE_WINDOW",
+        "NY_PGD_LEGACY_LANES",
+        "NY_PGD_ODI_ETA",
+        "NY_PGD_ODI_STEPS",
         "NY_PGD_VJP_BATCH",
+        "NY_PGD_VJP_K",
+        "NY_PGD_VJP_STEPS",
         "NY_POSTBAB_ATTACK",
         "NY_POSTBAB_BAB_SEEDS",
         "NY_POSTBAB_BAB_SEEDS_K",
@@ -563,11 +984,13 @@ ENV_ALLOWLIST = frozenset(
         "NY_ROOT_INTERM_CUDA_FACTORY",
         "NY_ROOT_JOINT_INTERM_ALPHA",
         "NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT",
+        "NY_ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP",
         "NY_ROOT_JOINT_INTERM_ALPHA_ITERS",
         "NY_ROOT_JOINT_INTERM_ALPHA_LR",
         "NY_ROOT_JOINT_INTERM_ALPHA_MAX_DIM",
         "NY_ROOT_JOINT_INTERM_ALPHA_MAX_SEL",
         "NY_ROOT_JOINT_INTERM_ALPHA_PROBE",
+        "NY_ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN",
         "NY_ROOT_JOINT_INTERM_ALPHA_SECS",
         "NY_ROOT_JOINT_MIN_REMAINING_SECS",
         "NY_ROOT_OUTPUT_CONDITIONED_HEAD",
@@ -603,6 +1026,7 @@ ENV_ALLOWLIST = frozenset(
         "NY_UPFRONT_ATTACK_AUTO_CAP",
         "NY_UPFRONT_ATTACK_CAP",
         "NY_UPFRONT_ATTACK_FRAC",
+        "NY_UPFRONT_ATTACK_PROBE_FIRST",
         "NY_UNSTABLE_COUNT",
         "NY_VNNLIB_CACHE",
         "NY_WARMUP_ITERS",
@@ -624,6 +1048,11 @@ ENV_ALLOWLIST = frozenset(
         "ORT_LOG_SEVERITY_LEVEL",
         "PATH",
         "PWD",
+        # Current score measurements may pin Rayon only through its canonical
+        # worker-count variable.  The runtime and flight-v3 recorder still
+        # recognize deprecated RAYON_RS_NUM_CPUS for honest legacy evidence,
+        # but _capture_environment rejects that name through the fail-closed
+        # RAYON_ namespace before any isolated solver launch.
         "RAYON_NUM_THREADS",
         "RUST_BACKTRACE",
         "RUST_TEST_THREADS",
@@ -656,6 +1085,7 @@ SOLVER_ENVIRONMENT_EXCLUDED_KEYS = frozenset(
         "NY_MEASURE_CATS",
         "NY_MEASURE_CONFIGS_DIR",
         "NY_MEASURE_GIT_BIN",
+        "NY_MEASURE_REQUIRE_FLIGHT_EVENT",
         "NY_MEASURE_INSTANCE_INDEX",
         "NY_MEASURE_MAX_ROWS_PER_CATEGORY",
         "NY_MEASURE_OUTPUT_DIR",
@@ -673,6 +1103,7 @@ SOLVER_ENVIRONMENT_EXCLUDED_KEYS = frozenset(
 
 TYPED_NONNEGATIVE_INTEGER_ENV = frozenset(
     {
+        "NY_BNN_ATTACK_CAP",
         "NY_CROWN_CUT_SEGMENT",
         "NY_FACET_BANK_MAX_BYTES",
         "NY_FACET_BANK_PLANES",
@@ -680,7 +1111,52 @@ TYPED_NONNEGATIVE_INTEGER_ENV = frozenset(
         "NY_IMB_REGION_K",
         "NY_IMB_REPLAY_ONLY_LEAF",
         "NY_MO_KFSB_K",
+        "NY_UPFRONT_ATTACK_AUTO_CAP",
+        "NY_UPFRONT_ATTACK_CAP",
         "NY_WARMUP_ITERS",
+    }
+)
+
+# Search-arm integers use one canonical decimal spelling so equivalent raw
+# parser forms cannot acquire different experiment identities. The runtime may
+# retain a wider compatibility grammar; measurement provenance is deliberately
+# narrower.
+TYPED_CANONICAL_NONNEGATIVE_INTEGER_ENV = frozenset(
+    {
+        "NY_CROWN_OBJ_CHUNK",
+        "NY_EPOCH_ATTEMPTS",
+        "NY_EPOCH_DEPTH",
+        "NY_EPOCH_RETAIN",
+        "NY_EPOCH_TIER0",
+        "NY_EPOCH_UNIVERSE",
+        "NY_MARGIN_ROW_ALPHA_COLS",
+        "NY_MARGIN_ROW_ALPHA_ITERS",
+        "NY_MARGIN_ROW_BETA_COLS",
+        "NY_MARGIN_ROW_BI_CHUNK",
+        "NY_MARGIN_ROW_BI_TOPK",
+        "NY_MARGIN_ROW_DOMAIN_ALPHA_ITERS",
+        "NY_MARGIN_ROW_EPOCH_PARENT_TOPK",
+        "NY_PGD_LANE_WINDOW",
+        "NY_PGD_LEGACY_LANES",
+        "NY_PGD_ODI_STEPS",
+        "NY_POSTBAB_RESERVE_SECS",
+        "NY_MARGIN_ROW_REBAKE_ROUNDS",
+        "NY_ROOT_JOINT_INTERM_ALPHA_ITERS",
+        "NY_ROOT_JOINT_INTERM_ALPHA_MAX_SEL",
+        "NY_ROOT_JOINT_INTERM_ALPHA_SECS",
+        "NY_ROOT_JOINT_MIN_REMAINING_SECS",
+        "NY_MARGIN_ROW_RESERVE_SECS",
+        "NY_MARGIN_ROW_CONCURRENT_THREADS",
+        "NY_VERIFIER_THREADS",
+    }
+)
+
+TYPED_CANONICAL_POSITIVE_INTEGER_ENV = frozenset(
+    {
+        "NY_MARGIN_ROW_K_HEAD",
+        "NY_MARGIN_ROW_K_TRUNK",
+        "NY_PGD_VJP_K",
+        "NY_PGD_VJP_STEPS",
     }
 )
 
@@ -741,18 +1217,76 @@ TYPED_BOUNDED_POSITIVE_INTEGER_ENV = (
 # Every admitted spelling is then checked against the runtime's finite open
 # interval, so the typed record cannot claim an armed ceiling that Rust would
 # silently decline.
-TYPED_OPEN_UNIT_DECIMAL_FRACTION_ENV = frozenset({"NY_MARGIN_ROW_RESERVE_MAX_FRAC"})
+TYPED_OPEN_UNIT_DECIMAL_FRACTION_ENV = frozenset(
+    {
+        "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC",
+        "NY_MARGIN_ROW_RESERVE_MAX_FRAC",
+    }
+)
 
 TYPED_BOUNDED_FLOAT_ENV = (
     # The runtime parses f32 and treats zero as disabled. Seal a research-safe
     # ceiling so a malformed or typo-sized grace cannot become score evidence.
     ("NY_ENDGAME_GRACE_SECS", 0.0, 30.0),
     ("NY_REL_BAB_DEADLINE_MULT", 1.0, 10.0),
+    # The backward-intermediate policy accepts every finite non-negative f64.
+    # Keep that exact numeric boundary while the closed search registry limits
+    # scored treatments to its small reviewed grids.
+    ("NY_MARGIN_ROW_BI_SECS", 0.0, sys.float_info.max),
+    ("NY_MARGIN_ROW_BI_CHUNK_SECS", 0.0, sys.float_info.max),
+    # The frozen root-alpha policy closes these trimmed finite-f64 controls.
+    # Search grids stay narrow, while exact terminal bits reject clamp aliases.
+    ("NY_MARGIN_ROW_ALPHA_SECS", 0.0, sys.float_info.max),
+    ("NY_MARGIN_ROW_ALPHA_LR", 0.0, sys.float_info.max),
+    ("NY_MARGIN_ROW_REBAKE_SECS", 0.0, sys.float_info.max),
+    # Per-domain alpha consumes a trimmed, finite, positive f64 and normalizes
+    # it into [0.01, 1.0]. Evidence admits only unclamped values, preventing two
+    # different raw inputs from naming the same frozen execution policy.
+    (
+        "NY_MARGIN_ROW_DOMAIN_ALPHA_ETA",
+        0.01,
+        1.0,
+    ),
+    # Exact runtime interval is 0 < fraction <= 1. `nextafter` names the
+    # smallest positive f64, preserving accepted subnormal treatments while
+    # rejecting zero before a full measurement can become a fake baseline.
+    ("NY_UPFRONT_ATTACK_FRAC", math.nextafter(0.0, math.inf), 1.0),
+    ("NY_BNN_ATTACK_FRAC", math.nextafter(0.0, math.inf), 1.0),
+    # The root optimizer consumes f32 but its governed declaration preserves the
+    # legacy trimmed finite-f64 parser inside the exact finite f32 range. The
+    # execution predicate later binds the requested token to the narrowed f32
+    # bits emitted by the runtime receipt.
+    (
+        "NY_ROOT_JOINT_INTERM_ALPHA_LR",
+        -3.402_823_466_385_288_6e38,
+        3.402_823_466_385_288_6e38,
+    ),
 )
+
+# These declarations parse directly as f32. Preserve that boundary in sealed
+# evidence: an f64-only value, f32 overflow, or positive value that underflows
+# to zero must fail before a scored run starts. The typed value is the exact
+# lossless f64 representation of the parsed f32, matching ny-levers receipts.
+TYPED_F32_POSITIVE_ENV = frozenset({"NY_PGD_ODI_ETA"})
+TYPED_F32_NONNEGATIVE_ENV = frozenset({"NY_PGD_HINGE_TAU"})
 
 TYPED_ABSOLUTE_PATH_ENV = frozenset({"NY_MIP_DUMP"})
 
+# Current sweep-level engagement contract. Unlike ordinary NY_* controls this
+# is harness-only: it never enters the solver environment. The start producer
+# requires it before assigning the current execution-evidence profile, and the
+# row archiver evaluates the sealed versioned predicate against both the exact
+# v3 lever delivery receipt and its family-specific runtime execution schema
+# before a result can be appended to the measurement CSV.
+TYPED_FLIGHT_EVENT_REQUIREMENT_ENV = frozenset(
+    {"NY_MEASURE_REQUIRE_FLIGHT_EVENT"}
+)
+
 TYPED_ENUM_ENV = (
+    (
+        "NY_BNN_SIGN_SPACE_TRUST_REGION",
+        frozenset({"box", "tight", "linf"}),
+    ),
     (
         "NY_CUDA_GEMM_TRANSPORT",
         frozenset(
@@ -765,6 +1299,11 @@ TYPED_ENUM_ENV = (
         ),
     ),
     ("NY_GPU_DENORM_PRESERVE", frozenset({"auto", "0", "1"})),
+    (
+        "NY_MARGIN_ROW_PARALLEL",
+        frozenset({"0", "2", "4", "8", "16"}),
+    ),
+    ("NY_MO_KFSB_REDUCE", frozenset({"min", "max"})),
     ("NY_WGPU_CROWN", frozenset({"auto", "0", "1"})),
     (
         "NY_IMB_AY_REGION_PROOF",
@@ -775,6 +1314,23 @@ TYPED_ENUM_ENV = (
 )
 
 TYPED_STRICT_BOOLEAN_ENV = frozenset({"GPU_AVAILABLE", "NY_AY_BRANCH_HINTS"})
+
+# This legacy reader accepts a broader truthy vocabulary at runtime, but the
+# governed search domain and sealed measurement syntax intentionally emit only
+# canonical Boolean treatments. Keeping it separate from the exact-runtime set
+# prevents the provenance model from claiming the compatibility grammar was
+# narrowed when it was not.
+TYPED_CANONICAL_TRUTHY_TRIMMED_ENV = frozenset({"NY_MARGIN_ROW_ROOT_F32"})
+
+# The runtime parser trims every Unicode token and treats only the resulting
+# exact string "1" as true; all other Unicode spellings are explicit false
+# overrides, while non-Unicode input falls through to typed config. Sealed
+# measurement syntax is deliberately narrower: only canonical 0/1 may name an
+# experiment, so padded values and typo-shaped false overrides cannot acquire
+# distinct measurement identities.
+TYPED_CANONICAL_TRIMMED_EXACT_ONE_ENV = frozenset(
+    {"NY_MARGIN_ROW_CONCURRENT", "NY_MARGIN_ROW_EARLY_EXIT"}
+)
 
 # These sealed gates have exact-string runtime semantics. Keep measurement
 # syntax equally exact: unlike GPU_AVAILABLE, an explicitly empty value is
@@ -790,6 +1346,8 @@ TYPED_EXACT_BOOLEAN_ENV = frozenset(
         "NY_ATTR_BRANCH",
         "NY_ATTR_BRANCH_DIAG",
         "NY_ATTACK_POINT_FAST_KERNELS",
+        "NY_UPFRONT_ATTACK",
+        "NY_UPFRONT_ATTACK_PROBE_FIRST",
         "NY_AY_MARGIN_REFRAME",
         "NY_AY_OBJECTIVE_FIRST_SAT",
         "NY_BAB_CLAUSE_LEARN",
@@ -798,10 +1356,15 @@ TYPED_EXACT_BOOLEAN_ENV = frozenset(
         "NY_BICCOS_BCP_SHADOW",
         "NY_BICCOS_Q_STAGE0",
         "NY_BICCOS_Q_STAGE1_REPLAY",
+        "NY_BN_GPU_EXTRACT",
         "NY_BN_FOLD_EXT",
+        "NY_BNN_SIGN_SPACE",
+        "NY_BNN_SIGN_SPACE_MINIMAL_MOVE",
+        "NY_BNN_STE_PGD",
         "NY_BRANCH_STEM",
         "NY_BRANCH_STEM_PROBE",
         "NY_BRANCH_TRACE",
+        "NY_CGAN_INPUT_LEAF",
         "NY_COMPACT_TAIL_K16",
         "NY_CONE_REFRESH",
         "NY_CONSTRAINED_PATCHES_ALPHA_RELU_INPLACE",
@@ -811,6 +1374,7 @@ TYPED_EXACT_BOOLEAN_ENV = frozenset(
         "NY_CUT_CROWN_RESIDENT_SHADOW",
         "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
         "NY_CROWN_CHUNK_AWARE_BUDGET",
+        "NY_CROWN_HONEST_PROVENANCE",
         "NY_CROWN_IBP_SPARSE_RELU_ROWS",
         "NY_CROWN_SERVE_TRUNCATED_CACHE",
         "NY_CUDA_DGEMM_TRIPLET",
@@ -821,12 +1385,26 @@ TYPED_EXACT_BOOLEAN_ENV = frozenset(
         "NY_CUDA_WIDE",
         "NY_EFT_ERR",
         "NY_GAP_ATTRIBUTION",
+        "NY_MARGIN_ROW_ALPHA_GUARD",
+        "NY_MARGIN_ROW_ALPHA_OPT",
+        "NY_MARGIN_ROW_BACKWARD_INTERM",
+        "NY_MARGIN_ROW_BETA_PERCOL",
+        "NY_MARGIN_ROW_COL_RETIRE",
         "NY_MARGIN_ROW_CONV_BWD_BLOCKED",
+        "NY_MARGIN_ROW_DOMAIN_ALPHA",
+        "NY_MARGIN_ROW_ADAPTIVE_RESERVE",
+        "NY_MARGIN_ROW_K_ADAPT",
+        "NY_MARGIN_ROW_PARALLEL_PREBUILD",
+        "NY_MARGIN_ROW_REBAKE",
+        "NY_MARGIN_ROW_TABLEAU_F32",
         "NY_MIP_CERTIFIED_SHARED_TREE",
         "NY_MIP_SAFENLP_DIRECT_FIRST",
         "NY_MIP_SAFENLP_SHARED_PREFIX",
         "NY_MIP_SAFENLP_TARGET_FSB_PREFIX",
         "NY_MIP_SERIAL",
+        "NY_NO_CHUNK_ABORT",
+        "NY_NO_CHUNK_GROW",
+        "NY_NO_CHUNK_WAVE_PAR",
         "NY_IMB_AY_TAIL_ADAPTIVE_FIVE_COMB",
         "NY_IMB_BATCHED_REPLAY",
         "NY_IMB_REPLAY_ONLY",
@@ -840,11 +1418,14 @@ TYPED_EXACT_BOOLEAN_ENV = frozenset(
         "NY_MO_ADAPTIVE_DEPTH_SHADOW",
         "NY_INTERM_REFINE_PROBE",
         "NY_MO_BAB_TRACE",
+        "NY_MO_ALPHA_STEP",
         "NY_MO_BETA_BASELINE_ONLY",
         "NY_MO_BETA_BASELINE_FIRST",
+        "NY_MO_BETA_SPSA",
         "NY_MO_CUDA_BETA_SPSA",
         "NY_MO_CUDA_BOUNDED_SHARED_EXECUTOR",
         "NY_MO_CUDA_FACTORY_ENGINE_HANDOFF",
+        "NY_MO_KFSB",
         "NY_MO_KFSB_CERT_REUSE",
         "NY_MO_KFSB_F64_SHADOW",
         "NY_MO_STALL_OBBT_CANARY",
@@ -852,11 +1433,14 @@ TYPED_EXACT_BOOLEAN_ENV = frozenset(
         "NY_NN4SYS_MVF_CLIP_DIAG",
         "NY_PACKED_GRAPH_ALPHA_QUEUE",
         "NY_PATCHES_DEADLINE_FLAT_BIAS",
-        "NY_PATCHES_DEADLINE_PARALLEL_SCATTER",
         "NY_PATCHES_DEADLINE_RELU",
         "NY_PATCHES_EAGER_ERR",
         "NY_PATCHES_EAGER_ERR_7D",
         "NY_PHASE_TELEMETRY",
+        "NY_PGD_EXACT_BATCHED",
+        "NY_PGD_EXPLOIT",
+        "NY_PGD_FAST_GRAD",
+        "NY_PGD_VJP_BATCH",
         "NY_RESNET_ERR_MERGE",
         "NY_ROOT_ALPHA_CUDA_MARGIN_LR_BRACKET",
         "NY_ROOT_ALPHA_CUDA_MARGIN_MW",
@@ -874,8 +1458,11 @@ TYPED_EXACT_BOOLEAN_ENV = frozenset(
         "NY_ROOT_CRITICAL_GPU_SPEC",
         "NY_ROOT_CROWN_INTERM",
         "NY_ROOT_INTERM_CUDA_FACTORY",
+        "NY_ROOT_JOINT_INTERM_ALPHA",
         "NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT",
+        "NY_ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP",
         "NY_ROOT_JOINT_INTERM_ALPHA_PROBE",
+        "NY_ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN",
         "NY_ROOT_OUTPUT_CONDITIONED_HEAD",
         "NY_ROOT_POST_C_SURVIVOR",
         "NY_ROOT_SPARSE_INTERM_CROWN",
@@ -891,8 +1478,2853 @@ TYPED_EXACT_BOOLEAN_ENV = frozenset(
 )
 
 
+def _typed_environment_keys() -> frozenset[str]:
+    """All fixed environment names with a closed measurement grammar."""
+
+    return frozenset(
+        set(TYPED_NONNEGATIVE_INTEGER_ENV)
+        | set(TYPED_CANONICAL_NONNEGATIVE_INTEGER_ENV)
+        | set(TYPED_CANONICAL_POSITIVE_INTEGER_ENV)
+        | set(TYPED_POSITIVE_INTEGER_ENV)
+        | {key for key, _minimum, _maximum in TYPED_BOUNDED_NONNEGATIVE_INTEGER_ENV}
+        | {
+            key
+            for key, _minimum, _maximum in TYPED_BOUNDED_CANONICAL_NONNEGATIVE_INTEGER_ENV
+        }
+        | {key for key, _minimum, _maximum in TYPED_BOUNDED_POSITIVE_INTEGER_ENV}
+        | set(TYPED_OPEN_UNIT_DECIMAL_FRACTION_ENV)
+        | {key for key, _minimum, _maximum in TYPED_BOUNDED_FLOAT_ENV}
+        | set(TYPED_F32_POSITIVE_ENV)
+        | set(TYPED_F32_NONNEGATIVE_ENV)
+        | set(TYPED_ABSOLUTE_PATH_ENV)
+        | set(TYPED_FLIGHT_EVENT_REQUIREMENT_ENV)
+        | {key for key, _allowed_values in TYPED_ENUM_ENV}
+        | set(TYPED_STRICT_BOOLEAN_ENV)
+        | set(TYPED_CANONICAL_TRUTHY_TRIMMED_ENV)
+        | set(TYPED_CANONICAL_TRIMMED_EXACT_ONE_ENV)
+        | set(TYPED_EXACT_BOOLEAN_ENV)
+    )
+
+
+EXECUTION_PREDICATE_AXES = frozenset(
+    axis
+    for spec in EXECUTION_PREDICATE_SPECS.values()
+    for axis in spec["axes"]
+)
+_UNALLOWLISTED_EXECUTION_PREDICATE_AXES = EXECUTION_PREDICATE_AXES - ENV_ALLOWLIST
+_UNTYPED_EXECUTION_PREDICATE_AXES = (
+    EXECUTION_PREDICATE_AXES - _typed_environment_keys()
+)
+_EXCLUDED_EXECUTION_PREDICATE_AXES = (
+    EXECUTION_PREDICATE_AXES & SOLVER_ENVIRONMENT_EXCLUDED_KEYS
+)
+if (
+    _UNALLOWLISTED_EXECUTION_PREDICATE_AXES
+    or _UNTYPED_EXECUTION_PREDICATE_AXES
+    or _EXCLUDED_EXECUTION_PREDICATE_AXES
+):
+    raise RuntimeError(
+        "current execution-predicate axes must be fixed-allowlisted, typed, "
+        "and delivered to the isolated solver; "
+        f"unallowlisted={sorted(_UNALLOWLISTED_EXECUTION_PREDICATE_AXES)!r}, "
+        f"untyped={sorted(_UNTYPED_EXECUTION_PREDICATE_AXES)!r}, "
+        f"solver_excluded={sorted(_EXCLUDED_EXECUTION_PREDICATE_AXES)!r}"
+    )
+
+
 class ProvenanceError(RuntimeError):
     """Evidence could not be captured completely and reproducibly."""
+
+
+class ExecutionPredicateError(ValueError):
+    """A scorecard execution predicate is malformed or unproved."""
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite_json_number(raw: str) -> object:
+    raise ValueError(f"non-finite JSON number {raw!r}")
+
+
+def _search_space_contract_from_payload(
+    payload: object, *, source: str
+) -> dict[str, object]:
+    """Close the measured binary's exact searchable-axis registry.
+
+    The compiled manifest, not the checkout and not a broad ``NY_*`` prefix,
+    decides which names and tokens are governed search inputs for this binary.
+    ``ny_search`` already owns the full v6 schema/parser mirror; reuse that
+    validator and add the stricter scorecard requirements here: exact JSON
+    shapes, parser-admissible domain tokens, and no semantically duplicate
+    treatments.
+    """
+    expected_top = {
+        "schema",
+        "axes",
+        "edges",
+        "unsafe",
+        "instrument_only",
+        "test_only",
+        "declarations",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_top:
+        raise ProvenanceError(
+            "solver search-space manifest has an invalid top-level field set"
+        )
+    try:
+        import ny_search  # type: ignore[import-not-found]
+
+        space = ny_search._space_from_binary_payload(payload, source)
+    except (ImportError, OSError, KeyError, TypeError, ValueError) as error:
+        raise ProvenanceError(
+            f"solver search-space manifest is invalid: {error}"
+        ) from error
+    if space.declarations is None:
+        raise ProvenanceError("solver search-space declarations are missing")
+
+    expected_axis_keys = {
+        "name",
+        "domain",
+        "values",
+        "class",
+        "deliver",
+        "why",
+        "absence_baseline",
+        "category_prefixes",
+        "preset_baseline_keys",
+    }
+    raw_axes = payload["axes"]
+    assert isinstance(raw_axes, list)
+    raw_by_name: dict[str, dict[str, object]] = {}
+    for item in raw_axes:
+        if not isinstance(item, dict) or set(item) != expected_axis_keys:
+            raise ProvenanceError(
+                "solver search-space axis has an invalid field set"
+            )
+        name = item.get("name")
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"NY_[A-Z0-9_]+", name) is None
+            or name in raw_by_name
+        ):
+            raise ProvenanceError("solver search-space axis name is invalid")
+        raw_by_name[name] = item
+
+    raw_edges = payload.get("edges")
+    expected_edge_keys = {
+        "child",
+        "kind",
+        "parent",
+        "parents",
+        "bound",
+        "token",
+        "site",
+    }
+    if not isinstance(raw_edges, list) or any(
+        not isinstance(item, dict) or set(item) != expected_edge_keys
+        for item in raw_edges
+    ):
+        raise ProvenanceError(
+            "solver search-space edge has an invalid field set"
+        )
+    declarations = payload.get("declarations")
+    expected_declaration_keys = {"kind", "default", "min", "max", "members"}
+    if not isinstance(declarations, dict) or any(
+        not isinstance(name, str)
+        or re.fullmatch(r"NY_[A-Z0-9_]+", name) is None
+        or not isinstance(declaration, dict)
+        or set(declaration) != expected_declaration_keys
+        for name, declaration in declarations.items()
+    ):
+        raise ProvenanceError(
+            "solver search-space declaration has an invalid field set"
+        )
+
+    axes: dict[str, dict[str, object]] = {}
+    for axis in space.axes:
+        declaration = space.declarations.get(axis.name)
+        if not isinstance(declaration, dict):
+            raise ProvenanceError(
+                f"solver search-space declaration is missing for {axis.name}"
+            )
+        values = list(axis.values)
+        if not values or any(
+            not ny_search.value_admissible(declaration, token) for token in values
+        ):
+            raise ProvenanceError(
+                f"solver search-space tokens do not match {axis.name}'s declaration"
+            )
+        for index, token in enumerate(values):
+            if any(
+                ny_search.tokens_semantically_equal(declaration, token, other)
+                for other in values[index + 1 :]
+            ):
+                raise ProvenanceError(
+                    f"solver search-space axis {axis.name} has duplicate typed values"
+                )
+        raw_axis = raw_by_name[axis.name]
+        axes[axis.name] = {
+            "class": raw_axis["class"],
+            "declaration_kind": declaration["kind"],
+            "deliver": raw_axis["deliver"],
+            "domain": raw_axis["domain"],
+            "values": values,
+        }
+
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    identity = {
+        "schema": SEARCH_SPACE_CONTRACT_IDENTITY_SCHEMA,
+        "manifest_schema": SEARCH_SPACE_SCHEMA,
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+        "axis_count": len(axes),
+        "axes": sorted(axes),
+    }
+    return {
+        "schema": SEARCH_SPACE_CONTRACT_SCHEMA,
+        "manifest": payload,
+        "identity": identity,
+        "axes": axes,
+    }
+
+
+def _validate_sealed_binary_identity(
+    binary: Path, identity: object
+) -> tuple[str, dict[str, int]]:
+    """Rehash one recorded read-only executable before/after a schema probe."""
+    if not isinstance(identity, dict):
+        raise ProvenanceError("sealed solver identity is missing")
+    expected_path = identity.get("path")
+    expected_digest = identity.get("sha256")
+    expected_fingerprint = identity.get("fingerprint")
+    try:
+        resolved = binary.resolve(strict=True)
+    except OSError as error:
+        raise ProvenanceError(f"sealed solver is unavailable: {binary}") from error
+    if (
+        not isinstance(expected_path, str)
+        or str(resolved) != expected_path
+        or not isinstance(expected_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+        or not isinstance(expected_fingerprint, dict)
+    ):
+        raise ProvenanceError("sealed solver identity is invalid")
+    observed_digest, observed_fingerprint = _stable_sealed_file_hash(
+        resolved, executable=True
+    )
+    if (
+        observed_digest != expected_digest
+        or observed_fingerprint != expected_fingerprint
+    ):
+        raise ProvenanceError("sealed solver identity no longer matches its record")
+    return observed_digest, observed_fingerprint
+
+
+def _capture_binary_search_space_contract(
+    binary: Path,
+    *,
+    expected_sealed_identity: object = None,
+) -> dict[str, object]:
+    """Ask the selected executable for its authoritative governed space.
+
+    A normal source probe is followed by sealing and an identical probe of the
+    sealed bytes.  Readers may additionally pass the recorded sealed identity;
+    the executable is then hashed immediately before and after the probe so an
+    accidental replacement or rewrite cannot be accepted as its registry.
+    """
+    before: tuple[str, dict[str, int]] | None = None
+    if expected_sealed_identity is not None:
+        before = _validate_sealed_binary_identity(binary, expected_sealed_identity)
+    result = _run(
+        [str(binary), *SEARCH_SPACE_PROBE],
+        check=False,
+        timeout=30,
+        env={"PATH": "/usr/bin:/bin", "RUST_LOG": "error"},
+    )
+    if result.returncode != 0:
+        raise ProvenanceError(
+            "solver binary cannot publish its current search-space manifest: "
+            f"{binary}"
+        )
+    try:
+        payload = json.loads(
+            result.stdout,
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_nonfinite_json_number,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ProvenanceError(
+            "solver binary emitted an invalid search-space manifest"
+        ) from error
+    contract = _search_space_contract_from_payload(payload, source=str(binary))
+    if expected_sealed_identity is not None:
+        after = _validate_sealed_binary_identity(binary, expected_sealed_identity)
+        if after != before:
+            raise ProvenanceError(
+                "sealed solver changed while its search-space manifest was captured"
+            )
+    return contract
+
+
+def _search_space_axes(contract: object) -> dict[str, dict[str, object]]:
+    if not isinstance(contract, dict) or set(contract) != {
+        "schema",
+        "manifest",
+        "identity",
+        "axes",
+    }:
+        raise ProvenanceError("captured solver search-space contract is invalid")
+    if contract.get("schema") != SEARCH_SPACE_CONTRACT_SCHEMA:
+        raise ProvenanceError("captured solver search-space contract is unsupported")
+    expected = _search_space_contract_from_payload(
+        contract.get("manifest"), source="carried measurement search-space contract"
+    )
+    if contract != expected:
+        raise ProvenanceError(
+            "captured solver search-space contract identity does not match its manifest"
+        )
+    axes = expected["axes"]
+    assert isinstance(axes, dict)
+    return axes
+
+
+def _search_space_identity(contract: object) -> dict[str, object]:
+    _search_space_axes(contract)
+    assert isinstance(contract, dict)
+    identity = contract.get("identity")
+    assert isinstance(identity, dict)
+    return dict(identity)
+
+
+def _space_from_search_space_contract(contract: object, *, source: str) -> object:
+    _search_space_axes(contract)
+    assert isinstance(contract, dict)
+    try:
+        import ny_search  # type: ignore[import-not-found]
+
+        return ny_search._space_from_binary_payload(contract["manifest"], source)
+    except (ImportError, OSError, KeyError, TypeError, ValueError) as error:
+        raise ProvenanceError(
+            f"carried solver search-space manifest is invalid: {error}"
+        ) from error
+
+
+def validate_start_search_space_contract(
+    start: object,
+    *,
+    reprobe_sealed_binary: bool = False,
+) -> dict[str, object]:
+    """Validate and return the full registry carried by a current start.
+
+    Archive readers can call this once per start and recompute every contrast
+    without executing the solver per row.  Promotion may set ``reprobe`` to
+    bind the carried payload to the still-present sealed executable again.
+    """
+    if not isinstance(start, dict):
+        raise ExecutionPredicateError("measurement start is not an object")
+    measurement = start.get("measurement")
+    if not isinstance(measurement, dict):
+        raise ExecutionPredicateError("measurement start has no measurement object")
+    contract = measurement.get("search_space_contract")
+    try:
+        identity = _search_space_identity(contract)
+    except ProvenanceError as error:
+        raise ExecutionPredicateError(str(error)) from error
+    assignment = measurement.get("execution_predicate_assignment")
+    if not isinstance(assignment, dict) or assignment.get("registry") != identity:
+        raise ExecutionPredicateError(
+            "measurement start search-space contract is not bound to its predicate"
+        )
+    if reprobe_sealed_binary:
+        solver = start.get("solver_binary")
+        sealed = solver.get("sealed_execution") if isinstance(solver, dict) else None
+        path = sealed.get("path") if isinstance(sealed, dict) else None
+        if not isinstance(path, str):
+            raise ExecutionPredicateError(
+                "measurement start has no sealed solver execution path"
+            )
+        try:
+            observed = _capture_binary_search_space_contract(
+                Path(path), expected_sealed_identity=sealed
+            )
+        except ProvenanceError as error:
+            raise ExecutionPredicateError(str(error)) from error
+        if observed != contract:
+            raise ExecutionPredicateError(
+                "sealed solver search-space manifest differs from the carried contract"
+            )
+    assert isinstance(contract, dict)
+    return contract
+
+
+def _canonical_assignment_pairs(
+    raw: object,
+    *,
+    label: str,
+) -> list[list[str]]:
+    if (
+        not isinstance(raw, list)
+        or any(
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not isinstance(pair[0], str)
+            or re.fullmatch(r"NY_[A-Z0-9_]+", pair[0]) is None
+            or not isinstance(pair[1], str)
+            or not pair[1]
+            or not pair[1].isascii()
+            or pair[1] != pair[1].strip()
+            or any(character.isspace() for character in pair[1])
+            for pair in raw
+        )
+    ):
+        raise ExecutionPredicateError(f"{label} is not a closed string-pair list")
+    pairs = [[pair[0], pair[1]] for pair in raw]
+    if pairs != sorted(pairs) or len({pair[0] for pair in pairs}) != len(pairs):
+        raise ExecutionPredicateError(f"{label} is not canonical and unique")
+    return pairs
+
+
+def _execution_requirement_assignment(
+    requirement: object,
+) -> tuple[str, list[list[str]], bool]:
+    """Return one canonical predicate family and its requested coordinates.
+
+    Scalar v1 requirements retain their historical shape. Joint v2
+    requirements deliberately carry two or more sorted, unique coordinates;
+    a one-coordinate v2 spelling would create two encodings for the same
+    treatment and is therefore refused.
+    """
+    if not isinstance(requirement, dict):
+        raise ExecutionPredicateError("typed execution predicate is incomplete")
+    predicate_id = requirement.get("predicate_id")
+    if not isinstance(predicate_id, str):
+        raise ExecutionPredicateError("typed execution predicate family is incomplete")
+    schema = requirement.get("schema")
+    if schema == EXECUTION_PREDICATE_SCHEMA:
+        axis = requirement.get("axis")
+        requested = requirement.get("requested_value")
+        if not isinstance(axis, str) or not isinstance(requested, str):
+            raise ExecutionPredicateError("typed scalar execution predicate is incomplete")
+        return predicate_id, [[axis, requested]], False
+    if schema == JOINT_EXECUTION_PREDICATE_SCHEMA:
+        requested_assignment = _canonical_assignment_pairs(
+            requirement.get("requested_assignment"),
+            label="joint requested assignment",
+        )
+        if len(requested_assignment) < 2:
+            raise ExecutionPredicateError(
+                "joint execution predicate requires at least two requested axes"
+            )
+        return predicate_id, requested_assignment, True
+    raise ExecutionPredicateError("typed execution predicate schema is unsupported")
+
+
+def _preset_delivery_node_exact(
+    preset_doc: object, delivery: str
+) -> tuple[str, object | None]:
+    """Read one typed preset node without scalar coercion or invalid-as-absent."""
+    if not delivery.startswith("preset:"):
+        return "invalid", None
+    if preset_doc is None:
+        return "absent", None
+    if not isinstance(preset_doc, dict):
+        return "invalid", None
+    node: object = preset_doc
+    for part in delivery[len("preset:"):].split("."):
+        if not isinstance(node, dict):
+            return "invalid", None
+        if part not in node:
+            return "absent", None
+        node = node[part]
+    # Serde Option<T> treats an explicit YAML null as an omitted value.
+    return ("absent", None) if node is None else ("present", node)
+
+
+def _schedule_unsafe_preset_runtime_value(
+    *, axis: str, spec: dict[str, object], preset_doc: object
+) -> tuple[str, str]:
+    """Mirror the Rust ``MarginRowPreset`` type and f32 projection exactly."""
+    delivery = spec.get("delivery")
+    runtime_default = spec.get("runtime_default")
+    if not isinstance(delivery, str) or not isinstance(runtime_default, str):
+        raise ProvenanceError(f"{axis} has a malformed unsafe preset contract")
+    state, raw = _preset_delivery_node_exact(preset_doc, delivery)
+    if state == "invalid":
+        raise ProvenanceError(
+            f"{axis} has an invalid typed preset route at {delivery}"
+        )
+    if state == "absent":
+        return runtime_default, "default"
+
+    kind = spec.get("kind")
+    if kind == "U64Override":
+        if type(raw) is not int or not 0 <= raw <= (1 << 64) - 1:
+            raise ProvenanceError(
+                f"{axis} preset value must be an exact YAML u64, not {raw!r}"
+            )
+        return str(raw), "config"
+    if kind in {"Bool", "TrimmedExactOne"}:
+        if type(raw) is not bool:
+            raise ProvenanceError(
+                f"{axis} preset value must be an exact YAML Boolean, not {raw!r}"
+            )
+        return ("1" if raw else "0"), "config"
+    if kind in {"UsizeTrimmedUnicodeOwned", "UsizeOverride"}:
+        usize_max = (sys.maxsize * 2) + 1
+        if type(raw) is not int or not 0 <= raw <= usize_max:
+            raise ProvenanceError(
+                f"{axis} preset value must be an exact native YAML usize, not {raw!r}"
+            )
+        return str(raw), "config"
+    if kind in {"F64OpenUnicodeOwned", "F64OpenOverride"}:
+        if type(raw) not in {int, float}:
+            raise ProvenanceError(
+                f"{axis} preset value must be an exact YAML number, not {raw!r}"
+            )
+        try:
+            # Rust deserializes these historical fields as f32 before the
+            # registry widens them. Preserve both that rounding and the
+            # historical rule that a typed non-finite/out-of-range number is
+            # accepted by the preset loader but declines to the lower layer.
+            narrowed = struct.unpack(">f", struct.pack(">f", float(raw)))[0]
+        except (OverflowError, struct.error, TypeError, ValueError) as error:
+            raise ProvenanceError(
+                f"{axis} preset number is not representable as a typed f32"
+            ) from error
+        minimum = spec.get("min")
+        maximum = spec.get("max")
+        if (
+            not isinstance(minimum, (int, float))
+            or isinstance(minimum, bool)
+            or not isinstance(maximum, (int, float))
+            or isinstance(maximum, bool)
+        ):
+            raise ProvenanceError(f"{axis} has a malformed fraction contract")
+        if not math.isfinite(narrowed) or not minimum < narrowed < maximum:
+            return runtime_default, "default"
+        return repr(narrowed), "config"
+    raise ProvenanceError(f"{axis} has an unsupported unsafe preset kind {kind!r}")
+
+
+def _execution_runtime_context_assignment(
+    *,
+    ny_search: object,
+    space: object,
+    predicate_id: str,
+    spec: dict[str, object],
+    full_assignment: list[list[str]],
+    source_overrides: dict[str, str],
+    preset_docs: list[dict[str, object]] | None,
+    preset_expected: bool,
+) -> tuple[list[list[str]], list[list[str]]]:
+    """Freeze every value reported by a full-policy execution terminal.
+
+    Most predicate families report only their requested coordinate. The
+    BNN-falsification, backward-intermediate, root-alpha/rebake,
+    per-domain-alpha, root-precision, epoch, and margin-row width terminals
+    intentionally report their complete frozen policies, so every sibling
+    must be derived from the same sealed category presets and then overlaid
+    with the generated treatment/prerequisites. A multi-category run with any
+    differing sibling context or authority must be split: one start-level
+    assignment cannot authenticate two contradictory terminals.
+    """
+    if predicate_id not in _CONTEXT_BOUND_FULL_POLICY_PREDICATES:
+        return [], []
+    family_axes = spec.get("configured_axes", spec.get("axes"))
+    if not isinstance(family_axes, frozenset):
+        raise ProvenanceError("execution predicate family is malformed")
+    declarations = getattr(space, "declarations", None)
+    by_name = getattr(space, "by_name", None)
+    if not isinstance(declarations, dict) or not isinstance(by_name, dict):
+        raise ProvenanceError("execution predicate search-space context is incomplete")
+    context: dict[str, str] = {}
+    context_sources: dict[str, str] = {}
+    for axis in sorted(family_axes):
+        axis_definition = by_name.get(axis)
+        declaration = declarations.get(axis)
+        if not isinstance(declaration, dict):
+            raise ProvenanceError(
+                f"selected solver does not publish runtime-context axis {axis}"
+            )
+        # A small reviewed set of configured siblings remains Class::Unsafe
+        # and therefore has no searchable Axis definition. Each is sealed from
+        # one exact declaration and typed preset route; this exception cannot
+        # authorize direct environment assignment (rejected separately below).
+        unsafe_context_spec = _UNSAFE_RUNTIME_CONTEXT_SPECS.get(
+            (predicate_id, axis)
+        )
+        if axis_definition is None and unsafe_context_spec is not None:
+            unsafe_names = getattr(space, "unsafe_names", None)
+            expected_default = unsafe_context_spec["default"]
+            observed_default = declaration.get("default")
+            default_matches = (
+                observed_default is None
+                if expected_default is None
+                else isinstance(observed_default, str)
+                and isinstance(expected_default, str)
+                and ny_search.tokens_semantically_equal(
+                    declaration, observed_default, expected_default
+                )
+            )
+            if (
+                not isinstance(unsafe_names, list)
+                or axis not in unsafe_names
+                or declaration.get("kind") != unsafe_context_spec["kind"]
+                or not default_matches
+                or (
+                    "min" in unsafe_context_spec
+                    and declaration.get("min") != unsafe_context_spec["min"]
+                )
+                or (
+                    "max" in unsafe_context_spec
+                    and declaration.get("max") != unsafe_context_spec["max"]
+                )
+            ):
+                raise ProvenanceError(
+                    f"selected solver does not publish the sealed unsafe "
+                    f"runtime-context contract for {axis}"
+                )
+            delivery = unsafe_context_spec["delivery"]
+            assert isinstance(delivery, str)
+            if preset_expected and not preset_docs:
+                raise ProvenanceError(
+                    f"{axis} has no sealed category preset context"
+                )
+            tokens = []
+            sources = []
+            for doc in preset_docs or [None]:
+                if predicate_id == (
+                    "ny-exec-v1.margin-row-schedule-parameter-engaged"
+                ):
+                    token, source = _schedule_unsafe_preset_runtime_value(
+                        axis=axis,
+                        spec=unsafe_context_spec,
+                        preset_doc=doc,
+                    )
+                else:
+                    preset_token = ny_search.preset_effective_token(doc, delivery)
+                    token = (
+                        unsafe_context_spec["runtime_default"]
+                        if preset_token is None
+                        else preset_token
+                    )
+                    source = "default" if preset_token is None else "config"
+                if not isinstance(token, str) or (
+                    token == "none"
+                    and unsafe_context_spec["runtime_default"] != "none"
+                ) or (
+                    token != "none"
+                    and not ny_search.value_admissible(declaration, token)
+                ):
+                    raise ProvenanceError(
+                        f"{axis} has an inadmissible sealed runtime value"
+                    )
+                tokens.append(token)
+                sources.append(source)
+            if (
+                len(set(sources)) != 1
+                or any(
+                    not (
+                        tokens[0] == token == "none"
+                        or ny_search.tokens_semantically_equal(
+                            declaration, tokens[0], token
+                        )
+                    )
+                    for token in tokens[1:]
+                )
+            ):
+                raise ProvenanceError(
+                    f"{axis} has no common runtime value and authority across "
+                    "the sealed category presets; split the measurement by "
+                    "baseline context"
+                )
+            context[axis] = tokens[0]
+            context_sources[axis] = sources[0]
+            continue
+        if axis_definition is None:
+            raise ProvenanceError(
+                f"selected solver does not publish runtime-context axis {axis}"
+            )
+        state, token, source = ny_search._effective_axis_baseline(
+            axis_definition,
+            declaration,
+            preset_expected=preset_expected,
+            preset_docs=preset_docs,
+        )
+        # Trust-region absence is intentionally a fourth, non-search token in
+        # the search-space contract. The runtime policy names that exact state
+        # ``full_box``; preserve Distinct in T0 while sealing its terminal and
+        # receipt representation here (JSON null in the LeverSet receipt).
+        if (
+            predicate_id
+            == "ny-exec-v1.bnn-falsification-parameter-engaged"
+            and axis == "NY_BNN_SIGN_SPACE_TRUST_REGION"
+            and state == "distinct"
+        ):
+            state, token = "known", "full_box"
+        if state != "known" or not isinstance(token, str):
+            raise ProvenanceError(
+                f"{axis} has no common effective runtime context across the "
+                f"sealed category presets ({source}); split the measurement by "
+                "baseline context"
+            )
+        context[axis] = token
+        preset_sources = []
+        if preset_docs is not None and axis_definition.deliver.startswith("preset:"):
+            path = axis_definition.deliver[len("preset:"):].split(".")
+            for doc in preset_docs:
+                node: object = doc
+                for part in path:
+                    if not isinstance(node, dict) or part not in node:
+                        node = None
+                        break
+                    node = node[part]
+                preset_sources.append("default" if node is None else "config")
+        else:
+            preset_sources.append("default")
+        if len(set(preset_sources)) != 1:
+            raise ProvenanceError(
+                f"{axis} has no common runtime authority across the sealed "
+                "category presets; split the measurement by baseline context"
+            )
+        context_sources[axis] = preset_sources[0]
+    context.update(dict(full_assignment))
+    context_sources.update(source_overrides)
+    if (
+        predicate_id == "ny-exec-v1.margin-row-epoch-parameter-engaged"
+        and context.get("NY_MARGIN_ROW_EPOCH_PARENT_TOPK") != "0"
+    ):
+        raise ProvenanceError(
+            "NY_MARGIN_ROW_EPOCH_PARENT_TOPK must remain sealed at 0 while the "
+            "incremental parent refresh is Class::Unsafe"
+        )
+    return (
+        [[axis, context[axis]] for axis in sorted(context)],
+        [[axis, context_sources[axis]] for axis in sorted(context_sources)],
+    )
+
+
+def build_execution_predicate_assignment(
+    environment: object,
+    search_space_contract: object,
+    *,
+    preset_docs: object = None,
+    preset_expected: bool = False,
+) -> dict[str, object]:
+    """Seal one scalar or same-family joint causal treatment.
+
+    The v1 writer remains byte-for-byte scalar. Joint v2 requirements may name
+    multiple coordinates, but all coordinates must belong to one existing
+    predicate family and the generated comparison remains the exact
+    prerequisite-only arm. No unrequested governed input may hitchhike in the
+    treatment environment. When the scored run loads category presets, the
+    exact sealed preset documents decide the effective baseline; declaration
+    defaults are not a substitute for that runtime context.
+    """
+    if not isinstance(environment, dict):
+        raise ProvenanceError("captured measurement environment is invalid")
+    values = environment.get("values")
+    typed = environment.get("typed_values")
+    if not isinstance(values, dict) or not isinstance(typed, dict):
+        raise ProvenanceError("captured measurement environment is incomplete")
+    requirement = typed.get("NY_MEASURE_REQUIRE_FLIGHT_EVENT")
+    try:
+        predicate_id, requested_assignment, is_joint = (
+            _execution_requirement_assignment(requirement)
+        )
+    except ExecutionPredicateError as error:
+        raise ProvenanceError(
+            "current measurement evidence requires a typed execution predicate"
+        ) from error
+    required_assignment = requested_assignment
+
+    if preset_docs is None:
+        resolved_preset_docs: list[dict[str, object]] | None = None
+    elif (
+        isinstance(preset_docs, list)
+        and preset_docs
+        and all(isinstance(doc, dict) for doc in preset_docs)
+    ):
+        resolved_preset_docs = [dict(doc) for doc in preset_docs]
+    else:
+        raise ProvenanceError("execution predicate preset context is invalid")
+    if preset_expected and resolved_preset_docs is None:
+        raise ProvenanceError(
+            "configured execution predicate is missing its sealed category presets"
+        )
+
+    axes = _search_space_axes(search_space_contract)
+    spec = EXECUTION_PREDICATE_SPECS.get(predicate_id)
+    if (
+        not isinstance(spec, dict)
+        or not isinstance(spec.get("axes"), frozenset)
+    ):
+        raise ProvenanceError("execution predicate family is unknown")
+    requested = dict(requested_assignment)
+    if any(axis not in spec["axes"] for axis in requested):
+        raise ProvenanceError(
+            "joint execution predicate crosses predicate families or names an "
+            "axis outside its family"
+        )
+    configured_axes = spec.get("configured_axes", spec["axes"])
+    if not isinstance(configured_axes, frozenset):
+        raise ProvenanceError("execution predicate configured family is malformed")
+    unsafe_context_hitchhikers = sorted(
+        axis
+        for axis in configured_axes.difference(spec["axes"])
+        if axis in values
+    )
+    if unsafe_context_hitchhikers:
+        raise ProvenanceError(
+            "unsearchable full-policy coordinates cannot hitchhike in the "
+            "direct measurement environment: "
+            + ", ".join(unsafe_context_hitchhikers)
+        )
+    for axis, token in requested_assignment:
+        axis_contract = axes.get(axis)
+        if not isinstance(axis_contract, dict):
+            raise ProvenanceError(
+                f"selected solver does not publish predicate axis {axis}"
+            )
+        allowed = axis_contract.get("values")
+        if not isinstance(allowed, list) or token not in allowed:
+            raise ProvenanceError(
+                f"requested {axis}={token} is outside the selected solver's "
+                "closed search domain"
+            )
+    try:
+        import ny_search  # type: ignore[import-not-found]
+
+        space = _space_from_search_space_contract(
+            search_space_contract, source="scorecard execution predicate"
+        )
+        composite_axes = sorted(
+            set(requested).intersection(ny_search._AUTOMATED_COMPOSITE_AXES)
+        )
+        if composite_axes:
+            raise ProvenanceError(
+                f"{', '.join(composite_axes)} is a composite admission master "
+                "and cannot receive automated scorecard execution credit"
+            )
+        baseline_values = ny_search.effective_baseline_values(
+            space,
+            space.declarations,
+            preset_expected=preset_expected,
+            preset_docs=resolved_preset_docs,
+        )
+        repair_baselines = (
+            ny_search.effective_repair_baselines(
+                space, space.declarations, resolved_preset_docs)
+            if resolved_preset_docs is not None else None
+        )
+        for axis, token in requested_assignment:
+            axis_definition = space.by_name.get(axis)
+            state, _baseline, source = ny_search._effective_axis_baseline(
+                axis_definition,
+                space.declarations.get(axis) or {},
+                preset_expected=preset_expected,
+                preset_docs=resolved_preset_docs,
+            )
+            if preset_expected and state == "unknown":
+                raise ProvenanceError(
+                    f"requested {axis} has no common effective baseline across "
+                    f"the sealed category presets ({source}); split the measurement "
+                    "by baseline context"
+                )
+            admissible, dropped = ny_search.admissible_values(
+                axis_definition,
+                space.declarations,
+                False,
+                preset_expected=preset_expected,
+                preset_docs=resolved_preset_docs,
+            )
+            if token not in admissible:
+                detail = next(
+                    (
+                        reason
+                        for reason in dropped
+                        if reason.startswith(f"{axis}={token} ")
+                    ),
+                    f"{axis}={token} is not an admissible treatment",
+                )
+                raise ProvenanceError(detail)
+        repaired = ny_search._repair_preserving(
+            requested,
+            space,
+            space.declarations,
+            baseline_values=baseline_values,
+            return_contrast=True,
+            repair_baselines=repair_baselines,
+        )
+    except (ImportError, OSError, KeyError, TypeError, ValueError) as error:
+        raise ProvenanceError(
+            f"execution predicate contrast could not be generated: {error}"
+        ) from error
+    if repaired is None:
+        raise ProvenanceError(
+            "requested assignment cannot form an attributable same-family contrast"
+        )
+    repaired_assignment, contrast = repaired
+    if not isinstance(contrast, dict) or set(contrast) != {
+        "schema",
+        "requested_axes",
+        "requested_assignment",
+        "prerequisites_added",
+        "treatment_assignment",
+        "comparison_assignment",
+        "contrast_id",
+    }:
+        raise ProvenanceError("generated execution predicate contrast is malformed")
+    try:
+        contrast_requested_assignment = _canonical_assignment_pairs(
+            contrast.get("requested_assignment"), label="requested assignment"
+        )
+        prerequisites = _canonical_assignment_pairs(
+            contrast.get("prerequisites_added"), label="prerequisites assignment"
+        )
+        full = _canonical_assignment_pairs(
+            contrast.get("treatment_assignment"), label="full assignment"
+        )
+        comparison = _canonical_assignment_pairs(
+            contrast.get("comparison_assignment"), label="comparison assignment"
+        )
+    except ExecutionPredicateError as error:
+        raise ProvenanceError(str(error)) from error
+    if (
+        contrast.get("schema") != ny_search.SEARCH_DESIGN_SCHEMA
+        or contrast.get("requested_axes") != sorted(requested)
+        or contrast_requested_assignment != required_assignment
+        or prerequisites != comparison
+        or full != sorted(contrast_requested_assignment + prerequisites)
+        or repaired_assignment != [tuple(pair) for pair in full]
+        or not isinstance(contrast.get("contrast_id"), str)
+        or re.fullmatch(r"[0-9a-f]{16}", contrast["contrast_id"]) is None
+    ):
+        raise ProvenanceError("generated execution predicate contrast is inconsistent")
+    requested_assignment = contrast_requested_assignment
+    explicit = sorted(
+        [name, setting]
+        for name, setting in values.items()
+        if name in axes and isinstance(setting, str)
+    )
+    explicit_names = {name for name, _setting in explicit}
+    requested_deliveries = [
+        [
+            axis,
+            "direct_environment" if axis in explicit_names else "runtime_config",
+        ]
+        for axis, _token in requested_assignment
+    ]
+    if is_joint and len({delivery for _axis, delivery in requested_deliveries}) != 1:
+        raise ProvenanceError(
+            "joint execution predicates cannot mix direct-environment and "
+            "runtime-config delivery authorities"
+        )
+    direct_requested = [
+        pair
+        for pair in requested_assignment
+        if pair[0] in explicit_names
+    ]
+    prerequisite_sources = {
+        axis: (
+            "config"
+            if (
+                predicate_id == "ny-exec-v1.mo-kfsb-parameter-engaged"
+                and axis == "NY_MO_KFSB"
+                and axis not in explicit_names
+                and baseline_values.get(axis) == token == "1"
+            )
+            else "legacy_env"
+        )
+        for axis, token in prerequisites
+    }
+    expected_explicit = sorted(
+        [
+            pair for pair in prerequisites
+            if prerequisite_sources[pair[0]] == "legacy_env"
+        ]
+        + direct_requested
+    )
+    if explicit != expected_explicit:
+        raise ProvenanceError(
+            "direct governed inputs do not equal the treatment's exact "
+            "generated assignment; expected "
+            f"{expected_explicit!r}, observed {explicit!r}"
+        )
+    for name, setting in explicit:
+        member = axes.get(name)
+        if (
+            not isinstance(member, dict)
+            or not isinstance(member.get("values"), list)
+            or setting not in member["values"]
+            or name not in typed
+            or name in SOLVER_ENVIRONMENT_EXCLUDED_KEYS
+        ):
+            raise ProvenanceError(
+                f"explicit governed input {name}={setting} is not closed, typed, "
+                "and solver-delivered"
+            )
+    requested_delivery_by_axis = dict(requested_deliveries)
+    source_overrides = dict(prerequisite_sources)
+    source_overrides.update(
+        {
+            axis: (
+                "legacy_env"
+                if requested_delivery_by_axis[axis] == "direct_environment"
+                else "config"
+            )
+            for axis, _token in requested_assignment
+        }
+    )
+    (
+        runtime_context_assignment,
+        runtime_context_source_assignment,
+    ) = _execution_runtime_context_assignment(
+        ny_search=ny_search,
+        space=space,
+        predicate_id=predicate_id,
+        spec=spec,
+        full_assignment=full,
+        source_overrides=source_overrides,
+        preset_docs=resolved_preset_docs,
+        preset_expected=preset_expected,
+    )
+
+    common = {
+        "predicate_id": predicate_id,
+        "requested_assignment": requested_assignment,
+        "prerequisites_assignment": prerequisites,
+        "full_assignment": full,
+        "comparison_assignment": comparison,
+        "contrast_schema": contrast["schema"],
+        "contrast_id": contrast["contrast_id"],
+        "registry": _search_space_identity(search_space_contract),
+        "runtime_context_assignment": runtime_context_assignment,
+        "runtime_context_source_assignment": runtime_context_source_assignment,
+    }
+    if not is_joint:
+        assert len(requested_deliveries) == 1
+        return {
+            "schema": EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA,
+            "predicate_id": common["predicate_id"],
+            "requested_delivery": requested_deliveries[0][1],
+            "requested_assignment": common["requested_assignment"],
+            "prerequisites_assignment": common["prerequisites_assignment"],
+            "full_assignment": common["full_assignment"],
+            "comparison_assignment": common["comparison_assignment"],
+            "contrast_schema": common["contrast_schema"],
+            "contrast_id": common["contrast_id"],
+            "registry": common["registry"],
+            "runtime_context_assignment": common["runtime_context_assignment"],
+            "runtime_context_source_assignment": common[
+                "runtime_context_source_assignment"
+            ],
+        }
+    return {
+        "schema": JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA,
+        "predicate_id": common["predicate_id"],
+        "requested_deliveries": requested_deliveries,
+        "requested_assignment": common["requested_assignment"],
+        "prerequisites_assignment": common["prerequisites_assignment"],
+        "full_assignment": common["full_assignment"],
+        "comparison_assignment": common["comparison_assignment"],
+        "contrast_schema": common["contrast_schema"],
+        "contrast_id": common["contrast_id"],
+        "registry": common["registry"],
+        "runtime_context_assignment": common["runtime_context_assignment"],
+        "runtime_context_source_assignment": common[
+            "runtime_context_source_assignment"
+        ],
+    }
+
+
+def validate_execution_predicate_assignment(
+    value: object,
+    *,
+    environment: object,
+    search_space_contract: object,
+    preset_docs: object = None,
+    preset_expected: bool = False,
+) -> dict[str, object]:
+    """Recompute one current context-bound or historical causal assignment."""
+    if not isinstance(value, dict):
+        raise ExecutionPredicateError(
+            "execution predicate assignment has an invalid field set"
+        )
+    schema = value.get("schema")
+    legacy_scalar_fields = {
+        "schema", "predicate_id", "requested_delivery",
+        "requested_assignment", "prerequisites_assignment", "full_assignment",
+        "comparison_assignment", "contrast_schema", "contrast_id", "registry",
+    }
+    legacy_joint_fields = {
+        "schema", "predicate_id", "requested_deliveries",
+        "requested_assignment", "prerequisites_assignment", "full_assignment",
+        "comparison_assignment", "contrast_schema", "contrast_id", "registry",
+    }
+    scalar_fields = legacy_scalar_fields | {
+        "runtime_context_assignment", "runtime_context_source_assignment",
+    }
+    joint_fields = legacy_joint_fields | {
+        "runtime_context_assignment", "runtime_context_source_assignment",
+    }
+    if schema == EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA:
+        is_joint = False
+        legacy_assignment = False
+        expected_fields = scalar_fields
+    elif schema == JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA:
+        is_joint = True
+        legacy_assignment = False
+        expected_fields = joint_fields
+    elif schema == LEGACY_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA:
+        is_joint = False
+        legacy_assignment = True
+        expected_fields = legacy_scalar_fields
+    elif schema == LEGACY_JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA:
+        is_joint = True
+        legacy_assignment = True
+        expected_fields = legacy_joint_fields
+    else:
+        raise ExecutionPredicateError("execution predicate assignment schema is unsupported")
+    if set(value) != expected_fields:
+        raise ExecutionPredicateError(
+            "execution predicate assignment has an invalid field set"
+        )
+    allowed_deliveries = {"direct_environment", "runtime_config"}
+    if not is_joint:
+        if value.get("requested_delivery") not in allowed_deliveries:
+            raise ExecutionPredicateError("execution predicate delivery is invalid")
+        requested_deliveries: object = None
+    else:
+        requested_deliveries = value.get("requested_deliveries")
+        if (
+            not isinstance(requested_deliveries, list)
+            or any(
+                not isinstance(item, list)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                or item[1] not in allowed_deliveries
+                for item in requested_deliveries
+            )
+            or requested_deliveries != sorted(requested_deliveries)
+            or len({item[0] for item in requested_deliveries})
+            != len(requested_deliveries)
+        ):
+            raise ExecutionPredicateError(
+                "joint execution predicate deliveries are not canonical and unique"
+            )
+    try:
+        registry = _search_space_identity(search_space_contract)
+    except ProvenanceError as error:
+        raise ExecutionPredicateError(str(error)) from error
+    if value.get("registry") != registry:
+        raise ExecutionPredicateError("execution predicate registry binding is invalid")
+
+    requested_assignment = _canonical_assignment_pairs(
+        value.get("requested_assignment"), label="requested assignment"
+    )
+    prerequisites = _canonical_assignment_pairs(
+        value.get("prerequisites_assignment"), label="prerequisites assignment"
+    )
+    full = _canonical_assignment_pairs(
+        value.get("full_assignment"), label="full assignment"
+    )
+    comparison = _canonical_assignment_pairs(
+        value.get("comparison_assignment"), label="comparison assignment"
+    )
+    runtime_context_assignment = (
+        []
+        if legacy_assignment
+        else _canonical_assignment_pairs(
+            value.get("runtime_context_assignment"),
+            label="runtime context assignment",
+        )
+    )
+    runtime_context_source_assignment = (
+        []
+        if legacy_assignment
+        else _canonical_assignment_pairs(
+            value.get("runtime_context_source_assignment"),
+            label="runtime context source assignment",
+        )
+    )
+    if (
+        [pair[0] for pair in runtime_context_source_assignment]
+        != [pair[0] for pair in runtime_context_assignment]
+        or any(
+            source not in {"default", "config", "legacy_env"}
+            for _axis, source in runtime_context_source_assignment
+        )
+    ):
+        raise ExecutionPredicateError(
+            "runtime context sources differ from the runtime context assignment"
+        )
+    if (
+        (len(requested_assignment) < 2 if is_joint else len(requested_assignment) != 1)
+        or comparison != prerequisites
+        or full != sorted(requested_assignment + prerequisites)
+    ):
+        raise ExecutionPredicateError("execution predicate assignment is inconsistent")
+    if set(pair[0] for pair in requested_assignment) & set(
+        pair[0] for pair in prerequisites
+    ):
+        raise ExecutionPredicateError("treatment is duplicated as a prerequisite")
+    predicate_id = value.get("predicate_id")
+    spec = EXECUTION_PREDICATE_SPECS.get(predicate_id)
+    if (
+        not isinstance(spec, dict)
+        or not isinstance(spec.get("axes"), frozenset)
+        or any(axis not in spec["axes"] for axis, _token in requested_assignment)
+    ):
+        raise ExecutionPredicateError("execution predicate assignment family is unknown")
+    if legacy_assignment and predicate_id in _CONTEXT_BOUND_FULL_POLICY_PREDICATES:
+        raise ExecutionPredicateError(
+            "full-policy predicates require a context-bound assignment schema"
+        )
+    if is_joint and [item[0] for item in requested_deliveries] != [
+        pair[0] for pair in requested_assignment
+    ]:
+        raise ExecutionPredicateError(
+            "joint execution predicate deliveries differ from requested axes"
+        )
+    if not isinstance(environment, dict):
+        raise ExecutionPredicateError("sealed assignment environment is missing")
+    values = environment.get("values")
+    typed = environment.get("typed_values")
+    if not isinstance(values, dict) or not isinstance(typed, dict):
+        raise ExecutionPredicateError("sealed assignment environment is incomplete")
+    requirement = typed.get("NY_MEASURE_REQUIRE_FLIGHT_EVENT")
+    try:
+        required_predicate, required_assignment, required_is_joint = (
+            _execution_requirement_assignment(requirement)
+        )
+    except ExecutionPredicateError as error:
+        raise ExecutionPredicateError(
+            "execution predicate assignment differs from its typed requirement"
+        ) from error
+    if (
+        required_predicate != predicate_id
+        or required_assignment != requested_assignment
+        or required_is_joint != is_joint
+    ):
+        raise ExecutionPredicateError(
+            "execution predicate assignment differs from its typed requirement"
+        )
+    try:
+        rebuilt = build_execution_predicate_assignment(
+            environment,
+            search_space_contract,
+            preset_docs=None if legacy_assignment else preset_docs,
+            preset_expected=False if legacy_assignment else preset_expected,
+        )
+    except ProvenanceError as error:
+        raise ExecutionPredicateError(str(error)) from error
+    if legacy_assignment:
+        rebuilt = dict(rebuilt)
+        rebuilt.pop("runtime_context_assignment", None)
+        rebuilt.pop("runtime_context_source_assignment", None)
+        rebuilt["schema"] = (
+            LEGACY_JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+            if is_joint
+            else LEGACY_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        )
+    if rebuilt != value:
+        raise ExecutionPredicateError(
+            "execution predicate assignment differs from the regenerated contrast"
+        )
+    if is_joint:
+        assert isinstance(requested_deliveries, list)
+        requested_delivery_by_axis = dict(requested_deliveries)
+    else:
+        requested_delivery_by_axis = {
+            requested_assignment[0][0]: value["requested_delivery"]
+        }
+    receipt_source_assignment = sorted(
+        [
+            [
+                axis,
+                (
+                    "legacy_env"
+                    if requested_delivery_by_axis[axis] == "direct_environment"
+                    else "config"
+                ),
+            ]
+            for axis, _token in requested_assignment
+        ]
+        + [
+            [
+                axis,
+                (
+                    "config"
+                    if (
+                        predicate_id
+                        == "ny-exec-v1.mo-kfsb-parameter-engaged"
+                        and axis == "NY_MO_KFSB"
+                        and axis not in values
+                    )
+                    else "legacy_env"
+                ),
+            ]
+            for axis, _token in prerequisites
+        ]
+    )
+    return {
+        "predicate_id": predicate_id,
+        "requested_assignment": requested_assignment,
+        "prerequisites_assignment": prerequisites,
+        "full_assignment": full,
+        "comparison_assignment": comparison,
+        "receipt_source_assignment": receipt_source_assignment,
+        "runtime_context_assignment": runtime_context_assignment,
+        "runtime_context_source_assignment": runtime_context_source_assignment,
+        "contrast_id": value["contrast_id"],
+        "registry": dict(registry),
+    }
+
+
+def parse_execution_predicate_requirement(raw: str) -> dict[str, object]:
+    """Parse one closed scalar-v1 or same-family joint-v2 requirement."""
+    if not isinstance(raw, str):
+        raise ExecutionPredicateError(
+            "required execution predicate must be a string"
+        )
+    encoded, separator, transport_status = raw.partition("=")
+    if (
+        not separator
+        or "=" in transport_status
+        or transport_status != EXECUTION_PREDICATE_TRANSPORT_STATUS
+    ):
+        raise ExecutionPredicateError(
+            "required execution predicate must be "
+            "a scalar ny-exec-v1 or same-family joint ny-exec-v2 predicate ending =ran"
+        )
+
+    if SAFE_COMPONENT.fullmatch(encoded) is not None:
+        for predicate_id, spec in EXECUTION_PREDICATE_SPECS.items():
+            prefix = f"{predicate_id}."
+            if not encoded.startswith(prefix):
+                continue
+            suffix = encoded[len(prefix) :]
+            axes = spec["axes"]
+            assert isinstance(axes, frozenset)
+            matches = [
+                axis for axis in axes if suffix.startswith(f"{axis}.")
+            ]
+            if len(matches) != 1:
+                raise ExecutionPredicateError(
+                    f"execution predicate {predicate_id!r} does not govern its "
+                    "encoded axis"
+                )
+            axis = matches[0]
+            requested = suffix[len(axis) + 1 :]
+            if not requested or SAFE_COMPONENT.fullmatch(requested) is None:
+                raise ExecutionPredicateError(
+                    "execution predicate requested value must be a non-empty safe "
+                    "token"
+                )
+            return {
+                "schema": EXECUTION_PREDICATE_SCHEMA,
+                "type": "execution_predicate_requirement",
+                "predicate_id": predicate_id,
+                "axis": axis,
+                "requested_value": requested,
+                "claim": "parameter_engaged",
+            }
+
+    if re.fullmatch(r"[A-Za-z0-9_.,-]+", encoded) is not None:
+        for predicate_id, spec in EXECUTION_PREDICATE_SPECS.items():
+            joint_predicate_id = predicate_id.replace(
+                "ny-exec-v1.", "ny-exec-v2.", 1
+            )
+            prefix = f"{joint_predicate_id}."
+            if not encoded.startswith(prefix):
+                continue
+            suffix = encoded[len(prefix) :]
+            axes = spec["axes"]
+            assert isinstance(axes, frozenset)
+            requested_assignment = []
+            for component in suffix.split(","):
+                matches = [
+                    axis for axis in axes if component.startswith(f"{axis}.")
+                ]
+                if len(matches) != 1:
+                    raise ExecutionPredicateError(
+                        f"joint execution predicate {joint_predicate_id!r} "
+                        "crosses families or names an unknown axis"
+                    )
+                axis = matches[0]
+                requested = component[len(axis) + 1 :]
+                if not requested or SAFE_COMPONENT.fullmatch(requested) is None:
+                    raise ExecutionPredicateError(
+                        "joint execution predicate values must be non-empty safe tokens"
+                    )
+                requested_assignment.append([axis, requested])
+            canonical = _canonical_assignment_pairs(
+                requested_assignment, label="joint requested assignment"
+            )
+            if len(canonical) < 2:
+                raise ExecutionPredicateError(
+                    "joint execution predicate requires at least two requested axes"
+                )
+            return {
+                "schema": JOINT_EXECUTION_PREDICATE_SCHEMA,
+                "type": "execution_predicate_requirement",
+                "predicate_id": predicate_id,
+                "requested_assignment": canonical,
+                "claim": "parameters_engaged",
+            }
+
+    raise ExecutionPredicateError(
+        "required execution predicate ID is unknown or legacy, cross-family, "
+        "or malformed; bare METHOD=STATUS events cannot earn current qualification credit"
+    )
+
+
+def _strict_current_upfront_envelope(
+    ny_search: object, record: dict[str, object]
+) -> bool:
+    """Require only the current, completely parsed upfront schema pair."""
+    events = record.get("events")
+    if not isinstance(events, list):
+        return False
+    row = {"flight": record}
+    contracts = (
+        ("upfront_attack_policy", "ny-cli/upfront-policy/v2"),
+        ("upfront_attack_execution", "ny-cli/upfront-execution/v2"),
+    )
+    for method, schema in contracts:
+        candidates = [
+            event
+            for event in events
+            if isinstance(event, dict) and event.get("method") == method
+        ]
+        parser = getattr(ny_search, "_machine_event_fields", None)
+        if not callable(parser):
+            return False
+        parsed = parser(row, method, schema)
+        # A legacy, malformed, or wrong-schema event is not silently skipped in
+        # a current qualification envelope.  It remains readable when no
+        # execution predicate is requested.
+        if not candidates or len(parsed) != len(candidates):
+            return False
+    return True
+
+
+def _strict_current_bnn_falsification_envelope(
+    ny_search: object, record: dict[str, object]
+) -> bool:
+    """Require the exact v1 pair and its shipped traffic lower policy."""
+    evidence = ny_search._bnn_falsification_evidence({"flight": record})
+    if evidence is None or not evidence["executions"]:
+        return False
+    policy = evidence["policy"]
+    return (
+        policy["mip_compiled"] == "true"
+        and policy["lower_sign_space_enabled"] == "true"
+        and policy["lower_minimal_move"] == "false"
+        and policy["lower_trust_region"] == "full_box"
+        and policy["lower_ste_pgd_enabled"] == "true"
+    )
+
+
+def _margin_row_backward_interm_receipt_context_errors(
+    ny_search: object,
+    record: dict[str, object],
+    entries: list[object],
+    expected_context_assignment: list[list[str]] | None,
+    expected_context_source_assignment: list[list[str]] | None,
+) -> list[str]:
+    """Bind the terminal's complete frozen BI policy to its v3 receipt."""
+    evidences = ny_search._margin_row_backward_interm_terminal_evidences(
+        {"flight": record}
+    )
+    if not evidences:
+        return [
+            "backward-intermediate context has no consistent current terminal receipt"
+        ]
+    event = evidences[0]
+    event_tokens = {
+        "NY_MARGIN_ROW_BACKWARD_INTERM": (
+            "1" if event["enabled"] == "true" else "0"
+        ),
+        "NY_MARGIN_ROW_BI_SECS": event["configured_secs"],
+        "NY_MARGIN_ROW_BI_CHUNK": event["configured_chunk"],
+        "NY_MARGIN_ROW_BI_CHUNK_SECS": event["configured_chunk_secs"],
+        "NY_MARGIN_ROW_BI_TOPK": event["configured_topk"],
+    }
+    expected_context = (
+        dict(expected_context_assignment)
+        if expected_context_assignment is not None
+        else None
+    )
+    expected_context_sources = (
+        dict(expected_context_source_assignment)
+        if expected_context_source_assignment is not None
+        else None
+    )
+    if expected_context is not None and set(expected_context) != set(event_tokens):
+        return [
+            "backward-intermediate sealed runtime context is incomplete"
+        ]
+    if (
+        expected_context_sources is not None
+        and set(expected_context_sources) != set(event_tokens)
+    ):
+        return [
+            "backward-intermediate sealed runtime authority is incomplete"
+        ]
+    errors = []
+    for axis, token in event_tokens.items():
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == axis
+        ]
+        if len(matches) != 1:
+            errors.append(f"{axis} must appear exactly once in the BI receipt context")
+            continue
+        entry = matches[0]
+        if (
+            "ignored_raw" in entry
+            or "rejected_raw" in entry
+            or not ny_search._receipt_value_matches_token(entry.get("value"), token)
+        ):
+            errors.append(
+                f"{axis}={token} terminal configuration differs from its exact receipt"
+            )
+        if expected_context is not None and not ny_search._receipt_value_matches_token(
+            entry.get("value"), expected_context[axis]
+        ):
+            errors.append(
+                f"{axis}={token} terminal configuration differs from the sealed "
+                f"runtime context {expected_context[axis]}"
+            )
+        if (
+            expected_context_sources is not None
+            and entry.get("source") != expected_context_sources[axis]
+        ):
+            errors.append(
+                f"{axis} runtime authority {entry.get('source')!r} differs from "
+                f"sealed authority {expected_context_sources[axis]!r}"
+            )
+    return errors
+
+
+def _margin_row_root_precision_receipt_context_errors(
+    ny_search: object,
+    record: dict[str, object],
+    entries: list[object],
+    expected_context_assignment: list[list[str]] | None,
+    expected_context_source_assignment: list[list[str]] | None,
+) -> list[str]:
+    """Bind both frozen precision switches to the receipt and v3 context."""
+    evidences = ny_search._margin_row_root_precision_terminal_evidences(
+        {"flight": record}
+    )
+    if not evidences:
+        return [
+            "root-precision context has no consistent current terminal receipt"
+        ]
+    event = evidences[0]
+    event_tokens = {
+        "NY_MARGIN_ROW_ROOT_F32": (
+            "1" if event["configured_root_f32"] == "true" else "0"
+        ),
+        "NY_MARGIN_ROW_TABLEAU_F32": (
+            "1" if event["configured_tableau_f32"] == "true" else "0"
+        ),
+    }
+    expected_context = (
+        dict(expected_context_assignment)
+        if expected_context_assignment is not None
+        else None
+    )
+    expected_context_sources = (
+        dict(expected_context_source_assignment)
+        if expected_context_source_assignment is not None
+        else None
+    )
+    if expected_context is not None and set(expected_context) != set(event_tokens):
+        return ["root-precision sealed runtime context is incomplete"]
+    if (
+        expected_context_sources is not None
+        and set(expected_context_sources) != set(event_tokens)
+    ):
+        return ["root-precision sealed runtime authority is incomplete"]
+    errors = []
+    for axis, token in event_tokens.items():
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == axis
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{axis} must appear exactly once in the root-precision receipt context"
+            )
+            continue
+        entry = matches[0]
+        if (
+            "ignored_raw" in entry
+            or "rejected_raw" in entry
+            or not ny_search._receipt_value_matches_token(entry.get("value"), token)
+        ):
+            errors.append(
+                f"{axis}={token} terminal configuration differs from its exact receipt"
+            )
+        if expected_context is not None and not ny_search._receipt_value_matches_token(
+            entry.get("value"), expected_context[axis]
+        ):
+            errors.append(
+                f"{axis}={token} terminal configuration differs from the sealed "
+                f"runtime context {expected_context[axis]}"
+            )
+        if (
+            expected_context_sources is not None
+            and entry.get("source") != expected_context_sources[axis]
+        ):
+            errors.append(
+                f"{axis} runtime authority {entry.get('source')!r} differs from "
+                f"sealed authority {expected_context_sources[axis]!r}"
+            )
+    return errors
+
+
+def _margin_row_width_receipt_context_errors(
+    ny_search: object,
+    record: dict[str, object],
+    entries: list[object],
+    expected_context_assignment: list[list[str]] | None,
+    expected_context_source_assignment: list[list[str]] | None,
+) -> list[str]:
+    """Bind both K bases and adaptive authority to receipt plus context."""
+    def runtime_width_matches(value: object, token: str) -> bool:
+        """Match the runtime width, including the typed zero -> 8 sentinel."""
+        return ny_search._receipt_value_matches_token(
+            value, token
+        ) or (
+            ny_search._receipt_value_matches_token(value, "0")
+            and ny_search._receipt_value_matches_token(8, token)
+        )
+
+    def runtime_adaptive_matches(entry: dict[str, object], token: str) -> bool:
+        """Match explicit Booleans and the Unset -> false runtime fallback."""
+        value = entry.get("value")
+        source = entry.get("source")
+        if value is None:
+            return token == "0" and source == "default"
+        return (
+            isinstance(value, bool)
+            and source in {"config", "legacy_env"}
+            and ny_search._receipt_value_matches_token(value, token)
+        )
+
+    evidences = ny_search._margin_row_width_terminal_evidences(
+        {"flight": record}
+    )
+    if len(evidences) != 1:
+        return ["margin-row width context has no singular current terminal receipt"]
+    event = evidences[0]
+    event_tokens = {
+        "NY_MARGIN_ROW_K_HEAD": event["configured_k_head"],
+        "NY_MARGIN_ROW_K_TRUNK": event["configured_k_trunk"],
+        "NY_MARGIN_ROW_K_ADAPT": (
+            "1" if event["adaptive_enabled"] == "true" else "0"
+        ),
+    }
+    expected_context = (
+        dict(expected_context_assignment)
+        if expected_context_assignment is not None
+        else None
+    )
+    expected_context_sources = (
+        dict(expected_context_source_assignment)
+        if expected_context_source_assignment is not None
+        else None
+    )
+    if expected_context is not None and set(expected_context) != set(event_tokens):
+        return ["margin-row width sealed runtime context is incomplete"]
+    if (
+        expected_context_sources is not None
+        and set(expected_context_sources) != set(event_tokens)
+    ):
+        return ["margin-row width sealed runtime authority is incomplete"]
+
+    errors = []
+    for axis, token in event_tokens.items():
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == axis
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{axis} must appear exactly once in the margin-row width receipt context"
+            )
+            continue
+        entry = matches[0]
+        if (
+            "ignored_raw" in entry
+            or "rejected_raw" in entry
+            or not (
+                runtime_width_matches(entry.get("value"), token)
+                if axis in {"NY_MARGIN_ROW_K_HEAD", "NY_MARGIN_ROW_K_TRUNK"}
+                else runtime_adaptive_matches(entry, token)
+            )
+        ):
+            errors.append(
+                f"{axis}={token} terminal configuration differs from its exact receipt"
+            )
+        if expected_context is None:
+            context_matches = True
+        elif axis == "NY_MARGIN_ROW_K_ADAPT":
+            context_matches = runtime_adaptive_matches(
+                entry, expected_context[axis]
+            )
+        else:
+            context_matches = ny_search._receipt_value_matches_token(
+                entry.get("value"), expected_context[axis]
+            )
+        if not context_matches:
+            errors.append(
+                f"{axis}={token} terminal configuration differs from the sealed "
+                f"runtime context {expected_context[axis]}"
+            )
+        if (
+            expected_context_sources is not None
+            and entry.get("source") != expected_context_sources[axis]
+        ):
+            errors.append(
+                f"{axis} runtime authority {entry.get('source')!r} differs from "
+                f"sealed authority {expected_context_sources[axis]!r}"
+            )
+    return errors
+
+
+def _margin_row_schedule_receipt_context_errors(
+    ny_search: object,
+    record: dict[str, object],
+    entries: list[object],
+    expected_context_assignment: list[list[str]] | None,
+    expected_context_source_assignment: list[list[str]] | None,
+) -> list[str]:
+    """Bind the complete eight-axis scheduler policy bit- and source-exactly."""
+    evidences = ny_search._margin_row_schedule_terminal_evidences(
+        {"flight": record}
+    )
+    if len(evidences) != 1:
+        return [
+            "margin-row schedule context has no singular current allocation receipt"
+        ]
+    event = evidences[0]
+    event_tokens = {
+        "NY_MARGIN_ROW_RESERVE_SECS": event["configured_reserve_secs"],
+        "NY_MARGIN_ROW_ADAPTIVE_RESERVE": (
+            "1" if event["configured_adaptive_reserve"] == "true" else "0"
+        ),
+        "NY_MARGIN_ROW_RESERVE_MAX_FRAC": (
+            event["configured_reserve_max_frac_bits"]
+        ),
+        "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC": (
+            event["configured_release_frac_bits"]
+        ),
+        "NY_MARGIN_ROW_CONCURRENT": (
+            "1" if event["configured_concurrent"] == "true" else "0"
+        ),
+        "NY_MARGIN_ROW_EARLY_EXIT": (
+            "1" if event["configured_early_exit"] == "true" else "0"
+        ),
+        "NY_VERIFIER_THREADS": event["configured_verifier_threads"],
+        "NY_MARGIN_ROW_CONCURRENT_THREADS": (
+            event["configured_concurrent_threads"]
+        ),
+    }
+    expected_context = (
+        dict(expected_context_assignment)
+        if expected_context_assignment is not None
+        else None
+    )
+    expected_context_sources = (
+        dict(expected_context_source_assignment)
+        if expected_context_source_assignment is not None
+        else None
+    )
+    if expected_context is None or set(expected_context) != set(event_tokens):
+        return ["margin-row schedule sealed runtime context is incomplete"]
+    if (
+        expected_context_sources is None
+        or set(expected_context_sources) != set(event_tokens)
+    ):
+        return ["margin-row schedule sealed runtime authority is incomplete"]
+
+    default_release_bits = str(
+        struct.unpack(">Q", struct.pack(">d", 0.40))[0]
+    )
+    if (
+        event["contextual_reserve_secs"] != "45"
+        or event["contextual_adaptive_reserve"] != "false"
+        or event["contextual_reserve_max_frac_bits"] != "none"
+        or event["contextual_release_frac_bits"] != default_release_bits
+        or event["contextual_concurrent"] != "false"
+        or event["contextual_early_exit"] != "true"
+        or event["contextual_verifier_threads"] != "none"
+        or event["contextual_concurrent_threads"] != "none"
+    ):
+        return [
+            "margin-row schedule lower-authority policy differs from its "
+            "sealed declaration context"
+        ]
+
+    float_axes = {
+        "NY_MARGIN_ROW_RESERVE_MAX_FRAC",
+        "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC",
+    }
+    bool_axes = {
+        "NY_MARGIN_ROW_ADAPTIVE_RESERVE",
+        "NY_MARGIN_ROW_CONCURRENT",
+        "NY_MARGIN_ROW_EARLY_EXIT",
+    }
+    optional_usize_axes = {
+        "NY_VERIFIER_THREADS",
+        "NY_MARGIN_ROW_CONCURRENT_THREADS",
+    }
+
+    def receipt_float_bits(value: object) -> str | None:
+        if type(value) not in {int, float}:
+            return None
+        try:
+            parsed = float(value)
+            if not math.isfinite(parsed):
+                return None
+            return str(struct.unpack(">Q", struct.pack(">d", parsed))[0])
+        except (OverflowError, struct.error, TypeError, ValueError):
+            return None
+
+    def receipt_u64(value: object) -> int | None:
+        return value if type(value) is int and 0 <= value <= (1 << 64) - 1 else None
+
+    def receipt_bool(value: object) -> bool | None:
+        return value if type(value) is bool else None
+
+    def receipt_usize(value: object) -> int | None:
+        usize_max = (sys.maxsize * 2) + 1
+        return value if type(value) is int and 0 <= value <= usize_max else None
+
+    def sealed_u64(token: str) -> int | None:
+        try:
+            value = int(token, 10)
+        except (TypeError, ValueError):
+            return None
+        return value if 0 <= value <= (1 << 64) - 1 and str(value) == token else None
+
+    def sealed_bool(token: str) -> bool | None:
+        if token == "1":
+            return True
+        if token == "0":
+            return False
+        return None
+
+    def sealed_optional_usize(token: str) -> tuple[int | None, bool]:
+        if token == "none":
+            return None, True
+        if (
+            not isinstance(token, str)
+            or re.fullmatch(r"0|[1-9][0-9]*", token) is None
+        ):
+            return None, False
+        value = int(token, 10)
+        if value > (sys.maxsize * 2) + 1:
+            return None, False
+        return value, True
+
+    def sealed_float_bits(axis: str, token: str, source: str) -> str | None:
+        if axis == "NY_MARGIN_ROW_RESERVE_MAX_FRAC" and token == "none":
+            return "none"
+        try:
+            value = float(token)
+            if source == "config":
+                value = struct.unpack(">f", struct.pack(">f", value))[0]
+        except (OverflowError, struct.error, TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or not 0.0 < value < 1.0:
+            return None
+        return str(struct.unpack(">Q", struct.pack(">d", value))[0])
+
+    errors = []
+    for axis, terminal_token in event_tokens.items():
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == axis
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{axis} must appear exactly once in the margin-row schedule "
+                "receipt context"
+            )
+            continue
+        entry = matches[0]
+        receipt_value = entry.get("value")
+        source = entry.get("source")
+        if axis == "NY_MARGIN_ROW_RESERVE_MAX_FRAC" and terminal_token == "none":
+            receipt_matches_terminal = receipt_value is None
+        elif axis in float_axes:
+            receipt_matches_terminal = receipt_float_bits(receipt_value) == terminal_token
+        elif axis == "NY_MARGIN_ROW_RESERVE_SECS":
+            receipt_matches_terminal = (
+                receipt_u64(receipt_value) is not None
+                and str(receipt_value) == terminal_token
+            )
+        elif axis in bool_axes:
+            typed_bool = receipt_bool(receipt_value)
+            receipt_matches_terminal = (
+                typed_bool is not None
+                and ("1" if typed_bool else "0") == terminal_token
+            )
+        elif axis in optional_usize_axes:
+            if terminal_token == "none":
+                receipt_matches_terminal = receipt_value is None
+            else:
+                typed_usize = receipt_usize(receipt_value)
+                receipt_matches_terminal = (
+                    typed_usize is not None and str(typed_usize) == terminal_token
+                )
+        else:
+            raise AssertionError(f"unknown scheduler receipt axis {axis}")
+        if (
+            "ignored_raw" in entry
+            or "rejected_raw" in entry
+            or not receipt_matches_terminal
+        ):
+            errors.append(
+                f"{axis} terminal configuration differs from its exact receipt"
+            )
+
+        sealed_token = expected_context[axis]
+        sealed_source = expected_context_sources[axis]
+        if axis in float_axes:
+            sealed_bits = sealed_float_bits(axis, sealed_token, sealed_source)
+            terminal_matches_context = terminal_token == sealed_bits
+            receipt_matches_context = (
+                receipt_value is None
+                if sealed_bits == "none"
+                else receipt_float_bits(receipt_value) == sealed_bits
+            )
+        elif axis == "NY_MARGIN_ROW_RESERVE_SECS":
+            sealed_value = sealed_u64(sealed_token)
+            terminal_matches_context = (
+                sealed_value is not None and terminal_token == str(sealed_value)
+            )
+            receipt_matches_context = (
+                sealed_value is not None
+                and receipt_u64(receipt_value) == sealed_value
+            )
+        elif axis in bool_axes:
+            sealed_value = sealed_bool(sealed_token)
+            terminal_matches_context = (
+                sealed_value is not None
+                and terminal_token == ("1" if sealed_value else "0")
+            )
+            receipt_matches_context = (
+                sealed_value is not None
+                and receipt_bool(receipt_value) is sealed_value
+            )
+        elif axis in optional_usize_axes:
+            sealed_value, sealed_valid = sealed_optional_usize(sealed_token)
+            terminal_matches_context = sealed_valid and terminal_token == sealed_token
+            receipt_matches_context = sealed_valid and (
+                receipt_value is None
+                if sealed_value is None
+                else receipt_usize(receipt_value) == sealed_value
+            )
+        else:
+            raise AssertionError(f"unknown scheduler context axis {axis}")
+        if not terminal_matches_context:
+            errors.append(
+                f"{axis}={terminal_token} terminal configuration differs from "
+                f"the sealed runtime context {sealed_token}"
+            )
+        if not receipt_matches_context:
+            errors.append(
+                f"{axis} receipt differs from the sealed runtime context "
+                f"{sealed_token}"
+            )
+        if source != sealed_source:
+            errors.append(
+                f"{axis} runtime authority {source!r} differs from sealed "
+                f"authority {sealed_source!r}"
+            )
+    return errors
+
+
+def _margin_row_epoch_receipt_context_errors(
+    ny_search: object,
+    record: dict[str, object],
+    entries: list[object],
+    expected_context_assignment: list[list[str]] | None,
+    expected_context_source_assignment: list[list[str]] | None,
+) -> list[str]:
+    """Bind the full epoch policy, including the unsafe dark sibling."""
+    evidences = ny_search._margin_row_epoch_terminal_evidences(
+        {"flight": record}
+    )
+    if not evidences:
+        return ["epoch context has no singular current terminal receipt"]
+    event = evidences[0]
+    if event["route"] != "joint":
+        return ["epoch execution credit requires the joint terminal route"]
+    if event["configured_parent_topk"] != "0":
+        return [
+            "NY_MARGIN_ROW_EPOCH_PARENT_TOPK must remain sealed at 0 for "
+            "graduated epoch execution credit"
+        ]
+    event_tokens = {
+        "NY_EPOCH_DEPTH": event["configured_depth"],
+        "NY_EPOCH_ATTEMPTS": event["configured_attempts"],
+        "NY_EPOCH_TIER0": event["configured_tier0"],
+        "NY_EPOCH_UNIVERSE": event["configured_universe"],
+        "NY_EPOCH_RETAIN": event["configured_retain"],
+        "NY_MARGIN_ROW_EPOCH_PARENT_TOPK": event["configured_parent_topk"],
+    }
+    expected_context = (
+        dict(expected_context_assignment)
+        if expected_context_assignment is not None
+        else None
+    )
+    expected_context_sources = (
+        dict(expected_context_source_assignment)
+        if expected_context_source_assignment is not None
+        else None
+    )
+    if expected_context is not None and set(expected_context) != set(event_tokens):
+        return ["epoch sealed runtime context is incomplete"]
+    if (
+        expected_context_sources is not None
+        and set(expected_context_sources) != set(event_tokens)
+    ):
+        return ["epoch sealed runtime authority is incomplete"]
+
+    errors = []
+    for axis, token in event_tokens.items():
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == axis
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{axis} must appear exactly once in the epoch receipt context"
+            )
+            continue
+        entry = matches[0]
+        if (
+            "ignored_raw" in entry
+            or "rejected_raw" in entry
+            or not ny_search._receipt_value_matches_token(
+                entry.get("value"), token
+            )
+        ):
+            errors.append(
+                f"{axis}={token} terminal configuration differs from its exact receipt"
+            )
+        if expected_context is not None:
+            sealed_token = expected_context[axis]
+            if not ny_search._margin_row_epoch_configuration_matches(
+                event, {axis: sealed_token}
+            ):
+                errors.append(
+                    f"{axis}={token} terminal configuration differs from the "
+                    f"sealed runtime context {sealed_token}"
+                )
+            if not ny_search._receipt_value_matches_token(
+                entry.get("value"), sealed_token
+            ):
+                errors.append(
+                    f"{axis} receipt differs from the sealed runtime context "
+                    f"{sealed_token}"
+                )
+        if (
+            expected_context_sources is not None
+            and entry.get("source") != expected_context_sources[axis]
+        ):
+            errors.append(
+                f"{axis} runtime authority {entry.get('source')!r} differs from "
+                f"sealed authority {expected_context_sources[axis]!r}"
+            )
+    return errors
+
+
+def _bnn_falsification_receipt_context_errors(
+    ny_search: object,
+    record: dict[str, object],
+    entries: list[object],
+    expected_context_assignment: list[list[str]] | None,
+    expected_context_source_assignment: list[list[str]] | None,
+) -> list[str]:
+    """Bind the complete effective BNN policy to receipt and sealed context."""
+    evidence = ny_search._bnn_falsification_evidence({"flight": record})
+    if evidence is None:
+        return ["BNN falsification context has no singular current policy envelope"]
+    policy = evidence["policy"]
+    event_tokens = {
+        "NY_BNN_SIGN_SPACE": (
+            "1" if policy["sign_space_enabled"] == "true" else "0"
+        ),
+        "NY_BNN_SIGN_SPACE_MINIMAL_MOVE": (
+            "1" if policy["minimal_move"] == "true" else "0"
+        ),
+        "NY_BNN_SIGN_SPACE_TRUST_REGION": policy["trust_region"],
+        "NY_BNN_STE_PGD": (
+            "1" if policy["ste_pgd_enabled"] == "true" else "0"
+        ),
+    }
+    expected_context = (
+        dict(expected_context_assignment)
+        if expected_context_assignment is not None
+        else None
+    )
+    expected_context_sources = (
+        dict(expected_context_source_assignment)
+        if expected_context_source_assignment is not None
+        else None
+    )
+    if expected_context is None or set(expected_context) != set(event_tokens):
+        return ["BNN falsification sealed runtime context is incomplete"]
+    if (
+        expected_context_sources is None
+        or set(expected_context_sources) != set(event_tokens)
+    ):
+        return ["BNN falsification sealed runtime authority is incomplete"]
+
+    errors = []
+    for axis, terminal_token in event_tokens.items():
+        matches = [
+            entry for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == axis
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{axis} must appear exactly once in the BNN falsification receipt context"
+            )
+            continue
+        entry = matches[0]
+        receipt_value = entry.get("value")
+        receipt_matches = (
+            receipt_value is None
+            if axis == "NY_BNN_SIGN_SPACE_TRUST_REGION"
+            and terminal_token == "full_box"
+            else ny_search._receipt_value_matches_token(
+                receipt_value, terminal_token
+            )
+        )
+        if (
+            "ignored_raw" in entry
+            or "rejected_raw" in entry
+            or not receipt_matches
+        ):
+            errors.append(
+                f"{axis} terminal configuration differs from its exact receipt"
+            )
+        sealed_token = expected_context[axis]
+        if terminal_token != sealed_token:
+            errors.append(
+                f"{axis}={terminal_token} terminal configuration differs from "
+                f"the sealed runtime context {sealed_token}"
+            )
+        sealed_receipt_matches = (
+            receipt_value is None
+            if axis == "NY_BNN_SIGN_SPACE_TRUST_REGION"
+            and sealed_token == "full_box"
+            else ny_search._receipt_value_matches_token(
+                receipt_value, sealed_token
+            )
+        )
+        if not sealed_receipt_matches:
+            errors.append(
+                f"{axis} receipt differs from the sealed runtime context {sealed_token}"
+            )
+        if entry.get("source") != expected_context_sources[axis]:
+            errors.append(
+                f"{axis} runtime authority {entry.get('source')!r} differs from "
+                f"sealed authority {expected_context_sources[axis]!r}"
+            )
+    return errors
+
+
+def _margin_row_domain_alpha_receipt_context_errors(
+    ny_search: object,
+    record: dict[str, object],
+    entries: list[object],
+    expected_context_assignment: list[list[str]] | None,
+    expected_context_source_assignment: list[list[str]] | None,
+) -> list[str]:
+    """Bind the complete frozen domain-alpha policy bit-exactly."""
+    evidences = ny_search._margin_row_domain_alpha_terminal_evidences(
+        {"flight": record}
+    )
+    if not evidences:
+        return [
+            "domain-alpha context has no singular current terminal receipt"
+        ]
+    event = evidences[0]
+    if event["route"] != "joint":
+        return ["domain-alpha execution credit requires the joint terminal route"]
+    event_tokens = {
+        "NY_MARGIN_ROW_DOMAIN_ALPHA": (
+            "1" if event["configured_enabled"] == "true" else "0"
+        ),
+        "NY_MARGIN_ROW_DOMAIN_ALPHA_ITERS": event["configured_iters"],
+        "NY_MARGIN_ROW_DOMAIN_ALPHA_ETA": event["configured_eta_bits"],
+    }
+    expected_context = (
+        dict(expected_context_assignment)
+        if expected_context_assignment is not None
+        else None
+    )
+    expected_context_sources = (
+        dict(expected_context_source_assignment)
+        if expected_context_source_assignment is not None
+        else None
+    )
+    if expected_context is not None and set(expected_context) != set(event_tokens):
+        return ["domain-alpha sealed runtime context is incomplete"]
+    if (
+        expected_context_sources is not None
+        and set(expected_context_sources) != set(event_tokens)
+    ):
+        return ["domain-alpha sealed runtime authority is incomplete"]
+
+    errors = []
+    for axis, terminal_token in event_tokens.items():
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == axis
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{axis} must appear exactly once in the domain-alpha receipt context"
+            )
+            continue
+        entry = matches[0]
+        receipt_value = entry.get("value")
+        if axis == "NY_MARGIN_ROW_DOMAIN_ALPHA_ETA":
+            receipt_matches_terminal = (
+                isinstance(receipt_value, (int, float))
+                and not isinstance(receipt_value, bool)
+                and math.isfinite(float(receipt_value))
+                and str(
+                    struct.unpack(">Q", struct.pack(">d", float(receipt_value)))[0]
+                ) == terminal_token
+            )
+        else:
+            receipt_matches_terminal = ny_search._receipt_value_matches_token(
+                receipt_value, terminal_token
+            )
+        if (
+            "ignored_raw" in entry
+            or "rejected_raw" in entry
+            or not receipt_matches_terminal
+        ):
+            errors.append(
+                f"{axis} terminal configuration differs from its exact receipt"
+            )
+        if expected_context is not None:
+            sealed_token = expected_context[axis]
+            if not ny_search._margin_row_domain_alpha_configuration_matches(
+                event, {axis: sealed_token}
+            ):
+                errors.append(
+                    f"{axis} terminal configuration differs from the sealed "
+                    f"runtime context {sealed_token}"
+                )
+            if not ny_search._receipt_value_matches_token(
+                receipt_value, sealed_token
+            ):
+                errors.append(
+                    f"{axis} receipt differs from the sealed runtime context "
+                    f"{sealed_token}"
+                )
+        if (
+            expected_context_sources is not None
+            and entry.get("source") != expected_context_sources[axis]
+        ):
+            errors.append(
+                f"{axis} runtime authority {entry.get('source')!r} differs from "
+                f"sealed authority {expected_context_sources[axis]!r}"
+            )
+    return errors
+
+
+def _margin_row_root_alpha_receipt_context_errors(
+    ny_search: object,
+    record: dict[str, object],
+    entries: list[object],
+    expected_context_assignment: list[list[str]] | None,
+    expected_context_source_assignment: list[list[str]] | None,
+) -> list[str]:
+    """Bind the complete frozen root-alpha/rebake policy bit-exactly."""
+    evidences = ny_search._margin_row_root_alpha_terminal_evidences(
+        {"flight": record}
+    )
+    if not evidences:
+        return [
+            "root-alpha context has no singular current terminal receipt"
+        ]
+    event = evidences[0]
+    event_tokens = {
+        "NY_MARGIN_ROW_ALPHA_OPT": (
+            "1" if event["alpha_enabled"] == "true" else "0"
+        ),
+        "NY_MARGIN_ROW_ALPHA_ITERS": event["alpha_iters"],
+        "NY_MARGIN_ROW_ALPHA_SECS": event["alpha_secs_bits"],
+        "NY_MARGIN_ROW_ALPHA_LR": event["alpha_lr_bits"],
+        "NY_MARGIN_ROW_ALPHA_COLS": event["alpha_cols"],
+        "NY_MARGIN_ROW_ALPHA_GUARD": (
+            "1" if event["alpha_guard"] == "true" else "0"
+        ),
+        "NY_MARGIN_ROW_REBAKE": (
+            "1" if event["rebake_enabled"] == "true" else "0"
+        ),
+        "NY_MARGIN_ROW_REBAKE_ROUNDS": event["rebake_rounds"],
+        "NY_MARGIN_ROW_REBAKE_SECS": event["rebake_secs_bits"],
+    }
+    float_axes = {
+        "NY_MARGIN_ROW_ALPHA_SECS",
+        "NY_MARGIN_ROW_ALPHA_LR",
+        "NY_MARGIN_ROW_REBAKE_SECS",
+    }
+    expected_context = (
+        dict(expected_context_assignment)
+        if expected_context_assignment is not None
+        else None
+    )
+    expected_context_sources = (
+        dict(expected_context_source_assignment)
+        if expected_context_source_assignment is not None
+        else None
+    )
+    if expected_context is not None and set(expected_context) != set(event_tokens):
+        return ["root-alpha sealed runtime context is incomplete"]
+    if (
+        expected_context_sources is not None
+        and set(expected_context_sources) != set(event_tokens)
+    ):
+        return ["root-alpha sealed runtime authority is incomplete"]
+
+    errors = []
+    for axis, terminal_token in event_tokens.items():
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == axis
+        ]
+        if len(matches) != 1:
+            errors.append(
+                f"{axis} must appear exactly once in the root-alpha receipt context"
+            )
+            continue
+        entry = matches[0]
+        receipt_value = entry.get("value")
+        if axis in float_axes:
+            receipt_matches_terminal = (
+                isinstance(receipt_value, (int, float))
+                and not isinstance(receipt_value, bool)
+                and math.isfinite(float(receipt_value))
+                and str(struct.unpack(">Q", struct.pack(">d", float(receipt_value)))[0])
+                == terminal_token
+            )
+        else:
+            receipt_matches_terminal = ny_search._receipt_value_matches_token(
+                receipt_value, terminal_token
+            )
+        if (
+            "ignored_raw" in entry
+            or "rejected_raw" in entry
+            or not receipt_matches_terminal
+        ):
+            errors.append(
+                f"{axis} terminal configuration differs from its exact receipt"
+            )
+        if expected_context is not None:
+            sealed_token = expected_context[axis]
+            if not ny_search._margin_row_root_alpha_configuration_matches(
+                event, {axis: sealed_token}
+            ):
+                errors.append(
+                    f"{axis} terminal configuration differs from the sealed "
+                    f"runtime context {sealed_token}"
+                )
+            if not ny_search._receipt_value_matches_token(
+                receipt_value, sealed_token
+            ):
+                errors.append(
+                    f"{axis} receipt differs from the sealed runtime context "
+                    f"{sealed_token}"
+                )
+        if (
+            expected_context_sources is not None
+            and entry.get("source") != expected_context_sources[axis]
+        ):
+            errors.append(
+                f"{axis} runtime authority {entry.get('source')!r} differs from "
+                f"sealed authority {expected_context_sources[axis]!r}"
+            )
+    return errors
+
+
+def validate_execution_predicate_requirement(
+    record: dict[str, object],
+    raw: str,
+    *,
+    assignment: object = None,
+) -> dict[str, object]:
+    """Prove a parsed predicate from one current row flight record.
+
+    This is the single qualification API used by the archiver.  Lever delivery
+    and the runtime event must independently agree on the exact requested
+    token, and the family-specific validator must prove terminal live work or
+    a genuine counterfactual decision rather than configuration presence.
+    """
+    requirement = parse_execution_predicate_requirement(raw)
+    if not isinstance(record, dict) or record.get("schema_version") != 3:
+        raise ExecutionPredicateError(
+            "current execution predicates require flight schema version 3"
+        )
+    events = record.get("events")
+    if not isinstance(events, list):
+        raise ExecutionPredicateError(
+            "current execution predicate has no flight-event array"
+        )
+    levers = record.get("levers")
+    if not isinstance(levers, dict) or levers.get("status") != "resolved":
+        raise ExecutionPredicateError(
+            "current execution predicate requires a resolved lever receipt"
+        )
+    receipt = levers.get("receipt")
+    if not isinstance(receipt, dict) or receipt.get("schema") != "ny-levers/receipt/v3":
+        raise ExecutionPredicateError(
+            "current execution predicate requires ny-levers/receipt/v3"
+        )
+
+    predicate_id, required_assignment, _is_joint = (
+        _execution_requirement_assignment(requirement)
+    )
+    if assignment is None:
+        treatment_assignment = required_assignment
+        full_assignment = list(treatment_assignment)
+        receipt_source_by_axis: dict[str, str] = {}
+        runtime_context_assignment: list[list[str]] | None = None
+        runtime_context_source_assignment: list[list[str]] | None = None
+    else:
+        if not isinstance(assignment, dict) or set(assignment) != {
+            "predicate_id",
+            "requested_assignment",
+            "prerequisites_assignment",
+            "full_assignment",
+            "comparison_assignment",
+            "receipt_source_assignment",
+            "runtime_context_assignment",
+            "runtime_context_source_assignment",
+            "contrast_id",
+            "registry",
+        }:
+            raise ExecutionPredicateError(
+                "execution predicate assignment validation result is invalid"
+            )
+        treatment_assignment = _canonical_assignment_pairs(
+            assignment.get("requested_assignment"), label="requested assignment"
+        )
+        prerequisites_assignment = _canonical_assignment_pairs(
+            assignment.get("prerequisites_assignment"),
+            label="prerequisites assignment",
+        )
+        full_assignment = _canonical_assignment_pairs(
+            assignment.get("full_assignment"), label="full assignment"
+        )
+        comparison_assignment = _canonical_assignment_pairs(
+            assignment.get("comparison_assignment"), label="comparison assignment"
+        )
+        receipt_source_assignment = _canonical_assignment_pairs(
+            assignment.get("receipt_source_assignment"),
+            label="receipt source assignment",
+        )
+        runtime_context_assignment = _canonical_assignment_pairs(
+            assignment.get("runtime_context_assignment"),
+            label="runtime context assignment",
+        )
+        runtime_context_source_assignment = _canonical_assignment_pairs(
+            assignment.get("runtime_context_source_assignment"),
+            label="runtime context source assignment",
+        )
+        if (
+            assignment.get("predicate_id") != predicate_id
+            or treatment_assignment != required_assignment
+            or comparison_assignment != prerequisites_assignment
+            or full_assignment
+            != sorted(treatment_assignment + prerequisites_assignment)
+            or [pair[0] for pair in receipt_source_assignment]
+            != [pair[0] for pair in full_assignment]
+            or any(
+                source not in {"config", "legacy_env"}
+                for _axis, source in receipt_source_assignment
+            )
+            or [pair[0] for pair in runtime_context_source_assignment]
+            != [pair[0] for pair in runtime_context_assignment]
+            or any(
+                source not in {"default", "config", "legacy_env"}
+                for _axis, source in runtime_context_source_assignment
+            )
+            or not isinstance(assignment.get("contrast_id"), str)
+            or not isinstance(assignment.get("registry"), dict)
+        ):
+            raise ExecutionPredicateError(
+                "execution predicate assignment differs from its requirement"
+            )
+        receipt_source_by_axis = dict(receipt_source_assignment)
+    # Lazy sibling import keeps provenance `start` lightweight and avoids a
+    # cycle: ny_search does not import this module or the row archiver.
+    try:
+        import ny_search  # type: ignore[import-not-found]
+    except (ImportError, OSError) as error:  # pragma: no cover - installation fault
+        raise ExecutionPredicateError(
+            f"execution predicate validator is unavailable: {error}"
+        ) from error
+
+    receipt_errors = ny_search._receipt_v3_errors(receipt, [])
+    if receipt_errors:
+        raise ExecutionPredicateError(
+            "lever delivery receipt is not current and exact: "
+            + "; ".join(receipt_errors)
+        )
+    entries = receipt.get("levers")
+    assert isinstance(entries, list)
+    spec = EXECUTION_PREDICATE_SPECS[predicate_id]
+    backward_interm_predicate = (
+        predicate_id
+        == "ny-exec-v1.margin-row-backward-interm-parameter-engaged"
+    )
+    root_precision_predicate = (
+        predicate_id
+        == "ny-exec-v1.margin-row-root-precision-parameter-engaged"
+    )
+    root_alpha_predicate = (
+        predicate_id
+        == "ny-exec-v1.margin-row-root-alpha-parameter-engaged"
+    )
+    epoch_predicate = (
+        predicate_id
+        == "ny-exec-v1.margin-row-epoch-parameter-engaged"
+    )
+    width_predicate = (
+        predicate_id
+        == "ny-exec-v1.margin-row-width-parameter-engaged"
+    )
+    schedule_predicate = (
+        predicate_id
+        == "ny-exec-v1.margin-row-schedule-parameter-engaged"
+    )
+    domain_alpha_predicate = (
+        predicate_id
+        == "ny-exec-v1.margin-row-domain-alpha-parameter-engaged"
+    )
+    bnn_falsification_predicate = (
+        predicate_id
+        == "ny-exec-v1.bnn-falsification-parameter-engaged"
+    )
+    if bnn_falsification_predicate:
+        context_errors = _bnn_falsification_receipt_context_errors(
+            ny_search,
+            record,
+            entries,
+            runtime_context_assignment,
+            runtime_context_source_assignment,
+        )
+        if context_errors:
+            raise ExecutionPredicateError("; ".join(context_errors))
+    if backward_interm_predicate:
+        context_errors = _margin_row_backward_interm_receipt_context_errors(
+            ny_search,
+            record,
+            entries,
+            runtime_context_assignment,
+            runtime_context_source_assignment,
+        )
+        if context_errors:
+            raise ExecutionPredicateError("; ".join(context_errors))
+    if root_precision_predicate:
+        context_errors = _margin_row_root_precision_receipt_context_errors(
+            ny_search,
+            record,
+            entries,
+            runtime_context_assignment,
+            runtime_context_source_assignment,
+        )
+        if context_errors:
+            raise ExecutionPredicateError("; ".join(context_errors))
+    if root_alpha_predicate:
+        context_errors = _margin_row_root_alpha_receipt_context_errors(
+            ny_search,
+            record,
+            entries,
+            runtime_context_assignment,
+            runtime_context_source_assignment,
+        )
+        if context_errors:
+            raise ExecutionPredicateError("; ".join(context_errors))
+    if epoch_predicate:
+        context_errors = _margin_row_epoch_receipt_context_errors(
+            ny_search,
+            record,
+            entries,
+            runtime_context_assignment,
+            runtime_context_source_assignment,
+        )
+        if context_errors:
+            raise ExecutionPredicateError("; ".join(context_errors))
+    if width_predicate:
+        context_errors = _margin_row_width_receipt_context_errors(
+            ny_search,
+            record,
+            entries,
+            runtime_context_assignment,
+            runtime_context_source_assignment,
+        )
+        if context_errors:
+            raise ExecutionPredicateError("; ".join(context_errors))
+    if schedule_predicate:
+        context_errors = _margin_row_schedule_receipt_context_errors(
+            ny_search,
+            record,
+            entries,
+            runtime_context_assignment,
+            runtime_context_source_assignment,
+        )
+        if context_errors:
+            raise ExecutionPredicateError("; ".join(context_errors))
+    if domain_alpha_predicate:
+        context_errors = _margin_row_domain_alpha_receipt_context_errors(
+            ny_search,
+            record,
+            entries,
+            runtime_context_assignment,
+            runtime_context_source_assignment,
+        )
+        if context_errors:
+            raise ExecutionPredicateError("; ".join(context_errors))
+    family_axes = spec.get("axes")
+    assert isinstance(family_axes, frozenset)
+    configured_axes = spec.get("configured_axes", family_axes)
+    assert isinstance(configured_axes, frozenset)
+    if assignment is not None:
+        sealed_axes = {axis for axis, _token in full_assignment}
+        unsealed_family_entries = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("name") in configured_axes
+            and entry["name"] not in sealed_axes
+        ]
+        # Full-policy terminals expose every frozen sibling value. A sibling
+        # delivered by the sealed category preset is authenticated context, not
+        # a hidden treatment coordinate; an unrequested child environment
+        # remains a hitchhiker and is always refused. Other families retain the
+        # stricter all-configured-coordinates-must-be-explicit rule.
+        refused_unsealed_entries = (
+            [
+                entry
+                for entry in unsealed_family_entries
+                if entry.get("source") not in {"config", "default"}
+                or "ignored_raw" in entry
+                or "rejected_raw" in entry
+            ]
+            if (
+                backward_interm_predicate
+                or bnn_falsification_predicate
+                or domain_alpha_predicate
+                or epoch_predicate
+                or root_precision_predicate
+                or root_alpha_predicate
+                or schedule_predicate
+                or width_predicate
+            )
+            else [
+                entry
+                for entry in unsealed_family_entries
+                if entry.get("source") in {"config", "legacy_env"}
+            ]
+        )
+        if refused_unsealed_entries:
+            raise ExecutionPredicateError(
+                "accepted same-family lever receipt contains unsealed configured axes: "
+                + ", ".join(sorted(entry["name"] for entry in refused_unsealed_entries))
+            )
+    ambient = record.get("ambient_env")
+    if not isinstance(ambient, dict):
+        raise ExecutionPredicateError(
+            "execution predicate record has no ambient environment receipt"
+        )
+    for governed_axis, governed_token in full_assignment:
+        if not isinstance(governed_axis, str) or not isinstance(
+            governed_token, str
+        ):
+            raise ExecutionPredicateError(
+                "execution predicate assignment contains a non-string pair"
+            )
+        requested_entries = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("name") == governed_axis
+        ]
+        if len(requested_entries) != 1:
+            raise ExecutionPredicateError(
+                f"governed {governed_axis}={governed_token} must appear exactly "
+                "once in the current lever receipt"
+            )
+        requested_entry = requested_entries[0]
+        source = requested_entry.get("source")
+        expected_source = (
+            receipt_source_by_axis.get(governed_axis)
+            if assignment is not None
+            else None
+        )
+        if (
+            source not in {"config", "legacy_env"}
+            or (expected_source is not None and source != expected_source)
+            or "ignored_raw" in requested_entry
+            or "rejected_raw" in requested_entry
+            or not ny_search._receipt_value_matches_token(
+                requested_entry.get("value"), governed_token
+            )
+        ):
+            raise ExecutionPredicateError(
+                f"governed {governed_axis}={governed_token} was not accepted "
+                "exactly from its sealed config or child-environment authority"
+            )
+        if (
+            source == "legacy_env"
+            and ambient.get(governed_axis) != governed_token
+        ) or (source == "config" and governed_axis in ambient):
+            raise ExecutionPredicateError(
+                f"governed {governed_axis}={governed_token} does not match its "
+                "receipted child authority"
+            )
+
+    if (
+        predicate_id == "ny-exec-v1.upfront-parameter-engaged"
+        and not _strict_current_upfront_envelope(ny_search, record)
+    ):
+        raise ExecutionPredicateError(
+            "upfront execution predicate requires complete current v2 policy "
+            "and execution events"
+        )
+    if (
+        bnn_falsification_predicate
+        and not _strict_current_bnn_falsification_envelope(ny_search, record)
+    ):
+        raise ExecutionPredicateError(
+            "BNN falsification execution predicate requires the complete current "
+            "v1 policy/execution envelope with MIP compiled and the shipped "
+            "traffic lower policy"
+        )
+    validator_name = spec["validator"]
+    assert isinstance(validator_name, str)
+    validator = getattr(ny_search, validator_name, None)
+    if not callable(validator):  # pragma: no cover - source/API drift
+        raise ExecutionPredicateError(
+            f"execution predicate validator {validator_name!r} is unavailable"
+        )
+    validator_assignment = treatment_assignment
+    if predicate_id == "ny-exec-v1.mo-kfsb-parameter-engaged":
+        # REDUCE is executable only beneath its generated NY_MO_KFSB=1
+        # prerequisite. Pass an environment-sourced master pair so the terminal
+        # must report exact-enable; omit a config-sourced pair so the validator
+        # instead requires canonical absence plus an armed typed master. Keep
+        # the reducer treatment itself in either authority case while asking
+        # the scorecard to credit treatment axes only.
+        if assignment is None and any(
+            pair[0] == "NY_MO_KFSB_REDUCE"
+            for pair in treatment_assignment
+        ):
+            raise ExecutionPredicateError(
+                "MO-kFSB reducer execution credit requires a sealed master assignment"
+            )
+        if assignment is not None:
+            validator_assignment = [
+                pair for pair in full_assignment
+                if pair[0] == "NY_MO_KFSB_REDUCE"
+                or (
+                    pair[0] == "NY_MO_KFSB"
+                    and receipt_source_by_axis.get("NY_MO_KFSB") == "legacy_env"
+                )
+            ]
+    if predicate_id == "ny-exec-v1.mo-alpha-step-parameter-engaged":
+        # Alpha stepping is executable only beneath the generated beta-SPSA
+        # prerequisite. A supplemental unsealed requirement cannot prove that
+        # dependency merely because the terminal reports beta=true: require
+        # the assignment and its independently authenticated lever receipt.
+        if assignment is None:
+            raise ExecutionPredicateError(
+                "MO-alpha execution credit requires a sealed beta-SPSA "
+                "prerequisite assignment"
+            )
+        if prerequisites_assignment != [["NY_MO_BETA_SPSA", "1"]]:
+            raise ExecutionPredicateError(
+                "MO-alpha execution credit requires the exact sealed "
+                "NY_MO_BETA_SPSA=1 prerequisite"
+            )
+        validator_assignment = full_assignment
+    engaged = validator(
+        [(name, token) for name, token in validator_assignment],
+        [{"flight": record}],
+    )
+    missing = {
+        name for name, _token in treatment_assignment
+    }.difference(engaged)
+    if missing:
+        raise ExecutionPredicateError(
+            f"execution predicate {predicate_id} did not prove live engagement "
+            "for "
+            + ", ".join(
+                f"{name}={token}"
+                for name, token in treatment_assignment
+                if name in missing
+            )
+        )
+    if predicate_id == "ny-exec-v1.root-joint-interm-alpha-parameter-engaged":
+        root_context = [
+            (name, token)
+            for name, token in full_assignment
+            if name
+            in (
+                ny_search._ROOT_JOINT_INTERM_ALPHA_FAMILY
+                | {"NY_ROOT_JOINT_INTERM_ALPHA_MAX_DIM"}
+            )
+        ]
+        if root_context and not any(
+            ny_search._root_joint_explicit_configuration_matches(
+                event, root_context
+            )
+            for event in ny_search._root_joint_interm_alpha_terminal_evidences(
+                {"flight": record}
+            )
+        ):
+            raise ExecutionPredicateError(
+                "root execution predicate terminal does not match its complete "
+                "configured treatment/prerequisite context"
+            )
+    return requirement
 
 
 def _expected_measurement_cpu_count() -> int:
@@ -1355,7 +4787,13 @@ def _seal_config_inputs(
     ):
         raise ProvenanceError("captured config identity is incomplete")
     source_root = Path(source_value)
-    sealed_root = run_dir / "sealed" / "configs" / manifest_digest
+    source_basename = source_root.name
+    if SAFE_COMPONENT.fullmatch(source_basename) is None:
+        raise ProvenanceError(
+            f"measurement config root has an unsafe basename: {source_basename!r}"
+        )
+    sealed_container = run_dir / "sealed" / "configs" / manifest_digest
+    sealed_root = sealed_container / source_basename
     sealed_root.mkdir(parents=True, exist_ok=True)
     directories = [sealed_root]
     for item in entries:
@@ -1396,10 +4834,89 @@ def _seal_config_inputs(
         directories, key=lambda path: len(path.parts), reverse=True
     ):
         directory.chmod(0o555)
+    sealed_container.chmod(0o555)
     sealed = _capture_config_inputs(sealed_root.resolve())
     if _capture_config_inputs(Path(str(original["declared_path"]))) != original:
         raise ProvenanceError("measurement configs changed while they were sealed")
     return sealed
+
+
+def _load_execution_preset_docs(
+    config_root: Path, categories: list[str]
+) -> list[dict[str, object]]:
+    """Load exact category presets from an immutable year-scoped config tree."""
+    match = re.fullmatch(r"vnncomp([0-9]{2})", config_root.name)
+    if match is None:
+        raise ProvenanceError(
+            "execution predicate configs must be an exact vnncompYY directory"
+        )
+    year = 2000 + int(match.group(1))
+    try:
+        import ny_search  # type: ignore[import-not-found]
+    except (ImportError, OSError) as error:
+        raise ProvenanceError(
+            f"execution predicate preset parser is unavailable: {error}"
+        ) from error
+    docs: list[dict[str, object]] = []
+    for category in categories:
+        if SAFE_COMPONENT.fullmatch(category) is None:
+            raise ProvenanceError(
+                f"execution predicate category is unsafe: {category!r}"
+            )
+        preset = ny_search.resolve_preset_path(config_root, category, year)
+        if preset is None:
+            raise ProvenanceError(
+                f"sealed VNN-COMP {year} configs have no preset for {category!r}"
+            )
+        doc = ny_search.load_preset_doc_portable(preset)
+        if not isinstance(doc, dict):
+            raise ProvenanceError(
+                f"sealed category preset could not be parsed exactly: {preset}"
+            )
+        docs.append(doc)
+    return docs
+
+
+def execution_predicate_preset_docs_from_start(
+    start: object,
+) -> list[dict[str, object]] | None:
+    """Recover the same sealed preset context used to build a start contrast."""
+    if not isinstance(start, dict):
+        raise ProvenanceError("measurement start manifest is invalid")
+    measurement = start.get("measurement")
+    if not isinstance(measurement, dict):
+        raise ProvenanceError("measurement start manifest has no measurement record")
+    assignment = measurement.get("execution_predicate_assignment")
+    assignment_schema = (
+        assignment.get("schema") if isinstance(assignment, dict) else None
+    )
+    if assignment_schema in {
+        LEGACY_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA,
+        LEGACY_JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA,
+    }:
+        return None
+    if assignment_schema not in {
+        EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA,
+        JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA,
+    }:
+        raise ProvenanceError(
+            "measurement start has no supported execution predicate assignment"
+        )
+    sealed = measurement.get("sealed_config_inputs")
+    if sealed is None:
+        return None
+    categories = measurement.get("categories")
+    resolved_path = sealed.get("resolved_path") if isinstance(sealed, dict) else None
+    if (
+        not isinstance(categories, list)
+        or not categories
+        or not all(isinstance(category, str) and category for category in categories)
+        or not isinstance(resolved_path, str)
+    ):
+        raise ProvenanceError(
+            "measurement start manifest has invalid sealed preset context"
+        )
+    return _load_execution_preset_docs(Path(resolved_path), categories)
 
 
 def _json_bytes(payload: object) -> bytes:
@@ -2719,10 +6236,6 @@ def _gpu_identity() -> dict[str, object]:
 
 
 def _resource_limits() -> dict[str, list[int]]:
-    # POSIX-only rlimit attestation. Imported HERE, not at module scope:
-    # a bare module-level `import resource` made this whole file unloadable
-    # off Linux and took every dependent tool and test down at import time.
-    import resource
     names = [
         "RLIMIT_AS",
         "RLIMIT_CORE",
@@ -2742,6 +6255,16 @@ def _resource_limits() -> dict[str, list[int]]:
     return limits
 
 
+def _resource_limit_as() -> tuple[int, int]:
+    """Read the process address-space limit without breaking non-POSIX imports."""
+    # Keep the POSIX-only module behind the call boundary. Tests replace this
+    # narrow reader when exercising the Linux cgroup policy on another host;
+    # production still obtains both values directly from the kernel module.
+    import resource
+
+    return resource.getrlimit(resource.RLIMIT_AS)
+
+
 def _capture_measurement_containment(
     *,
     proc_self_cgroup: Path | None = None,
@@ -2749,10 +6272,6 @@ def _capture_measurement_containment(
     cgroup_root: Path | None = None,
 ) -> dict[str, object]:
     """Capture and validate the scorecard process's effective containment."""
-    # POSIX-only rlimit attestation. Imported HERE, not at module scope:
-    # a bare module-level `import resource` made this whole file unloadable
-    # off Linux and took every dependent tool and test down at import time.
-    import resource
     expected_cpu_count = _expected_measurement_cpu_count()
     expected_cpu_period_us = 100_000
     expected_cpu_quota_us = expected_cpu_count * expected_cpu_period_us
@@ -2946,7 +6465,7 @@ def _capture_measurement_containment(
             "levels": levels,
         }
 
-    soft_as, hard_as = resource.getrlimit(resource.RLIMIT_AS)
+    soft_as, hard_as = _resource_limit_as()
     expected_as = _expected_rlimit_as_bytes()
     if soft_as != expected_as or hard_as != expected_as:
         raise ProvenanceError(
@@ -3070,7 +6589,19 @@ def _validate_cuda_library_directory(component: str) -> None:
             ) from error
 
 
-def _capture_environment() -> dict[str, object]:
+def _capture_environment(
+    search_space_contract: object | None = None,
+) -> dict[str, object]:
+    search_axes = (
+        _search_space_axes(search_space_contract)
+        if search_space_contract is not None
+        else {}
+    )
+    # The compiled registry is a closed, binary-specific extension to the
+    # fixed operational allowlist.  Admission here grants transport only; the
+    # v2 assignment builder below still rejects every explicit searchable axis
+    # outside the exact generated scalar treatment/prerequisite assignment.
+    effective_allowlist = frozenset(set(ENV_ALLOWLIST) | set(search_axes))
     unsafe_loader_environment = sorted(
         key for key in UNSAFE_DYNAMIC_LOADER_ENV if key in os.environ
     )
@@ -3128,7 +6659,7 @@ def _capture_environment() -> dict[str, object]:
     unreviewed_solver_runtime_environment = sorted(
         key
         for key in os.environ
-        if key not in ENV_ALLOWLIST
+        if key not in effective_allowlist
         and (
             key in UNREVIEWED_SOLVER_RUNTIME_ENV_EXACT
             or key.startswith(UNREVIEWED_SOLVER_RUNTIME_ENV_PREFIXES)
@@ -3142,6 +6673,34 @@ def _capture_environment() -> dict[str, object]:
             "allowlist or unset it: "
             + ", ".join(unreviewed_solver_runtime_environment)
         )
+    present_search_axes = sorted(set(search_axes) & set(os.environ))
+    unpublished_predicate_axes = (
+        sorted((EXECUTION_PREDICATE_AXES - set(search_axes)) & set(os.environ))
+        if search_space_contract is not None
+        else []
+    )
+    if unpublished_predicate_axes:
+        raise ProvenanceError(
+            "current predicate axes are explicit but absent from the selected "
+            "solver's governed registry: "
+            + ", ".join(unpublished_predicate_axes)
+        )
+    excluded_search_axes = sorted(
+        set(present_search_axes) & SOLVER_ENVIRONMENT_EXCLUDED_KEYS
+    )
+    if excluded_search_axes:
+        raise ProvenanceError(
+            "explicit searchable axes would be removed from the solver environment: "
+            + ", ".join(excluded_search_axes)
+        )
+    for key in present_search_axes:
+        axis = search_axes[key]
+        allowed = axis.get("values")
+        if not isinstance(allowed, list) or os.environ[key] not in allowed:
+            raise ProvenanceError(
+                f"{key}={os.environ[key]!r} is outside the selected solver's "
+                "closed search domain"
+            )
     unknown_solver = sorted(
         key
         for key in os.environ
@@ -3149,7 +6708,7 @@ def _capture_environment() -> dict[str, object]:
             key.startswith(("NY_", "AY_"))
             or key.upper().startswith("MIMALLOC_")
         )
-        and key not in ENV_ALLOWLIST
+        and key not in effective_allowlist
     )
     if unknown_solver:
         raise ProvenanceError(
@@ -3158,7 +6717,9 @@ def _capture_environment() -> dict[str, object]:
             f"{', '.join(unknown_solver)}"
         )
     values: dict[str, str] = {
-        key: os.environ[key] for key in sorted(ENV_ALLOWLIST) if key in os.environ
+        key: os.environ[key]
+        for key in sorted(effective_allowlist)
+        if key in os.environ
     }
     typed_values: dict[str, dict[str, object]] = {}
     usize_max = (sys.maxsize * 2) + 1
@@ -3200,6 +6761,43 @@ def _capture_environment() -> dict[str, object]:
             "type": "positive_integer",
             "value": value,
         }
+    canonical_nonnegative_integer_pattern = r"(?:0|[1-9][0-9]*)"
+    for key in sorted(TYPED_CANONICAL_NONNEGATIVE_INTEGER_ENV):
+        if key not in values:
+            continue
+        raw = values[key]
+        if re.fullmatch(canonical_nonnegative_integer_pattern, raw) is None:
+            raise ProvenanceError(
+                f"{key} must be a canonical nonnegative integer "
+                "for measurement provenance"
+            )
+        value = int(raw)
+        if value > usize_max:
+            raise ProvenanceError(
+                f"{key} is outside the native usize range for measurement provenance"
+            )
+        typed_values[key] = {
+            "type": "nonnegative_integer",
+            "value": value,
+        }
+    for key in sorted(TYPED_CANONICAL_POSITIVE_INTEGER_ENV):
+        if key not in values:
+            continue
+        raw = values[key]
+        if re.fullmatch(r"[1-9][0-9]*", raw) is None:
+            raise ProvenanceError(
+                f"{key} must be a canonical positive integer "
+                "for measurement provenance"
+            )
+        value = int(raw)
+        if value > usize_max:
+            raise ProvenanceError(
+                f"{key} is outside the native usize range for measurement provenance"
+            )
+        typed_values[key] = {
+            "type": "positive_integer",
+            "value": value,
+        }
     for key, minimum, maximum in TYPED_BOUNDED_NONNEGATIVE_INTEGER_ENV:
         if key not in values:
             continue
@@ -3221,7 +6819,6 @@ def _capture_environment() -> dict[str, object]:
             "minimum": minimum,
             "maximum": maximum,
         }
-    canonical_nonnegative_integer_pattern = r"(?:0|[1-9][0-9]*)"
     for (
         key,
         minimum,
@@ -3310,6 +6907,33 @@ def _capture_environment() -> dict[str, object]:
             "minimum": minimum,
             "maximum": maximum,
         }
+    for key, positive in (
+        *((key, True) for key in sorted(TYPED_F32_POSITIVE_ENV)),
+        *((key, False) for key in sorted(TYPED_F32_NONNEGATIVE_ENV)),
+    ):
+        if key not in values:
+            continue
+        raw = values[key]
+        if re.fullmatch(decimal_pattern, raw) is None:
+            raise ProvenanceError(
+                f"{key} must be an untrimmed decimal f32 for measurement provenance"
+            )
+        value = float(raw)
+        try:
+            narrowed = struct.unpack(">f", struct.pack(">f", value))[0]
+        except (OverflowError, struct.error):
+            narrowed = math.inf
+        lower_bound_ok = narrowed > 0.0 if positive else narrowed >= 0.0
+        if not math.isfinite(narrowed) or not lower_bound_ok:
+            qualifier = "positive" if positive else "nonnegative"
+            raise ProvenanceError(
+                f"{key} must parse to a finite {qualifier} f32 "
+                "for measurement provenance"
+            )
+        typed_values[key] = {
+            "type": "f32_positive" if positive else "f32_nonnegative",
+            "value": narrowed,
+        }
     for key in sorted(TYPED_ABSOLUTE_PATH_ENV):
         if key not in values:
             continue
@@ -3322,6 +6946,29 @@ def _capture_environment() -> dict[str, object]:
             "type": "absolute_path",
             "value": raw,
         }
+    for key in sorted(TYPED_FLIGHT_EVENT_REQUIREMENT_ENV):
+        if key not in values:
+            continue
+        raw = values[key]
+        try:
+            requirement = parse_execution_predicate_requirement(raw)
+        except ExecutionPredicateError as error:
+            raise ProvenanceError(
+                f"{key} is not a current execution predicate: {error}"
+            ) from error
+        try:
+            _predicate_id, requested_assignment, _is_joint = (
+                _execution_requirement_assignment(requirement)
+            )
+        except ExecutionPredicateError as error:  # pragma: no cover - parser drift
+            raise ProvenanceError(f"{key} is internally inconsistent: {error}") from error
+        for axis, requested in requested_assignment:
+            if axis in values and values[axis] != requested:
+                raise ProvenanceError(
+                    f"{key} requests {axis}={requested}, but the direct measurement "
+                    f"environment contains {values.get(axis)!r}"
+                )
+        typed_values[key] = requirement
     for key, allowed_values in TYPED_ENUM_ENV:
         if key not in values:
             continue
@@ -3352,6 +6999,32 @@ def _capture_environment() -> dict[str, object]:
             "type": "boolean",
             "value": raw == "1",
         }
+    for key in sorted(TYPED_CANONICAL_TRUTHY_TRIMMED_ENV):
+        if key not in values:
+            continue
+        raw = values[key]
+        if raw not in {"0", "1"}:
+            raise ProvenanceError(
+                f"{key} measurement treatment must be unset, '0', or '1'"
+            )
+        typed_values[key] = {
+            "type": "boolean",
+            "value": raw == "1",
+        }
+    for key in sorted(TYPED_CANONICAL_TRIMMED_EXACT_ONE_ENV):
+        if key not in values:
+            continue
+        raw = values[key]
+        if raw not in {"0", "1"}:
+            raise ProvenanceError(
+                f"{key} measurement treatment must be unset, '0', or '1'; "
+                "the runtime's trimmed compatibility grammar is not a "
+                "measurement identity"
+            )
+        typed_values[key] = {
+            "type": "boolean",
+            "value": raw == "1",
+        }
     for key in sorted(TYPED_EXACT_BOOLEAN_ENV):
         if key not in values:
             continue
@@ -3364,6 +7037,36 @@ def _capture_environment() -> dict[str, object]:
             "type": "boolean",
             "value": raw == "1",
         }
+    registry_identity = (
+        _search_space_identity(search_space_contract)
+        if search_space_contract is not None
+        else None
+    )
+    for key in present_search_axes:
+        if key in typed_values:
+            continue
+        axis = search_axes[key]
+        allowed = axis["values"]
+        declaration_kind = axis.get("declaration_kind")
+        domain = axis.get("domain")
+        if (
+            not isinstance(allowed, list)
+            or not all(isinstance(token, str) for token in allowed)
+            or not isinstance(declaration_kind, str)
+            or not isinstance(domain, str)
+            or not isinstance(registry_identity, dict)
+        ):
+            raise ProvenanceError(
+                f"selected solver has no closed typed grammar for {key}"
+            )
+        typed_values[key] = {
+            "type": "governed_search_axis",
+            "value": values[key],
+            "declaration_kind": declaration_kind,
+            "domain": domain,
+            "allowed_values": list(allowed),
+            "registry_sha256": registry_identity["sha256"],
+        }
     return {
         "allowlist_schema": "ny_measurement_environment_v1",
         "values": values,
@@ -3371,12 +7074,184 @@ def _capture_environment() -> dict[str, object]:
     }
 
 
+BUILD_ID_SCHEMA = "NY_BUILD_ID_V1"
+BUILD_STAMP_SCHEMA = "NY_BUILD_STAMP_V1"
+BUILD_ID_CANONICAL_FIELDS = (
+    "version",
+    "features",
+    "backend",
+    "markers",
+    "commit",
+    "dirty",
+    "revision",
+    "source",
+    "profile",
+    "target",
+    "rustc",
+    "stamp",
+    "exe",
+    "id",
+)
+BUILD_STAMP_CANONICAL_FIELDS = BUILD_ID_CANONICAL_FIELDS[:-2]
+
+
+def validate_binary_build_id(
+    value: object,
+    *,
+    expected_executable_sha256: str | None = None,
+    declared_features: object = None,
+) -> dict[str, str]:
+    """Validate the exact current ``ny --build-id`` producer contract."""
+    if not isinstance(value, dict) or set(value) != {"schema", "line", "fields"}:
+        raise ProvenanceError("solver binary build identity has an invalid field set")
+    fields = value.get("fields")
+    if (
+        value.get("schema") != BUILD_ID_SCHEMA
+        or not isinstance(fields, dict)
+        or set(fields) != set(BUILD_ID_CANONICAL_FIELDS)
+        or any(
+            not isinstance(fields.get(field), str)
+            or not fields[field]
+            or any(character.isspace() for character in fields[field])
+            for field in BUILD_ID_CANONICAL_FIELDS
+        )
+    ):
+        raise ProvenanceError("solver binary build identity fields are noncanonical")
+    canonical_line = " ".join(
+        [BUILD_ID_SCHEMA]
+        + [f"{field}={fields[field]}" for field in BUILD_ID_CANONICAL_FIELDS]
+    )
+    if value.get("line") != canonical_line:
+        raise ProvenanceError("solver binary build identity line is noncanonical")
+    for field in ("stamp", "exe", "id"):
+        if re.fullmatch(r"[0-9a-f]{64}", fields[field]) is None:
+            raise ProvenanceError(
+                f"solver binary build identity {field} is not a SHA-256"
+            )
+    expected_id = hashlib.sha256(
+        f"{BUILD_ID_SCHEMA}\n{fields['stamp']}\n{fields['exe']}\n".encode("ascii")
+    ).hexdigest()
+    if fields["id"] != expected_id:
+        raise ProvenanceError("solver binary build identity digest is inconsistent")
+    if (
+        expected_executable_sha256 is not None
+        and fields["exe"] != expected_executable_sha256
+    ):
+        raise ProvenanceError(
+            "solver binary build identity names different executable bytes"
+        )
+    if declared_features is not None:
+        if not isinstance(declared_features, list) or not all(
+            isinstance(feature, str) for feature in declared_features
+        ):
+            raise ProvenanceError("declared solver build features are invalid")
+        verdict_features = frozenset(declared_features) & _VERDICT_FEATURES
+        expected_features = ",".join(
+            feature for feature in ("mip", "cuda") if feature in verdict_features
+        ) or "none"
+        if fields["features"] != expected_features:
+            raise ProvenanceError(
+                "solver binary build identity disagrees with declared build features"
+            )
+    return dict(fields)
+
+
+def flight_build_stamp_for_binary_build_id(value: object) -> str:
+    """Project a validated full build identity to Rust's free flight stamp."""
+    fields = validate_binary_build_id(value)
+    return " ".join(
+        [BUILD_STAMP_SCHEMA]
+        + [f"{field}={fields[field]}" for field in BUILD_STAMP_CANONICAL_FIELDS]
+    )
+
+# The cargo features that change what a VERDICT is, as opposed to which model
+# loaders are linked. `mip` carries the relational/graph-MIP oracle; `cuda`
+# carries the f64 GEMM seams. These are the two the campaign argues about and
+# the two `ny --build-id` reports as its `features=` tier.
+_VERDICT_FEATURES = frozenset({"mip", "cuda"})
+
+
+def _capture_binary_build_id(
+    binary: Path, expected_sha256: str, declared_features: list[str]
+) -> dict:
+    """Bind the manifest to WHICH VERIFIER will run, from the binary itself.
+
+    `NY_BUILD_FEATURES` below is an operator DECLARATION. It used to be
+    unverifiable, so it was also unfalsifiable: a manifest could declare
+    `mip,cuda` while the sealed binary was mip-only, and nothing downstream
+    could tell. `ny --build-id` (#binary-identity) makes the binary answer for
+    itself — derived version, feature tier, backend class, impl markers, commit
+    plus dirty digest, and the sha256 of its own bytes — so the declaration is
+    now cross-checked against the program.
+
+    Fail-closed on every disagreement. A measurement whose manifest and binary
+    disagree about the feature tier is exactly the artifact that let 330 rows
+    be attributed to a verifier that never ran them.
+    """
+    # Generous timeout: `--build-id` hashes the whole executable, which is
+    # ~0.1 s for a 133 MB release binary but far slower for an unoptimized
+    # debug one. This runs once per measurement, not once per row.
+    result = _run(
+        [str(binary), "--build-id"],
+        check=False,
+        timeout=180,
+        env=_cuda_probe_environment(None),
+    )
+    stdout = result.stdout.decode("utf-8", "replace")
+    line = stdout.splitlines()[0].strip() if stdout.strip() else ""
+    if result.returncode != 0 or not line.startswith(f"{BUILD_ID_SCHEMA} "):
+        raise ProvenanceError(
+            f"solver binary cannot state its own build identity: {binary}. "
+            "It predates #binary-identity, so no row it measures could name "
+            "the verifier that produced it. Rebuild before measuring."
+        )
+    fields: dict[str, str] = {}
+    for token in line.split(" ")[1:]:
+        key, separator, value = token.partition("=")
+        if not separator or not key:
+            raise ProvenanceError(f"malformed build identity token {token!r}")
+        if key in fields:
+            raise ProvenanceError(f"duplicate build identity field {key!r}")
+        fields[key] = value
+    for required in ("version", "features", "commit", "dirty", "exe", "id"):
+        if required not in fields:
+            raise ProvenanceError(f"build identity has no {required}= field: {line}")
+
+    # Content addressing, not self-assertion: the binary's claim about its own
+    # bytes must equal the bytes provenance independently hashed.
+    if fields["exe"] != expected_sha256:
+        raise ProvenanceError(
+            "solver binary reports bytes that are not the bytes provenance "
+            f"sealed: reported {fields['exe']}, sealed {expected_sha256}"
+        )
+
+    declared = frozenset(declared_features) & _VERDICT_FEATURES
+    compiled_raw = fields["features"]
+    compiled = frozenset() if compiled_raw == "none" else frozenset(compiled_raw.split(","))
+    if declared != compiled:
+        raise ProvenanceError(
+            "NY_BUILD_FEATURES does not describe the sealed binary: declared "
+            f"{sorted(declared) or ['none']}, compiled {sorted(compiled) or ['none']} "
+            f"({fields['version']}). The declaration is a claim about the program; "
+            "the program disagrees."
+        )
+    identity = {"schema": BUILD_ID_SCHEMA, "line": line, "fields": fields}
+    validate_binary_build_id(
+        identity,
+        expected_executable_sha256=expected_sha256,
+        declared_features=declared_features,
+    )
+    return identity
+
+
 def _declared_build_features() -> tuple[str, list[str]]:
     raw = os.environ.get("NY_BUILD_FEATURES", "").strip()
     if not raw:
         raise ProvenanceError(
-            "NY_BUILD_FEATURES is required; provenance cannot infer Cargo "
-            "features from an already-built binary"
+            "NY_BUILD_FEATURES is required: it declares which Cargo features "
+            "the run intends to measure. It is cross-checked against the "
+            "binary's own `ny --build-id` report, so a wrong declaration now "
+            "fails the run instead of silently mislabelling the bank."
         )
     features = [feature.strip() for feature in raw.split(",")]
     if any(
@@ -4382,6 +8257,13 @@ def capture_start_manifest(
         raise ValueError("instance index must be nonnegative")
     if vnnlib_version not in {"", "1.0", "2.0"}:
         raise ValueError("VNN-LIB version selection must be empty, 1.0, or 2.0")
+    categories = categories_raw.split()
+    if not categories:
+        raise ValueError("measurement category list is empty")
+    if len(set(categories)) != len(categories):
+        raise ValueError("measurement category list contains duplicates")
+    if any(SAFE_COMPONENT.fullmatch(category) is None for category in categories):
+        raise ValueError("measurement category list contains an unsafe name")
     git_bound_path = str(git_executable["resolved_path"])
     with _bound_git_executable(git_bound_path):
         _validate_mutation_root(
@@ -4411,7 +8293,23 @@ def capture_start_manifest(
     config_inputs = (
         _capture_config_inputs(configs_dir) if configs_dir is not None else None
     )
-    environment = _capture_environment()
+    initial_search_space = _capture_binary_search_space_contract(binary)
+    environment = _capture_environment(initial_search_space)
+    typed_environment = environment.get("typed_values")
+    current_requirement = (
+        typed_environment.get("NY_MEASURE_REQUIRE_FLIGHT_EVENT")
+        if isinstance(typed_environment, dict)
+        else None
+    )
+    if (
+        not isinstance(current_requirement, dict)
+        or current_requirement.get("schema")
+        not in {EXECUTION_PREDICATE_SCHEMA, JOINT_EXECUTION_PREDICATE_SCHEMA}
+    ):
+        raise ProvenanceError(
+            "current measurement evidence requires a typed "
+            "NY_MEASURE_REQUIRE_FLIGHT_EVENT execution predicate"
+        )
     build_features_raw, build_features = _declared_build_features()
     ay_dependency: dict[str, object] = dict(_parse_ay_pin(repo_root))
     ay_dependency["executable"] = _capture_ay_executable(
@@ -4426,6 +8324,38 @@ def capture_start_manifest(
         executable=True,
         expected_sha256=binary_digest,
         expected_fingerprint=binary_fingerprint,
+    )
+    sealed_binary_path = str(sealed_binary["path"])
+    sealed_search_space = _capture_binary_search_space_contract(
+        Path(sealed_binary_path), expected_sealed_identity=sealed_binary
+    )
+    if sealed_search_space != initial_search_space:
+        raise ProvenanceError(
+            "solver search-space manifest changed between source capture and "
+            "sealed execution"
+        )
+    sealed_config_inputs = (
+        _seal_config_inputs(config_inputs, run_dir)
+        if config_inputs is not None
+        else None
+    )
+    preset_docs = (
+        _load_execution_preset_docs(
+            Path(str(sealed_config_inputs["resolved_path"])), categories
+        )
+        if sealed_config_inputs is not None
+        else None
+    )
+    execution_predicate_assignment = build_execution_predicate_assignment(
+        environment,
+        sealed_search_space,
+        preset_docs=preset_docs,
+        preset_expected=sealed_config_inputs is not None,
+    )
+    execution_evidence_profile = (
+        JOINT_EXECUTION_EVIDENCE_PROFILE
+        if current_requirement.get("schema") == JOINT_EXECUTION_PREDICATE_SCHEMA
+        else EXECUTION_EVIDENCE_PROFILE
     )
     ay_executable = ay_dependency["executable"]
     if isinstance(ay_executable, dict):
@@ -4447,17 +8377,16 @@ def capture_start_manifest(
         )
     else:
         ay_dependency["sealed_executable"] = None
-    sealed_config_inputs = (
-        _seal_config_inputs(config_inputs, run_dir)
-        if config_inputs is not None
-        else None
-    )
-    sealed_binary_path = str(sealed_binary["path"])
     binary_version = _run(
         [sealed_binary_path, "--version"],
         check=False,
         timeout=15,
         env=_cuda_probe_environment(None),
+    )
+    # #binary-identity: seal WHICH VERIFIER, not just which bytes, and refuse
+    # a binary whose compiled feature tier contradicts NY_BUILD_FEATURES.
+    binary_build_id = _capture_binary_build_id(
+        Path(sealed_binary_path), binary_digest, build_features
     )
     cuda_runtime_dependency = _capture_and_seal_cuda_runtime_dependency(
         Path(sealed_binary_path),
@@ -4469,9 +8398,6 @@ def capture_start_manifest(
         raise ProvenanceError(
             f"solver binary changed during provenance capture: {binary}"
         )
-    categories = categories_raw.split()
-    if not categories:
-        raise ValueError("measurement category list is empty")
     solver_command_template = [
         sealed_binary_path,
         "vnncomp",
@@ -4550,6 +8476,13 @@ def capture_start_manifest(
             "version_stderr": binary_version.stderr.decode("utf-8", "replace").strip(),
             "declared_build_features": build_features,
             "declared_build_features_raw": build_features_raw,
+            # #binary-identity. `sha256` above addresses the FILE; this names
+            # the PROGRAM: derived version (<major>.<minor>.<rev-list count>, plus an
+            # explicit +dirty.<commit>.<diff digest> when the tree was dirty),
+            # compiled feature tier, backend class, impl markers, toolchain.
+            # Cross-checked against `sha256` and `declared_build_features` at
+            # capture time — see `_capture_binary_build_id`.
+            "build_id": binary_build_id,
             "build_coherence": build_coherence,
         },
         "dependencies": {
@@ -4562,6 +8495,9 @@ def capture_start_manifest(
         "rust_toolchain": rust_toolchain,
         "benchmark": benchmark_identity,
         "measurement": {
+            "execution_evidence_profile": execution_evidence_profile,
+            "search_space_contract": sealed_search_space,
+            "execution_predicate_assignment": execution_predicate_assignment,
             "sweep_invocation": [str(sweep_script)],
             "categories_raw": categories_raw,
             "categories": categories,

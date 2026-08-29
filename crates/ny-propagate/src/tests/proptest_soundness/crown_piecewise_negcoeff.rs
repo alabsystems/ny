@@ -665,7 +665,11 @@ proptest! {
     fn soundness_thresholded_relu_ibp(
         l in -10.0f32..10.0,
         delta in 0.0f32..20.0,
-        alpha in 0.0f32..5.0,
+        // NEGATIVE alpha included on purpose: a false proof lived exactly
+        // there (the interval image must be the hull of BOTH branches when
+        // the box straddles the threshold, at every sign of alpha) and was
+        // repaired 2026-08-26. Sampling only alpha >= 0 could not see it.
+        alpha in -5.0f32..5.0,
     ) {
         let u = (l + delta).max(l);
         prop_assume!(l <= u);

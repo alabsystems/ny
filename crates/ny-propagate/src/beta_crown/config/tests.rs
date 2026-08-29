@@ -4,10 +4,9 @@
 
 use ny_core::NyError;
 
-use super::beta_config::kfsb_cert_reuse_from_raw;
 use super::*;
 use crate::beta_crown::branching::BranchingHeuristic;
-use crate::{PgdAlphaMode, PgdInitialization, PgdOptimizer};
+use crate::{ExactVjpPgdConfig, PgdAlphaMode, PgdInitialization, PgdOptimizer};
 
 fn verification_mode_label(verify_upper_bound: bool) -> &'static str {
     if verify_upper_bound {
@@ -1148,6 +1147,36 @@ fn beta_crown_config_default_validates() {
 
 #[ntest::timeout(5000)]
 #[test]
+fn beta_crown_config_rejects_invalid_exact_vjp_policy() {
+    for invalid in [
+        ExactVjpPgdConfig {
+            batch_width: Some(0),
+            ..ExactVjpPgdConfig::default()
+        },
+        ExactVjpPgdConfig {
+            wave_steps: Some(0),
+            ..ExactVjpPgdConfig::default()
+        },
+        ExactVjpPgdConfig {
+            odi_eta: f32::NAN,
+            ..ExactVjpPgdConfig::default()
+        },
+        ExactVjpPgdConfig {
+            hinge_tau: -0.1,
+            ..ExactVjpPgdConfig::default()
+        },
+    ] {
+        let config = BetaCrownConfig {
+            pgd_exact_vjp: invalid,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert_invalid_config_contains(&err, "exact-VJP");
+    }
+}
+
+#[ntest::timeout(5000)]
+#[test]
 fn beta_crown_config_rejects_unbounded_or_nonfinite_depth_two_policy() {
     for invalid in [
         DepthTwoBranchLookaheadConfig {
@@ -1577,6 +1606,7 @@ fn root_alpha_phase_checkpoint_serde_is_typed_and_default_off() {
 fn kfsb_cert_reuse_serde_is_typed_and_default_off() {
     let default: BetaCrownConfig = serde_json::from_str("{}").expect("empty config deserializes");
     assert!(!default.kfsb_cert_reuse);
+    assert_eq!(default.kfsb_cert_reuse_runtime, None);
 
     let armed: BetaCrownConfig = serde_json::from_str(r#"{"kfsb_cert_reuse": true}"#)
         .expect("typed kFSB certificate-reuse config deserializes");
@@ -1585,26 +1615,21 @@ fn kfsb_cert_reuse_serde_is_typed_and_default_off() {
     let disabled: BetaCrownConfig = serde_json::from_str(r#"{"kfsb_cert_reuse": false}"#)
         .expect("typed kFSB certificate-reuse kill switch deserializes");
     assert!(!disabled.kfsb_cert_reuse);
-}
+    assert!(
+        serde_json::from_str::<BetaCrownConfig>(r#"{"kfsb_cert_reuse_runtime": true}"#).is_err(),
+        "runtime authority cannot be supplied through serialized config"
+    );
 
-#[test]
-fn kfsb_cert_reuse_raw_resolution_is_exact_and_fail_closed() {
-    assert!(!kfsb_cert_reuse_from_raw(false, None));
-    assert!(kfsb_cert_reuse_from_raw(true, None));
-    assert!(kfsb_cert_reuse_from_raw(
-        false,
-        Some(std::ffi::OsStr::new("1"))
-    ));
-    for malformed in ["", "0", "01", "true", " 1", "1 "] {
-        assert!(!kfsb_cert_reuse_from_raw(
-            false,
-            Some(std::ffi::OsStr::new(malformed))
-        ));
-        assert!(!kfsb_cert_reuse_from_raw(
-            true,
-            Some(std::ffi::OsStr::new(malformed))
-        ));
-    }
+    let runtime = BetaCrownConfig {
+        kfsb_cert_reuse_runtime: Some(true),
+        ..BetaCrownConfig::default()
+    };
+    assert_eq!(runtime.kfsb_cert_reuse_runtime, Some(true));
+    let serialized = serde_json::to_value(runtime).expect("runtime config serializes");
+    assert!(
+        serialized.get("kfsb_cert_reuse_runtime").is_none(),
+        "runtime authority must not enter serialized solver configuration"
+    );
 }
 
 #[test]
@@ -1631,20 +1656,24 @@ fn kfsb_cert_reuse_armed_is_the_typed_environment_resolution_point() {
     }
 }
 
-#[cfg(unix)]
 #[test]
-fn kfsb_cert_reuse_non_unicode_override_disables_typed_policy() {
-    use std::os::unix::ffi::OsStringExt;
-
-    let non_unicode = std::ffi::OsString::from_vec(vec![b'1', 0xff]);
-    assert!(!kfsb_cert_reuse_from_raw(
-        false,
-        Some(non_unicode.as_os_str())
-    ));
-    assert!(!kfsb_cert_reuse_from_raw(
-        true,
-        Some(non_unicode.as_os_str())
-    ));
+fn kfsb_cert_reuse_runtime_override_is_immutable_authority() {
+    crate::tests::with_serialized_env_vars(&[("NY_MO_KFSB_CERT_REUSE", "1")], || {
+        assert!(!BetaCrownConfig {
+            kfsb_cert_reuse: true,
+            kfsb_cert_reuse_runtime: Some(false),
+            ..BetaCrownConfig::default()
+        }
+        .kfsb_cert_reuse_armed());
+    });
+    crate::tests::with_serialized_env_vars(&[("NY_MO_KFSB_CERT_REUSE", "0")], || {
+        assert!(BetaCrownConfig {
+            kfsb_cert_reuse: false,
+            kfsb_cert_reuse_runtime: Some(true),
+            ..BetaCrownConfig::default()
+        }
+        .kfsb_cert_reuse_armed());
+    });
 }
 
 #[test]
@@ -1667,8 +1696,13 @@ fn verification_artifact_authority_is_runtime_only_and_fail_closed_under_serde()
         "runtime-only authority must be rejected by config deserialization"
     );
 
+    let frozen = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(
+        ny_levers::all(),
+        |_| None,
+    ));
     let runtime = BetaCrownConfig {
         verification_artifact_authority: VerificationArtifactAuthority::VerdictOnly,
+        frozen_levers: Some(std::sync::Arc::clone(&frozen)),
         ..Default::default()
     };
     let serialized = serde_json::to_value(&runtime).expect("config serializes");
@@ -1676,6 +1710,7 @@ fn verification_artifact_authority_is_runtime_only_and_fail_closed_under_serde()
         serialized.get("verification_artifact_authority").is_none(),
         "runtime authority must never leak into reusable preset/config material"
     );
+    assert!(serialized.get("frozen_levers").is_none());
     let cloned_runtime = runtime.clone();
     assert_eq!(
         runtime.verification_artifact_authority,
@@ -1687,6 +1722,31 @@ fn verification_artifact_authority_is_runtime_only_and_fail_closed_under_serde()
         VerificationArtifactAuthority::VerdictOnly,
         "in-process verifier clones must preserve the resolved frontend request"
     );
+    assert!(std::sync::Arc::ptr_eq(
+        cloned_runtime
+            .frozen_levers
+            .as_ref()
+            .expect("clone retains frozen authority"),
+        &frozen,
+    ));
+}
+
+#[test]
+fn chunk_wave_parallelism_is_runtime_only_and_defaults_to_the_memory_guard() {
+    let default: BetaCrownConfig = serde_json::from_str("{}").expect("empty config deserializes");
+    assert!(!default.chunk_wave_parallel_enabled);
+    assert!(
+        serde_json::from_str::<BetaCrownConfig>(r#"{"chunk_wave_parallel_enabled":true}"#).is_err(),
+        "reusable config must not arm the unsafe wave experiment"
+    );
+
+    let runtime = BetaCrownConfig {
+        chunk_wave_parallel_enabled: true,
+        ..Default::default()
+    };
+    let serialized = serde_json::to_value(&runtime).expect("config serializes");
+    assert!(serialized.get("chunk_wave_parallel_enabled").is_none());
+    assert!(runtime.chunk_wave_parallel_enabled);
 }
 
 #[test]

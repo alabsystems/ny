@@ -175,6 +175,74 @@ fn authenticated_unbatched_axis_zero_wins_ambiguous_c_equals_l_shape() {
     }
 }
 
+/// `BatchNormChannelAxisHint::Fixed(axis > 1)` is **reachable**, so the
+/// `axis > 1` arms in `validate_affine_parameters` and its patches twin are live
+/// fail-closed guards, not dead defensive code.
+///
+/// `with_channel_axis` (the checked constructor) rejects `axis > 1` up front and
+/// has no production caller — which is what makes this look unreachable. But
+/// `channel_axis_hint` is a **public field** on a struct with public fields, and
+/// this crate's own `make_bn_7d_fixture` already builds `BatchNormLayer` by
+/// struct literal. So an out-of-range `Fixed` can arrive at propagation without
+/// ever passing a constructor, and both propagation surfaces must refuse it.
+#[test]
+fn channel_axis_hint_fixed_above_one_is_refused_from_a_struct_literal() {
+    use super::types::BatchNormChannelAxisHint;
+
+    let scale = ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 10.0]).unwrap();
+    let bias = ArrayD::from_shape_vec(IxDyn(&[2]), vec![0.0, 0.0]).unwrap();
+
+    // The checked constructor refuses it, so it cannot be the source.
+    assert!(
+        BatchNormLayer::from_scale_bias(scale.clone(), bias.clone())
+            .unwrap()
+            .with_channel_axis(2)
+            .is_err(),
+        "with_channel_axis must reject an axis above 1"
+    );
+
+    // The unchecked public-field route succeeds in constructing it...
+    let mut layer = BatchNormLayer::from_scale_bias(scale, bias).unwrap();
+    layer.channel_axis_hint = Some(BatchNormChannelAxisHint::Fixed(2));
+
+    // ...and the IBP surface fails closed on it. A rank-3 [C,H,W] input with
+    // axis 2 would otherwise mis-key the per-channel affine.
+    let ones = ArrayD::from_elem(IxDyn(&[2, 1, 2]), 1.0);
+    let input = BoundedTensor::new(ones.clone(), ones).unwrap();
+    let err = layer
+        .propagate_ibp(&input)
+        .expect_err("out-of-range Fixed hint must be refused, not propagated");
+    assert!(
+        err.to_string().contains("unsupported channel-axis hint 2"),
+        "expected the channel-axis-hint rejection, got: {err}"
+    );
+
+    // The patches path has TWO validators: the ordinary entry reuses
+    // `validate_affine_parameters` (covered above), while the finite-deadline
+    // entry carries its own poll-aware copy of the same `axis > 1` arm. Cover
+    // that second copy explicitly — it is the one an orphan scan reads as dead.
+    use crate::layers::common::PatchesPropagation;
+    let (mut patches_layer, bounds) = make_bn_7d_fixture(None, None);
+    patches_layer.channel_axis_hint = Some(BatchNormChannelAxisHint::Fixed(2));
+
+    let err = patches_layer
+        .propagate_patches(&bounds)
+        .expect_err("patches path must refuse the same hint");
+    assert!(
+        err.to_string().contains("unsupported channel-axis hint 2"),
+        "expected the channel-axis-hint rejection on the patches path, got: {err}"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    let err = patches_layer
+        .propagate_patches_with_deadline(&bounds, deadline)
+        .expect_err("deadline patches path must refuse the same hint");
+    assert!(
+        err.to_string().contains("unsupported channel-axis hint 2"),
+        "expected the channel-axis-hint rejection on the deadline patches path, got: {err}"
+    );
+}
+
 #[test]
 fn test_ibp_rank4_batch_count_equal_to_channels_scales_per_channel() {
     // Rank-4 input is batched [N, C, H, W], so the channel axis is 1 even when

@@ -25,6 +25,10 @@ use ny_tensor::BoundedTensor;
 use std::time::Instant;
 
 use super::attack_stall::AttackStallPolicy;
+use super::graph_pgd_exact_vjp_evidence::{
+    ExactVjpExecution, ExactVjpInactiveReason as VjpInactive, ExactVjpOutcome as VjpEvidenceOutcome,
+};
+use super::graph_pgd_fast_gradient_evidence::{PgdFastGradientExecution, PgdFastGradientRoute};
 #[cfg(test)]
 pub(super) use super::graph_pgd_init::independent_graph_forward;
 pub(super) use super::graph_pgd_init::{
@@ -173,6 +177,9 @@ fn legacy_pgd_config(
         osi_steps,
         optimizer: PgdOptimizer::SignedGradient,
         alpha_mode: PgdAlphaMode::Scalar(0.01),
+        exact_vjp: ny_propagate::ExactVjpPgdConfig::default()
+            .legacy_env_over()
+            .expect("the built-in exact-VJP compatibility policy must be admissible"),
         ..PgdConfig::default()
     }
 }
@@ -242,14 +249,20 @@ pub(super) fn try_graph_pgd_upfront_with_config(
     // check. Ineligible graphs keep the batched SPSA dispatch unchanged, so
     // categories that win via batched SPSA are unaffected. Attack-only either
     // way — every candidate still flows through revalidate_graph_counterexample.
-    let route_exact_over_batched =
-        exact_grad_eligible && std::env::var("NY_PGD_EXACT_BATCHED").ok().as_deref() != Some("0");
+    let route_exact_over_batched = exact_grad_eligible && pgd_config.exact_vjp.prefer_exact_batched;
 
     if gemm_engine.is_some()
         && pgd_config.num_restarts > 1
         && graph_supports_restart_batching(graph)
         && !route_exact_over_batched
     {
+        let generic_evidence = exact_grad_eligible.then(|| {
+            ExactVjpExecution::conjunctive_generic(
+                pgd_config.exact_vjp,
+                pgd_config.num_restarts.max(1),
+                pgd_config.num_steps,
+            )
+        });
         match super::graph_pgd_batched::try_graph_pgd_upfront_batched_with_config(
             graph,
             input,
@@ -258,10 +271,31 @@ pub(super) fn try_graph_pgd_upfront_with_config(
             gemm_engine,
             json,
         )? {
-            super::graph_pgd_batched::BatchedGraphPgdOutcome::Completed(result) => {
+            super::graph_pgd_batched::BatchedGraphPgdOutcome::Completed {
+                result,
+                work_started,
+            } => {
+                if let Some(evidence) = generic_evidence.as_ref() {
+                    if work_started {
+                        evidence.mark_work_started();
+                        evidence.finish(VjpEvidenceOutcome::GenericCompleted, VjpInactive::None);
+                    } else {
+                        evidence.finish(
+                            VjpEvidenceOutcome::NotStarted,
+                            VjpInactive::DeadlineBeforeStart,
+                        );
+                    }
+                }
                 return Ok(result.map(|b| *b));
             }
-            super::graph_pgd_batched::BatchedGraphPgdOutcome::FallbackToSequential => {}
+            super::graph_pgd_batched::BatchedGraphPgdOutcome::FallbackToSequential => {
+                if let Some(evidence) = generic_evidence.as_ref() {
+                    evidence.finish(
+                        VjpEvidenceOutcome::FallbackSequential,
+                        VjpInactive::GenericFallback,
+                    );
+                }
+            }
         }
     } else if route_exact_over_batched && gemm_engine.is_some() && pgd_config.num_restarts > 1 {
         emit_graph_pgd_status(
@@ -289,7 +323,38 @@ pub(super) fn try_graph_pgd_upfront_with_config(
             }
             super::graph_pgd_vjp_batched::VjpBatchedOutcome::FallbackToSequential => {}
         }
+    } else if exact_grad_eligible && !pgd_config.exact_vjp.prefer_exact_batched {
+        let evidence = ExactVjpExecution::conjunctive_generic(
+            pgd_config.exact_vjp,
+            pgd_config.num_restarts.max(1),
+            pgd_config.num_steps,
+        );
+        evidence.finish(
+            VjpEvidenceOutcome::FallbackSequential,
+            VjpInactive::GenericFallback,
+        );
+    } else if route_exact_over_batched {
+        let evidence = ExactVjpExecution::conjunctive(
+            pgd_config.exact_vjp,
+            pgd_config.num_restarts.max(1),
+            pgd_config.num_steps,
+        );
+        evidence.finish(
+            VjpEvidenceOutcome::NotStarted,
+            if gemm_engine.is_none() {
+                VjpInactive::GpuUnavailable
+            } else if pgd_config.num_restarts <= 1 {
+                VjpInactive::InsufficientRestarts
+            } else {
+                VjpInactive::StructuralIneligible
+            },
+        );
     }
+
+    let fast_gradient_execution = PgdFastGradientExecution::new(
+        PgdFastGradientRoute::Conjunctive,
+        pgd_config.exact_vjp.fast_gradient,
+    );
 
     let constraints = &vnnlib.output_constraints;
     let spsa_delta = pgd_config
@@ -459,6 +524,7 @@ pub(super) fn try_graph_pgd_upfront_with_config(
                     &spec_row,
                     gemm_engine,
                     pgd_config.deadline,
+                    &fast_gradient_execution,
                 ) {
                     Ok(Some(g)) => {
                         exact_grad_used += 1;
@@ -466,6 +532,7 @@ pub(super) fn try_graph_pgd_upfront_with_config(
                     }
                     Ok(None) | Err(_) => {
                         spsa_used += 1;
+                        fast_gradient_execution.selected_spsa();
                         joint_spsa_gradient(
                             graph,
                             input,
@@ -940,6 +1007,12 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
 ) -> Result<GraphDisjunctiveAttackOutcome> {
     let mut outcome = GraphDisjunctiveAttackOutcome::empty();
     if clauses.is_empty() {
+        let evidence = ExactVjpExecution::disjunctive(
+            pgd_config.exact_vjp,
+            pgd_config.num_restarts.max(1),
+            pgd_config.num_steps,
+        );
+        evidence.finish(VjpEvidenceOutcome::NotStarted, VjpInactive::EmptyObjective);
         return Ok(outcome);
     }
     // #attack-stall: window sized from THIS phase's own slice (deadline minus
@@ -1022,7 +1095,28 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
             }
             super::graph_pgd_vjp_batched_disj::DisjVjpBatchedOutcome::FallbackToSequential => {}
         }
+    } else {
+        let evidence = ExactVjpExecution::disjunctive(
+            pgd_config.exact_vjp,
+            pgd_config.num_restarts.max(1),
+            pgd_config.num_steps,
+        );
+        evidence.finish(
+            VjpEvidenceOutcome::NotStarted,
+            if experimental_lane_active {
+                VjpInactive::ExperimentalLaneActive
+            } else if gemm_engine.is_none() {
+                VjpInactive::GpuUnavailable
+            } else {
+                VjpInactive::InsufficientRestarts
+            },
+        );
     }
+
+    let fast_gradient_execution = PgdFastGradientExecution::new(
+        PgdFastGradientRoute::Disjunctive,
+        pgd_config.exact_vjp.fast_gradient,
+    );
 
     // #vnncomp-targeted (attack-only, `NY_PGD_TARGETED=1`, default OFF): rank the
     // candidate target classes ONCE at the clean image, so each restart commits to
@@ -1184,18 +1278,22 @@ pub(super) fn try_graph_disjunctive_pgd_attack(
                     num_outputs.unwrap_or(output.len()),
                     gemm_engine,
                     pgd_config.deadline,
+                    &fast_gradient_execution,
                 ) {
                     Ok(Some(g)) => g,
-                    Ok(None) | Err(_) => spsa_gradient(
-                        graph,
-                        input,
-                        &x,
-                        &target,
-                        gemm_engine,
-                        &mut rng,
-                        spsa_delta,
-                        ste_surrogate.as_ref(),
-                    )?,
+                    Ok(None) | Err(_) => {
+                        fast_gradient_execution.selected_spsa();
+                        spsa_gradient(
+                            graph,
+                            input,
+                            &x,
+                            &target,
+                            gemm_engine,
+                            &mut rng,
+                            spsa_delta,
+                            ste_surrogate.as_ref(),
+                        )?
+                    }
                 }
             } else {
                 spsa_gradient(

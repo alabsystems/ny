@@ -6,7 +6,10 @@
 
 use ndarray::{Array1, ArrayD, IxDyn};
 use ny_core::{NyError, Result};
-use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
+use ny_tensor::{
+    cast_f64_to_f32_down, cast_f64_to_f32_up, next_down_f32, next_up_f32, BoundedTensor,
+    RepairStrategy,
+};
 use std::borrow::Cow;
 use tracing::debug;
 
@@ -51,16 +54,62 @@ impl BoundPropagation for ReciprocalLayer {
                 // Directed rounding: compute in f64, round lower down, upper up. (#3243)
                 // IEEE 754 division is correctly rounded (max 0.5 ULP), but f64→f32
                 // cast may round the wrong direction.
+                //
+                // SATURATION IS THE HAZARD THE PLAIN `as f32` STEP MISSES, and
+                // the old comment above named only the cast direction. When
+                // `1/ub` exceeds f32 range the inner cast yields +inf, and
+                // `next_down_f32` deliberately returns ±Inf UNCHANGED as an
+                // infeasible-interval sentinel (rounding.rs:47-52) — so the
+                // LOWER bound was rounded UP, from a large finite real all the
+                // way to +inf. `cast_f64_to_f32_down` handles exactly this and
+                // says so in its own docs (rounding.rs:203-210).
+                //
+                // Witness: lb = f32::from_bits(0x00100000) = 1.4693679e-39,
+                // ub = f32::from_bits(0x00200000) = 2.9387359e-39. The exact
+                // range of 1/x there is [3.4028236692093846e38,
+                // 6.8056473384187693e38]; `1.0/f64::from(ub)` is finite, but
+                // `as f32` overflows and the emitted lower bound was +inf —
+                // certifying `1/x >= +inf` where the true infimum is
+                // 3.4028236692093846e38. `BoundedTensor::new_repaired` with
+                // `RepairStrategy::Conservative` does NOT catch it: it replaces
+                // only NaN and preserves ±Inf by design, and `fix_inverted`
+                // swaps only when lower > upper, which +inf > +inf is not. So
+                // [+inf, +inf] shipped.
+                //
+                // Enumerating all 8,388,607 positive subnormal f32 values of
+                // `ub`, exactly 2^21 = 2,097,152 of them triggered this, and
+                // `cast_f64_to_f32_down` is sound on every one of them (checked
+                // against exact rationals, not floats). The outer
+                // `next_down_f32` is kept so the result is <= today's value at
+                // EVERY input: over those 8.4M subnormals plus 208,192 normal
+                // `ub` including the top and bottom of the normal range, the new
+                // expression is tighter than the old one in 0 cases. Strictly
+                // widening, so no banked bound can move.
                 (
-                    next_down_f32((1.0_f64 / ub as f64) as f32),
+                    next_down_f32(cast_f64_to_f32_down(1.0_f64 / f64::from(ub))),
                     next_up_f32((1.0_f64 / lb as f64) as f32),
                 )
             } else if ub < 0.0 {
                 // Entire interval is negative: 1/x is decreasing, so flip bounds.
                 // Same directed rounding pattern. (#3243)
+                //
+                // Exact mirror of the positive branch above, on the UPPER side:
+                // when `1/lb` underflows past -f32::MAX the cast yields -inf and
+                // `next_up_f32` returns it unchanged, so the UPPER bound was
+                // rounded DOWN to -inf. `cast_f64_to_f32_up` documents this
+                // mirror case at rounding.rs:224-226.
+                //
+                // Witness: lb = -2.9387359e-39, ub = -1.4693679e-39, where the
+                // exact range of 1/x is [-6.8056473384187693e38,
+                // -3.4028236692093846e38] and the emitted upper bound was -inf,
+                // certifying `1/x <= -inf` against a true supremum of
+                // -3.4028236692093846e38. Same 2^21 magnitudes as above, by the
+                // symmetry 1/(-x) = -(1/x). Note the branch geometry forces both
+                // endpoints to collapse together here: lb <= ub < 0 gives
+                // |lb| >= |ub|, so whenever 1/lb overflows, 1/ub already has.
                 (
                     next_down_f32((1.0_f64 / ub as f64) as f32),
-                    next_up_f32((1.0_f64 / lb as f64) as f32),
+                    next_up_f32(cast_f64_to_f32_up(1.0_f64 / f64::from(lb))),
                 )
             } else {
                 // Interval contains zero: reciprocal is undefined at 0

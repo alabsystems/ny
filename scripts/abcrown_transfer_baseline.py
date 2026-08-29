@@ -688,6 +688,21 @@ def capture_baseline(
             if entry["kind"] == "vnncomp"
         )
     )
+    preset_parents = {
+        PurePosixPath(entry["preset"]).parent
+        for entry in manifest["entries"]
+        if entry["kind"] == "vnncomp"
+    }
+    if (
+        len(preset_parents) != 1
+        or re.fullmatch(r"vnncomp[0-9]{2}", next(iter(preset_parents)).name)
+        is None
+    ):
+        raise BaselineError(
+            "VNN-COMP transfer entries must share one exact configs/vnncompYY "
+            "preset directory"
+        )
+    configs_dir = repo_root.joinpath(*next(iter(preset_parents)).parts)
     timeout_cap = max(entry["timeout_seconds"] for entry in manifest["entries"])
     provenance = provenance_module or _provenance_module()
     try:
@@ -708,7 +723,7 @@ def capture_baseline(
             instance_index=0,
             vnnlib_version="",
             sweep_script=Path(__file__),
-            configs_dir=repo_root / "configs",
+            configs_dir=configs_dir,
         )
     except Exception as error:
         provenance_error = getattr(provenance, "ProvenanceError", None)

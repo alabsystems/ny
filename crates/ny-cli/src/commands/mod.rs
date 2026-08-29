@@ -30,14 +30,21 @@ pub(crate) mod bench;
 pub(crate) mod bench_acasxu;
 pub(crate) mod bench_vnncomp;
 pub(crate) mod beta_crown;
+pub(crate) mod bnn_falsification_policy;
 pub(crate) mod cgan_status;
 pub(crate) mod coupled_delta;
 pub(crate) mod coverage;
-// Qualification milestone: compiled and tested under `mip`, deliberately
-// unreachable from commands/verdicts until the full-network/replay gate lands.
+// Qualification milestone: compiled and tested under `mip`. Historically
+// deliberately unreachable from commands/verdicts; since #cz-hybrid its
+// `qualification` submodule exposes one wired production entry, reached only
+// through `cz_metaroom_wired` below.
 #[cfg(feature = "mip")]
 #[allow(dead_code)]
 pub(crate) mod cz_metaroom_unwired;
+// #cz-hybrid: the wired, preset-gated CZ+Box verdict lane for the metaroom
+// spec_idx_119 instance allowlist (see `configs/vnncomp25/metaroom_2023.yaml`).
+#[cfg(feature = "mip")]
+pub(crate) mod cz_metaroom_wired;
 // Default-dark real-model qualification machinery. Its public probe reports
 // remain verdict-neutral; the beta-crown cGAN input-leaf module is the sole
 // property-bound authority layer for the private scalar leaf-row API.

@@ -135,6 +135,32 @@ pub(super) fn graph_mip_statically_ineligible(model: &BetaCrownModel) -> bool {
     }
 }
 
+/// #reserve-demand — the purely STATIC half of the post-BaB falsification
+/// lane's admission test: can this net take a gradient step at all?
+///
+/// `PhaseBudgetLedger::bab_deadline` subtracts `post_bab_pgd_fraction` from
+/// BaB's slice BEFORE BaB runs, so the subtraction can only be justified by a
+/// capability known BEFORE BaB. `postbab_lane_has_executable_stage`
+/// (commands/vnncomp.rs) admits the lane on EITHER a seed or a gradient; a seed
+/// is produced by the verifier itself and therefore cannot justify a
+/// pre-payment, while `supports_attack_point_gradient` is a pure function of the
+/// loaded graph and can.
+///
+/// `true` means every gradient stage (Newton equality-seek, DLR-APGD) is dead
+/// on this net, so the reserve's only pre-BaB-knowable spender does not exist.
+/// The lane is NOT disabled: if the verifier does export a seed, the
+/// derivative-free stages still receive whatever wall remains after BaB — they
+/// are simply not pre-paid out of BaB's slice.
+///
+/// Sequential models keep the historical reservation (fail safe): the
+/// exact-gradient fragment test is defined on the graph form.
+pub(super) fn postbab_attack_statically_ineligible(model: &BetaCrownModel) -> bool {
+    match model {
+        BetaCrownModel::Graph(graph) => !graph.supports_attack_point_gradient(),
+        BetaCrownModel::Sequential(_) => false,
+    }
+}
+
 /// Exact-string resolver shared with the NY-MIP SafeNLP canary.
 ///
 /// Only literal Unicode `1` arms the budget half of the existing experiment.
@@ -145,12 +171,50 @@ fn safenlp_shared_prefix_budget_repair_enabled_from_value(value: Option<&std::ff
     value == Some(std::ffi::OsStr::new("1"))
 }
 
+/// #safenlp-cycle — ONE exact default-off gate for the SafeNLP full-cycle A/B
+/// (`NY_SAFENLP_MIP_CYCLE=1`), composing four existing pieces without any new
+/// mechanism of its own:
+///
+/// 1. it arms the MIP-handoff budget treatment (same effect as
+///    `NY_MIP_SAFENLP_SHARED_PREFIX=1`), so the sequential reduced-verification
+///    lane actually receives a BaB deadline and the planned handoff is MADE;
+/// 2. it makes that handoff CONDITIONAL: the phase ledger keeps BaB's
+///    HISTORICAL floor-protected slice (`max(total*(1-post_bab_pgd), total/2)`)
+///    instead of the enforce_mip_handoff floor-drop that cut BaB to ~4.5s on
+///    every row, and the MIP fires only in the remaining reserved wall — the
+///    slice where today nothing runs (the handoff "planned and never made",
+///    configs/vnncomp26/safenlp_2024.yaml);
+/// 3. it defaults the sequential MIP to SERIAL (`parallel_split = 1`, the
+///    Gurobi-winning one-model shape) inside `mip_highs`;
+/// 4. it arms AY's verdict-preserving margin reframe (marked-margin ingress →
+///    `MarginMode::Required` in the pinned ay-milp, whose threshold-stop banks
+///    UNSAT on a strict bound crossing with original-model proof replay).
+///
+/// Measurement-only (the A/B in docs/SAFENLP_CYCLE_2026-08-20.md); a winning
+/// cycle ships as typed preset keys per the campaign rule. The gate is a
+/// DECLARED lever (ratchet discipline): exact `1` arms, everything else is a
+/// recorded rejection resolving to the declaration's `false` default.
+///
+/// DELIVERY SEAM (#lever-reachability, 2026-08-23). The comment above says "a
+/// winning cycle ships as typed preset keys per the campaign rule" — but the
+/// A/B itself could only ever run by hand, because `run_instance.sh` exports
+/// no `NY_*`. `NY_SAFENLP_MIP_CYCLE` still wins in both directions;
+/// absent, the typed `bab.safenlp_mip_cycle` key decides, so the winning arm is
+/// now shippable to `safenlp_2024` alone instead of needing a global default.
+pub(in crate::commands::beta_crown) fn safenlp_mip_cycle_enabled() -> bool {
+    crate::preset_gates::safenlp_mip_cycle_armed()
+}
+
 fn safenlp_shared_prefix_budget_repair_enabled() -> bool {
     #[cfg(feature = "mip")]
     {
         safenlp_shared_prefix_budget_repair_enabled_from_value(
             std::env::var_os("NY_MIP_SAFENLP_SHARED_PREFIX").as_deref(),
         )
+        // #safenlp-cycle: the full-cycle gate needs a reachable handoff; it
+        // arms the SAME budget treatment, with the conditional-handoff floor
+        // preserved by the ledger (see `PhaseBudgetLedger::bab_deadline`).
+        || safenlp_mip_cycle_enabled()
     }
     #[cfg(not(feature = "mip"))]
     {
@@ -514,11 +578,13 @@ fn apply_bab_mip_budget_policy(
     complete_verifier: CompleteVerifierArg,
     graph_mip_statically_ineligible: bool,
     safenlp_shared_prefix_budget_repair: bool,
+    postbab_attack_statically_ineligible: bool,
 ) -> PhaseBudgetLedger {
     ledger
         .with_mip_escalation_allowed(!matches!(complete_verifier, CompleteVerifierArg::Bab))
         .with_safenlp_shared_prefix_budget_repair(safenlp_shared_prefix_budget_repair)
         .with_static_mip_ineligibility(graph_mip_statically_ineligible)
+        .with_static_postbab_attack_ineligibility(postbab_attack_statically_ineligible)
 }
 
 /// Graph-level form of [`graph_mip_statically_ineligible`]. `false` in a non-mip
@@ -813,6 +879,15 @@ pub(super) fn gate_result_at_deadline(
     normalize_result_wall_time(result, verification_start)
 }
 
+/// Bridge only a typed engine-global timeout source into wrapper capture.
+/// Status and elapsed time alone cannot distinguish a phase-local timeout or
+/// a natural result that merely unwound after the configured wall.
+fn mark_captured_engine_timeout_source(result: &BetaCrownResult, source_deadline: Option<Instant>) {
+    if matches!(result.result, BabVerificationStatus::Timeout) {
+        super::output::mark_captured_timeout_at_deadline(source_deadline);
+    }
+}
+
 /// Recover a finite context deadline for direct internal callers that provide
 /// a bounded config but omit the normally-authoritative handler deadline.
 fn ledger_deadline(ctx: &DispatchContext<'_>) -> Option<Instant> {
@@ -1103,6 +1178,7 @@ pub(super) fn run_bab_with_fallback(
         complete_verifier,
         graph_mip_statically_ineligible(&*ctx.model_net),
         safenlp_shared_prefix_budget_repair_enabled(),
+        postbab_attack_statically_ineligible(&*ctx.model_net),
     );
     bab_ledger.emit_telemetry("bab-dispatch");
     let internal_authority_deadline = bab_ledger.overall_deadline();
@@ -1349,6 +1425,8 @@ pub(super) fn run_bab_with_fallback(
 
     if let BetaCrownModel::Graph(graph) = &mut *ctx.model_net {
         graph.set_use_patches_mode(execution_config.use_patches());
+        graph.set_chunk_wave_parallel_enabled(execution_config.chunk_wave_parallel_enabled);
+        graph.set_frozen_levers(execution_config.frozen_levers.clone());
     }
 
     #[cfg(feature = "mip")]
@@ -1434,6 +1512,7 @@ pub(super) fn run_bab_with_fallback(
     // f64 leaf escalation). Verdict semantics are identical for one clause.
     let has_multi_constraints = routes_to_relational_verifier(ctx.vnnlib_spec, ctx.has_relational);
 
+    ny_propagate::beta_crown::reset_global_timeout_deadline_source();
     let verification = if let (true, Some(vnnlib)) = (has_multi_constraints, ctx.vnnlib_spec) {
         verify_relational_constraints_with_ledger(
             &*ctx.model_net,
@@ -1475,6 +1554,7 @@ pub(super) fn run_bab_with_fallback(
             bab_ledger.bab_deadline(),
         )
     };
+    let engine_timeout_source = ny_propagate::beta_crown::take_global_timeout_deadline_source();
     #[cfg(feature = "mip")]
     if let Some(attachment) = cgan_input_leaf_attachment.as_ref() {
         attachment.emit_final_once("bab-return");
@@ -1492,6 +1572,7 @@ pub(super) fn run_bab_with_fallback(
             timeout
         }
     };
+    mark_captured_engine_timeout_source(&result, engine_timeout_source);
 
     let deadline = internal_authority_deadline;
     let confirmation_deadline =
@@ -1747,6 +1828,21 @@ pub(super) fn run_bab_with_fallback(
     // consumed additional wall time after the first normalization.
     let result =
         gate_result_at_deadline(result, ctx.verification_start, internal_authority_deadline);
+    // #stop-accounting: `GraphBabLifecycle::unresolved_reason()` builds the exact
+    // stop reason ("Max depth 100 reached", "Queue cap ... evicted unverified
+    // domains", "No unstable ReLU/Sign neurons left in some domains") and the
+    // verdict boundary then DROPS it — every `VnncompResult::Unknown` return site
+    // is reasonless, and the eviction/decline telemetry behind it is `info!` under
+    // a default `WARN` filter with `RUST_LOG` not honoured. Carry it to the one
+    // terminal accounting line instead, so an `unknown` row says WHY it stopped
+    // and HOW MUCH of its official budget it left on the table.
+    match &result.result {
+        BabVerificationStatus::Unknown { reason } => crate::flight::note_stop_reason(reason),
+        BabVerificationStatus::Timeout => {
+            crate::flight::note_stop_reason("BaB stopped at its deadline (Timeout)")
+        }
+        _ => {}
+    }
     output_result(
         &result,
         ctx.property,
@@ -1858,6 +1954,81 @@ mod deadline_error_tests {
         assert!(
             timeout_result_from_deadline_error(&local_deadline, start, None).is_none(),
             "an unbounded caller must not claim its own budget expired"
+        );
+    }
+
+    #[test]
+    fn postbab_reserve_deadline_marker_requires_a_typed_engine_source() {
+        let verification_start = Instant::now()
+            .checked_sub(Duration::from_millis(10))
+            .expect("ten milliseconds before now is representable");
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond before now is representable");
+        let result = |status| BetaCrownResult {
+            result: status,
+            domains_explored: 0,
+            domains_verified: 0,
+            cuts_generated: 0,
+            max_depth_reached: 0,
+            time_elapsed: Duration::ZERO,
+            output_bounds: None,
+        };
+
+        super::super::output::begin_capture();
+        super::super::output::record_captured_deadline_plan(
+            Duration::from_millis(10),
+            Some(deadline),
+            true,
+        );
+        let carried = gate_result_at_deadline(
+            result(BabVerificationStatus::Timeout),
+            verification_start,
+            Some(deadline),
+        );
+        let carried_plan = super::super::output::take_captured_deadline_plan()
+            .expect("capture records the configured deadline plan");
+        super::super::output::end_capture();
+        assert!(matches!(carried.result, BabVerificationStatus::Timeout));
+        assert!(
+            !carried_plan.configured_deadline_caused_terminal_timeout,
+            "a pre-existing phase timeout must not be credited to the later configured wall"
+        );
+
+        super::super::output::begin_capture();
+        super::super::output::record_captured_deadline_plan(
+            Duration::from_millis(10),
+            Some(deadline),
+            true,
+        );
+        let converted = gate_result_at_deadline(
+            result(BabVerificationStatus::Verified),
+            verification_start,
+            Some(deadline),
+        );
+        let converted_plan = super::super::output::take_captured_deadline_plan()
+            .expect("capture records the configured deadline plan");
+        super::super::output::end_capture();
+        assert!(matches!(converted.result, BabVerificationStatus::Timeout));
+        assert!(
+            !converted_plan.configured_deadline_caused_terminal_timeout,
+            "late publication suppression does not prove the reserve created verifier work"
+        );
+
+        super::super::output::begin_capture();
+        super::super::output::record_captured_deadline_plan(
+            Duration::from_millis(10),
+            Some(deadline),
+            true,
+        );
+        let timeout = result(BabVerificationStatus::Timeout);
+        mark_captured_engine_timeout_source(&timeout, Some(deadline));
+        let sourced_plan = super::super::output::take_captured_deadline_plan()
+            .expect("capture records the configured deadline plan");
+        super::super::output::end_capture();
+        assert!(
+            sourced_plan.configured_deadline_caused_terminal_timeout,
+            "an exact typed engine-global timeout source is causal evidence"
         );
     }
 }
@@ -2687,6 +2858,32 @@ mod tests {
         }
     }
 
+    /// #safenlp-cycle: the one full-cycle gate is exact and default-dark,
+    /// resolved through its ny-levers declaration (no raw env read; env-free
+    /// via the injected lookup).
+    #[test]
+    fn safenlp_mip_cycle_gate_accepts_only_literal_one() {
+        let decl = &ny_levers::decls::safenlp_cycle::SAFENLP_MIP_CYCLE;
+        assert!(ny_levers::read_with(decl, |_| Some("1".to_string()))
+            .value
+            .as_bool());
+        for raw in [
+            None,
+            Some("0"),
+            Some(" 1"),
+            Some("1 "),
+            Some("true"),
+            Some("01"),
+        ] {
+            assert!(
+                !ny_levers::read_with(decl, |_| raw.map(str::to_string))
+                    .value
+                    .as_bool(),
+                "non-exact cycle spelling {raw:?} must leave every historical path byte-identical"
+            );
+        }
+    }
+
     fn safenlp_official_internal_policy() -> PhaseBudgetConfig {
         PhaseBudgetConfig {
             mip_min_fraction: 0.65,
@@ -2708,7 +2905,8 @@ mod tests {
             .clone()
             .with_mip_escalation_allowed(true)
             .with_static_mip_ineligibility(true);
-        let routed = apply_bab_mip_budget_policy(base, CompleteVerifierArg::Auto, true, false);
+        let routed =
+            apply_bab_mip_budget_policy(base, CompleteVerifierArg::Auto, true, false, false);
 
         assert_eq!(routed.bab_deadline(), historical.bab_deadline());
         assert_eq!(
@@ -2732,6 +2930,9 @@ mod tests {
             CompleteVerifierArg::Auto,
             true,
             true,
+            // #reserve-demand: this regression is about the MIP reservation, so
+            // the post-BaB demand finding stays at its fail-safe `false`.
+            false,
         );
         assert!(
             repaired.mip_reservation_armed_for_test(),
@@ -2750,6 +2951,7 @@ mod tests {
             CompleteVerifierArg::Bab,
             true,
             true,
+            false,
         );
         assert!(
             !bab_only.mip_reservation_armed_for_test(),

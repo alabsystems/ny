@@ -58,6 +58,28 @@ impl StreamingVerifier {
                     source: Box::new(e),
                 })?;
 
+            // Certified per-node float-rounding widening, matching the graph
+            // IBP driver's sound path (`network/graph_ibp.rs`): Linear gets
+            // `in_features + 2` ULPs (Higham Thm 3.1 over the two matmuls, the
+            // combine and the bias), every other layer 1 ULP on top of its own
+            // enclosure.
+            //
+            // Applied UNCONDITIONALLY here, unlike the graph driver's `sound`
+            // flag, because a streamed box feeds `tighten_crown_output`: an
+            // un-widened forward box could tighten a sound CROWN result below
+            // the certified graph answer, i.e. the streamed bound would be
+            // narrower than the true enclosure. The cost is ULP-scale and the
+            // alternative is a silently weaker guarantee on the path whose
+            // whole purpose is verifying models too large for the graph
+            // driver.
+            let rounding_ulps = match layer {
+                Layer::Linear(linear) => u32::try_from(linear.in_features())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(2),
+                _ => 1,
+            };
+            current.round_for_soundness_n_ulps_inplace(rounding_ulps);
+
             // Store checkpoint at intervals and always at the last layer
             if (i + 1) % interval == 0 || i == num_layers - 1 {
                 debug!(

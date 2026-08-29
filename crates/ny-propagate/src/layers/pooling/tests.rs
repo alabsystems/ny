@@ -412,7 +412,6 @@ fn test_maxpool_rejects_padding_ge_kernel() -> Result<()> {
         MaxPool2dLayer::new((2, 2), (2, 2), (2, 2)),
         MaxPool2dLayer::new((2, 3), (1, 1), (2, 1)), // height dimension only
         MaxPool2dLayer::new((3, 2), (1, 1), (1, 2)), // width dimension only
-        MaxPool2dLayer::with_padding_mode((2, 2), (2, 2), (2, 2), false),
     ] {
         let err = layer
             .output_size(4, 4)
@@ -422,6 +421,37 @@ fn test_maxpool_rejects_padding_ge_kernel() -> Result<()> {
     // Boundary: padding == kernel - 1 is still accepted.
     let layer = MaxPool2dLayer::new((2, 2), (2, 2), (1, 1));
     assert_eq!(layer.output_size(4, 4)?, (3, 3));
+    Ok(())
+}
+
+/// Pins MaxPool2d's padding semantics now that the inert `use_negative_inf_padding`
+/// flag is gone: a padded window's max is the max over its **valid** positions
+/// only, which is exactly ONNX/PyTorch `-inf` padding because `-inf` is the
+/// identity of `max`. The two readings the deleted flag claimed to select are one
+/// computation, so removing it cannot have changed any bound.
+///
+/// Input `[[1,2,3],[4,5,6],[7,8,9]]` (degenerate bounds), kernel 3x3, stride 1,
+/// padding 1. Each output position's expected value is the hand-computed max over
+/// the in-bounds slice of its window.
+#[ntest::timeout(10000)]
+#[test]
+fn test_maxpool_padding_excludes_padded_positions_from_the_max() -> Result<()> {
+    let values: Vec<f32> = (1..=9).map(|v| v as f32).collect();
+    let point = ArrayD::from_shape_vec(IxDyn(&[1, 3, 3]), values).unwrap();
+    let input = BoundedTensor::new(point.clone(), point)?;
+
+    let layer = MaxPool2dLayer::new((3, 3), (1, 1), (1, 1));
+    assert_eq!(layer.output_size(3, 3)?, (3, 3));
+    let out = layer.propagate_ibp(&input)?;
+
+    // Windows clipped to the valid region; padding never raises (nor lowers) the max.
+    let expected = [[5.0, 6.0, 6.0], [8.0, 9.0, 9.0], [8.0, 9.0, 9.0]];
+    for (oh, row) in expected.iter().enumerate() {
+        for (ow, &want) in row.iter().enumerate() {
+            assert_eq!(out.lower()[[0, oh, ow]], want, "lower at ({oh},{ow})");
+            assert_eq!(out.upper()[[0, oh, ow]], want, "upper at ({oh},{ow})");
+        }
+    }
     Ok(())
 }
 

@@ -29,7 +29,12 @@ pub(crate) use whisper_args::WhisperCommonArgs;
 #[derive(Parser)]
 #[command(name = "ny")]
 #[command(author = "ny Team")]
-#[command(version)]
+// #binary-identity: the DERIVED version (`<major>.<minor>.<git rev-list count>`
+// plus an explicit `+dirty.<commit>.<diff digest>` suffix), never the frozen
+// `[workspace.package] version`, which did not move for the whole campaign
+// while the verifier changed underneath it many times. `ny --build-id` prints
+// the full identity this version is the primary key of.
+#[command(version = crate::build_id::DISPLAY_VERSION)]
 #[command(about = "Neural network verification and analysis CLI", long_about = None)]
 pub(crate) struct Cli {
     /// Verbosity level (-v info, -vv debug, -vvv trace)
@@ -1219,6 +1224,21 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: commands::gt::GtAction,
     },
+
+    /// Re-derive every recorded empirical claim from the artifacts it was made
+    /// from, and print TRUE / FALSE / STALE / VACUOUS / UNGROUNDED.
+    ///
+    /// The ledger lives in `claims/`. A claim carries the artifacts it was
+    /// derived from (content-pinned), an extractor that re-derives its number
+    /// today, the ENGAGEMENT OBSERVABLES that prove the measurement observed
+    /// its own subject, and the provenance dimensions its truth depends on.
+    ///
+    /// The subcommand exists here for people who already have `ny` in hand;
+    /// the identical check is in the leaf `ny-claims` binary, which builds in
+    /// seconds rather than relinking this one. Hosted in `ny`, the current
+    /// verifier's identity comes from THIS RUNNING PROCESS rather than from
+    /// re-invoking a file by path, which is strictly better evidence.
+    Claims(ny_claims::cli::ClaimsArgs),
 
     /// Learn to verify neural networks, interactively (start with no argument)
     Tutorial {

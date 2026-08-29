@@ -22,9 +22,14 @@
 // Import the proof-support scalar surface from ny-relaxation.
 // This lightweight crate contains only the f32 relaxation math needed by
 // proof harnesses, avoiding ny-propagate's heavy deps (faer, ndarray, etc.).
-// ny-propagate does not re-export these items yet, and the copies here are
-// not mechanically kept equivalent to it — what these harnesses prove is
-// soundness of the ny-relaxation implementations themselves.
+// ny-propagate does not re-export these items, but the copies are no longer
+// unbound: `crates/ny-relaxation/tests/drift.rs` evaluates every mirrored pair
+// against the production ny-propagate relaxation over a deterministic
+// adversarial grid and fails on any drift. What these harnesses prove is
+// soundness of the ny-relaxation implementations themselves; drift.rs is what
+// carries that across to the shipped path. Only the centered-normalization
+// helpers (`src/bin/normalization.rs`) have no function counterpart in either
+// crate and remain unbound.
 use ny_relaxation::{
     abs_linear_relaxation, exp_linear_relaxation, gelu_eval, gelu_sound_linear_relaxation,
     gelu_tanh_sound_linear_relaxation, interval_mul_for_bounds, log_linear_relaxation,

@@ -32,6 +32,10 @@ mod preloop_cuda_rows;
 mod spec_axis;
 mod supplements;
 
+/// Test-only router-arm probe (#mulbinary-alpha-router). Tests assert the route
+/// the DAG router selected instead of guessing it from bounds or wall time.
+#[cfg(test)]
+pub(in crate::network::graph_alpha) use init::route_probe;
 use init::{DagAlphaInitResult, DagAlphaInitState};
 use preloop_cuda_rows::PreloopCudaRowsOutcome;
 
@@ -43,7 +47,9 @@ use ny_core::{GemmEngine, NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::{debug, info, instrument, warn};
 
-use super::propagate_helpers::{clamp_inverted_best_bounds, update_elementwise_best_bounds};
+use super::propagate_helpers::{
+    clamp_inverted_best_bounds, intersect_sound_enclosure, update_elementwise_best_bounds,
+};
 use super::resnet_decompose::{multiobj_joint_alpha_enabled, root_alpha_gpu_enabled};
 use super::resnet_skeleton::{build_resnet_segment_skeleton, extract_skeleton_enabled};
 use super::runtime_state::DagAlphaRuntimeState;
@@ -247,7 +253,7 @@ fn root_alpha_margin_enabled_from(raw: Option<&std::ffi::OsStr>, preset_default:
 ///
 /// Delivery contract (see `crates/ny-cli/tests/measured_gate_delivery.rs`): an experimental,
 /// default-off lever needs a typed preset key to be available to a future scored run, because
-/// the scored wrapper exports exactly one `NY_*` variable. `AlphaCrownPreset::root_alpha_margin`
+/// the scored wrapper exports no `NY_*` variables. `AlphaCrownPreset::root_alpha_margin`
 /// is that key.
 ///
 /// The env var still WINS wherever it is present, in both directions: `=1` arms a lever the
@@ -737,6 +743,7 @@ impl GraphNetwork {
             has_sqrt,
             has_reciprocal,
             invprop_enabled,
+            batched_floor,
         } = init;
 
         let num_unstable = runtime.graph().num_unstable();
@@ -812,11 +819,22 @@ impl GraphNetwork {
             } else {
                 &self.output_node
             };
-            let output_bounds = node_bounds.get(output_node).cloned().ok_or_else(|| {
+            let mut output_bounds = node_bounds.get(output_node).cloned().ok_or_else(|| {
                 NyError::InvalidSpec(format!(
                     "DAG alpha zero-iteration request missing output bounds for '{output_node}'"
                 ))
             })?;
+            // A re-routed multiplicative graph must not lose the previous
+            // route's bound just because this request asked for zero iterations.
+            if let Some(floor) = batched_floor.as_ref() {
+                if let Some(intersected) = intersect_sound_enclosure(
+                    &output_bounds,
+                    floor,
+                    "dag-alpha zero-iteration batched floor",
+                ) {
+                    output_bounds = intersected;
+                }
+            }
             crate::phase_telemetry::phase_marker(
                 "dag-alpha-warmup skip root-collection configured-iterations=0",
             );
@@ -840,7 +858,7 @@ impl GraphNetwork {
                 config.adaptive_skip_depth_threshold
             );
             let alpha_state = runtime.into_graph_alpha_state();
-            let output_bounds = if node_bounds_source.is_typed_cgan() {
+            let mut output_bounds = if node_bounds_source.is_typed_cgan() {
                 self.propagate_crown_with_engine_and_deadline_and_node_bounds(
                     input,
                     engine,
@@ -852,6 +870,17 @@ impl GraphNetwork {
                 self.propagate_crown_with_engine_and_deadline(input, engine, config.deadline)?
                     .bounds
             };
+            // Same contract as the loop below: a re-routed multiplicative graph
+            // never returns looser than the route it replaced, adaptive skip included.
+            if let Some(floor) = batched_floor.as_ref() {
+                if let Some(intersected) = intersect_sound_enclosure(
+                    &output_bounds,
+                    floor,
+                    "dag-alpha adaptive-skip batched floor",
+                ) {
+                    output_bounds = intersected;
+                }
+            }
             return Ok(DagAlphaCollectionArtifact {
                 output_bounds,
                 alpha_state,
@@ -1072,6 +1101,22 @@ impl GraphNetwork {
                     }
                 }
             }
+        };
+        // #mulbinary-alpha-router: fold the previous route's bound into the
+        // elementwise best box BEFORE iteration 0. The loop only ever tightens
+        // this box (`update_elementwise_best_bounds`), so seeding it here is
+        // what makes "the alpha route is never looser than the batched route it
+        // replaced" a structural property rather than a measured hope — and it
+        // also gives early stopping a correct starting objective. Both operands
+        // enclose the same output, so the intersection is a valid enclosure.
+        let crown_bounds = match batched_floor.as_ref() {
+            Some(floor) => intersect_sound_enclosure(
+                &crown_bounds,
+                floor,
+                "dag-alpha initial-bound batched floor",
+            )
+            .unwrap_or(crown_bounds),
+            None => crown_bounds,
         };
         let mut best_lower: ArrayD<f32> = crown_bounds.lower().clone();
         let mut best_upper: ArrayD<f32> = crown_bounds.upper().clone();
@@ -2247,7 +2292,8 @@ impl GraphNetwork {
                 engine,
                 &mut runtime,
                 &gradients,
-                &bilinear_alphas,
+                &mut bilinear_alphas,
+                &mut grad_result.bilinear_grads,
                 &mut mul_binary_alphas,
                 &mut grad_result.mul_binary_grads,
                 &mut grad_result.s_shaped_grads,
@@ -2723,6 +2769,12 @@ impl GraphNetwork {
             }
         }
 
+        // Deliberately NOT floor-intersected: this is the INVPROP typed
+        // infeasibility sentinel (an inverted box), not an output enclosure, so
+        // intersecting an enclosure into it would erase the proof. It also
+        // cannot co-occur with a floor — `batched_floor` is only ever set on an
+        // arm the router takes when `gamma_only_invprop` is false, and this
+        // sentinel is only produced while gamma optimization is active.
         if let Some(bounds) = infeasible_bounds {
             return Ok(DagAlphaCollectionArtifact {
                 output_bounds: bounds,
@@ -2804,6 +2856,18 @@ impl GraphNetwork {
                     crown_bounds
                 }
                 Err(error) => return Err(error),
+            };
+            // The NaN fallback recollects CROWN from scratch, so it would
+            // otherwise discard the previous route's bound on a re-routed
+            // multiplicative graph.
+            let bounds = match batched_floor.as_ref() {
+                Some(floor) => intersect_sound_enclosure(
+                    &bounds,
+                    floor,
+                    "dag-alpha nan-fallback batched floor",
+                )
+                .unwrap_or(bounds),
+                None => bounds,
             };
             Ok(DagAlphaCollectionArtifact {
                 output_bounds: bounds,

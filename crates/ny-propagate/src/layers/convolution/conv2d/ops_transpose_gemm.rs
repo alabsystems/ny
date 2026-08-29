@@ -41,14 +41,10 @@ const DEADLINE_BOUNDED_CONV_HOST_BUFFER_SITE: &str =
 /// clock and launch as closures makes that exact boundary deterministic to
 /// test: expiry must refuse before entering the unpollable faer call.
 #[inline]
-fn run_f64_gemm_before_deadline_with_clock<N, G>(
-    deadline: Instant,
-    now: N,
-    gemm: G,
-) -> Result<Mat<f64>>
+fn run_f64_gemm_before_deadline_with_clock<N, G, T>(deadline: Instant, now: N, gemm: G) -> Result<T>
 where
     N: FnOnce() -> Instant,
-    G: FnOnce() -> Mat<f64>,
+    G: FnOnce() -> T,
 {
     if now() >= deadline {
         return Err(per_node_deadline_exceeded());
@@ -2574,8 +2570,14 @@ fn conv_group_col_flat_f64_deadline_via_engine_or_cpu(
         kw,
         deadline,
     )? {
+        CONV_GROUP_ENGINE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(result);
     }
+    // Engine declined (dispatch cap, refusal, or non-finite image): the
+    // pollable body below runs *inside* the engine-attempt timer, so
+    // [group-split] engine_attempt covers it. The miss counter makes that
+    // attribution visible instead of inferred.
+    CONV_GROUP_ENGINE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     conv_group_col_flat_f64_pollable(
         a_coefficients,
         kernel,
@@ -2639,6 +2641,7 @@ fn conv_group_col_flat_f64_try_deadline_engine(
         guard_deadline_bounded_conv_f64_buffer(output_len)?;
     }
 
+    let fill_t = Instant::now();
     // A: (total_spatial × out_c_per_group), exactly widened from f32.
     let mut a64 = if bounded_host_engine {
         let mut values = Vec::new();
@@ -2653,19 +2656,118 @@ fn conv_group_col_flat_f64_try_deadline_engine(
     } else {
         Vec::with_capacity(a_len)
     };
-    for row in 0..total_spatial {
-        let obj = row / spatial_per_obj;
-        let spatial = row % spatial_per_obj;
-        for oc_local in 0..out_c_per_group {
-            let oc = oc_start + oc_local;
-            let value = a_coefficients[[obj, oc * spatial_per_obj + spatial]];
-            if !value.is_finite() {
-                check_deadline()?;
-                return Ok(None);
+    // Fast lane (#conv-fill-hoist): identical scan order, identical values,
+    // identical first-non-finite early return — with the per-element 2D
+    // bounds-checked index hoisted to one contiguous row slice per `obj` and
+    // the poll moved to once per row (>= the legacy 4096-element cadence in
+    // responsiveness; ~20 ns per row). Probe-measured motivation: these fills
+    // carried ~16 s of the group arm's engine share on `cifar_bias_field_46`
+    // while the tile math itself cost 0.055 s (REGRESSION doc, 2026-08-20).
+    let a_flat = if a_coefficients.is_standard_layout() {
+        a_coefficients.as_slice()
+    } else {
+        None
+    };
+    if let (Some(a_flat), true, 0) = (
+        a_flat,
+        spatial_per_obj > 0,
+        total_spatial % spatial_per_obj.max(1),
+    ) {
+        // Cache-blocked transpose (#conv-fill-hoist leg 2). The row-order fill
+        // read one element per cache line (source stride `spatial_per_obj`,
+        // measured 2.9 s of the engine attempt). Per `obj`, the source block
+        // is (out_c x spatial) row-major and the destination wants its
+        // transpose; tiling `spatial` so a destination tile of
+        // `s_tile * out_c_per_group` f64s stays L2-resident makes every source
+        // read sequential and every destination line written to completion
+        // while resident. Values, the any-non-finite -> Ok(None) outcome, and
+        // the deadline-checked returns are identical; only the DETECTION order
+        // of the first non-finite element changes, which no caller can
+        // observe (the fallback signal carries no location).
+        let a_cols = a_coefficients.ncols();
+        let num_objs = total_spatial / spatial_per_obj;
+        let s_tile = (32_768 / out_c_per_group.max(1)).max(64);
+        a64.resize(a_len, 0.0);
+        // Objects are independent (each writes its own disjoint destination
+        // block), so the blocked transpose parallelizes over them with
+        // identical values. The early Ok(None)/deadline returns become flags:
+        // any non-finite anywhere still yields the same Ok(None), any expiry
+        // observed at the same per-oc-pass cadence still yields the same
+        // typed error, and expiry keeps precedence over the fallback signal
+        // exactly as the serial `check_deadline()?; return Ok(None)` did.
+        let fill_bad = std::sync::atomic::AtomicBool::new(false);
+        let fill_expired = std::sync::atomic::AtomicBool::new(false);
+        a64.par_chunks_mut(spatial_per_obj * out_c_per_group)
+            .enumerate()
+            .for_each(|(obj, obj_out)| {
+                use std::sync::atomic::Ordering::Relaxed;
+                if obj >= num_objs {
+                    return;
+                }
+                let row_slice = &a_flat[obj * a_cols..(obj + 1) * a_cols];
+                let mut s0 = 0usize;
+                while s0 < spatial_per_obj {
+                    if fill_bad.load(Relaxed) || fill_expired.load(Relaxed) {
+                        return;
+                    }
+                    let s1 = (s0 + s_tile).min(spatial_per_obj);
+                    for oc_local in 0..out_c_per_group {
+                        let src_base = (oc_start + oc_local) * spatial_per_obj;
+                        let src = &row_slice[src_base + s0..src_base + s1];
+                        for (ds, &value) in src.iter().enumerate() {
+                            if !value.is_finite() {
+                                fill_bad.store(true, Relaxed);
+                                return;
+                            }
+                            obj_out[(s0 + ds) * out_c_per_group + oc_local] = f64::from(value);
+                        }
+                        if Instant::now() >= deadline {
+                            fill_expired.store(true, Relaxed);
+                            return;
+                        }
+                    }
+                    s0 = s1;
+                }
+            });
+        if fill_expired.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(per_node_deadline_exceeded());
+        }
+        if fill_bad.load(std::sync::atomic::Ordering::Relaxed) {
+            check_deadline()?;
+            return Ok(None);
+        }
+    } else if let Some(a_flat) = a_flat {
+        let a_cols = a_coefficients.ncols();
+        for row in 0..total_spatial {
+            let obj = row / spatial_per_obj;
+            let spatial = row % spatial_per_obj;
+            let row_slice = &a_flat[obj * a_cols..(obj + 1) * a_cols];
+            let base = oc_start * spatial_per_obj + spatial;
+            for oc_local in 0..out_c_per_group {
+                let value = row_slice[base + oc_local * spatial_per_obj];
+                if !value.is_finite() {
+                    check_deadline()?;
+                    return Ok(None);
+                }
+                a64.push(f64::from(value));
             }
-            a64.push(f64::from(value));
-            if a64.len().is_multiple_of(PREP_POLL_ELEMENTS) {
-                check_deadline()?;
+            check_deadline()?;
+        }
+    } else {
+        for row in 0..total_spatial {
+            let obj = row / spatial_per_obj;
+            let spatial = row % spatial_per_obj;
+            for oc_local in 0..out_c_per_group {
+                let oc = oc_start + oc_local;
+                let value = a_coefficients[[obj, oc * spatial_per_obj + spatial]];
+                if !value.is_finite() {
+                    check_deadline()?;
+                    return Ok(None);
+                }
+                a64.push(f64::from(value));
+                if a64.len().is_multiple_of(PREP_POLL_ELEMENTS) {
+                    check_deadline()?;
+                }
             }
         }
     }
@@ -2684,21 +2786,52 @@ fn conv_group_col_flat_f64_try_deadline_engine(
     } else {
         Vec::with_capacity(w_len)
     };
-    for oc_local in 0..out_c_per_group {
-        let oc = oc_start + oc_local;
-        for col in 0..kernel_cols_per_group {
-            let ic = col / kernel_spatial;
-            let rem = col % kernel_spatial;
-            let ki = rem / kw;
-            let kj = rem % kw;
-            let value = kernel[[oc, ic, ki, kj]];
-            if !value.is_finite() {
-                check_deadline()?;
-                return Ok(None);
+    // Fast lane (#conv-fill-hoist, W side): `col = ic·kernel_spatial + ki·kw
+    // + kj` reconstructs exactly the flat offset inside kernel row `oc` when
+    // the kernel is standard-layout [OC, ic_g, kh, kw] with matching group
+    // geometry — so each W row is one contiguous slice and the whole
+    // div/mod-per-element chain disappears. Guarded structurally; any
+    // mismatch keeps the legacy loop.
+    let kernel_flat = if kernel.ndim() == 4
+        && kernel.is_standard_layout()
+        && kernel.shape()[1] * kernel.shape()[2] * kernel.shape()[3] == kernel_cols_per_group
+        && kernel.shape()[2] * kernel.shape()[3] == kernel_spatial
+        && kernel.shape()[3] == kw
+    {
+        kernel.as_slice_memory_order()
+    } else {
+        None
+    };
+    if let Some(kernel_flat) = kernel_flat {
+        for oc_local in 0..out_c_per_group {
+            let oc = oc_start + oc_local;
+            let krow = &kernel_flat[oc * kernel_cols_per_group..(oc + 1) * kernel_cols_per_group];
+            for &value in krow {
+                if !value.is_finite() {
+                    check_deadline()?;
+                    return Ok(None);
+                }
+                w64.push(f64::from(value));
             }
-            w64.push(f64::from(value));
-            if w64.len().is_multiple_of(PREP_POLL_ELEMENTS) {
-                check_deadline()?;
+            check_deadline()?;
+        }
+    } else {
+        for oc_local in 0..out_c_per_group {
+            let oc = oc_start + oc_local;
+            for col in 0..kernel_cols_per_group {
+                let ic = col / kernel_spatial;
+                let rem = col % kernel_spatial;
+                let ki = rem / kw;
+                let kj = rem % kw;
+                let value = kernel[[oc, ic, ki, kj]];
+                if !value.is_finite() {
+                    check_deadline()?;
+                    return Ok(None);
+                }
+                w64.push(f64::from(value));
+                if w64.len().is_multiple_of(PREP_POLL_ELEMENTS) {
+                    check_deadline()?;
+                }
             }
         }
     }
@@ -2717,30 +2850,81 @@ fn conv_group_col_flat_f64_try_deadline_engine(
         minimum_dispatches,
         "admitting deadline-bounded sound-f64 Conv2d contraction"
     );
-    match engine.gemm_f64_with_deadline(
+    CONV_GROUP_ENGINE_FILL_NANOS.fetch_add(
+        u64::try_from(fill_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    CONV_GROUP_ENGINE_MACS.fetch_add(
+        u64::try_from(
+            total_spatial
+                .saturating_mul(out_c_per_group)
+                .saturating_mul(kernel_cols_per_group),
+        )
+        .unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let engine_gemm_t = Instant::now();
+    // The engine states its own cancellation granularity; the CPU floor engine
+    // widens the accelerator-sized cap to tiles it can block and thread
+    // (#cpu-sound-f64-deadline). Accelerator engines return the cap unchanged.
+    let dispatch_macs =
+        engine.deadline_dispatch_macs_hint(CONV_DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS);
+    let gemm_result = engine.gemm_f64_with_deadline(
         total_spatial,
         out_c_per_group,
         kernel_cols_per_group,
         &a64,
         &w64,
         deadline,
-        CONV_DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS,
-    ) {
+        dispatch_macs,
+    );
+    CONV_GROUP_ENGINE_GEMM_NANOS.fetch_add(
+        u64::try_from(engine_gemm_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    match gemm_result {
         Ok(result) if result.len() == output_len => {
-            for chunk in result.chunks(PREP_POLL_ELEMENTS) {
-                if chunk.iter().any(|value| !value.is_finite()) {
-                    check_deadline()?;
-                    return if bounded_host_engine {
-                        Err(NyError::InvalidSpec(
-                            "bounded Conv2d f64 engine returned non-finite output".into(),
-                        ))
-                    } else {
-                        Ok(None)
-                    };
+            let scan_t = Instant::now();
+            // Parallel finite-scan: chunks are independent reads; the serial
+            // loop's outcomes map onto flags with the same precedence (expiry
+            // beats the non-finite signal, which beats Ok). The badness fold
+            // per chunk uses `|=` so the reduction vectorizes.
+            let scan_bad = std::sync::atomic::AtomicBool::new(false);
+            let scan_expired = std::sync::atomic::AtomicBool::new(false);
+            result.par_chunks(PREP_POLL_ELEMENTS).for_each(|chunk| {
+                use std::sync::atomic::Ordering::Relaxed;
+                if scan_bad.load(Relaxed) || scan_expired.load(Relaxed) {
+                    return;
                 }
+                let mut bad = false;
+                for value in chunk {
+                    bad |= !value.is_finite();
+                }
+                if bad {
+                    scan_bad.store(true, Relaxed);
+                }
+                if Instant::now() >= deadline {
+                    scan_expired.store(true, Relaxed);
+                }
+            });
+            if scan_expired.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(per_node_deadline_exceeded());
+            }
+            if scan_bad.load(std::sync::atomic::Ordering::Relaxed) {
                 check_deadline()?;
+                return if bounded_host_engine {
+                    Err(NyError::InvalidSpec(
+                        "bounded Conv2d f64 engine returned non-finite output".into(),
+                    ))
+                } else {
+                    Ok(None)
+                };
             }
             check_deadline()?;
+            CONV_GROUP_ENGINE_SCAN_NANOS.fetch_add(
+                u64::try_from(scan_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             Ok(Some(result))
         }
         Ok(_) => {
@@ -2814,6 +2998,7 @@ fn conv_group_col_flat_f64_pollable(
     // so faer's blocked accumulation is covered by exactly the same certificate
     // as the scalar running sum — the identical argument the no-deadline twin
     // and the cuBLAS route already rely on.
+    let fill_t = Instant::now();
     let w64 = Mat::<f64>::from_fn(out_c_per_group, kernel_cols_per_group, |oc_local, col| {
         let oc = oc_start + oc_local;
         let ic = col / kernel_spatial;
@@ -2859,18 +3044,31 @@ fn conv_group_col_flat_f64_pollable(
         let oc = oc_start + oc_local;
         f64::from(a_coefficients[[obj, oc * spatial_per_obj + spatial]])
     });
+    CONV_GROUP_FILL_NANOS.fetch_add(
+        u64::try_from(fill_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // Operand materialization itself can consume the remaining node budget.
     // Poll at the exact launch boundary so expired authority never enters the
     // unpollable faer contraction.
-    let prod = run_f64_gemm_before_deadline_with_clock(deadline, Instant::now, || {
-        crate::faer_parallelism::mat_mul_f64(&a64, &w64)
+    let gemm_t = Instant::now();
+    // Direct-write (#conv-fill-hoist): matmul straight into `col_flat` through
+    // a row-major MatMut view — the former per-element `prod[(row, col)]`
+    // copy paid a bounds-checked column-major read per output cell (the same
+    // defect the deadline-GEMM tile loop had; both probe-measured). Same faer
+    // kernel, same single-call blocking, certificate order-independent.
+    run_f64_gemm_before_deadline_with_clock(deadline, Instant::now, || {
+        let out_view = faer::MatMut::from_row_major_slice_mut(
+            &mut col_flat,
+            total_spatial,
+            kernel_cols_per_group,
+        );
+        crate::faer_parallelism::mat_mul_f64_into(out_view, &a64, &w64)
     })?;
-    for row in 0..total_spatial {
-        let row_base = row * kernel_cols_per_group;
-        for col in 0..kernel_cols_per_group {
-            col_flat[row_base + col] = prod[(row, col)];
-        }
-    }
+    CONV_GROUP_GEMM_NANOS.fetch_add(
+        u64::try_from(gemm_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     if Instant::now() >= deadline {
         return Err(per_node_deadline_exceeded());
@@ -2933,6 +3131,7 @@ fn conv_group_col_flat_f64(
     // the certified error `cast + γ_n^f64·S + prop` is summation-order
     // independent, so faer's blocked f64 accumulation is covered by the same
     // certificate as the scalar loop (identical argument to the cuBLAS route).
+    let fill_t = Instant::now();
     let a64 = Mat::<f64>::from_fn(total_spatial, out_c_per_group, |row, oc_local| {
         let obj = row / spatial_per_obj;
         let spatial = row % spatial_per_obj;
@@ -2947,6 +3146,10 @@ fn conv_group_col_flat_f64(
         let kj = rem % kw;
         f64::from(kernel[[oc, ic, ki, kj]])
     });
+    CONV_GROUP_FILL_NANOS.fetch_add(
+        u64::try_from(fill_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let prod = crate::faer_parallelism::mat_mul_f64(&a64, &w64);
     let mut col_flat = vec![0.0f64; total_spatial * kernel_cols_per_group];
     for row in 0..total_spatial {
@@ -3047,7 +3250,31 @@ fn conv_group_col_flat_with_engine(
 /// arm's time sits in the sound_f64_gemm engine-attempt path". Reading it is
 /// the point: written-but-never-read, it measures into a void and the claim
 /// stays untested, which is the state it was in when restored.
+pub(crate) static CONV_GROUP_FILL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CONV_GROUP_GEMM_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static CONV_GROUP_ENGINE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Engine-attempt outcome counters: HITS = the explicit bounded engine method
+/// produced the contraction; MISSES = it declined (`Ok(None)`) and the
+/// pollable CPU body ran *inside* the engine-attempt timer. A nonzero miss
+/// count means `engine_attempt` nanos are mostly pollable-fallback cost, not
+/// engine cost — the attribution 61c628a76's probe could not distinguish.
+pub(crate) static CONV_GROUP_ENGINE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Phase split INSIDE the engine attempt (fill → engine GEMM → finite scan),
+/// plus total contraction MACs, so `[group-split]` can attribute the attempt
+/// wall time to preparation, arithmetic, or validation instead of guessing.
+pub(crate) static CONV_GROUP_ENGINE_FILL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CONV_GROUP_ENGINE_GEMM_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CONV_GROUP_ENGINE_SCAN_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CONV_GROUP_ENGINE_MACS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CONV_GROUP_ENGINE_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]

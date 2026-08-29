@@ -72,7 +72,7 @@ impl PgdAttacker<'_> {
         // initialization. Degrading to the plain uniform seed is safe: PGD is a
         // falsification heuristic, so a weaker seed can only miss
         // counterexamples, never produce a wrong verdict.
-        if self.config.past_deadline() {
+        if self.past_deadline() {
             return Ok(x);
         }
 
@@ -99,7 +99,7 @@ impl PgdAttacker<'_> {
             // Deadline guard (see above): stop refining this seed once the
             // attack budget is spent; the partially-diversified point is
             // still a valid in-box seed.
-            if self.config.past_deadline() {
+            if self.past_deadline() {
                 break;
             }
             // Rademacher perturbation vector.

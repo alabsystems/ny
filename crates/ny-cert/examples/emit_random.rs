@@ -63,12 +63,12 @@ fn main() {
         let stem = format!("s{seed}");
         std::fs::write(
             format!("{out_dir}/{stem}_entailment.json"),
-            serde_json::to_string_pretty(&ent).unwrap(),
+            ny_cert::json::to_string_pretty(&ent),
         )
         .unwrap();
         std::fs::write(
             format!("{out_dir}/{stem}_farkas.json"),
-            serde_json::to_string_pretty(&far).unwrap(),
+            ny_cert::json::to_string_pretty(&far),
         )
         .unwrap();
         println!(

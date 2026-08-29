@@ -51,6 +51,9 @@ bab:
     # ReLU-split explores ~191 domains. candidates/reduceop still tune kfsb.
     candidates: 10
     reduceop: max
+    # Exact wave-selector mirrors for governed search; runtime is unchanged.
+    kfsb_multi_candidates: 10
+    kfsb_multi_reduceop: max
   alpha_crown:
     lr_alpha: 0.3
     iterations: 50

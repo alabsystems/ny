@@ -252,6 +252,7 @@ impl GraphNetwork {
                             precomputed_ibp: Some(baseline),
                             tightening_cap: Some(CGAN_COMPLETE_CROWN_IBP_ROOT_CAP),
                             collection_mode: crown_tighten::CrownIbpCollectionMode::CganComplete,
+                            cgan_narrow_target_max_rows: config.cgan_narrow_target_max_rows,
                             ..Default::default()
                         },
                     )?;

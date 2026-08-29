@@ -41,7 +41,33 @@ pub(in crate::beta_crown::engine) fn crown_ibp_budget_exceeded(
     exceeded
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::beta_crown::engine) struct SequentialCrownIbpRuntimePolicy {
+    pub(in crate::beta_crown::engine) honest_provenance_enabled: bool,
+    pub(in crate::beta_crown::engine) patches_deadline_flat_bias_enabled: bool,
+}
+
 impl BetaCrownVerifier {
+    /// Resolve sequential CROWN publication/execution controls from one
+    /// per-run authority snapshot. A verifier without frozen authority retains
+    /// the historical live-reader values for interactive callers.
+    pub(in crate::beta_crown::engine) fn sequential_crown_ibp_runtime_policy(
+        &self,
+    ) -> SequentialCrownIbpRuntimePolicy {
+        use ny_levers::decls::crown_ibp_budget::{
+            CROWN_HONEST_PROVENANCE, PATCHES_DEADLINE_FLAT_BIAS,
+        };
+
+        let value = |decl: &'static ny_levers::LeverDecl| match self.config.frozen_levers.as_ref() {
+            Some(levers) => levers.get(decl),
+            None => ny_levers::read(decl).value,
+        };
+        SequentialCrownIbpRuntimePolicy {
+            honest_provenance_enabled: value(&CROWN_HONEST_PROVENANCE).as_bool(),
+            patches_deadline_flat_bias_enabled: value(&PATCHES_DEADLINE_FLAT_BIAS).as_bool(),
+        }
+    }
+
     /// Collect sequential CROWN-IBP bounds with this verifier's configured
     /// per-node floor/cap. Both the fresh-IBP and precomputed-IBP paths pass
     /// through this helper so preset policy is not replaced by the
@@ -55,21 +81,27 @@ impl BetaCrownVerifier {
         deadline: Option<std::time::Instant>,
     ) -> Result<CrownIbpBoundsResult> {
         let per_node_time_budget = self.config.crown_ibp_per_node_time_budget();
+        let runtime_policy = self.sequential_crown_ibp_runtime_policy();
         match precomputed_ibp {
             Some(ibp_bounds) => network
-                .collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_impl(
+                .collect_crown_ibp_bounds_with_precomputed_ibp_and_budget_and_flat_bias_policy_impl(
                     input,
                     ibp_bounds,
                     engine,
                     deadline,
                     &per_node_time_budget,
+                    runtime_policy.honest_provenance_enabled,
+                    runtime_policy.patches_deadline_flat_bias_enabled,
                 ),
-            None => network.collect_crown_ibp_bounds_with_engine_deadline_budget_and_status_impl(
-                input,
-                engine,
-                deadline,
-                &per_node_time_budget,
-            ),
+            None => network
+                .collect_crown_ibp_bounds_with_engine_deadline_budget_and_flat_bias_policy_and_status_impl(
+                    input,
+                    engine,
+                    deadline,
+                    &per_node_time_budget,
+                    runtime_policy.honest_provenance_enabled,
+                    runtime_policy.patches_deadline_flat_bias_enabled,
+                ),
         }
     }
 
@@ -108,10 +140,12 @@ impl BetaCrownVerifier {
             return seq_bounds;
         }
 
-        let graph = match crate::GraphNetwork::from_sequential(network) {
+        let mut graph = match crate::GraphNetwork::from_sequential(network) {
             Ok(g) => g,
             Err(_) => return seq_bounds,
         };
+        graph.set_chunk_wave_parallel_enabled(self.config.chunk_wave_parallel_enabled);
+        graph.set_frozen_levers(self.config.frozen_levers.clone());
         let graph_bounds =
             match graph.propagate_alpha_crown_with_config_and_engine(input, alpha_config, engine) {
                 Ok(b) => b,
@@ -219,8 +253,23 @@ impl BetaCrownVerifier {
             }
         }
 
-        let mut cached_root_layer_bounds = match (use_crown_ibp_layer_bounds, cached_ibp_bounds) {
-            (true, Some(ibp_bounds)) => Some(
+        // #bab-root-tight-boxes (2026-08-21): the BaB root's per-layer boxes
+        // become every domain's ReLU-relaxation triangles for the WHOLE
+        // branch-and-bound tree. Handing raw forward-IBP boxes here (the
+        // historical `use_crown_ibp = false` arm) is catastrophic on deep
+        // nets: measured on `mnist_fc 256x4`, raw-IBP root boxes carried
+        // total width 269,688 vs the CROWN-IBP collection's ~15,700, and the
+        // per-domain joint bound landed at -1083 against the initial phase's
+        // -23.9 on the SAME problem — so no domain EVER closed (verified=0 at
+        // depth 31, the sequential BaB's historical steady state). The
+        // collection is cheap exactly where this lane runs (sub-second on FC
+        // nets; the node-budget guard below keeps huge nets on the old path),
+        // so upgrade the cached IBP to collection-grade whenever the fast
+        // path did not already verify. Sound: the collection only intersects
+        // valid enclosures. On collection failure the raw IBP boxes remain
+        // (previous behavior).
+        let mut cached_root_layer_bounds = match (budget_exceeded, cached_ibp_bounds) {
+            (false, Some(ibp_bounds)) => Some(
                 self.collect_sequential_crown_ibp_bounds_with_status(
                     network,
                     input,
@@ -230,7 +279,7 @@ impl BetaCrownVerifier {
                 )?
                 .bounds,
             ),
-            (_, Some(ibp_bounds)) => Some(ibp_bounds),
+            (true, Some(ibp_bounds)) => Some(ibp_bounds),
             (_, None) => None,
         };
 

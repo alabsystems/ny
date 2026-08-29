@@ -40,6 +40,7 @@
 //! per-cell slice already relies on — established by NY's runtime forward
 //! self-check, not by this linear checker.
 
+use crate::json::{Json, Map};
 use crate::rational::{ensure_healthy, poisoned, Rat, RatError};
 use crate::schema::{entailment_to_json, ConstraintKind, EntailmentCertificate, LinearConstraint};
 use crate::selfcheck::{check_entailment, CheckError};
@@ -47,6 +48,23 @@ use crate::selfcheck::{check_entailment, CheckError};
 use core::contracts::ensures;
 #[cfg(not(trust_verify))]
 use trust::ensures;
+
+/// Largest product-cell count a branch-tree certificate may claim.
+///
+/// The partition cardinality is the product of the per-axis slab counts, all
+/// read from an untrusted certificate, so nothing in the program text bounds it
+/// — the allocation checker refutes the claim table with a counterexample at
+/// `2^28` cells. This is the domain answer: a partition at or above 2^20 cells
+/// is not a certificate anyone means to check. It must already carry that many
+/// `BranchLeaf` values (the cardinality equality below), each holding two
+/// coordinate `Vec`s and a proof, so ~2^20 cells is already hundreds of MB of
+/// resident certificate; the largest shipped example is 64 cells (an 8x8 grid).
+///
+/// The value matches `exact::MAX_EXACT_SYSTEM_DIMENSION`, deliberately, so the
+/// crate carries one size doctrine rather than a second unexplained constant.
+/// Rejecting is fail-CLOSED: an oversized certificate is refused, never
+/// truncated and silently checked at the wrong cardinality.
+const MAX_PARTITION_CELLS: usize = 1_048_576;
 
 /// A 1-D axis partition: `edges` strictly increasing, `edges[0]` = box lower,
 /// `edges[last]` = box upper. The `k`-th slab is `[edges[k], edges[k+1]]`.
@@ -103,51 +121,116 @@ pub struct BranchTreeCertificate {
 }
 
 /// Why a branch-tree certificate failed verification.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BranchError {
     /// An axis had fewer than two edges (no cell).
-    #[error("axis {0} has < 2 edges")]
     DegenerateAxis(usize),
     /// Axis edges are not strictly increasing (partition not an exact cover).
-    #[error("axis {0} edges are not strictly increasing at index {1}")]
     NonMonotoneAxis(usize, usize),
     /// The leaf set is not exactly the product grid (gap, overlap, or extra).
-    #[error("leaf set is not the exact product grid: {0}")]
     PartitionMismatch(String),
     /// The Cartesian product of per-axis cells cannot be represented by
     /// `usize`; attempting to enumerate it would otherwise wrap or saturate.
-    #[error("partition cell count overflows usize at axis {0}")]
     PartitionSizeOverflow(usize),
     /// A leaf's dimension disagrees with the number of axes.
-    #[error("leaf {0} has wrong dimension")]
     LeafDimension(usize),
     /// A leaf has no supporting member entailments.
-    #[error("leaf {0} has no member entailments")]
     EmptyLeaf(usize),
     /// `member_entailments` / `member_biases` length mismatch.
-    #[error("leaf {0}: {1} entailments vs {2} biases")]
     MemberLengthMismatch(usize, usize, usize),
     /// A member entailment premise is not a face of this leaf's cell.
-    #[error("leaf {0} member {1}: premise is not a cell face")]
     PremiseNotCellFace(usize, usize),
     /// A member entailment conclusion is not `≥` over the cell variables.
-    #[error("leaf {0} member {1}: conclusion is not a Ge inequality")]
     ConclusionNotGe(usize, usize),
     /// A member entailment does not bind to the leaf's declared bound.
-    #[error("leaf {0} member {1}: conclusion + bias does not equal the leaf bound")]
     BoundBindingFailed(usize, usize),
     /// The certificate direction needs evidence this format cannot express.
-    #[error("threshold direction {0:?} is unsupported by lower-bound branch certificates")]
     UnsupportedDirection(ThreshDir),
     /// The composed global bound does not clear the threshold.
-    #[error("global bound does not clear the threshold ({0})")]
     ThresholdNotCleared(String),
     /// A per-leaf entailment failed the flat check.
-    #[error("leaf {0} member {1}: {2}")]
     Leaf(usize, usize, CheckError),
     /// Exact arithmetic failure.
-    #[error(transparent)]
-    Rat(#[from] RatError),
+    ///
+    /// Transparent: `Display` and `source` forward to the inner [`RatError`].
+    Rat(RatError),
+}
+
+// Hand-written replacements for the former `thiserror::Error` derive: the
+// proc-macro dependency is removed so the whole dependency stack (including
+// bignum) can be verified rather than assumed. Messages, `source()` polarity
+// and the `From` conversion are byte-for-byte what the derive expanded to.
+impl core::fmt::Display for BranchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BranchError::DegenerateAxis(axis) => write!(f, "axis {0} has < 2 edges", axis),
+            BranchError::NonMonotoneAxis(axis, index) => write!(
+                f,
+                "axis {0} edges are not strictly increasing at index {1}",
+                axis, index
+            ),
+            BranchError::PartitionMismatch(detail) => {
+                write!(f, "leaf set is not the exact product grid: {0}", detail)
+            }
+            BranchError::PartitionSizeOverflow(axis) => {
+                write!(f, "partition cell count overflows usize at axis {0}", axis)
+            }
+            BranchError::LeafDimension(leaf) => write!(f, "leaf {0} has wrong dimension", leaf),
+            BranchError::EmptyLeaf(leaf) => write!(f, "leaf {0} has no member entailments", leaf),
+            BranchError::MemberLengthMismatch(leaf, entailments, biases) => write!(
+                f,
+                "leaf {0}: {1} entailments vs {2} biases",
+                leaf, entailments, biases
+            ),
+            BranchError::PremiseNotCellFace(leaf, member) => write!(
+                f,
+                "leaf {0} member {1}: premise is not a cell face",
+                leaf, member
+            ),
+            BranchError::ConclusionNotGe(leaf, member) => write!(
+                f,
+                "leaf {0} member {1}: conclusion is not a Ge inequality",
+                leaf, member
+            ),
+            BranchError::BoundBindingFailed(leaf, member) => write!(
+                f,
+                "leaf {0} member {1}: conclusion + bias does not equal the leaf bound",
+                leaf, member
+            ),
+            BranchError::UnsupportedDirection(dir) => write!(
+                f,
+                "threshold direction {0:?} is unsupported by lower-bound branch certificates",
+                dir
+            ),
+            BranchError::ThresholdNotCleared(detail) => {
+                write!(f, "global bound does not clear the threshold ({0})", detail)
+            }
+            BranchError::Leaf(leaf, member, err) => {
+                write!(f, "leaf {0} member {1}: {2}", leaf, member, err)
+            }
+            // `#[error(transparent)]`: delegate to the inner error's `Display`.
+            BranchError::Rat(err) => core::fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl core::error::Error for BranchError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            // `#[error(transparent)]` forwards `source()` to the inner error
+            // (it does NOT report the inner error as its own source).
+            BranchError::Rat(err) => core::error::Error::source(err),
+            // No other variant carries a `#[from]`/`#[source]` field; the
+            // `CheckError` in `Leaf` was a plain payload rendered by `{2}`.
+            _ => None,
+        }
+    }
+}
+
+impl From<RatError> for BranchError {
+    fn from(source: RatError) -> Self {
+        BranchError::Rat(source)
+    }
 }
 
 /// True iff `c` is the single-variable face `var (Ge) lo` or `var (Le) hi`
@@ -194,10 +277,21 @@ fn slab_index(edges: &[Rat], lo: Rat, hi: Rat) -> Option<usize> {
     let mut left = 0usize;
     let mut right = edges.len();
     while left < right {
-        let mid = left + (right - left) / 2;
+        // Totalized to match the `checked_add` already used below: saturation is
+        // UNREACHABLE on every path this loop admits, so the rewrite is
+        // behaviour-identical and merely removes the MIR overflow asserts rather
+        // than assuming them away.
+        //   `right - left`     the loop guard IS `left < right`, so no underflow.
+        //   `left + (r-l)/2`   `(right-left)/2 < right-left`, so `mid < right`.
+        //   `mid + 1`          `mid < right <= edges.len() <= usize::MAX`.
+        // The two arithmetic obligations here were blocked by the fresh-private-
+        // consumer PDR replay wall — an invariant WAS found and could not be
+        // admitted — so totalizing on the ny side sidesteps a research-grade
+        // verifier blocker with no toolchain change.
+        let mid = left.saturating_add(right.saturating_sub(left) / 2);
         let edge = *edges.get(mid)?;
         if edge < lo {
-            left = mid + 1;
+            left = mid.saturating_add(1);
         } else {
             right = mid;
         }
@@ -266,8 +360,16 @@ pub fn check_branch_tree(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), Bra
     // construction — the inner step-4 `cleared` check already admitted the
     // same strict inequality on the same pair — so this is
     // behavior-identical, fail-closed hardening.
-    let (g, t) = match check_branch_tree_inner(cert) {
-        Ok(pair) => pair,
+    // `Option` carrier: see the note in `selfcheck::check_entailment`. A
+    // `TRUST_LENWITNESS_DEBUG=1` probe traced one return path here (bb32->bb33)
+    // whose `_0 def=NONE (Call-dest)`, against zero such paths in
+    // `selfcheck::check_chain`, which proves. Because
+    // `check_branch_tree_inner` returns the SAME `Result<(Rat, Rat),
+    // BranchError>` this wrapper does, the optimizer forwards its Result rather
+    // than rebuilding the tail `Ok`, so no in-body aggregate exists on that path
+    // and the discr gate fails closed.
+    let carried: Option<(Rat, Rat)> = match check_branch_tree_inner(cert) {
+        Ok(pair) => Some(pair),
         // `crate::err_barrier` (identity, `#[inline(never)]`): a fresh in-body
         // `Err` aggregate, not a whole-`Result` forward the return-grounding
         // lane cannot see (nor a const-promoted+merged unit variant).
@@ -277,6 +379,13 @@ pub fn check_branch_tree(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), Bra
             }
             return Err(crate::err_barrier(e));
         }
+    };
+    // UNREACHABLE: the `Err` arm returns, so every path here stored `Some`.
+    // Reuses an error this function already constructs, adding no call and no
+    // allocation for the verifier to discharge.
+    let (g, t) = match carried {
+        Some(pair) => pair,
+        None => return Err(crate::err_barrier(BranchError::Rat(RatError::Poisoned))),
     };
     let cleared = g > t;
     if !cleared {
@@ -350,13 +459,41 @@ fn check_branch_tree_inner(cert: &BranchTreeCertificate) -> Result<(Rat, Rat), B
             ncells
         )));
     }
+    // Dominating size cap (fail-closed), guarding the SAME operand the allocation
+    // below consumes. Without it the claim table is bounded only by `ncells`, which
+    // is derived from the parsed certificate's axis edge counts and is therefore
+    // untrusted: the verifier refutes the allocation with a counterexample at
+    // `ncells = 2^28`. `try_reserve_exact` alone does not answer that — under memory
+    // overcommit it can return `Ok` on an unbacked mapping, leaving the `resize`
+    // below to fault in every page.
+    //
+    // Deliberately the bare `if x >= MAX { return Err }` shape rather than an inline
+    // `.min(MAX)`: truncation would silently check a SMALLER partition than the
+    // certificate claims, which is fail-wrong for a proof checker. The bare form is
+    // also the one the allocation checker demonstrably accepts (see `exact.rs`,
+    // whose `MAX_EXACT_SYSTEM_DIMENSION` guard discharges the same obligation).
+    // Rebind to a fresh single-assignment local before guarding. `ncells` is
+    // assigned inside the `checked_mul` loop above, so it reads as
+    // may-reassigned at every later program point and a guard written against it
+    // is dropped by the checker's versioning kill -- measured in R40, where the
+    // guard on `ncells` left this row refuted while the identically-shaped guard
+    // in `fp_margin::deployed_fp_margin` (over a fresh `let dim = mags.len()`)
+    // proved. `cells` is written once and never again, so the guard survives to
+    // the allocation that consumes it.
+    let cells = ncells;
+    if cells >= MAX_PARTITION_CELLS {
+        return Err(BranchError::PartitionMismatch(format!(
+            "partition has {cells} product cells, at or above the {MAX_PARTITION_CELLS} \
+             cell limit; refusing to allocate a claim table this large"
+        )));
+    }
     let mut used: Vec<bool> = Vec::new();
-    used.try_reserve_exact(ncells).map_err(|error| {
+    used.try_reserve_exact(cells).map_err(|error| {
         BranchError::PartitionMismatch(format!(
-            "claim table for {ncells} product cells cannot be allocated: {error}"
+            "claim table for {cells} product cells cannot be allocated: {error}"
         ))
     })?;
-    used.resize(ncells, false);
+    used.resize(cells, false);
     for (li, leaf) in cert.leaves.iter().enumerate() {
         if leaf.lo.len() != cert.axes.len() || leaf.hi.len() != cert.axes.len() {
             return Err(BranchError::LeafDimension(li));
@@ -487,13 +624,13 @@ fn dir_str(d: ThreshDir) -> &'static str {
 /// `.map(closure).collect::<Result<Vec<_>, _>>()?`): keeps the encoding in
 /// verified code (no absent-adapter `Iterator::map`/`Result::map`/closure-Fn
 /// obligation). Identical elements, order, and early-`Err` propagation.
-fn rat_arr_json(xs: &[Rat]) -> Result<serde_json::Value, RatError> {
-    let mut out: Vec<serde_json::Value> = Vec::new();
+fn rat_arr_json(xs: &[Rat]) -> Result<Json, RatError> {
+    let mut out: Vec<Json> = Vec::new();
     for x in xs {
         let s = x.to_clean_string()?;
-        out.push(serde_json::Value::String(s));
+        out.push(Json::Str(s));
     }
-    Ok(serde_json::Value::Array(out))
+    Ok(Json::Arr(out))
 }
 
 /// Serialize a branch-tree certificate to a self-describing JSON envelope.
@@ -512,27 +649,27 @@ fn rat_arr_json(xs: &[Rat]) -> Result<serde_json::Value, RatError> {
 ///
 /// # Errors
 /// Propagates rational-encoding failures, including a poisoned rational arena.
-pub fn branch_tree_to_json(cert: &BranchTreeCertificate) -> Result<serde_json::Value, RatError> {
+pub fn branch_tree_to_json(cert: &BranchTreeCertificate) -> Result<Json, RatError> {
     ensure_healthy()?;
     // Explicit loops (not `.map(closure).collect::<Result<Vec<_>, _>>()?`): keeps
     // the per-axis / per-leaf JSON construction in verified code (no
     // absent-adapter `Iterator::map`/`Result::map`/closure-Fn obligations).
     // Identical elements, order, and early-`Err` propagation; `rat_arr_json` is a
     // free `fn` (not a closure) for the same reason.
-    let mut axes: Vec<serde_json::Value> = Vec::new();
+    let mut axes: Vec<Json> = Vec::new();
     for a in &cert.axes {
-        let mut edges: Vec<serde_json::Value> = Vec::new();
+        let mut edges: Vec<Json> = Vec::new();
         for e in &a.edges {
             let s = e.to_clean_string()?;
-            edges.push(serde_json::Value::String(s));
+            edges.push(Json::Str(s));
         }
-        let mut o = serde_json::Map::new();
-        o.insert("var".to_owned(), serde_json::Value::String(a.var.clone()));
-        o.insert("edges".to_owned(), serde_json::Value::Array(edges));
-        axes.push(serde_json::Value::Object(o));
+        let mut o = Map::new();
+        o.insert("var".to_owned(), Json::Str(a.var.clone()));
+        o.insert("edges".to_owned(), Json::Arr(edges));
+        axes.push(Json::Obj(o));
     }
 
-    let mut leaves: Vec<serde_json::Value> = Vec::new();
+    let mut leaves: Vec<Json> = Vec::new();
     for leaf in &cert.leaves {
         // Explicit Vec::new()+push (not `.collect()`): the length is the
         // input-derived member count, so a bulk `.collect()` raises an
@@ -542,48 +679,39 @@ pub fn branch_tree_to_json(cert: &BranchTreeCertificate) -> Result<serde_json::V
         for ent in &leaf.member_entailments {
             ents.push(entailment_to_json(ent)?);
         }
-        let mut o = serde_json::Map::new();
+        let mut o = Map::new();
         o.insert("cell_lo".to_owned(), rat_arr_json(&leaf.lo)?);
         o.insert("cell_hi".to_owned(), rat_arr_json(&leaf.hi)?);
-        o.insert(
-            "bound".to_owned(),
-            serde_json::Value::String(leaf.bound.to_clean_string()?),
-        );
+        o.insert("bound".to_owned(), Json::Str(leaf.bound.to_clean_string()?));
         o.insert(
             "member_biases".to_owned(),
             rat_arr_json(&leaf.member_biases)?,
         );
-        o.insert(
-            "member_entailments".to_owned(),
-            serde_json::Value::Array(ents),
-        );
-        leaves.push(serde_json::Value::Object(o));
+        o.insert("member_entailments".to_owned(), Json::Arr(ents));
+        leaves.push(Json::Obj(o));
     }
 
-    let mut root = serde_json::Map::new();
+    let mut root = Map::new();
     root.insert(
         "type".to_owned(),
-        serde_json::Value::String("branch_tree_certificate".to_owned()),
+        Json::Str("branch_tree_certificate".to_owned()),
     );
-    root.insert(
-        "version".to_owned(),
-        serde_json::Value::String("1.0".to_owned()),
-    );
+    root.insert("version".to_owned(), Json::Str("1.0".to_owned()));
     root.insert(
         "composition_rule".to_owned(),
-        serde_json::Value::String("crownproof::branch_split_min".to_owned()),
+        Json::Str("crownproof::branch_split_min".to_owned()),
     );
-    root.insert("axes".to_owned(), serde_json::Value::Array(axes));
+    root.insert("axes".to_owned(), Json::Arr(axes));
     root.insert(
         "threshold".to_owned(),
-        serde_json::Value::String(cert.threshold.to_clean_string()?),
+        Json::Str(cert.threshold.to_clean_string()?),
     );
     root.insert(
         "direction".to_owned(),
-        serde_json::Value::String(dir_str(cert.dir).to_owned()),
+        Json::Str(dir_str(cert.dir).to_owned()),
     );
-    root.insert("leaves".to_owned(), serde_json::Value::Array(leaves));
-    let value = serde_json::Value::Object(root);
+    root.insert("leaves".to_owned(), Json::Arr(leaves));
+    let value = Json::Obj(root);
     ensure_healthy()?;
     Ok(value)
 }
@@ -597,9 +725,7 @@ pub fn branch_tree_to_json(cert: &BranchTreeCertificate) -> Result<serde_json::V
 /// # Errors
 /// Propagates rational-encoding failures, including a poisoned rational arena
 /// even when the leaf batch is empty.
-pub fn branch_tree_leaf_batch_json(
-    cert: &BranchTreeCertificate,
-) -> Result<serde_json::Value, RatError> {
+pub fn branch_tree_leaf_batch_json(cert: &BranchTreeCertificate) -> Result<Json, RatError> {
     ensure_healthy()?;
     let mut items = Vec::new();
     for leaf in &cert.leaves {
@@ -607,7 +733,7 @@ pub fn branch_tree_leaf_batch_json(
             items.push(entailment_to_json(ent)?);
         }
     }
-    let value = serde_json::Value::Array(items);
+    let value = Json::Arr(items);
     ensure_healthy()?;
     Ok(value)
 }

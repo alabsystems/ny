@@ -238,22 +238,27 @@ fn subbox_tensor(box_lo: &[f32], box_hi: &[f32]) -> Option<BoundedTensor> {
     .ok()
 }
 
+/// Parse the exact live frontier modes. Mode 3 was a measured-null experiment
+/// and is retired; whitespace and all other spellings remain off.
+fn frontier_mode_from_raw(raw: Option<&str>) -> Option<u8> {
+    match raw {
+        Some("1") => Some(1),
+        Some("2") => Some(2),
+        // Mode 3 was a measured-null experiment and is retired. In particular,
+        // do not record a mode-2 payload that the consumer will interpret as
+        // mode 0/1 centers-only behavior.
+        _ => None,
+    }
+}
+
 /// Shared `NY_POSTBAB_BAB_SEEDS` gate for every recording wrapper (sequential
 /// heap, graph heap, graph DomainList): `None` => fully off (unset/anything
 /// but `"1"`/`"2"`); `Some((mode, k))` otherwise, with K =
 /// `NY_POSTBAB_BAB_SEEDS_K` (default [`BAB_FRONTIER_DEFAULT_K`], clamped
 /// 1..=[`BAB_FRONTIER_MAX_K`]).
 fn frontier_gate_mode_and_k() -> Option<(u8, usize)> {
-    let mode: u8 = match std::env::var("NY_POSTBAB_BAB_SEEDS").ok().as_deref() {
-        Some("1") => 1,
-        Some("2") => 2,
-        // #bab-frontier v3: recording is identical to mode 2 (the corner pass
-        // keys off `mode >= 2`); the extra behavior is CONSUMER-side only
-        // (the attack's leftover random restarts are drawn INSIDE the exported
-        // subboxes instead of the global box).
-        Some("3") => 3,
-        _ => return None,
-    };
+    let raw_mode = std::env::var("NY_POSTBAB_BAB_SEEDS").ok();
+    let mode = frontier_mode_from_raw(raw_mode.as_deref())?;
     let k = std::env::var("NY_POSTBAB_BAB_SEEDS_K")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
@@ -520,6 +525,23 @@ mod tests {
             arr1(&[1.0f32, 1.0]).into_dyn(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn frontier_mode_parser_accepts_only_exact_live_modes() {
+        for (raw, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("0"), None),
+            (Some("1"), Some(1)),
+            (Some("2"), Some(2)),
+            (Some("3"), None),
+            (Some(" 1"), None),
+            (Some("1 "), None),
+            (Some("bad"), None),
+        ] {
+            assert_eq!(frontier_mode_from_raw(raw), expected, "raw mode {raw:?}");
+        }
     }
 
     /// Serialize tests touching the process-global channel.

@@ -825,6 +825,13 @@ pub struct SignSpaceCandidate {
     pub flips: usize,
     /// Realizability LPs solved.
     pub lp_solves: usize,
+    /// Search work units consumed by the producing lane.
+    ///
+    /// For the LP-guided lane this equals [`Self::lp_solves`]. The STE-PGD
+    /// lane shares this candidate type but has no LPs, so it reports gradient
+    /// iterations plus local-search probes here while retaining probes in
+    /// `lp_solves` for the scheduler's historical value denominator.
+    pub work_units: usize,
     /// Wall time consumed.
     pub elapsed: Duration,
 }
@@ -998,6 +1005,10 @@ pub enum SignSpaceOutcome {
         flips: usize,
         /// Realizability LPs solved.
         lp_solves: usize,
+        /// Search work units consumed by the producing lane. Equal to
+        /// `lp_solves` for the LP-guided search; STE-PGD reports gradient
+        /// iterations plus local-search probes.
+        work_units: usize,
         /// Wall time consumed.
         elapsed: Duration,
     },
@@ -3575,6 +3586,7 @@ pub fn falsify_bnn_sign_suffix_unwired(
                     free.len(),
                     flips,
                     lp_solves,
+                    lp_solves,
                     started.elapsed(),
                 ) {
                     return Ok(SignSpaceOutcome::Candidate(Box::new(candidate)));
@@ -3623,6 +3635,7 @@ pub fn falsify_bnn_sign_suffix_unwired(
                             slack,
                             free.len(),
                             flips,
+                            lp_solves,
                             lp_solves,
                             started.elapsed(),
                         ) {
@@ -3701,6 +3714,7 @@ pub fn falsify_bnn_sign_suffix_unwired(
                                 free.len(),
                                 flips,
                                 lp_solves,
+                                lp_solves,
                                 started.elapsed(),
                             ) {
                                 return Ok(SignSpaceOutcome::Candidate(Box::new(candidate)));
@@ -3736,6 +3750,7 @@ pub fn falsify_bnn_sign_suffix_unwired(
         free_units: free.len(),
         flips,
         lp_solves,
+        work_units: lp_solves,
         elapsed: started.elapsed(),
     })
 }
@@ -3781,6 +3796,7 @@ fn finalize(
     free_units: usize,
     flips: usize,
     lp_solves: usize,
+    work_units: usize,
     elapsed: Duration,
 ) -> Option<SignSpaceCandidate> {
     let input = admitted.to_replay_bytes(x)?;
@@ -3841,6 +3857,7 @@ fn finalize(
         free_units,
         flips,
         lp_solves,
+        work_units,
         elapsed,
     })
 }

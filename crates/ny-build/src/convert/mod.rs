@@ -4,6 +4,7 @@
 
 //! ONNX layer conversion, split by op family into focused modules.
 
+mod accumulate;
 mod arithmetic;
 mod concat;
 mod const_eval;
@@ -14,6 +15,7 @@ mod elementwise_invalid_attr_tests;
 #[cfg(test)]
 mod elementwise_tests;
 mod gather;
+mod interval_const;
 mod linear;
 mod matmul;
 mod normalization;
@@ -411,15 +413,19 @@ impl ConvertContext<'_> {
         match &spec.layer_type {
             LayerType::Linear => self.convert_linear(spec),
             LayerType::Conv1d => self.convert_conv1d(spec),
+            LayerType::Conv3d => self.convert_conv3d(spec),
             LayerType::Conv2d => {
                 // ONNX uses one "Conv" op for every spatial rank, while the
                 // loader maps it to this compatibility variant. Dispatch the
-                // ranks that NY can propagate exactly and classify every other
-                // rank as unsupported. In particular, a 5-D kernel is Conv3d
+                // ranks that NY can propagate and classify every other rank as
+                // unsupported. A 5-D kernel is Conv3d
                 // (`[out_c, in_c/group, kD, kH, kW]`), not a malformed Conv2d
-                // kernel. Returning UnsupportedOp lets graph conversion insert
-                // its conservative unbounded fallback instead of hard-failing
-                // with a misleading ShapeMismatch.
+                // kernel; it now has a real layer to lower to (IBP-only —
+                // `Conv3dLayer`'s CROWN backward fails closed, so such a node
+                // degrades the network to IBP rather than being dropped).
+                // Ranks outside 1..=3 still return UnsupportedOp so graph
+                // conversion inserts its conservative unbounded fallback
+                // instead of hard-failing with a misleading ShapeMismatch.
                 if let Some(kernel) = spec
                     .inputs
                     .get(1)
@@ -428,12 +434,13 @@ impl ConvertContext<'_> {
                     return match kernel.ndim() {
                         3 => self.convert_conv1d(spec),
                         4 => self.convert_conv2d(spec),
+                        5 => self.convert_conv3d(spec),
                         rank => {
                             let spatial_rank = rank.saturating_sub(2);
                             Err(NyError::UnsupportedOp(format!(
                                 "ONNX Conv layer '{}' has rank-{rank} kernel {:?} \
                                  (Conv{spatial_rank}d, spatial rank {spatial_rank}); \
-                                 NY supports only Conv1d and Conv2d propagation",
+                                 NY supports only Conv1d, Conv2d and Conv3d propagation",
                                 spec.name,
                                 kernel.shape(),
                             )))
@@ -468,6 +475,7 @@ impl ConvertContext<'_> {
             LayerType::BatchNorm => self.convert_batch_norm(spec),
             LayerType::DequantizeLinear => self.convert_dequantize_linear(spec),
             LayerType::QuantizeLinear => self.convert_quantize_linear(spec),
+            LayerType::EpsilonExpand => self.convert_epsilon_expand(spec),
             LayerType::AveragePool => self.convert_average_pool(spec),
             LayerType::MaxPool => self.convert_max_pool(spec),
             LayerType::MatMul => self.convert_matmul(spec),
@@ -563,6 +571,7 @@ impl ConvertContext<'_> {
             LayerType::Div => self.convert_div(spec),
             LayerType::Sub => self.convert_sub(spec),
             LayerType::Pow => self.convert_pow(spec),
+            LayerType::Atan2 => self.convert_atan2(spec),
             LayerType::Min => self.convert_min(spec),
             LayerType::Max => self.convert_max(spec),
             LayerType::ReduceMean => self.convert_reduce_mean(spec),
@@ -579,6 +588,8 @@ impl ConvertContext<'_> {
             LayerType::Slice => self.convert_slice(spec),
             LayerType::Gather => self.convert_gather(spec),
             LayerType::ScatterND => self.convert_scatter_nd(spec),
+            LayerType::ScatterAdd => self.convert_scatter_add(spec),
+            LayerType::IndexAdd => self.convert_index_add(spec),
             LayerType::Pad => self.convert_pad(spec),
             LayerType::Shape => {
                 let input = spec.inputs.first().map(String::as_str).unwrap_or("<missing>");
@@ -695,12 +706,16 @@ mod tests {
         assert!(matches!(layer, Layer::Conv1d(_)));
     }
 
+    /// A rank-5 ONNX `Conv` kernel used to fail closed as "unsupported Conv3d"
+    /// because no 3-D convolution layer existed to emit. `Conv3dLayer` now
+    /// exists, so the same fixture — the exact shape of Smart Turn's first
+    /// video convolution — must LOWER, with the ONNX spatial geometry threaded
+    /// through and the input volume recovered from the recorded shape.
     #[test]
-    fn convert_layer_classifies_smart_turn_5d_kernel_as_unsupported_conv3d() {
+    fn convert_layer_lowers_a_smart_turn_5d_kernel_to_conv3d() {
         let tensor_shapes = HashMap::from([("pixel_values".to_string(), vec![1, 3, 32, 112, 112])]);
         let weights = WeightStore::new();
         let constant_tensors = HashSet::new();
-        // Exact shape of Smart Turn's first video convolution.
         let evaluated = HashMap::from([(
             "onnx::Conv_822_DequantizeLinear_Output".to_string(),
             ArrayD::from_shape_vec(IxDyn(&[64, 3, 3, 7, 7]), vec![0.0; 64 * 3 * 3 * 7 * 7])
@@ -722,21 +737,117 @@ mod tests {
             ],
             outputs: vec!["stem_output".to_string()],
             weights: None,
+            attributes: HashMap::from([
+                ("strides".to_string(), AttributeValue::Ints(vec![1, 2, 2])),
+                (
+                    "pads".to_string(),
+                    AttributeValue::Ints(vec![1, 3, 3, 1, 3, 3]),
+                ),
+                ("dilations".to_string(), AttributeValue::Ints(vec![1, 1, 1])),
+            ]),
+        };
+
+        let layer = ctx
+            .convert_layer(&spec)
+            .expect("a rank-5 ONNX Conv kernel must lower to Conv3d");
+        let Layer::Conv3d(conv) = layer else {
+            panic!("expected Layer::Conv3d, got {}", layer.layer_type());
+        };
+        assert_eq!(conv.kernel.shape(), &[64, 3, 3, 7, 7]);
+        assert_eq!(conv.stride, [1, 2, 2]);
+        // ONNX orders pads begin-first: [d_b, h_b, w_b, d_e, h_e, w_e].
+        assert_eq!(conv.padding, [1, 3, 3]);
+        assert_eq!(conv.dilation, [1, 1, 1]);
+        assert_eq!(conv.groups, 1);
+        assert_eq!(conv.input_shape, Some([32, 112, 112]));
+        assert_eq!(
+            conv.output_size([32, 112, 112]).expect("output size"),
+            [32, 56, 56]
+        );
+    }
+
+    /// Asymmetric `pads` must still be refused BY NAME: `Conv3dLayer` carries one
+    /// padding value per axis, so silently symmetrising would change which input
+    /// cells the kernel sees.
+    #[test]
+    fn convert_conv3d_refuses_asymmetric_pads() {
+        let tensor_shapes = HashMap::new();
+        let weights = WeightStore::new();
+        let constant_tensors = HashSet::new();
+        let evaluated = HashMap::from([(
+            "k".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1]), vec![1.0]).unwrap(),
+        )]);
+        let ctx = ConvertContext::with_evaluated_constants(
+            &weights,
+            &tensor_shapes,
+            &constant_tensors,
+            &evaluated,
+        );
+
+        let spec = LayerSpec {
+            name: "conv3d".to_string(),
+            layer_type: LayerType::Conv3d,
+            inputs: vec!["x".to_string(), "k".to_string()],
+            outputs: vec!["y".to_string()],
+            weights: None,
+            attributes: HashMap::from([(
+                "pads".to_string(),
+                AttributeValue::Ints(vec![0, 0, 0, 1, 0, 0]),
+            )]),
+        };
+
+        let error = ctx
+            .convert_layer(&spec)
+            .expect_err("asymmetric pads must be refused");
+        assert!(
+            matches!(
+                &error,
+                NyError::UnsupportedConfiguration(message)
+                    if message.contains("Conv3d") && message.contains("asymmetric pads")
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// Rank 6 and above still fail closed: there is no Conv4d layer, and the
+    /// refusal must name the real spatial rank rather than blame the kernel.
+    #[test]
+    fn convert_layer_still_refuses_a_6d_conv_kernel() {
+        let tensor_shapes = HashMap::new();
+        let weights = WeightStore::new();
+        let constant_tensors = HashSet::new();
+        let evaluated = HashMap::from([(
+            "k".to_string(),
+            ArrayD::from_shape_vec(IxDyn(&[1, 1, 1, 1, 1, 1]), vec![0.0]).unwrap(),
+        )]);
+        let ctx = ConvertContext::with_evaluated_constants(
+            &weights,
+            &tensor_shapes,
+            &constant_tensors,
+            &evaluated,
+        );
+
+        let spec = LayerSpec {
+            name: "conv6".to_string(),
+            layer_type: LayerType::Conv2d,
+            inputs: vec!["x".to_string(), "k".to_string()],
+            outputs: vec!["y".to_string()],
+            weights: None,
             attributes: HashMap::new(),
         };
 
         let error = ctx
             .convert_layer(&spec)
-            .expect_err("5-D ONNX Conv kernel must fail closed as unsupported Conv3d");
+            .expect_err("6-D ONNX Conv kernel must fail closed");
         assert!(
             matches!(
                 &error,
                 NyError::UnsupportedOp(message)
-                    if message.contains("/video_backbone/stem/stem.0/Conv")
-                        && message.contains("rank-5 kernel [64, 3, 3, 7, 7]")
-                        && message.contains("Conv3d")
-                        && message.contains("spatial rank 3")
-                        && message.contains("Conv1d and Conv2d")
+                    if message.contains("rank-6 kernel")
+                        && message.contains("Conv4d")
+                        && message.contains("spatial rank 4")
+                        && message.contains("Conv1d, Conv2d and Conv3d")
             ),
             "unexpected error: {error:?}"
         );

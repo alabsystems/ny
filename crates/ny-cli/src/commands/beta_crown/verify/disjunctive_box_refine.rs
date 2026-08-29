@@ -635,12 +635,20 @@ type ClauseBoxGroups = HashMap<Vec<u32>, (BoundedTensor, Vec<usize>)>;
 /// key order.  The refinement loop pops from the tail, so this yields a stable
 /// descending-key root order (and stable capped-wave clause selection) across
 /// processes and hash seeds.
-fn ordered_root_queue(groups: ClauseBoxGroups) -> Vec<BoxNode> {
+///
+/// `extra_depth` grants additional bisection levels to specific root keys —
+/// used by #ctx-group hull roots so the narrowest member keeps its legacy
+/// leaf resolution. An empty map (gate off) is byte-identical to the
+/// historical caps.
+fn ordered_root_queue(
+    groups: ClauseBoxGroups,
+    extra_depth: &HashMap<Vec<u32>, u16>,
+) -> Vec<BoxNode> {
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
     groups
         .into_iter()
-        .map(|(_, (bounds, active))| {
+        .map(|(key, (bounds, active))| {
             // Depth budget scales with the ROOT box's wide axes: every level
             // bisects only the widest axis, so `k` wide axes share the
             // lineage depth — a flat cap left multi-axis mscn `_dual` boxes
@@ -654,14 +662,492 @@ fn ordered_root_queue(groups: ClauseBoxGroups) -> Vec<BoxNode> {
                     .max(1) as u16,
                 _ => 1,
             };
+            let extra = extra_depth.get(&key).copied().unwrap_or(0);
             BoxNode {
                 bounds,
                 active,
                 depth: 0,
-                depth_cap: MAX_DEPTH.saturating_mul(wide_axes),
+                depth_cap: MAX_DEPTH.saturating_mul(wide_axes).saturating_add(extra),
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// #ctx-group: context-grouped refinement covers (`NY_NN4SYS_CTX_GROUP=1`).
+//
+// The M3 exact-lane structural insight
+// (`docs/NN4SYS_GROUPED_EXACT_CONTEXT_M3_2026-07-26.md`: 56,186 one-axis
+// nn4sys clauses collapse to 122 `(free_axis, fixed_inputs)` contexts) ported
+// to the production screen. Clauses whose tightened boxes are BIT-IDENTICAL
+// on every axis except a common set of wide "free" axes describe the same
+// 1-D/few-D function family and differ only in their intervals/thresholds:
+// ONE shared refinement tree over the hull of their boxes bounds that family
+// once, instead of one tree per bit-identical box.
+//
+// SOUNDNESS (blind category — a wrong nn4sys `unsat` is uncontradictable):
+// grouping changes WHICH boxes get bounded, never how. Every bound pass on a
+// hull node is the unchanged certified machinery (`bound_node`: same IBP /
+// CROWN / f64 cell / MVF / mono calls, same outward rounding). Per-clause
+// verdicts follow the same obligation calculus as the legacy trees, refined
+// by the carried-children invariant:
+//   * a clause joins a shared tree only with an EXPLICIT cover proof that
+//     the hull encloses its own box (`box_covers`, fail-closed to the
+//     per-clause path on any doubt);
+//   * a node's proof discharges clause c only over `node_box ∩ own_box(c)`
+//     — sound because certified bounds over `node_box` enclose all outputs
+//     over any subset;
+//   * when a node splits, c's obligation moves to EXACTLY the children not
+//     provably disjoint from `own_box(c)` (`boxes_provably_disjoint`,
+//     fail-closed: doubt keeps the obligation). Children cover the parent,
+//     so those children cover `parent_box ∩ own_box(c)`;
+//   * therefore `open_nodes[c] == 0 && !failed[c]` still implies own_box(c)
+//     is covered by regions over which c's own constraints were proven
+//     impossible — the same invariant the per-clause trees discharge.
+// Default OFF: with the gate unset the per-clause path is byte-identical.
+// ---------------------------------------------------------------------------
+
+/// DECLARED lever (ratchet discipline): exact `1` arms, everything else —
+/// absence, `"0"`, and every rejected token — resolves to the declaration's
+/// `false` default, preserving the historical `== Some("1")` test verbatim.
+///
+/// DELIVERY SEAM (#lever-reachability, 2026-08-23): `NY_NN4SYS_CTX_GROUP` still
+/// wins in both directions; absent, the typed `bab.nn4sys_ctx_group` key
+/// decides. The cover/disjointness proofs above are fail-closed — doubt keeps
+/// the obligation — so arming it can only lose coverage, never fake it.
+fn ctx_group_enabled() -> bool {
+    crate::preset_gates::nn4sys_ctx_group_armed()
+}
+
+/// TRUE only when `outer` PROVABLY encloses `inner` on every axis (closed
+/// boxes, exact f32 comparisons — no arithmetic, no rounding). Any doubt
+/// (non-contiguous storage, shape mismatch, NaN endpoint) returns FALSE:
+/// callers treat "not proven covered" as fail-closed fallback to the
+/// per-clause path.
+fn box_covers(outer: &BoundedTensor, inner: &BoundedTensor) -> bool {
+    let outer_lo = outer.lower();
+    let outer_hi = outer.upper();
+    let inner_lo = inner.lower();
+    let inner_hi = inner.upper();
+    let (Some(ol), Some(oh), Some(il), Some(ih)) = (
+        outer_lo.as_slice(),
+        outer_hi.as_slice(),
+        inner_lo.as_slice(),
+        inner_hi.as_slice(),
+    ) else {
+        return false;
+    };
+    ol.len() == il.len()
+        && oh.len() == ih.len()
+        && ol.len() == oh.len()
+        && ol.iter().zip(il).all(|(&o, &i)| o <= i)
+        && oh.iter().zip(ih).all(|(&o, &i)| o >= i)
+}
+
+/// TRUE only when the two closed boxes are PROVABLY disjoint: some axis
+/// strictly separates them (exact f32 comparisons). Any doubt (shape
+/// mismatch, non-contiguous storage, NaN) returns FALSE — the caller then
+/// KEEPS the proof obligation. The conservative direction matters: a false
+/// "disjoint" would silently drop an obligation (unsound); a false
+/// "intersecting" only costs a redundant bound check.
+fn boxes_provably_disjoint(a: &BoundedTensor, b: &BoundedTensor) -> bool {
+    let a_lo = a.lower();
+    let a_hi = a.upper();
+    let b_lo = b.lower();
+    let b_hi = b.upper();
+    let (Some(al), Some(ah), Some(bl), Some(bh)) = (
+        a_lo.as_slice(),
+        a_hi.as_slice(),
+        b_lo.as_slice(),
+        b_hi.as_slice(),
+    ) else {
+        return false;
+    };
+    if al.len() != bl.len() || ah.len() != bh.len() || al.len() != ah.len() {
+        return false;
+    }
+    al.iter()
+        .zip(ah)
+        .zip(bl.iter().zip(bh))
+        .any(|((&al, &ah), (&bl, &bh))| al > bh || ah < bl)
+}
+
+/// Exact f32 intersection of two closed boxes (component-wise max-lo /
+/// min-hi, no arithmetic beyond selection). `None` on structural doubt or an
+/// empty/invalid result — callers fail closed (the affected clause stays
+/// unproven).
+fn intersect_boxes(a: &BoundedTensor, b: &BoundedTensor) -> Option<BoundedTensor> {
+    let mut lo = a.lower().clone();
+    let mut hi = a.upper().clone();
+    {
+        let lo_s = lo.as_slice_mut()?;
+        let hi_s = hi.as_slice_mut()?;
+        let b_lo = b.lower();
+        let b_hi = b.upper();
+        let bl = b_lo.as_slice()?;
+        let bh = b_hi.as_slice()?;
+        if bl.len() != lo_s.len() || bh.len() != hi_s.len() {
+            return None;
+        }
+        for (dst, &src) in lo_s.iter_mut().zip(bl) {
+            if src > *dst {
+                *dst = src;
+            }
+        }
+        for (dst, &src) in hi_s.iter_mut().zip(bh) {
+            if src < *dst {
+                *dst = src;
+            }
+        }
+        if lo_s
+            .iter()
+            .zip(hi_s.iter())
+            .any(|(&l, &h)| h < l || l.is_nan() || h.is_nan())
+        {
+            return None;
+        }
+    }
+    BoundedTensor::new(lo, hi).ok()
+}
+
+/// The single axis along which a split's children differ from their parent
+/// (`split_widest_axis`/`_4way` bisect exactly one axis; every child differs
+/// from the parent only there). `None` = could not be determined — callers
+/// fall back to the closed-intersection carry rule (conservative: more
+/// children carry the obligation).
+fn split_axis_of(parent: &BoundedTensor, child: &BoundedTensor) -> Option<usize> {
+    let p_lo = parent.lower();
+    let p_hi = parent.upper();
+    let c_lo = child.lower();
+    let c_hi = child.upper();
+    let (Some(pl), Some(ph), Some(cl), Some(ch)) = (
+        p_lo.as_slice(),
+        p_hi.as_slice(),
+        c_lo.as_slice(),
+        c_hi.as_slice(),
+    ) else {
+        return None;
+    };
+    if pl.len() != cl.len() || ph.len() != ch.len() || pl.len() != ph.len() {
+        return None;
+    }
+    (0..pl.len())
+        .find(|&i| pl[i].to_bits() != cl[i].to_bits() || ph[i].to_bits() != ch[i].to_bits())
+}
+
+/// #ctx-group carry rule for one child at a split along `split_axis`:
+/// whether `child` must inherit the obligation for a clause whose OWN box is
+/// `own`.
+///
+/// Base rule (always sound): a child PROVABLY disjoint from `own` carries
+/// nothing — no point of the clause's box lies there.
+///
+/// Refinement on the split axis: children tile the parent there with SHARED
+/// closed endpoints, so a child whose overlap with `own` is only such a
+/// shared endpoint may release the obligation — the carried neighbor that
+/// owns the same endpoint covers it. Formally the child carries iff
+/// `child.lo < own.hi && child.hi > own.lo` on the split axis (strict).
+/// Every point of `own ∩ parent` then still lies in a carried child EXCEPT
+/// when NO child qualifies (a degenerate point overlap exactly on a cut) —
+/// the caller detects that case and falls back to the closed rule, which is
+/// unconditionally covering. Without the strict rule, abutting member tiles
+/// would force boundary leaves to prove a neighbor's clause over regions
+/// outside its own box, structurally failing every shared-endpoint tile.
+///
+/// Any structural doubt returns TRUE (keep the obligation — conservative).
+fn ctx_child_carries(
+    child: &BoundedTensor,
+    own: &BoundedTensor,
+    split_axis: Option<usize>,
+) -> bool {
+    if boxes_provably_disjoint(child, own) {
+        return false;
+    }
+    let Some(axis) = split_axis else {
+        return true;
+    };
+    let c_lo = child.lower();
+    let c_hi = child.upper();
+    let o_lo = own.lower();
+    let o_hi = own.upper();
+    let (Some(cl), Some(ch), Some(ol), Some(oh)) = (
+        c_lo.as_slice(),
+        c_hi.as_slice(),
+        o_lo.as_slice(),
+        o_hi.as_slice(),
+    ) else {
+        return true;
+    };
+    let (Some(&cl), Some(&ch), Some(&ol), Some(&oh)) =
+        (cl.get(axis), ch.get(axis), ol.get(axis), oh.get(axis))
+    else {
+        return true;
+    };
+    cl < oh && ch > ol
+}
+
+/// Context signature of a clause box: the `(free_axes, fixed_inputs)`
+/// identity of M3's exact contexts, over exact bit patterns. Two boxes share
+/// a context iff they have the SAME set of wide (finite positive width) axes
+/// and BIT-IDENTICAL bounds on every other axis; their wide-axis intervals
+/// may differ — that is the shared function family one hull tree bounds
+/// once. `None` = not context-groupable (pure point box, or non-contiguous
+/// storage) — the box stays on the per-clause path.
+fn context_signature(bounds: &BoundedTensor) -> Option<Vec<u32>> {
+    let lo = bounds.lower();
+    let hi = bounds.upper();
+    let lo_s = lo.as_slice()?;
+    let hi_s = hi.as_slice()?;
+    if lo_s.len() != hi_s.len() {
+        return None;
+    }
+    let mut wide: Vec<u32> = Vec::new();
+    for (i, (&l, &h)) in lo_s.iter().zip(hi_s).enumerate() {
+        let w = h - l;
+        if w.is_finite() && w > 0.0 {
+            wide.push(u32::try_from(i).ok()?);
+        }
+    }
+    if wide.is_empty() {
+        return None;
+    }
+    let mut sig = Vec::with_capacity(1 + wide.len() + 2 * (lo_s.len() - wide.len()));
+    sig.push(u32::try_from(wide.len()).ok()?);
+    sig.extend_from_slice(&wide);
+    let mut wide_iter = wide.iter().copied().peekable();
+    for (i, (&l, &h)) in lo_s.iter().zip(hi_s).enumerate() {
+        let i = u32::try_from(i).ok()?;
+        if wide_iter.peek() == Some(&i) {
+            wide_iter.next();
+            continue;
+        }
+        sig.push(l.to_bits());
+        sig.push(h.to_bits());
+    }
+    Some(sig)
+}
+
+/// Component-wise hull (min lower / max upper) of the member boxes — exact
+/// f32 min/max of already-stored endpoints, no rounding introduced. `None`
+/// on any structural doubt (fail-closed to the per-clause path).
+fn context_hull(members: &[&BoundedTensor]) -> Option<BoundedTensor> {
+    let first = members.first()?;
+    let mut lo = first.lower().clone();
+    let mut hi = first.upper().clone();
+    {
+        let lo_s = lo.as_slice_mut()?;
+        let hi_s = hi.as_slice_mut()?;
+        for m in &members[1..] {
+            let m_lo = m.lower();
+            let m_hi = m.upper();
+            let ml = m_lo.as_slice()?;
+            let mh = m_hi.as_slice()?;
+            if ml.len() != lo_s.len() || mh.len() != hi_s.len() {
+                return None;
+            }
+            for (dst, &src) in lo_s.iter_mut().zip(ml) {
+                if src < *dst {
+                    *dst = src;
+                }
+            }
+            for (dst, &src) in hi_s.iter_mut().zip(mh) {
+                if src > *dst {
+                    *dst = src;
+                }
+            }
+        }
+    }
+    BoundedTensor::new(lo, hi).ok()
+}
+
+/// Extra bisection budget for a context hull root: the legacy per-clause
+/// tree guarantees each member `MAX_DEPTH` levels PER WIDE AXIS of its OWN
+/// box; reaching the same leaf resolution from the (wider) hull needs
+/// `ceil(log2(hull_width / member_width))` additional levels per axis.
+/// Granting the max ratio keeps the NARROWEST member's proof floor intact.
+/// Capped defensively — the deadline / node cap still bound total work.
+fn context_extra_depth(hull: &BoundedTensor, members: &[&BoundedTensor]) -> u16 {
+    const EXTRA_CAP: f64 = 96.0;
+    let hull_lo = hull.lower();
+    let hull_hi = hull.upper();
+    let (Some(hl), Some(hh)) = (hull_lo.as_slice(), hull_hi.as_slice()) else {
+        return 0;
+    };
+    let mut extra = 0.0f64;
+    for (axis, (&l, &h)) in hl.iter().zip(hh).enumerate() {
+        let hull_w = f64::from(h) - f64::from(l);
+        if !(hull_w.is_finite() && hull_w > 0.0) {
+            continue;
+        }
+        let mut min_w = f64::INFINITY;
+        for m in members {
+            let m_lo = m.lower();
+            let m_hi = m.upper();
+            let (Some(ml), Some(mh)) = (m_lo.as_slice(), m_hi.as_slice()) else {
+                continue;
+            };
+            let (Some(&a), Some(&b)) = (ml.get(axis), mh.get(axis)) else {
+                continue;
+            };
+            let w = f64::from(b) - f64::from(a);
+            if w.is_finite() && w > 0.0 && w < min_w {
+                min_w = w;
+            }
+        }
+        if min_w.is_finite() && min_w < hull_w {
+            extra += (hull_w / min_w).log2().ceil().clamp(0.0, EXTRA_CAP);
+        }
+        if extra >= EXTRA_CAP {
+            extra = EXTRA_CAP;
+            break;
+        }
+    }
+    extra as u16
+}
+
+/// #ctx-group runtime state: per-clause OWN-box lookup for the shared
+/// context trees, plus engagement telemetry. Clauses absent from
+/// `clause_box_idx` keep the unchanged per-clause semantics (their tree's
+/// boxes are subsets of their own box by construction).
+struct CtxGroupState {
+    clause_box_idx: HashMap<usize, usize>,
+    member_boxes: Vec<BoundedTensor>,
+    contexts: usize,
+    total_clauses: usize,
+    covered_clauses: usize,
+    fallback_clauses: usize,
+    ineligible_clauses: usize,
+    /// Defensive counter: a split's children failed to reach a carried
+    /// clause's own box (structurally unreachable — children cover the
+    /// parent). The affected clause fails CLOSED (unproven).
+    cover_gaps: AtomicUsize,
+}
+
+impl CtxGroupState {
+    fn member_box(&self, clause: usize) -> Option<&BoundedTensor> {
+        self.clause_box_idx
+            .get(&clause)
+            .map(|&idx| &self.member_boxes[idx])
+    }
+}
+
+/// Explicit per-member cover admission for a context tree. Production call
+/// sites must never bypass this: a member whose own box the hull does not
+/// PROVABLY enclose falls back to the per-clause path.
+fn context_admits_member(hull: &BoundedTensor, member: &BoundedTensor) -> bool {
+    box_covers(hull, member)
+}
+
+/// Merge bit-identical-box root groups that share a context into one hull
+/// root group each (deterministic: member groups are visited in ascending
+/// bit-key order, contexts in ascending signature order). Groups that are
+/// ineligible, in a singleton context, or that fail the explicit cover
+/// admission stay byte-identical per-clause root groups.
+fn context_group_roots(
+    groups: ClauseBoxGroups,
+) -> (ClauseBoxGroups, HashMap<Vec<u32>, u16>, CtxGroupState) {
+    let mut sorted: Vec<(Vec<u32>, BoundedTensor, Vec<usize>)> = groups
+        .into_iter()
+        .map(|(key, (bounds, members))| (key, bounds, members))
+        .collect();
+    sorted.sort_unstable_by(|(l, ..), (r, ..)| l.cmp(r));
+
+    let mut state = CtxGroupState {
+        clause_box_idx: HashMap::new(),
+        member_boxes: Vec::new(),
+        contexts: 0,
+        total_clauses: 0,
+        covered_clauses: 0,
+        fallback_clauses: 0,
+        ineligible_clauses: 0,
+        cover_gaps: AtomicUsize::new(0),
+    };
+    let mut by_context: std::collections::BTreeMap<Vec<u32>, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, (_, bounds, members)) in sorted.iter().enumerate() {
+        state.total_clauses += members.len();
+        match context_signature(bounds) {
+            Some(sig) => by_context.entry(sig).or_default().push(i),
+            None => state.ineligible_clauses += members.len(),
+        }
+    }
+
+    // (hull box, hull key, absorbed clause indices, extra depth) per context.
+    let mut merged: Vec<(BoundedTensor, Vec<u32>, Vec<usize>, u16)> = Vec::new();
+    let mut absorbed = vec![false; sorted.len()];
+    for member_idxs in by_context.values() {
+        let clause_count = |idxs: &[usize]| idxs.iter().map(|&i| sorted[i].2.len()).sum::<usize>();
+        if member_idxs.len() < 2 {
+            // Singleton context: nothing to share.
+            state.fallback_clauses += clause_count(member_idxs);
+            continue;
+        }
+        let member_boxes: Vec<&BoundedTensor> = member_idxs.iter().map(|&i| &sorted[i].1).collect();
+        let hull_key =
+            context_hull(&member_boxes).and_then(|hull| box_key(&hull).map(|key| (hull, key)));
+        let Some((hull, hull_key)) = hull_key else {
+            state.fallback_clauses += clause_count(member_idxs);
+            continue;
+        };
+        // EXPLICIT cover proof per member (fail-closed): only members whose
+        // own box the hull provably encloses may take verdicts from the
+        // shared tree.
+        let (admitted, rejected): (Vec<usize>, Vec<usize>) = member_idxs
+            .iter()
+            .copied()
+            .partition(|&i| context_admits_member(&hull, &sorted[i].1));
+        state.fallback_clauses += clause_count(&rejected);
+        if admitted.len() < 2 {
+            state.fallback_clauses += clause_count(&admitted);
+            continue;
+        }
+        let admitted_boxes: Vec<&BoundedTensor> = admitted.iter().map(|&i| &sorted[i].1).collect();
+        let extra = context_extra_depth(&hull, &admitted_boxes);
+        let mut clause_members: Vec<usize> = Vec::with_capacity(clause_count(&admitted));
+        for &i in &admitted {
+            absorbed[i] = true;
+            let box_idx = state.member_boxes.len();
+            state.member_boxes.push(sorted[i].1.clone());
+            for &c in &sorted[i].2 {
+                state.clause_box_idx.insert(c, box_idx);
+            }
+            clause_members.extend_from_slice(&sorted[i].2);
+            state.covered_clauses += sorted[i].2.len();
+        }
+        state.contexts += 1;
+        merged.push((hull, hull_key, clause_members, extra));
+    }
+
+    // A key collision means bit-identical boxes: sharing one tree is exactly
+    // the legacy bit-identical-group semantics.
+    fn insert_group(
+        out: &mut ClauseBoxGroups,
+        key: Vec<u32>,
+        bounds: BoundedTensor,
+        mut members: Vec<usize>,
+    ) {
+        match out.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().1.append(&mut members);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((bounds, members));
+            }
+        }
+    }
+    let mut out: ClauseBoxGroups = HashMap::new();
+    let mut extra_depth: HashMap<Vec<u32>, u16> = HashMap::new();
+    for (absorbed, (key, bounds, members)) in absorbed.into_iter().zip(sorted) {
+        if !absorbed {
+            insert_group(&mut out, key, bounds, members);
+        }
+    }
+    for (hull, hull_key, members, extra) in merged {
+        let entry = extra_depth.entry(hull_key.clone()).or_insert(0);
+        *entry = (*entry).max(extra);
+        insert_group(&mut out, hull_key, hull, members);
+    }
+    (out, extra_depth, state)
 }
 
 /// Outcome of bounding one node (computed in parallel, applied serially).
@@ -2927,7 +3413,26 @@ fn refine_clause_boxes_counted_seeded(
             phase_target_override,
         )
     });
-    let mut queue = ordered_root_queue(groups);
+    // #ctx-group (NY_NN4SYS_CTX_GROUP=1, default OFF = byte-identical roots):
+    // merge same-context root groups into ONE shared hull tree each. Grouping
+    // changes WHICH boxes get bounded, never how — every bound pass below is
+    // the unchanged certified machinery; per-clause verdicts follow the
+    // carried-children invariant applied at the split transition below.
+    let (groups, ctx_extra_depth, ctx_state) = if ctx_group_enabled() {
+        let (merged, extra, state) = context_group_roots(groups);
+        eprintln!(
+            "[ctx-group] contexts={} clauses={} covered={} fallback={} ineligible={}",
+            state.contexts,
+            state.total_clauses,
+            state.covered_clauses,
+            state.fallback_clauses,
+            state.ineligible_clauses
+        );
+        (merged, extra, Some(state))
+    } else {
+        (groups, HashMap::new(), None)
+    };
+    let mut queue = ordered_root_queue(groups, &ctx_extra_depth);
 
     let mut nodes_processed = 0usize;
     let mut deadline_hit = false;
@@ -3161,7 +3666,7 @@ fn refine_clause_boxes_counted_seeded(
             break;
         }
 
-        for outcome in outcomes {
+        for (node, outcome) in wave.iter().zip(outcomes) {
             for &c in &outcome.proven {
                 open_nodes[c] -= 1;
             }
@@ -3171,10 +3676,113 @@ fn refine_clause_boxes_counted_seeded(
             }
             if outcome.children.is_empty() {
                 // Depth cap or unsplittable box: these clauses cannot be
-                // fully proven — conservative unproven.
+                // fully proven here — conservative unproven, EXCEPT that a
+                // #ctx-group boundary leaf spilling past a member's own box
+                // gets ONE clipped per-clause retry (below) before failing.
                 for &c in open {
+                    if let Some(own) = ctx_state.as_ref().and_then(|ctx| ctx.member_box(c)) {
+                        // #ctx-group boundary clip: a shared-tree leaf that
+                        // extends past clause c's OWN box can be unprovable
+                        // for c solely because the bound covers out-of-box
+                        // points (the clause is only claimed over its own
+                        // box). Re-bound `leaf ∩ own_box(c)` once with the
+                        // UNCHANGED machinery — exactly M3's member-interval
+                        // clip. The clipped box is a strict sub-box on some
+                        // axis, and its own descendants satisfy the cover
+                        // check, so at most one clip fires per clause-leaf
+                        // (no regress). The obligation MOVES (parent -1,
+                        // clip +1: net zero) — never discharged here.
+                        if !box_covers(own, &node.bounds) {
+                            if let Some(clipped) = intersect_boxes(&node.bounds, own) {
+                                queue.push(BoxNode {
+                                    bounds: clipped,
+                                    active: vec![c],
+                                    depth: outcome.child_depth,
+                                    depth_cap: outcome.depth_cap,
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     failed[c] = true;
                     open_nodes[c] -= 1;
+                }
+            } else if let Some(ctx) = ctx_state
+                .as_ref()
+                .filter(|ctx| !ctx.clause_box_idx.is_empty())
+            {
+                // #ctx-group carried-children invariant: on a shared context
+                // tree, clause c's obligation moves to exactly the children
+                // that (per `ctx_child_carries`) still cover
+                // `parent ∩ own_box(c)`; a child the clause's box provably
+                // never reaches holds a vacuous obligation (no point of
+                // own_box(c) lies there) and is released without any verdict.
+                // If the strict rule degenerates (no carrier), fall back to
+                // the closed rule — carry every non-disjoint child — which is
+                // unconditionally covering. Legacy clauses (no member box)
+                // keep the historical all-children inheritance verbatim.
+                let split_axis = outcome
+                    .children
+                    .first()
+                    .and_then(|child| split_axis_of(&node.bounds, child));
+                let mut child_actives: Vec<Vec<usize>> =
+                    outcome.children.iter().map(|_| Vec::new()).collect();
+                for &c in open {
+                    match ctx.member_box(c) {
+                        Some(own) => {
+                            let mut carriers: Vec<usize> = outcome
+                                .children
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, child)| ctx_child_carries(child, own, split_axis))
+                                .map(|(i, _)| i)
+                                .collect();
+                            if carriers.is_empty() {
+                                // Degenerate strict overlap (own ∩ parent is
+                                // a point on a cut): closed-rule fallback.
+                                carriers = outcome
+                                    .children
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, child)| !boxes_provably_disjoint(child, own))
+                                    .map(|(i, _)| i)
+                                    .collect();
+                            }
+                            if carriers.is_empty() {
+                                // Children cover the parent and the parent
+                                // carried c, so some child must reach c's box;
+                                // reaching here means the cover argument
+                                // failed — fail the clause CLOSED.
+                                ctx.cover_gaps.fetch_add(1, Ordering::Relaxed);
+                                failed[c] = true;
+                                open_nodes[c] -= 1;
+                            } else {
+                                open_nodes[c] += carriers.len() - 1;
+                                for i in carriers {
+                                    child_actives[i].push(c);
+                                }
+                            }
+                        }
+                        None => {
+                            for child_active in &mut child_actives {
+                                child_active.push(c);
+                            }
+                            open_nodes[c] += outcome.children.len() - 1;
+                        }
+                    }
+                }
+                for (child, active) in outcome.children.into_iter().zip(child_actives) {
+                    if active.is_empty() {
+                        // No carried obligation reaches this child: vacuously
+                        // covered, no bound pass needed.
+                        continue;
+                    }
+                    queue.push(BoxNode {
+                        bounds: child,
+                        active,
+                        depth: outcome.child_depth,
+                        depth_cap: outcome.depth_cap,
+                    });
                 }
             } else {
                 // Each open clause's obligation moves from the parent to
@@ -3278,6 +3886,14 @@ fn refine_clause_boxes_counted_seeded(
         crown_avg_ms,
         crown_shed,
         crown_skips,
+        ctx_group_active = ctx_state.is_some(),
+        ctx_contexts = ctx_state.as_ref().map_or(0, |s| s.contexts),
+        ctx_covered_clauses = ctx_state.as_ref().map_or(0, |s| s.covered_clauses),
+        ctx_fallback_clauses = ctx_state.as_ref().map_or(0, |s| s.fallback_clauses),
+        ctx_ineligible_clauses = ctx_state.as_ref().map_or(0, |s| s.ineligible_clauses),
+        ctx_cover_gaps = ctx_state
+            .as_ref()
+            .map_or(0, |s| s.cover_gaps.load(Ordering::Relaxed)),
         elapsed_s = start.elapsed().as_secs_f64(),
         "Box-refinement clause screen complete"
     );
@@ -3409,12 +4025,248 @@ mod tests {
             );
         }
 
-        let queue = ordered_root_queue(groups);
+        let queue = ordered_root_queue(groups, &HashMap::new());
         assert_eq!(
             queue.iter().map(|node| node.active[0]).collect::<Vec<_>>(),
             vec![2, 5, 7],
             "root stack must follow ascending bit-key order; tail pops are stable"
         );
+    }
+
+    #[test]
+    fn ctx_group_env_gate_requires_exact_opt_in() {
+        // Exercises the REAL declaration parser plus the production site's
+        // decision derivation (`.value.as_bool()`), without touching the
+        // process environment.
+        let armed = |raw: Option<&str>| {
+            ny_levers::read_with(
+                &ny_levers::decls::nn4sys_ctx_group::NN4SYS_CTX_GROUP,
+                |_| raw.map(str::to_owned),
+            )
+            .value
+            .as_bool()
+        };
+        assert!(armed(Some("1")));
+        for value in [None, Some(""), Some("0"), Some("true"), Some("01")] {
+            assert!(!armed(value), "{value:?} must not arm the ctx-group gate");
+        }
+    }
+
+    #[test]
+    fn box_cover_is_fail_closed_and_disjointness_is_conservative() {
+        let outer = boxed(vec![0.0, 1.0], vec![1.0, 1.0]);
+        let inner = boxed(vec![0.25, 1.0], vec![0.75, 1.0]);
+        assert!(box_covers(&outer, &inner));
+        assert!(box_covers(&outer, &outer), "a box covers itself");
+        assert!(
+            !box_covers(&inner, &outer),
+            "a member exceeding the hull on any axis must be refused"
+        );
+        assert!(
+            !context_admits_member(&inner, &outer),
+            "the admission seam must refuse a member whose box exceeds the hull"
+        );
+        let mismatched = boxed(vec![0.0], vec![1.0]);
+        assert!(
+            !box_covers(&outer, &mismatched),
+            "shape doubt must fail closed (no cover proof)"
+        );
+
+        let left = boxed(vec![0.0, 1.0], vec![0.5, 1.0]);
+        let right = boxed(vec![0.5, 1.0], vec![1.0, 1.0]);
+        let far = boxed(vec![0.75, 1.0], vec![1.0, 1.0]);
+        assert!(
+            !boxes_provably_disjoint(&left, &right),
+            "closed boxes sharing a split endpoint intersect — the obligation must be kept"
+        );
+        assert!(boxes_provably_disjoint(&left, &far));
+        assert!(
+            !boxes_provably_disjoint(&left, &mismatched),
+            "shape doubt must KEEP the obligation (conservative direction)"
+        );
+    }
+
+    #[test]
+    fn context_signature_requires_same_free_axes_and_bitwise_fixed_inputs() {
+        let a = boxed(vec![0.0, 0.5], vec![0.25, 0.5]);
+        let b = boxed(vec![0.25, 0.5], vec![1.0, 0.5]); // same fixed x1, same free axis
+        let c = boxed(vec![0.0, 0.25], vec![0.25, 0.25]); // different fixed input
+        let d = boxed(vec![0.5, 0.5], vec![0.5, 0.5]); // pure point box
+        let e = boxed(vec![0.0, 0.0], vec![0.25, 1.0]); // two free axes
+        let sig_a = context_signature(&a).expect("one free axis");
+        assert_eq!(sig_a, context_signature(&b).expect("context mate"));
+        assert_ne!(sig_a, context_signature(&c).expect("other fixed input"));
+        assert!(
+            context_signature(&d).is_none(),
+            "a point box has no free axis to group on"
+        );
+        assert_ne!(sig_a, context_signature(&e).expect("two free axes"));
+    }
+
+    #[test]
+    fn context_group_roots_merges_context_mates_and_isolates_the_rest() {
+        // Context A (fixed x1 = 0.5): two free-axis tiles -> ONE hull tree.
+        let a1 = boxed(vec![0.0, 0.5], vec![0.25, 0.5]);
+        let a2 = boxed(vec![0.25, 0.5], vec![1.0, 0.5]);
+        // Context B (fixed x1 = 0.25): singleton — stays per-clause.
+        let b1 = boxed(vec![0.0, 0.25], vec![0.5, 0.25]);
+        // Point box: not context-groupable (ineligible).
+        let p = boxed(vec![0.75, 0.75], vec![0.75, 0.75]);
+        let mut groups = ClauseBoxGroups::new();
+        // Clauses 0 and 1 are a band pair on one bit-identical box.
+        groups.insert(box_key(&a1).unwrap(), (a1.clone(), vec![0, 1]));
+        groups.insert(box_key(&a2).unwrap(), (a2.clone(), vec![2]));
+        groups.insert(box_key(&b1).unwrap(), (b1.clone(), vec![3]));
+        groups.insert(box_key(&p).unwrap(), (p.clone(), vec![4]));
+
+        let (merged, extra, state) = context_group_roots(groups);
+        assert_eq!(state.contexts, 1);
+        assert_eq!(state.total_clauses, 5);
+        assert_eq!(state.covered_clauses, 3);
+        assert_eq!(state.fallback_clauses, 1, "singleton context falls back");
+        assert_eq!(state.ineligible_clauses, 1, "point box is ineligible");
+        assert_eq!(state.cover_gaps.load(Ordering::Relaxed), 0);
+
+        let hull = boxed(vec![0.0, 0.5], vec![1.0, 0.5]);
+        let hull_key = box_key(&hull).unwrap();
+        assert_eq!(merged.len(), 3, "hull + singleton + point");
+        let (hull_box, hull_members) = merged.get(&hull_key).expect("hull root group");
+        let mut members = hull_members.clone();
+        members.sort_unstable();
+        assert_eq!(members, vec![0, 1, 2]);
+        assert!(box_covers(hull_box, &a1) && box_covers(hull_box, &a2));
+        // Hull free width 1.0 vs narrowest member 0.25: two extra levels keep
+        // the narrow tile's legacy leaf resolution.
+        assert_eq!(extra.get(&hull_key).copied(), Some(2));
+        // Own-box lookups exist exactly for the absorbed members.
+        assert_eq!(
+            box_key(state.member_box(0).expect("absorbed")).unwrap(),
+            box_key(&a1).unwrap()
+        );
+        assert_eq!(
+            box_key(state.member_box(2).expect("absorbed")).unwrap(),
+            box_key(&a2).unwrap()
+        );
+        assert!(state.member_box(3).is_none(), "fallback keeps legacy path");
+        assert!(
+            state.member_box(4).is_none(),
+            "ineligible keeps legacy path"
+        );
+    }
+
+    /// #ctx-group end-to-end agreement + sharing: two overlapping plateau
+    /// clauses (same context: free axes {0,1}, no fixed inputs, different
+    /// boxes/thresholds) must produce the SAME verdicts grouped as solo,
+    /// while the shared hull tree costs FEWER bound passes than the two
+    /// per-clause trees.
+    #[test]
+    fn ctx_grouped_verdicts_agree_with_solo_and_share_the_tree() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let graph = build_plateau_graph();
+        let model = BetaCrownModel::Graph(Box::new(graph));
+        let input = boxed(vec![0.0, 0.0], vec![2.0, 2.0]);
+        let sup = 0.25 * (1.0f64 / (1.0 + (-1.0f64).exp()));
+        let clauses = vec![
+            vec![OutputConstraint::GreaterEqConst(0, sup + 1e-9)],
+            vec![OutputConstraint::GreaterEqConst(0, sup + 2e-9)],
+        ];
+        let box1 =
+            std::collections::BTreeMap::from([(0usize, (0.5f64, 1.5f64)), (1usize, (0.5, 1.5))]);
+        let box2 =
+            std::collections::BTreeMap::from([(0usize, (0.625f64, 1.5f64)), (1usize, (0.5, 1.5))]);
+        let boxes = vec![box1, box2];
+
+        let (solo, solo_nodes) =
+            refine_clause_boxes_counted(&model, &input, &clauses, &boxes, None, None);
+        assert_eq!(solo, vec![true, true], "both plateau clauses are provable");
+
+        let (grouped, grouped_nodes) =
+            ny_test_utils::env::with_serialized_env_vars(&[("NY_NN4SYS_CTX_GROUP", "1")], || {
+                refine_clause_boxes_counted(&model, &input, &clauses, &boxes, None, None)
+            });
+        assert_eq!(grouped, solo, "grouped verdicts must agree with solo");
+        assert!(
+            grouped_nodes < solo_nodes,
+            "one hull tree must cost fewer bound passes than two per-clause \
+             trees over overlapping boxes (grouped {grouped_nodes} vs solo {solo_nodes})"
+        );
+    }
+
+    /// #ctx-group soundness (fail-closed cover semantics): a clause whose own
+    /// box extends past the region the shared tree can prove must stay
+    /// UNPROVEN — partial leaf coverage never completes a clause — while its
+    /// context-mate still converts. Verdicts must match the solo arm exactly.
+    #[test]
+    fn ctx_grouping_never_overclaims_partially_covered_clauses() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let graph = build_band_graph();
+        let model = BetaCrownModel::Graph(Box::new(graph));
+        let input = boxed(vec![0.0], vec![1.0]);
+
+        // Exact-f32 endpoints so tighten_input_to_box is exact in both arms.
+        let lb = 0.25f32;
+        let ub0 = 0.375f32;
+        let mut ub1 = ub0;
+        for _ in 0..4 {
+            ub1 = ny_tensor::next_up_f32(ub1);
+        }
+        let y = |x: f64| f64::from(1.0f32 / 3.0) * x + f64::from(0.7f32);
+        let clauses = vec![
+            // c0: impossible over [0.25, 0.375] (threshold above the max).
+            vec![OutputConstraint::GreaterEqConst(
+                0,
+                y(f64::from(ub0)) + 1e-9,
+            )],
+            // c1: SATISFIABLE near its upper edge (threshold below y(0.375)):
+            // provable on most leaves, impossible to prove on the last ULPs —
+            // its own box exceeds the provable region.
+            vec![OutputConstraint::GreaterEqConst(
+                0,
+                y(f64::from(ub0)) - 1e-9,
+            )],
+        ];
+        let boxes = vec![
+            std::collections::BTreeMap::from([(0usize, (f64::from(lb), f64::from(ub0)))]),
+            std::collections::BTreeMap::from([(0usize, (f64::from(lb), f64::from(ub1)))]),
+        ];
+
+        let solo = refine_clause_boxes(&model, &input, &clauses, &boxes, None, None);
+        assert_eq!(
+            solo,
+            vec![true, false],
+            "solo: c0 converts, satisfiable c1 must stay unproven"
+        );
+
+        let grouped =
+            ny_test_utils::env::with_serialized_env_vars(&[("NY_NN4SYS_CTX_GROUP", "1")], || {
+                refine_clause_boxes(&model, &input, &clauses, &boxes, None, None)
+            });
+        assert_eq!(
+            grouped, solo,
+            "grouped arm must not over-claim the partially covered clause"
+        );
+    }
+
+    /// Gate OFF (unset or "0") must be bit-identical to the legacy path:
+    /// same verdicts AND the same node trajectory.
+    #[test]
+    fn ctx_group_gate_off_is_bit_identical() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let graph = build_band_graph();
+        let model = BetaCrownModel::Graph(Box::new(graph));
+        let input = boxed(vec![0.0], vec![1.0]);
+        let clauses = vec![vec![OutputConstraint::GreaterEqConst(
+            0,
+            f64::from(1.0f32 / 3.0) * 0.375 + f64::from(0.7f32) + 1e-9,
+        )]];
+        let boxes = vec![std::collections::BTreeMap::from([(0usize, (0.25, 0.375))])];
+
+        let baseline = refine_clause_boxes_counted(&model, &input, &clauses, &boxes, None, None);
+        let off =
+            ny_test_utils::env::with_serialized_env_vars(&[("NY_NN4SYS_CTX_GROUP", "0")], || {
+                refine_clause_boxes_counted(&model, &input, &clauses, &boxes, None, None)
+            });
+        assert_eq!(baseline, off, "gate '0' must match the unset legacy path");
     }
 
     #[test]

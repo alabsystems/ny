@@ -229,6 +229,28 @@ impl crate::registry::Strategy for Square {
         let started = std::time::Instant::now();
         let mut effort = Effort::default();
         let n = domain.free_dims();
+        // #falsify-ceiling-authority: the slice's OWN ceiling, consulted at the
+        // seam that SPENDS the budget and not only at the seam that grants it.
+        //
+        // Byte-identical today, deliberately: `admit` refuses
+        // `spec.free_dims > SQUARE_MAX_FREE_DIMS`, the profile copies that same
+        // constant into `params.free_dims_ceiling`, and `SpecFacts::free_dims`
+        // is `domain.free_dims()` off the very box handed to `search`
+        // (ny-cli `falsify_portfolio::spec_facts_from`). So the two agree on
+        // every production path and this branch cannot be taken -- no lever, no
+        // default moves.
+        //
+        // It exists because `ParamSpace::free_dims_ceiling` is documented
+        // "per strategy, never shared" and cites ny's MEASURED regression
+        // (`model_30_idx_1703_eps_15`, 1.3 s -> 139.4 s, 0 accepted flips) as
+        // the reason -- yet the threaded value had no reader, so a NARROWED
+        // per-slice ceiling was silently ignored and only the strategy's
+        // private constant ever bound. That is the same shape as the measured
+        // instance itself. The field is now the authority it claims to be.
+        if n > budget.params.free_dims_ceiling {
+            effort.wall = started.elapsed();
+            return Proposal::Exhausted(effort);
+        }
         if n < SQUARE_MIN_FREE_DIMS {
             effort.wall = started.elapsed();
             return Proposal::Exhausted(effort);

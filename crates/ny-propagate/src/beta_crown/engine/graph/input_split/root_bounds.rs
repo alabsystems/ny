@@ -23,6 +23,124 @@ type RootBoundsValue = (
     Option<GraphAlphaState>,
 );
 
+/// Absolute authority for the input-split root-joint treatment.
+///
+/// A standalone research call has no top-level deadline and retains the
+/// historical `_SECS` grace request. Every scored caller carries its overall
+/// instance deadline independently of restart-cache availability; that deadline
+/// is an unbreakable ceiling, even when the earlier initial-bounds phase has
+/// spent its own sub-deadline. Overflow fails closed unless the caller supplied
+/// the stronger absolute authority.
+fn root_joint_pass_deadline(
+    now: Instant,
+    requested: std::time::Duration,
+    overall_deadline: Option<Instant>,
+) -> Option<Instant> {
+    match (now.checked_add(requested), overall_deadline) {
+        (Some(requested_deadline), Some(overall)) => Some(requested_deadline.min(overall)),
+        (Some(requested_deadline), None) => Some(requested_deadline),
+        (None, Some(overall)) => Some(overall),
+        (None, None) => None,
+    }
+}
+
+/// Strictest absolute wall carried by an input-split verification call.
+///
+/// `caller_deadline` is the ordinary BaB/ledger boundary. Some scored routes
+/// deliberately carry a longer effort-shaping horizon and therefore also set
+/// `scored_wall`; that wall must still cap optional root work. No deadline at
+/// either seam means a genuinely standalone/direct research call, which keeps
+/// the historical root-joint grace request.
+pub(crate) fn input_split_root_authority_deadline(
+    caller_deadline: Option<Instant>,
+    scored_wall: Option<Instant>,
+) -> Option<Instant> {
+    match (caller_deadline, scored_wall) {
+        (Some(caller), Some(wall)) => Some(caller.min(wall)),
+        (Some(caller), None) => Some(caller),
+        (None, Some(wall)) => Some(wall),
+        (None, None) => None,
+    }
+}
+
+/// Guarantees one closed execution receipt even when root collection exits via
+/// a cache hit or `?` before the optional treatment reaches its own block.
+struct RootJointInvocationGuard(Option<crate::execution_telemetry::RootJointIntermAlphaInvocation>);
+
+impl RootJointInvocationGuard {
+    fn new(invocation: crate::execution_telemetry::RootJointIntermAlphaInvocation) -> Self {
+        Self(Some(invocation))
+    }
+
+    fn invocation_mut(
+        &mut self,
+    ) -> &mut crate::execution_telemetry::RootJointIntermAlphaInvocation {
+        self.0
+            .as_mut()
+            .expect("root-joint invocation records exactly once at drop")
+    }
+}
+
+impl Drop for RootJointInvocationGuard {
+    fn drop(&mut self) {
+        if let Some(invocation) = self.0.take() {
+            crate::execution_telemetry::record_root_joint_interm_alpha_invocation(invocation);
+        }
+    }
+}
+
+/// Closed result of the finite-deadline root-joint engine route.
+///
+/// The nested factory result is deliberate: the outer `Option` says whether a
+/// deadline-safe sound-f64 engine was available, while the inner `Option` says
+/// whether that engine exposed the exact bounded root-joint capability. Only a
+/// completed typed invocation owns an attempt.
+enum RootJointDeadlineDispatch<R> {
+    Completed(R),
+    CapabilityUnavailable,
+    ExecutionRefused(NyError),
+}
+
+impl<R> RootJointDeadlineDispatch<R> {
+    fn terminal_receipt(
+        &self,
+    ) -> (
+        usize,
+        crate::execution_telemetry::RootJointIntermAlphaOutcome,
+    ) {
+        match self {
+            Self::Completed(_) => (
+                1,
+                crate::execution_telemetry::RootJointIntermAlphaOutcome::Completed,
+            ),
+            Self::CapabilityUnavailable => (
+                0,
+                crate::execution_telemetry::RootJointIntermAlphaOutcome::CapabilityUnavailable,
+            ),
+            Self::ExecutionRefused(_) => (
+                0,
+                crate::execution_telemetry::RootJointIntermAlphaOutcome::ExecutionRefused,
+            ),
+        }
+    }
+}
+
+fn finish_root_joint_deadline_dispatch<R>(
+    local: Option<R>,
+    factory: impl FnOnce() -> Result<Option<Option<R>>>,
+) -> RootJointDeadlineDispatch<R> {
+    if let Some(completed) = local {
+        // A completed local attempt, including a sound zero-result, owns this
+        // invocation. Never retry it on another backend.
+        return RootJointDeadlineDispatch::Completed(completed);
+    }
+    match factory() {
+        Ok(Some(Some(completed))) => RootJointDeadlineDispatch::Completed(completed),
+        Ok(Some(None)) | Ok(None) => RootJointDeadlineDispatch::CapabilityUnavailable,
+        Err(error) => RootJointDeadlineDispatch::ExecutionRefused(error),
+    }
+}
+
 /// Clone the numeric alpha state bit-for-bit while detaching its mutable,
 /// cost-only GPU-suffix negative cache. Ordinary `GraphAlphaState::clone`
 /// intentionally shares that `Arc`; a first restart may populate it during
@@ -260,7 +378,11 @@ fn root_collection_options_identity(
     engine: Option<&dyn GemmEngine>,
 ) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"ny.disjunctive-root-cache.options.v2\0");
+    // v3 (#target-cost-weight): the two CROWN-IBP target-scheduling fields are
+    // appended below, so the byte layout changed. The tag is bumped rather than
+    // silently extended — a v2 entry keyed under the old layout must never be
+    // served to a run whose collection schedule differs.
+    bytes.extend_from_slice(b"ny.disjunctive-root-cache.options.v3\0");
     bytes.push(u8::from(config.use_alpha_crown));
     bytes.push(u8::from(config.use_forward_bounds));
     bytes.push(u8::from(config.use_crown_ibp));
@@ -272,9 +394,15 @@ fn root_collection_options_identity(
         }
         None => bytes.push(0),
     }
+    // #target-cost-weight: these two choose WHICH collection targets get time,
+    // which decides which nodes publish CROWN∩IBP and which keep their IBP
+    // fallback — so two runs differing only here produce different (both sound)
+    // root maps. They are semantic cache key material, not diagnostics.
+    bytes.push(u8::from(config.crown_ibp_prefix_cost_weighted));
     for value in [
         config.crown_ibp_per_node_floor_secs,
         config.crown_ibp_per_node_cap_secs,
+        config.crown_ibp_max_target_share_frac,
     ] {
         match value {
             Some(value) => {
@@ -513,12 +641,78 @@ pub(crate) fn collect_input_split_root_node_bounds(
     config: &BetaCrownConfig,
     engine: Option<&dyn GemmEngine>,
     initial_deadline: Option<Instant>,
+    root_joint_authority_deadline: Option<Instant>,
     mode_label: &str,
     restart_cache: Option<(&InputSplitRootBoundsCache, Option<Instant>)>,
 ) -> Result<(
     Option<HashMap<String, BoundedTensor>>,
     Option<GraphAlphaState>,
 )> {
+    // Root-joint authority is independent of restart-cache availability. A
+    // non-cache route and a cache miss owe the same absolute scored wall.
+    let overall_deadline = root_joint_authority_deadline;
+    let invocation_started = Instant::now();
+    let configured_master = crate::preset_gates::root_joint_interm_alpha_enabled();
+    let configured_secs = crate::preset_gates::root_joint_interm_alpha_secs();
+    let configured_iters = crate::preset_gates::root_joint_interm_alpha_iters();
+    let configured_lr = crate::preset_gates::root_joint_interm_alpha_lr() as f32;
+    let configured_max_sel = crate::preset_gates::root_joint_interm_alpha_max_sel();
+    let configured_frozen_stop = crate::preset_gates::root_joint_interm_alpha_frozen_stop_enabled();
+    let configured_pure_chain = crate::preset_gates::root_joint_interm_alpha_pure_chain_enabled();
+    let configured_bn_gpu_extract = crate::preset_gates::bn_gpu_extract_enabled();
+    let configured_deadline_ascent =
+        crate::preset_gates::root_joint_interm_alpha_deadline_ascent_enabled();
+    let deadline_lane_requested = crate::sound_gpu_gate::root_joint_deadline_lane_requested();
+    debug_assert_eq!(
+        deadline_lane_requested,
+        configured_master && configured_deadline_ascent,
+        "the compound GPU admission must use the same governed answers as the receipt"
+    );
+    let configured_min_remaining_secs = crate::preset_gates::root_joint_min_remaining_secs();
+    let configured_max_dim_override =
+        crate::preset_gates::root_joint_interm_alpha_max_dim_override();
+    let configured_max_dim = configured_max_dim_override.unwrap_or(32_768);
+    let mut root_joint_invocation =
+        RootJointInvocationGuard::new(crate::execution_telemetry::RootJointIntermAlphaInvocation {
+            route: crate::execution_telemetry::RootJointIntermAlphaRoute::InputSplit,
+            configured_master,
+            configured_max_dim_override,
+            configured_max_dim,
+            configured_secs,
+            configured_iters: u64::try_from(configured_iters).unwrap_or(u64::MAX),
+            configured_lr,
+            configured_max_sel: u64::try_from(configured_max_sel).unwrap_or(u64::MAX),
+            configured_frozen_stop,
+            configured_pure_chain,
+            configured_bn_gpu_extract,
+            configured_deadline_ascent,
+            configured_min_remaining_secs,
+            target_count: 0,
+            available_budget: overall_deadline
+                .map(|deadline| deadline.saturating_duration_since(invocation_started))
+                .unwrap_or_else(|| std::time::Duration::from_secs(configured_secs)),
+            effective_slice: std::time::Duration::ZERO,
+            attempts: 0,
+            tightened_count: 0,
+            outlier_tightened_count: 0,
+            target_attempts: 0,
+            base_folds_completed: 0,
+            effective_iters: 0,
+            ascent_iterations_attempted: 0,
+            max_ascent_iterations_attempted: 0,
+            optimizer_steps: 0,
+            ascent_folds_completed: 0,
+            max_selected_rows: 0,
+            selection_cap_bound_targets: 0,
+            frozen_stop_targets: 0,
+            pure_chain_targets: 0,
+            bn_extract_targets: 0,
+            outcome: if configured_master {
+                crate::execution_telemetry::RootJointIntermAlphaOutcome::ExecutionRefused
+            } else {
+                crate::execution_telemetry::RootJointIntermAlphaOutcome::MasterDisabled
+            },
+        });
     let cache_key = restart_cache.and_then(|(cache, overall_deadline)| {
         cache
             .deadline_matches(overall_deadline)
@@ -652,7 +846,7 @@ pub(crate) fn collect_input_split_root_node_bounds(
         // inherits the tightened map. SOUND: shrink-only sound-fold intersect in
         // the driver; fail-closed on unsupported topology (prep refusal => the
         // reference bounds are kept unchanged).
-        if std::env::var("NY_ROOT_JOINT_INTERM_ALPHA").ok().as_deref() == Some("1") {
+        if configured_master {
             let now = Instant::now();
             // #root-joint-diag (dark; only under the gate): unconditional trace so a
             // probe run can see the seam is REACHED and why it may no-op — the
@@ -666,11 +860,7 @@ pub(crate) fn collect_input_split_root_node_bounds(
             );
             // #generator-enclosure diag: per-node mean width profile of the frozen
             // map (exec order), to locate WHERE the enclosure blows up.
-            if std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_PROBE")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
+            if crate::preset_gates::root_joint_interm_alpha_probe_enabled() {
                 if let Ok(order) = graph.exec_order() {
                     for name in order {
                         if let Some(bt) = bounds.get(name) {
@@ -687,79 +877,179 @@ pub(crate) fn collect_input_split_root_node_bounds(
                     }
                 }
             }
-            let grace = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_SECS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(30);
+            let grace = configured_secs;
             let remaining = initial_deadline
                 .map(|d| d.saturating_duration_since(now))
                 .unwrap_or_else(|| std::time::Duration::from_secs(grace));
             // The alpha-CROWN collect above CONSUMES the initial-bounds phase
             // deadline (measured on cgan: remaining == 0.0s at this point on
             // every route), so budgeting the joint pass off that spent deadline
-            // permanently no-ops it. This is a DARK research lever: when the
-            // phase window is exhausted, borrow the grace cap outright —
-            // budget-only (sound), bounded by _SECS, and unreachable unless the
-            // gate is explicitly set. A scored enable must re-budget properly.
-            // Dark research lever: ALWAYS take the grace, ignoring the (already
-            // mostly-spent, run-to-run noisy) initial-bounds phase window.
+            // permanently no-ops it. The joint pass therefore requests its own
+            // `_SECS` slice instead of reusing that spent sub-deadline.
+            // The historical research route always takes the grace, ignoring
+            // the mostly-spent, run-to-run noisy initial-bounds phase window.
             // Measured: remaining oscillates 0-36s across invocations, and
             // slice=remaining*0.5 starved every walk (v5: 17.2s envelope, all
             // five targets reference-filled); only the grace-borrow path ever
-            // succeeded. Budget-borrow is sound (schedule-only) and the lever is
-            // unreachable unless the gate is explicitly set; a scored enable
-            // must integrate with the real phase budget.
+            // succeeded. A standalone research call (no overall authority)
+            // retains that behavior. Every scored input-split caller supplies
+            // its real authority independently of the restart cache; the helper
+            // below caps the grace by it, so typed delivery can never extend
+            // the process wall.
             let _ = remaining;
-            let slice = std::time::Duration::from_secs(grace);
-            if slice >= std::time::Duration::from_secs(2) {
-                // #image-node-crown: fix width-outlier nodes FIRST (the generator's
-                // image node never gets a CROWN bound — activation-input targets
-                // only — and its one-interval-step entry blows up 100x+), so the
-                // joint pass below inherits the tighter stop box.
-                // Full slice: measured on cgan, the five amplifier walks +
-                // iterated passes need ~1-3 min; a 60s sub-cap starved them to a
-                // single target per invocation (ConvT_13 26.25 -> 0.02 proved the
-                // mechanism; the cascade needs the rest).
-                let n_outlier = graph.tighten_outlier_node_bounds(
-                    input,
-                    &alpha_state,
-                    engine,
-                    Some(now + slice),
-                    &mut bounds,
-                );
-                if n_outlier > 0 {
-                    eprintln!(
-                        "[image-node-crown] input-split root: {n_outlier} outlier node(s) tightened"
-                    );
-                }
-                let targets = crate::beta_crown::engine::graph::propagation::batched::interm_refine::scoped_joint_alpha_targets(graph, &bounds);
+            let requested_slice = std::time::Duration::from_secs(grace);
+            let pass_deadline =
+                match root_joint_pass_deadline(now, requested_slice, overall_deadline) {
+                    Some(deadline) => deadline,
+                    None => {
+                        eprintln!(
+                            "[root-joint-interm-alpha] input-split deadline overflow; skipping"
+                        );
+                        now
+                    }
+                };
+            let slice = pass_deadline.saturating_duration_since(now);
+            {
+                let invocation = root_joint_invocation.invocation_mut();
+                invocation.available_budget = overall_deadline
+                    .map(|deadline| deadline.saturating_duration_since(now))
+                    .unwrap_or(requested_slice);
+                invocation.effective_slice = slice;
+                invocation.outcome = if deadline_lane_requested {
+                    crate::execution_telemetry::RootJointIntermAlphaOutcome::SliceTooSmall
+                } else {
+                    crate::execution_telemetry::RootJointIntermAlphaOutcome::DeadlineRouteDisabled
+                };
+            }
+            if deadline_lane_requested && slice >= std::time::Duration::from_secs(2) {
+                let targets = crate::beta_crown::engine::graph::propagation::batched::interm_refine::scoped_joint_alpha_targets_demand_ranked(graph, &bounds);
+                root_joint_invocation.invocation_mut().target_count = targets.len();
                 eprintln!(
                     "[root-joint-interm-alpha] input-split targets={} slice_ok=1",
                     targets.len()
                 );
                 if !targets.is_empty() {
-                    let iters = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_ITERS")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<usize>().ok())
-                        .unwrap_or(100);
-                    let lr = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_LR")
-                        .ok()
-                        .and_then(|s| s.trim().parse::<f32>().ok())
-                        .unwrap_or(0.1);
-                    let n = crate::beta_crown::engine::graph::propagation::batched::interm_refine::root_joint_tighten_relu_preactivations(
-                        graph,
-                        input,
-                        &targets,
-                        engine,
-                        Some(now + slice),
-                        iters,
-                        lr,
-                        &mut bounds,
-                    );
-                    info!(
-                        "[root-joint-interm-alpha] input-split root: {n}/{} target(s) tightened",
-                        targets.len()
-                    );
+                    let iters = configured_iters;
+                    let lr = configured_lr;
+                    let local = engine.and_then(|local_engine| {
+                        crate::sound_gpu_gate::with_root_joint_deadline_gpu(
+                            local_engine,
+                            |gpu| {
+                                // #image-node-crown: this prerequisite and the
+                                // joint pass are one treatment owned by the same
+                                // exact-qualified engine. Its separate counter
+                                // prevents an outlier-only shrink from masquerading
+                                // as joint-alpha target work.
+                                let outlier_tightened_count = graph.tighten_outlier_node_bounds(
+                                    input,
+                                    &alpha_state,
+                                    Some(local_engine),
+                                    Some(pass_deadline),
+                                    &mut bounds,
+                                );
+                                let report = crate::beta_crown::engine::graph::propagation::batched::interm_refine::root_joint_tighten_relu_preactivations_with_deadline_gpu(
+                                    graph,
+                                    input,
+                                    &targets,
+                                    gpu,
+                                    pass_deadline,
+                                    iters,
+                                    lr,
+                                    None,
+                                    &mut bounds,
+                                );
+                                (report, outlier_tightened_count)
+                            },
+                        )
+                    });
+                    let dispatch = finish_root_joint_deadline_dispatch(local, || {
+                        crate::sound_f64_gemm::with_engine_deadline(
+                            pass_deadline,
+                            |factory_engine| {
+                                crate::sound_gpu_gate::with_root_joint_deadline_gpu(
+                                    factory_engine,
+                                    |gpu| {
+                                        let outlier_tightened_count = graph
+                                            .tighten_outlier_node_bounds(
+                                                input,
+                                                &alpha_state,
+                                                Some(factory_engine),
+                                                Some(pass_deadline),
+                                                &mut bounds,
+                                            );
+                                        let report = crate::beta_crown::engine::graph::propagation::batched::interm_refine::root_joint_tighten_relu_preactivations_with_deadline_gpu(
+                                            graph,
+                                            input,
+                                            &targets,
+                                            gpu,
+                                            pass_deadline,
+                                            iters,
+                                            lr,
+                                            None,
+                                            &mut bounds,
+                                        );
+                                        (report, outlier_tightened_count)
+                                    },
+                                )
+                            },
+                        )
+                    });
+                    let (attempts, terminal_outcome) = dispatch.terminal_receipt();
+                    match dispatch {
+                        RootJointDeadlineDispatch::Completed((report, outlier_tightened_count)) => {
+                            {
+                                let invocation = root_joint_invocation.invocation_mut();
+                                invocation.attempts = attempts;
+                                invocation.tightened_count = report.tightened_count;
+                                invocation.outlier_tightened_count = outlier_tightened_count;
+                                invocation.target_attempts = report.target_attempts;
+                                invocation.base_folds_completed = report.base_folds_completed;
+                                invocation.effective_iters = report.effective_iters;
+                                invocation.ascent_iterations_attempted =
+                                    report.ascent_iterations_attempted;
+                                invocation.max_ascent_iterations_attempted =
+                                    report.max_ascent_iterations_attempted;
+                                invocation.optimizer_steps = report.optimizer_steps;
+                                invocation.ascent_folds_completed = report.ascent_folds_completed;
+                                invocation.max_selected_rows = report.max_selected_rows;
+                                invocation.selection_cap_bound_targets =
+                                    report.selection_cap_bound_targets;
+                                invocation.frozen_stop_targets = report.frozen_stop_targets;
+                                invocation.pure_chain_targets = report.pure_chain_targets;
+                                invocation.bn_extract_targets = report.bn_extract_targets;
+                                invocation.outcome = terminal_outcome;
+                            }
+                            if outlier_tightened_count > 0 {
+                                eprintln!(
+                                    "[image-node-crown] input-split root: {outlier_tightened_count} outlier node-pass(es) tightened"
+                                );
+                            }
+                            info!(
+                                "[root-joint-interm-alpha] input-split root: {}/{} target(s) tightened",
+                                report.tightened_count,
+                                targets.len()
+                            );
+                        }
+                        RootJointDeadlineDispatch::CapabilityUnavailable => {
+                            let invocation = root_joint_invocation.invocation_mut();
+                            invocation.attempts = attempts;
+                            invocation.outcome = terminal_outcome;
+                            eprintln!(
+                                "[root-joint-interm-alpha] input-split sound CUDA factory or exact bounded root-joint capability unavailable; skipping (sound no-op)"
+                            );
+                        }
+                        RootJointDeadlineDispatch::ExecutionRefused(error) => {
+                            let invocation = root_joint_invocation.invocation_mut();
+                            invocation.attempts = attempts;
+                            invocation.outcome = terminal_outcome;
+                            eprintln!(
+                                "[root-joint-interm-alpha] input-split sound CUDA factory admission refused: {error}; skipping (sound no-op)"
+                            );
+                        }
+                    }
+                } else {
+                    root_joint_invocation.invocation_mut().outcome =
+                        crate::execution_telemetry::RootJointIntermAlphaOutcome::NoTargets;
                 }
             }
         }

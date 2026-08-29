@@ -119,7 +119,7 @@ impl PgdAttacker<'_> {
             // Poll per STEP too. Schedule-only and attack-only: stopping the
             // ascent early can only return a weaker (or no) candidate, never a
             // wrong verdict.
-            if self.config().past_deadline() {
+            if self.past_deadline() {
                 break;
             }
             let output = self.evaluate(network, &x)?;
@@ -389,7 +389,7 @@ impl PgdAttacker<'_> {
         let mut failed_restarts = 0usize;
 
         for restart in 0..self.config().num_restarts {
-            if self.config().past_deadline() {
+            if self.past_deadline() {
                 break;
             }
 
@@ -477,7 +477,7 @@ impl PgdAttacker<'_> {
         let results: Vec<_> = (0..self.config().num_restarts)
             .into_par_iter()
             .filter_map(|restart| {
-                if found.load(Ordering::Relaxed) || self.config().past_deadline() {
+                if found.load(Ordering::Relaxed) || self.past_deadline() {
                     return None;
                 }
 

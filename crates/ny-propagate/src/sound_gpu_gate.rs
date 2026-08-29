@@ -675,11 +675,8 @@ fn resident_cut_shadow_backend_from_gate<'a>(
         .filter(|gpu| gpu.provides_resident_cut_shadow())
 }
 
-fn root_joint_deadline_lane_requested_from_values(
-    root_joint: Option<&str>,
-    deadline_ascent: Option<&str>,
-) -> bool {
-    root_joint == Some("1") && deadline_ascent == Some("1")
+fn root_joint_deadline_lane_requested_from_values(root_joint: bool, deadline_ascent: bool) -> bool {
+    root_joint && deadline_ascent
 }
 
 /// Headroom the GPU-suffix shortcut needs before a finite request may enter it.
@@ -704,25 +701,22 @@ const GPU_SUFFIX_PREDISPATCH_HEADROOM: std::time::Duration = std::time::Duration
 /// run carries one, the GPU shortcut was unreachable in competition and reachable
 /// nowhere else.
 ///
-/// * lever OFF (default): always refuses under a deadline. Byte-identical.
-/// * lever ON: refuses only when expired or within
-///   [`GPU_SUFFIX_PREDISPATCH_HEADROOM`] of expiry, so the unpollable prologue
-///   cannot overrun the request.
+/// * lever OFF (`NY_PATCHES_FINITE_EXPIRY=0`, the kill switch): always refuses
+///   under a deadline — the historical presence behaviour, byte-identical.
+/// * lever ON (**the shipped default** — `PATCHES_FINITE_EXPIRY` declares
+///   `DefaultSpec::Bool(true)`, so absent means ARMED): refuses only when
+///   expired or within [`GPU_SUFFIX_PREDISPATCH_HEADROOM`] of expiry, so the
+///   unpollable prologue cannot overrun the request.
 #[must_use]
 pub(crate) fn gpu_suffix_declines_under_finite_authority(limit: std::time::Instant) -> bool {
-    // Reads the SAME lever declaration as the patches set-mates
-    // (`patches_step::expiry_authority_armed`) rather than calling it, because
-    // `network::core` is a private module. Latched identically: this predicate
-    // runs per node per target per iteration, and `env::var_os` there is a lock
-    // plus a scan of the whole environment block. Sharing the DECLARATION is what
-    // keeps the lanes from drifting; sharing the function would be nicer but the
-    // module graph does not allow it.
+    // Resolves the SAME central preset gate as the patches set-mates
+    // (`patches_step::expiry_authority_armed`). It keeps its own identical latch
+    // because `network::core` is private and this predicate runs per node per
+    // target per iteration. Sharing the resolver keeps both lanes on one typed
+    // preset/environment precedence rule even though they cannot share the
+    // private read-site function.
     static ARMED: OnceLock<bool> = OnceLock::new();
-    let armed = *ARMED.get_or_init(|| {
-        ny_levers::read(&ny_levers::decls::diagnostics::PATCHES_FINITE_EXPIRY)
-            .value
-            .as_bool()
-    });
+    let armed = *ARMED.get_or_init(crate::preset_gates::patches_finite_expiry_enabled);
     if !armed {
         return true;
     }
@@ -736,11 +730,9 @@ pub(crate) fn gpu_suffix_declines_under_finite_authority(limit: std::time::Insta
 /// initialize an accelerator or consume verifier wall time.
 #[must_use]
 pub(crate) fn root_joint_deadline_lane_requested() -> bool {
-    let root_joint = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA").ok();
-    let deadline_ascent = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT").ok();
     root_joint_deadline_lane_requested_from_values(
-        root_joint.as_deref(),
-        deadline_ascent.as_deref(),
+        crate::preset_gates::root_joint_interm_alpha_enabled(),
+        crate::preset_gates::root_joint_interm_alpha_deadline_ascent_enabled(),
     )
 }
 
@@ -1548,26 +1540,13 @@ mod tests {
 
     #[test]
     fn root_joint_deadline_lane_requires_both_exact_default_dark_gates() {
-        for (root_joint, deadline_ascent) in [
-            (None, None),
-            (Some("1"), None),
-            (None, Some("1")),
-            (Some("0"), Some("1")),
-            (Some("1"), Some("0")),
-            (Some("true"), Some("1")),
-            (Some("1"), Some("true")),
-            (Some(" 1 "), Some("1")),
-            (Some("1"), Some(" 1 ")),
-        ] {
+        for (root_joint, deadline_ascent) in [(false, false), (true, false), (false, true)] {
             assert!(!root_joint_deadline_lane_requested_from_values(
                 root_joint,
                 deadline_ascent
             ));
         }
-        assert!(root_joint_deadline_lane_requested_from_values(
-            Some("1"),
-            Some("1")
-        ));
+        assert!(root_joint_deadline_lane_requested_from_values(true, true));
     }
 
     #[test]

@@ -211,6 +211,7 @@ pub(super) fn try_patches_target_step_core(
     engine: Option<&dyn ny_core::GemmEngine>,
     per_node_deadline: Option<std::time::Instant>,
     deadline_is_hard: bool,
+    flat_bias_enabled: bool,
     collector_patches_override: bool,
     alpha_state: Option<&GraphAlphaState>,
 ) -> Result<bool> {
@@ -330,7 +331,7 @@ pub(super) fn try_patches_target_step_core(
         }
     }
 
-    match crown_backward_step_patches_with_deadline_authority(
+    match crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy(
         &node.layer,
         node_cb,
         pre_activation,
@@ -339,6 +340,7 @@ pub(super) fn try_patches_target_step_core(
         label,
         per_node_deadline,
         deadline_is_hard,
+        flat_bias_enabled,
     ) {
         Ok(CrownStepResult::Continue) => {
             graph.accumulate_crown_bounds_to_input_with_deadline_authority(

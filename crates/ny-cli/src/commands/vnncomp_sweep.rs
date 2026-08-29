@@ -19,14 +19,13 @@
 //!   comes from `instances.csv`; `--timeout-cap` may only LOWER it, and when it
 //!   does, the emitted CSV and the summary both say so.
 //! * **environment drift** — the scored path is
-//!   `vnncomp_scripts/run_instance.sh`, which exports throughput and lane
-//!   settings before calling `ny vnncomp`. A sweep that omits them measures a
-//!   DIFFERENT verifier than the one being submitted, and the difference shows
-//!   up exactly where it hurts: those knobs can only turn a budget-edge timeout
-//!   into its already-certified UNSAT, so omitting them makes budget-edge rows
-//!   look capability-limited. `submission_environment` below replicates the
-//!   wrapper, and `sweep_environment_matches_the_submission_wrapper` parses the
-//!   wrapper and fails when the two drift apart.
+//!   `vnncomp_scripts/run_instance.sh`, which exports the deterministic
+//!   throughput setting before calling `ny vnncomp`. A sweep that omits it
+//!   measures a different performance environment than the submission.
+//!   Verdict-affecting lane settings travel through typed presets instead.
+//!   `submission_environment` below replicates the wrapper, and
+//!   `sweep_environment_matches_the_submission_wrapper` parses the wrapper and
+//!   fails when the two drift apart.
 //!
 //! Layouts handled (both are real in-tree today):
 //! * flat — `benchmarks/vnncomp2025/benchmarks/<category>/instances.csv`
@@ -56,6 +55,8 @@
 //! manifest at sweep end.
 
 use anyhow::{bail, Context, Result};
+use flate2::read::GzDecoder;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 /// Content-addressed verdict cache (#sweep-cache): turns an arm x row matrix into
@@ -111,9 +112,8 @@ fn parse_budget_secs(raw: &str, lineno: usize) -> Result<u64> {
 /// before it execs `ny vnncomp`.
 ///
 /// A sweep MUST reproduce this or it measures a different verifier than the one
-/// being submitted. That is not hypothetical: the `safenlp_2024`
-/// `NY_UPFRONT_ATTACK` lane lived only in the wrapper, so every measurement path
-/// disagreed with the submission path on rows it could actually solve.
+/// being submitted. Historically the `safenlp_2024` upfront lane lived only in
+/// a wrapper export; it now travels through the frozen typed preset instead.
 ///
 /// `NY_MARGIN_ROW_CONV_BWD_BLOCKED=1` / `NY_MARGIN_ROW_PARALLEL=1` were removed
 /// from this list (and from the wrapper and the scorecard script) because 1 has
@@ -129,8 +129,8 @@ fn parse_budget_secs(raw: &str, lineno: usize) -> Result<u64> {
 /// (`configs/vnncomp26/safenlp_2024.yaml`) is consumed by
 /// `commands::vnncomp::upfront_wrapper_route` (`ForcedByPreset`), so a sweep
 /// arms the same lane the submission wrapper arms without any category-fenced
-/// export. `run_instance.sh`'s `NY_UPFRONT_ATTACK=1` for safenlp_2024 is now a
-/// redundant belt-and-braces force of the identical route, not a divergence.
+/// export. The redundant SafeNLP shell force was removed once the same frozen
+/// LeverSet became the execution and receipt authority.
 pub(crate) fn submission_environment() -> &'static [(&'static str, &'static str)] {
     &[
         // ny uses faer/ndarray matrixmultiply, not OpenBLAS; single-threaded OMP
@@ -181,6 +181,20 @@ pub(crate) fn parse_instances(body: &str) -> Result<Vec<SweepInstance>> {
 /// One `--instances` selector: a row identity from `instances.csv`, prefixed
 /// with the category that owns it.
 type InstanceSelector = (String, String, String);
+
+/// Cross-tool schema for the semantic identity of an exact row selector.
+///
+/// `scripts/ny_search.py` uses the same schema and canonical JSON payload, so
+/// it can compare the selector it requested with the selector the native sweep
+/// sealed without depending on a temporary file's path or byte layout.
+const INSTANCE_SELECTOR_IDENTITY_SCHEMA: &str = "ny-search/instance-selectors/v1";
+
+/// Cross-tool schema for the exact selected row set materialized from a plan.
+const MEASURED_ROW_SET_IDENTITY_SCHEMA: &str = "ny-search/measured-row-set/v1";
+
+/// Schema for the explicit resolved-file companion to the semantic row set.
+const SELECTED_ROW_INPUTS_SCHEMA: &str = "ny-cli/selected-row-inputs/v2";
+const ONNX_CACHE_INPUT_SCHEMA: &str = "ny-cli/onnx-cache-input/v1";
 
 /// Parse an `--instances` file into row selectors.
 ///
@@ -278,6 +292,21 @@ fn ensure_every_selector_matched(
         },
         selected_categories.join(", ")
     );
+}
+
+/// Whether one corpus row belongs to this invocation's requested subset.
+///
+/// Exact selectors are identities, not occurrence selectors: if an official
+/// `instances.csv` repeats the same model/property pair, selecting that pair
+/// selects every occurrence. The full `instances.csv` fingerprint in the
+/// manifest pins how many such occurrences exist and where they occur.
+fn instance_is_selected(
+    wanted: Option<&HashSet<InstanceSelector>>,
+    identity: &InstanceSelector,
+    index: usize,
+    take: usize,
+) -> bool {
+    wanted.map_or(index < take, |wanted| wanted.contains(identity))
 }
 
 /// Quote a CSV field when it contains a comma, quote, or newline.
@@ -430,9 +459,10 @@ pub(crate) struct SweepRow {
     /// #arm-overrides: the lever assignment this row was measured under, sorted.
     ///
     /// A verdict is only interpretable together with the configuration that
-    /// produced it. Recording the arm ON THE ROW means two arms of the same
-    /// instance can coexist in one bank without ambiguity, and a cache can key on
-    /// it. Empty (and omitted) for a default-configuration row, so existing banks
+    /// produced it. Recording the arm ON THE ROW lets legacy manifests prove a
+    /// one-time arm adoption and makes any historical mixed bank diagnosable;
+    /// the manifest seal now prevents different arms from entering one bank.
+    /// Empty (and omitted) for a default-configuration row, so existing banks
     /// round-trip unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) arm: Vec<(String, String)>,
@@ -734,6 +764,84 @@ struct ArtifactFingerprint {
     sha256: String,
 }
 
+/// One external tensor-data file named by an ONNX model.
+///
+/// `location` is the normalized relative POSIX path authored in the protobuf;
+/// `artifact` binds that logical dependency to the exact resolved file bytes.
+/// Hashing only the `.onnx` container is incomplete because ONNX permits tensor
+/// payloads to live in sibling files whose contents can change independently.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct ExternalDataInputFingerprint {
+    location: String,
+    artifact: ArtifactFingerprint,
+}
+
+/// One resolved ONNX member and the exact bytes planned for this sweep.
+///
+/// A relational model has one entry per labelled network, in literal order;
+/// a single-model row has one entry whose label is absent. Keeping the label in
+/// the seal prevents two byte-identical members from being silently exchanged.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct ModelInputFingerprint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    artifact: ArtifactFingerprint,
+    /// Affirmative closure of every external tensor-data location this model
+    /// can read. `Some([])` is meaningful; `None` identifies an incomplete
+    /// legacy/tampered record and is never valid under schema v2.
+    #[serde(default)]
+    external_data: Option<Vec<ExternalDataInputFingerprint>>,
+}
+
+/// Exact resolved inputs for one planned corpus row (#instance-content-seal).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct ResolvedInstanceInputs {
+    onnx: Vec<ModelInputFingerprint>,
+    vnnlib: ArtifactFingerprint,
+}
+
+/// Audit-visible binding from a selected semantic row to its resolved bytes.
+///
+/// `selected_rows` remains the cross-language v1 identity consumed by
+/// `ny_search.py`. This companion seal closes the content hole without changing
+/// that wire contract: the CSV field strings can stay identical while a model
+/// or property is edited in place.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct SelectedRowInputSeal {
+    onnx: String,
+    vnnlib: String,
+    occurrence: usize,
+    instance_index: usize,
+    inputs: ResolvedInstanceInputs,
+}
+
+/// Compact, stable, order-insensitive identity of a semantic set.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct SemanticSetIdentity {
+    schema: String,
+    count: usize,
+    sha256: String,
+}
+
+/// The row-selection operation applied independently to every selected
+/// category. This is part of a sweep bank's resume identity.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum InstanceSelection {
+    /// Run every row in each selected category.
+    All,
+    /// Run the first `per_category` rows in each selected category.
+    Limit { per_category: usize },
+    /// Run the exact semantic set named by `--instances`.
+    Exact { identity: SemanticSetIdentity },
+}
+
+fn canonical_arm(arm: &[(String, String)]) -> Vec<(String, String)> {
+    let mut canonical = arm.to_vec();
+    canonical.sort();
+    canonical
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 struct SweepManifest {
     schema_version: u32,
@@ -743,6 +851,19 @@ struct SweepManifest {
     timeout_cap: Option<u64>,
     configs: Option<ArtifactFingerprint>,
     executable: ArtifactFingerprint,
+    /// The canonical `NY_BUILD_ID_V1 …` line of the binary that measured this
+    /// bank (#binary-identity).
+    ///
+    /// `executable.sha256` above already content-addresses the file, but a
+    /// digest cannot be read. This line names the DERIVED VERSION
+    /// (`<major>.<minor>.<rev-list count>[+dirty.<commit>.<diff>]`), the cargo feature
+    /// tier, the compiled backend class, and the impl markers — the things a
+    /// human compares when two banks disagree. Two rows whose versions differ
+    /// were not produced by the same verifier, full stop.
+    ///
+    /// Empty on banks written before #binary-identity existed.
+    #[serde(default)]
+    build_id: String,
     build_provenance: String,
     target_os: String,
     target_arch: String,
@@ -756,7 +877,22 @@ struct SweepManifest {
     /// are still not comparable. Empty on banks written before the probe.
     #[serde(default)]
     host: String,
-    /// Ambient `NY_*` / `OMP_NUM_THREADS` at sweep start (#arm-sealing).
+    /// Canonical explicit `--lever` arm applied to every child in this bank.
+    ///
+    /// `Some([])` is an affirmative baseline seal. `None` means only that the
+    /// manifest predates this field; a legacy resume may adopt the requested
+    /// arm only after every retained measurement's row provenance agrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    arm: Option<Vec<(String, String)>>,
+    /// Version of the ambient capture contract used by `ambient_env`.
+    ///
+    /// Absent manifests used the pre-Rayon capture and are legacy even when
+    /// they contain an `ambient_env` object. An unknown present schema is never
+    /// silently migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ambient_env_schema: Option<String>,
+    /// Ambient `NY_*` / thread-control environment at sweep start
+    /// (#arm-sealing).
     ///
     /// `run_instance` only ADDS `RUST_LOG` and the submission environment to each
     /// child, so any lever exported into the parent shell is inherited by every
@@ -764,10 +900,13 @@ struct SweepManifest {
     /// of which have produced fake results in this repo: a `--resume` could
     /// silently continue a bank under a different arm than it started with, and
     /// any cache keyed on this manifest would serve rows measured under an
-    /// environment the key never saw. Sealing the ambient set makes the arm part
-    /// of the bank's identity. Empty on banks written before sealing existed.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    ambient_env: BTreeMap<String, String>,
+    /// environment the key never saw. `Some({})` is affirmative evidence that
+    /// the parent was clean; `None` is reserved for manifests written before
+    /// this presence-sensitive seal existed. A legacy resume may adopt only
+    /// after every retained measurement's child flight record proves the same
+    /// effective environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ambient_env: Option<BTreeMap<String, String>>,
     /// Content fingerprint of the retained-witness directory, sealed at sweep
     /// end (#witness-retention-gap) — the directory grows during the run, so
     /// the start-of-run manifest cannot carry it. Derived output provenance
@@ -776,6 +915,36 @@ struct SweepManifest {
     /// retention existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     witness_dir: Option<ArtifactFingerprint>,
+    /// Semantic row-selection request (#instance-selection-seal).
+    ///
+    /// This must be sealed separately from `instances_csv`: the latter pins the
+    /// full source corpus, but says nothing about whether this bank ran all
+    /// rows, a first-N prefix, or an exact named subset. Absent only on manifests
+    /// written before selection sealing; a legacy resume adopts the current
+    /// request once, after which every change is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    instance_selection: Option<InstanceSelection>,
+    /// Exact selected row set for every category planned by this invocation.
+    ///
+    /// Each identity includes category/model/property, duplicate occurrence,
+    /// and source `instance_index`. A present category with `count: 0` means a
+    /// proven empty selection; an absent category is deliberately unsealed
+    /// legacy provenance. Compatible resumes compare overlapping categories
+    /// and may add new ones without relabeling omitted historical categories.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    selected_rows: BTreeMap<String, SemanticSetIdentity>,
+    /// Presence-sensitive version of `selected_row_inputs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_row_inputs_schema: Option<String>,
+    /// Resolved ONNX/VNN-LIB content for every selected row.
+    ///
+    /// The semantic row seal above deliberately uses the stable cross-tool v1
+    /// tuple and therefore cannot notice an in-place edit to a referenced file.
+    /// These explicit fingerprints are the missing half of the identity. A
+    /// retained non-error row from a manifest without this field is unproven and
+    /// is never adopted on resume.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    selected_row_inputs: BTreeMap<String, Vec<SelectedRowInputSeal>>,
     instances_csv: BTreeMap<String, ArtifactFingerprint>,
 }
 
@@ -817,6 +986,65 @@ fn finish_sha256(hasher: Sha256) -> String {
     encoded
 }
 
+/// Build a semantic-set digest shared with `scripts/ny_search.py`.
+///
+/// Python canonicalizes `{"entries":[...],"schema":"..."}` with sorted keys,
+/// compact separators and UTF-8 output. Declaring `entries` before `schema`
+/// gives serde the same key order; sorting entries gives both tools the same
+/// set-like identity even when input order changes.
+fn semantic_set_identity<T>(schema: &str, entries: &[T]) -> Result<SemanticSetIdentity>
+where
+    T: Clone + Ord + Serialize,
+{
+    #[derive(Serialize)]
+    struct CanonicalIdentity<'a, T> {
+        entries: &'a [T],
+        schema: &'a str,
+    }
+
+    let mut entries = entries.to_vec();
+    entries.sort();
+    if entries.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("semantic set {schema:?} cannot contain duplicate identities");
+    }
+    let canonical = serde_json::to_vec(&CanonicalIdentity {
+        entries: &entries,
+        schema,
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical);
+    Ok(SemanticSetIdentity {
+        schema: schema.to_string(),
+        count: entries.len(),
+        sha256: finish_sha256(hasher),
+    })
+}
+
+fn exact_instance_selection_identity(
+    selectors: &[InstanceSelector],
+) -> Result<SemanticSetIdentity> {
+    if selectors.is_empty() {
+        bail!("an exact instance selection cannot be empty");
+    }
+    semantic_set_identity(INSTANCE_SELECTOR_IDENTITY_SCHEMA, selectors)
+}
+
+fn requested_instance_selection(
+    limit: Option<usize>,
+    selectors: Option<&[InstanceSelector]>,
+) -> Result<InstanceSelection> {
+    match (limit, selectors) {
+        (None, None) => Ok(InstanceSelection::All),
+        (Some(per_category), None) => Ok(InstanceSelection::Limit { per_category }),
+        (None, Some(selectors)) => Ok(InstanceSelection::Exact {
+            identity: exact_instance_selection_identity(selectors)?,
+        }),
+        (Some(_), Some(_)) => {
+            bail!("--instances and --limit cannot both define the instance selection")
+        }
+    }
+}
+
 fn fingerprint_file(path: &Path, what: &str) -> Result<ArtifactFingerprint> {
     let (canonical, canonical_path) = canonical_utf8(path, what)?;
     if !canonical.is_file() {
@@ -828,6 +1056,418 @@ fn fingerprint_file(path: &Path, what: &str) -> Result<ArtifactFingerprint> {
         canonical_path,
         sha256: finish_sha256(hasher),
     })
+}
+
+/// Project the one early executable guard into manifest identity without
+/// reopening the mutable source path.
+fn fingerprint_from_binary_identity(
+    identity: &crate::build_id::BinaryIdentity,
+) -> Result<ArtifactFingerprint> {
+    let canonical_path = identity
+        .path
+        .to_str()
+        .map(str::to_string)
+        .with_context(|| {
+            format!(
+                "ny executable path is not valid UTF-8: {}",
+                identity.path.display()
+            )
+        })?;
+    Ok(ArtifactFingerprint {
+        canonical_path,
+        sha256: identity.exe_sha256.clone(),
+    })
+}
+
+/// Copy the guarded executable into the sweep's private directory, prove the
+/// copy has the guarded bytes, then remove write permission.
+///
+/// The original executable path is a build target and is therefore mutable.
+/// Re-hashing it before each launch narrows the race but does not close the gap
+/// between the final hash read and `exec`. The child path returned here is a
+/// private, content-verified copy that ordinary rebuilds cannot name or replace.
+/// On Unix it is mode 0500 inside tempfile's mode-0700 directory; elsewhere it
+/// is marked read-only. This is the safest portable copy-and-hash design: it
+/// does not claim filesystem immutability against the sweep's own privileged
+/// process, but it removes the live build path from every child launch.
+fn sealed_executable_copy(
+    guard: &crate::build_id::BinaryIdentityGuard,
+    scratch: &Path,
+) -> Result<PathBuf> {
+    guard
+        .reverify("creating the private executable copy")
+        .context("the ny executable changed before it could be copied")?;
+    let extension = guard.sealed().path.extension();
+    let mut file_name = PathBuf::from("sealed-ny");
+    if let Some(extension) = extension {
+        file_name.set_extension(extension);
+    }
+    let destination = scratch.join(file_name);
+    let mut source = std::fs::File::open(&guard.sealed().path).with_context(|| {
+        format!(
+            "open sealed ny executable {} for private copy",
+            guard.sealed().path.display()
+        )
+    })?;
+    let mut copy = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .with_context(|| format!("create private executable copy {}", destination.display()))?;
+    std::io::copy(&mut source, &mut copy)
+        .with_context(|| format!("copy ny executable to {}", destination.display()))?;
+    copy.flush()
+        .with_context(|| format!("flush private executable copy {}", destination.display()))?;
+    copy.sync_all()
+        .with_context(|| format!("sync private executable copy {}", destination.display()))?;
+    drop(copy);
+
+    // Detect both atomic replacement of the source while it was open and an
+    // in-place write during the copy. Either race aborts before planning.
+    guard
+        .reverify("finalizing the private executable copy")
+        .context("the ny executable changed while it was being copied")?;
+    let copied = fingerprint_file(&destination, "private ny executable copy")?;
+    if copied.sha256 != guard.sealed().exe_sha256 {
+        bail!(
+            "private ny executable copy does not match the early binary seal\n  sealed: {}\n  \
+             copied: {}",
+            guard.sealed().exe_sha256,
+            copied.sha256,
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o500))
+            .with_context(|| {
+                format!(
+                    "make private executable copy read/execute-only {}",
+                    destination.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = std::fs::metadata(&destination)
+            .with_context(|| format!("inspect private executable copy {}", destination.display()))?
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&destination, permissions).with_context(|| {
+            format!(
+                "make private executable copy read-only {}",
+                destination.display()
+            )
+        })?;
+    }
+    Ok(destination)
+}
+
+#[derive(Debug, Default)]
+struct InputFingerprintMemo {
+    artifacts: BTreeMap<PathBuf, ArtifactFingerprint>,
+    onnx_external_data: BTreeMap<PathBuf, Vec<ExternalDataInputFingerprint>>,
+}
+
+impl InputFingerprintMemo {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+fn fingerprint_input_file(
+    path: &Path,
+    what: &str,
+    memo: &mut InputFingerprintMemo,
+) -> Result<ArtifactFingerprint> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("resolve {what} {}", path.display()))?;
+    if let Some(fingerprint) = memo.artifacts.get(&canonical) {
+        return Ok(fingerprint.clone());
+    }
+    let fingerprint = fingerprint_file(&canonical, what)?;
+    memo.artifacts.insert(canonical, fingerprint.clone());
+    Ok(fingerprint)
+}
+
+fn normalize_external_data_location(raw: &str, tensor_name: &str) -> Result<String> {
+    if raw.is_empty() || raw.as_bytes().contains(&0) {
+        bail!("ONNX tensor {tensor_name:?} has an empty or NUL-containing external-data location");
+    }
+    let bytes = raw.as_bytes();
+    let looks_like_windows_prefix = raw.starts_with('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':');
+    if raw.contains('\\') || looks_like_windows_prefix {
+        bail!(
+            "ONNX tensor {tensor_name:?} external-data location {raw:?} is not a portable relative POSIX path"
+        );
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        bail!(
+            "ONNX tensor {tensor_name:?} external-data location {raw:?} must be relative to the model directory"
+        );
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => {
+                parts.push(part.to_str().with_context(|| {
+                    format!(
+                        "ONNX tensor {tensor_name:?} external-data location {raw:?} is not UTF-8"
+                    )
+                })?);
+            }
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                bail!(
+                    "ONNX tensor {tensor_name:?} external-data location {raw:?} attempts to escape the model directory"
+                );
+            }
+        }
+    }
+    if parts.is_empty() {
+        bail!("ONNX tensor {tensor_name:?} external-data location {raw:?} does not name a file");
+    }
+    Ok(parts.join("/"))
+}
+
+fn tensor_external_data_location(
+    tensor: &ny_onnx::onnx_proto::TensorProto,
+) -> Result<Option<String>> {
+    const DATA_LOCATION_DEFAULT: i32 = 0;
+    const DATA_LOCATION_EXTERNAL: i32 = 1;
+
+    match tensor.data_location {
+        DATA_LOCATION_DEFAULT if tensor.external_data.is_empty() => return Ok(None),
+        DATA_LOCATION_DEFAULT => {
+            bail!(
+                "ONNX tensor {:?} has external_data metadata but data_location is DEFAULT",
+                tensor.name
+            );
+        }
+        DATA_LOCATION_EXTERNAL => {}
+        other => {
+            bail!(
+                "ONNX tensor {:?} has unknown data_location {other}",
+                tensor.name
+            );
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut location = None;
+    for entry in &tensor.external_data {
+        if !seen.insert(entry.key.as_str()) {
+            bail!(
+                "ONNX tensor {:?} repeats external_data key {:?}",
+                tensor.name,
+                entry.key
+            );
+        }
+        match entry.key.as_str() {
+            "location" => {
+                location = Some(normalize_external_data_location(
+                    &entry.value,
+                    &tensor.name,
+                )?)
+            }
+            // These fields select or authenticate bytes inside the same file;
+            // the closure conservatively hashes the complete file.
+            "offset" | "length" | "checksum" | "basepath" => {}
+            other => {
+                bail!(
+                    "ONNX tensor {:?} has unsupported external_data key {other:?}",
+                    tensor.name
+                );
+            }
+        }
+    }
+    location
+        .map(Some)
+        .context("ONNX external_data is missing its required location")
+}
+
+fn onnx_external_data_locations(model_path: &Path, container_bytes: &[u8]) -> Result<Vec<String>> {
+    let mut decoded = Vec::new();
+    let protobuf = if model_path.extension().and_then(std::ffi::OsStr::to_str) == Some("gz") {
+        GzDecoder::new(container_bytes)
+            .read_to_end(&mut decoded)
+            .with_context(|| format!("decode gzipped ONNX model {}", model_path.display()))?;
+        decoded.as_slice()
+    } else {
+        container_bytes
+    };
+    let model = ny_onnx::onnx_proto::ModelProto::decode(protobuf).with_context(|| {
+        format!(
+            "decode ONNX model {} for dependency sealing",
+            model_path.display()
+        )
+    })?;
+    let Some(graph) = model.graph.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if !graph.sparse_initializer.is_empty() {
+        bail!(
+            "ONNX model {} contains unsupported sparse initializers; its input dependency closure cannot be proven",
+            model_path.display()
+        );
+    }
+
+    let mut locations = std::collections::BTreeSet::new();
+    for tensor in &graph.initializer {
+        if let Some(location) = tensor_external_data_location(tensor)? {
+            locations.insert(location);
+        }
+    }
+    for node in &graph.node {
+        for attribute in &node.attribute {
+            let has_tensor = attribute.t.is_some();
+            if has_tensor != (attribute.r#type == ny_onnx::onnx_proto::attribute_type::TENSOR) {
+                bail!(
+                    "ONNX attribute {:?} on node {:?} has inconsistent tensor payload/type metadata",
+                    attribute.name,
+                    node.name
+                );
+            }
+            let has_unmodeled_container = attribute.g.is_some()
+                || !attribute.tensors.is_empty()
+                || !attribute.graphs.is_empty()
+                || attribute.sparse_tensor.is_some()
+                || !attribute.sparse_tensors.is_empty();
+            if has_unmodeled_container || matches!(attribute.r#type, 5 | 9..=12) {
+                bail!(
+                    "ONNX attribute {:?} on node {:?} uses an unsupported nested tensor container; its input dependency closure cannot be proven",
+                    attribute.name,
+                    node.name
+                );
+            }
+            if let Some(tensor) = attribute.t.as_ref() {
+                if let Some(location) = tensor_external_data_location(tensor)? {
+                    locations.insert(location);
+                }
+            }
+        }
+    }
+    Ok(locations.into_iter().collect())
+}
+
+fn ensure_external_data_path_has_no_symlinks(model_dir: &Path, location: &str) -> Result<PathBuf> {
+    let mut path = model_dir.to_path_buf();
+    let parts = location.split('/').collect::<Vec<_>>();
+    for (index, part) in parts.iter().enumerate() {
+        path.push(part);
+        let metadata = std::fs::symlink_metadata(&path).with_context(|| {
+            format!(
+                "inspect ONNX external-data dependency {location:?} at {}",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "ONNX external-data dependency {location:?} contains a symlink at {}; the verifier rejects sidecar symlinks",
+                path.display()
+            );
+        }
+        if index + 1 < parts.len() && !metadata.is_dir() {
+            bail!(
+                "ONNX external-data dependency {location:?} traverses non-directory {}",
+                path.display()
+            );
+        }
+        if index + 1 == parts.len() && !metadata.is_file() {
+            bail!(
+                "ONNX external-data dependency {location:?} does not resolve to a regular file at {}",
+                path.display()
+            );
+        }
+    }
+    Ok(path)
+}
+
+fn fingerprint_onnx_input(
+    path: &Path,
+    label: Option<String>,
+    memo: &mut InputFingerprintMemo,
+) -> Result<ModelInputFingerprint> {
+    let canonical = std::fs::canonicalize(path)
+        .with_context(|| format!("resolve ONNX input {}", path.display()))?;
+    let external_data = if let Some(found) = memo.onnx_external_data.get(&canonical) {
+        found.clone()
+    } else {
+        // Hash and decode the SAME container bytes. Separate opens allow an
+        // atomic replacement to combine model A's hash with model B's sidecar
+        // closure, which is not a valid identity even though the next row
+        // preflight would normally catch a stable replacement.
+        let container_bytes = std::fs::read(&canonical)
+            .with_context(|| format!("read ONNX input {}", canonical.display()))?;
+        let canonical_path = canonical
+            .to_str()
+            .map(str::to_string)
+            .with_context(|| format!("ONNX input path is not UTF-8: {}", canonical.display()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&container_bytes);
+        memo.artifacts.insert(
+            canonical.clone(),
+            ArtifactFingerprint {
+                canonical_path,
+                sha256: finish_sha256(hasher),
+            },
+        );
+        let model_dir = canonical
+            .parent()
+            .context("resolved ONNX model has no parent directory")?;
+        let mut found = Vec::new();
+        for location in onnx_external_data_locations(&canonical, &container_bytes)? {
+            let dependency = ensure_external_data_path_has_no_symlinks(model_dir, &location)?;
+            found.push(ExternalDataInputFingerprint {
+                location,
+                artifact: fingerprint_input_file(
+                    &dependency,
+                    "resolved ONNX external-data input",
+                    memo,
+                )?,
+            });
+        }
+        memo.onnx_external_data
+            .insert(canonical.clone(), found.clone());
+        found
+    };
+    let artifact = memo
+        .artifacts
+        .get(&canonical)
+        .cloned()
+        .context("ONNX dependency memo has no paired container fingerprint")?;
+    Ok(ModelInputFingerprint {
+        label,
+        artifact,
+        external_data: Some(external_data),
+    })
+}
+
+/// Resolve and content-address every file the child will read for one row.
+fn fingerprint_instance_inputs(
+    category_dir: &Path,
+    instance: &SweepInstance,
+    memo: &mut InputFingerprintMemo,
+) -> Result<ResolvedInstanceInputs> {
+    let models = super::vnncomp_reseed::model_identity_entries(&instance.onnx_field)
+        .context("parse ONNX field for content sealing")?;
+    let mut onnx = Vec::with_capacity(models.len());
+    for (label, model) in models {
+        let path = category_dir.join(&model);
+        onnx.push(fingerprint_onnx_input(&path, label, memo)?);
+    }
+    let vnnlib = fingerprint_input_file(
+        &category_dir.join(&instance.vnnlib_field),
+        "resolved VNN-LIB input",
+        memo,
+    )?;
+    Ok(ResolvedInstanceInputs { onnx, vnnlib })
 }
 
 fn collect_tree_files(dir: &Path, what: &str, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -890,6 +1530,46 @@ fn fingerprint_tree(path: &Path, what: &str) -> Result<ArtifactFingerprint> {
         canonical_path,
         sha256: finish_sha256(hasher),
     })
+}
+
+/// Fingerprint the ORDERED set of preset directories this sweep may consult.
+///
+/// #sweep-preset-parity: a `--year 2026` sweep resolves each category
+/// newest-first from `vnncomp26` down through the older year directories (see
+/// [`vnncomp::benchmark_preset_search_dirs`]), so pinning only the exact-year
+/// directory would leave every preset that actually shipped from `vnncomp25`
+/// outside the manifest — a bank could then be reproduced against different
+/// preset bytes than it ran on. A single-directory set keeps the previous
+/// fingerprint byte for byte, so nothing that really was year-scoped changes
+/// identity.
+fn fingerprint_preset_dirs(dirs: &[PathBuf]) -> Result<Option<ArtifactFingerprint>> {
+    let Some(primary) = dirs.first() else {
+        return Ok(None);
+    };
+    let primary_fingerprint = fingerprint_tree(primary, "configuration directory")?;
+    if dirs.len() == 1 {
+        return Ok(Some(primary_fingerprint));
+    }
+    let mut hasher = Sha256::new();
+    for dir in dirs {
+        let fingerprint = fingerprint_tree(dir, "configuration directory")?;
+        let name = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| {
+                format!(
+                    "configuration directory has no UTF-8 name: {}",
+                    dir.display()
+                )
+            })?;
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(fingerprint.sha256.as_bytes());
+    }
+    Ok(Some(ArtifactFingerprint {
+        canonical_path: primary_fingerprint.canonical_path,
+        sha256: finish_sha256(hasher),
+    }))
 }
 
 fn read_manifest(path: &Path) -> Result<SweepManifest> {
@@ -1031,9 +1711,307 @@ fn publish_state(metadata: &Path, output: &Path, state: &SweepState) -> Result<(
     write_results_atomic(output, state)
 }
 
+fn expected_child_ambient_env(
+    ambient_env: &BTreeMap<String, String>,
+    arm: &[(String, String)],
+) -> BTreeMap<String, String> {
+    let mut effective = ambient_env.clone();
+    for (name, value) in submission_environment() {
+        effective.insert((*name).to_string(), (*value).to_string());
+    }
+    // The explicit arm is applied last in `run_instance` and therefore wins
+    // over both the inherited parent environment and submission defaults.
+    for (name, value) in arm {
+        effective.insert(name.clone(), value.clone());
+    }
+    crate::flight::ambient_env_from(effective)
+}
+
+fn row_flight_ambient_env(
+    identity: &SweepIdentity,
+    row: &SweepRow,
+) -> Result<BTreeMap<String, String>> {
+    let flight = row.flight.as_ref().with_context(|| {
+        format!(
+            "cannot safely --resume row {identity:?}: \
+             the retained measurement has no child flight record"
+        )
+    })?;
+    let schema = flight
+        .get("ambient_env_schema")
+        .and_then(serde_json::Value::as_str);
+    if schema != Some(crate::flight::AMBIENT_ENV_SCHEMA) {
+        bail!(
+            "cannot safely --resume row {identity:?}: \
+             the child flight ambient_env_schema is {:?}, expected {:?}; pre-v3 captures did \
+             not record every Rayon worker-count variable and cannot prove a clean environment",
+            schema,
+            crate::flight::AMBIENT_ENV_SCHEMA,
+        );
+    }
+    let ambient = flight.get("ambient_env").with_context(|| {
+        format!(
+            "cannot safely --resume row {identity:?}: \
+             the child flight record has no ambient_env"
+        )
+    })?;
+    serde_json::from_value(ambient.clone()).with_context(|| {
+        format!(
+            "cannot safely --resume row {identity:?}: \
+             the child flight ambient_env is not a string map"
+        )
+    })
+}
+
+/// Validate every retained measurement against the current execution-input
+/// seals. This both proves a one-time legacy-manifest adoption and detects a
+/// corrupt or historically mixed bank even when its manifest already claims
+/// current seals. Error rows are retried and are not measurements.
+fn validate_retained_execution_seals(
+    existing: &SweepManifest,
+    desired: &SweepManifest,
+    state: &SweepState,
+) -> Result<()> {
+    let desired_arm = desired
+        .arm
+        .as_deref()
+        .context("current sweep plan is missing its required explicit-arm seal")?;
+    let desired_ambient_schema = desired
+        .ambient_env_schema
+        .as_deref()
+        .context("current sweep plan is missing its required ambient-environment schema")?;
+    if desired_ambient_schema != crate::flight::AMBIENT_ENV_SCHEMA {
+        bail!(
+            "current sweep plan uses unsupported ambient-environment schema {:?}; expected {:?}",
+            desired_ambient_schema,
+            crate::flight::AMBIENT_ENV_SCHEMA,
+        );
+    }
+    let desired_ambient = desired
+        .ambient_env
+        .as_ref()
+        .context("current sweep plan is missing its required ambient-environment seal")?;
+    let expected_ambient = expected_child_ambient_env(desired_ambient, desired_arm);
+
+    for (identity, row) in state {
+        if row.verdict == SweepVerdict::Error {
+            continue;
+        }
+        let row_arm = canonical_arm(&row.arm);
+        if row_arm != desired_arm {
+            bail!(
+                "cannot safely --resume row {identity:?}: the retained measurement records \
+                 explicit arm {:?}, expected bank arm {:?}{}; use a new output bank",
+                row_arm,
+                desired_arm,
+                if existing.arm.is_none() {
+                    " (legacy manifest adoption requires every row to agree)"
+                } else {
+                    ""
+                },
+            );
+        }
+        let observed = row_flight_ambient_env(identity, row)?;
+        if observed != expected_ambient {
+            bail!(
+                "cannot safely --resume row {identity:?}: its child flight records effective \
+                 ambient environment {:?}, expected {:?} from the bank seals{}; use a new \
+                 output bank",
+                observed,
+                expected_ambient,
+                if existing.ambient_env_schema.is_none() {
+                    " (legacy manifest adoption requires every row to agree)"
+                } else {
+                    ""
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn row_set_identity_from_input_seals(
+    category: &str,
+    seals: &[SelectedRowInputSeal],
+) -> Result<SemanticSetIdentity> {
+    let rows = seals
+        .iter()
+        .map(|seal| {
+            (
+                category.to_string(),
+                seal.onnx.clone(),
+                seal.vnnlib.clone(),
+                seal.occurrence,
+                seal.instance_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    selected_row_set_identity(&rows)
+}
+
+/// Validate the self-consistency of the explicit row-to-file-content map.
+fn validate_selected_row_input_manifest(manifest: &SweepManifest, which: &str) -> Result<()> {
+    match manifest.selected_row_inputs_schema.as_deref() {
+        Some(SELECTED_ROW_INPUTS_SCHEMA) => {}
+        Some(schema) => {
+            bail!(
+                "cannot safely use {which} sweep manifest: unsupported selected-row input \
+                 schema {schema:?}; expected {SELECTED_ROW_INPUTS_SCHEMA:?}"
+            );
+        }
+        None if manifest.selected_row_inputs.is_empty() => return Ok(()),
+        None => {
+            bail!(
+                "cannot safely use {which} sweep manifest: selected_row_inputs is present \
+                 without its schema"
+            );
+        }
+    }
+
+    if manifest.selected_row_inputs.len() != manifest.selected_rows.len()
+        || manifest
+            .selected_rows
+            .keys()
+            .any(|category| !manifest.selected_row_inputs.contains_key(category))
+    {
+        bail!(
+            "cannot safely use {which} sweep manifest: selected_rows and \
+             selected_row_inputs do not cover the same categories"
+        );
+    }
+    for (category, seals) in &manifest.selected_row_inputs {
+        let semantic = manifest.selected_rows.get(category).with_context(|| {
+            format!(
+                "cannot safely use {which} sweep manifest: category {category:?} has input \
+                 seals but no semantic row seal"
+            )
+        })?;
+        let reconstructed =
+            row_set_identity_from_input_seals(category, seals).with_context(|| {
+                format!(
+                    "cannot safely use {which} sweep manifest: invalid selected-row input seals for \
+                     category {category:?}"
+                )
+            })?;
+        if &reconstructed != semantic {
+            bail!(
+                "cannot safely use {which} sweep manifest: category {category:?} input seals do \
+                 not describe its selected_rows identity"
+            );
+        }
+        for seal in seals {
+            if seal.inputs.onnx.is_empty()
+                || seal.inputs.vnnlib.canonical_path.is_empty()
+                || seal.inputs.vnnlib.sha256.is_empty()
+            {
+                bail!(
+                    "cannot safely use {which} sweep manifest: category {category:?} row \
+                     {}/{:?} has an empty resolved input path or content hash",
+                    seal.instance_index,
+                    seal.vnnlib,
+                );
+            }
+            for model in &seal.inputs.onnx {
+                if model.artifact.canonical_path.is_empty() || model.artifact.sha256.is_empty() {
+                    bail!(
+                        "cannot safely use {which} sweep manifest: category {category:?} row \
+                         {}/{:?} has an empty resolved ONNX path or content hash",
+                        seal.instance_index,
+                        seal.vnnlib,
+                    );
+                }
+                let dependencies = model.external_data.as_ref().with_context(|| {
+                    format!(
+                        "cannot safely use {which} sweep manifest: category {category:?} row \
+                         {}/{:?} has no affirmative ONNX external-data closure",
+                        seal.instance_index, seal.vnnlib,
+                    )
+                })?;
+                if dependencies.iter().any(|dependency| {
+                    dependency.location.is_empty()
+                        || dependency.artifact.canonical_path.is_empty()
+                        || dependency.artifact.sha256.is_empty()
+                }) || dependencies
+                    .windows(2)
+                    .any(|pair| pair[0].location >= pair[1].location)
+                {
+                    bail!(
+                        "cannot safely use {which} sweep manifest: category {category:?} row \
+                         {}/{:?} has malformed, duplicate, or noncanonical ONNX external-data seals",
+                        seal.instance_index,
+                        seal.vnnlib,
+                    );
+                }
+                let model_parent = Path::new(&model.artifact.canonical_path)
+                    .parent()
+                    .with_context(|| {
+                        format!(
+                            "cannot safely use {which} sweep manifest: ONNX path {:?} has no parent",
+                            model.artifact.canonical_path
+                        )
+                    })?;
+                for dependency in dependencies {
+                    let normalized =
+                        normalize_external_data_location(&dependency.location, "manifest seal")?;
+                    let expected_path = dependency
+                        .location
+                        .split('/')
+                        .fold(model_parent.to_path_buf(), |path, part| path.join(part));
+                    if normalized != dependency.location
+                        || expected_path != Path::new(&dependency.artifact.canonical_path)
+                    {
+                        bail!(
+                            "cannot safely use {which} sweep manifest: ONNX external-data \
+                             location {:?} is noncanonical or does not resolve from model {:?} \
+                             to sealed artifact {:?}",
+                            dependency.location,
+                            model.artifact.canonical_path,
+                            dependency.artifact.canonical_path,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every reusable historical verdict must point to a current-format content
+/// seal. The present files cannot retroactively prove which bytes a legacy row
+/// measured, so absence is a hard refusal rather than one-time adoption.
+fn validate_retained_input_seals(manifest: &SweepManifest, state: &SweepState) -> Result<()> {
+    validate_selected_row_input_manifest(manifest, "banked")?;
+    for (identity, row) in state {
+        if row.verdict == SweepVerdict::Error {
+            // Harness errors are retried and never reused or cached.
+            continue;
+        }
+        let seal = manifest
+            .selected_row_inputs
+            .get(&row.category)
+            .and_then(|seals| {
+                seals.iter().find(|seal| {
+                    seal.onnx == row.onnx
+                        && seal.vnnlib == row.vnnlib
+                        && seal.occurrence == row.occurrence
+                        && seal.instance_index == row.instance_index
+                })
+            });
+        if seal.is_none() {
+            bail!(
+                "cannot safely --resume retained row {identity:?}: its manifest does not prove \
+                 the resolved ONNX/VNN-LIB content hashes that produced the verdict. Legacy \
+                 rows cannot adopt today's file bytes retroactively; use a new output bank."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn merge_resume_manifest(
     existing: SweepManifest,
     desired: &SweepManifest,
+    state: &SweepState,
 ) -> Result<SweepManifest> {
     if existing.schema_version != SWEEP_MANIFEST_SCHEMA_VERSION {
         bail!(
@@ -1042,19 +2020,77 @@ fn merge_resume_manifest(
             SWEEP_MANIFEST_SCHEMA_VERSION
         );
     }
+    validate_selected_row_input_manifest(desired, "current")?;
+    validate_retained_input_seals(&existing, state)?;
     let same_run = existing.year == desired.year
         && existing.vnnlib_version == desired.vnnlib_version
         && existing.timeout_cap == desired.timeout_cap
         && existing.configs == desired.configs
         && existing.executable == desired.executable
+        // #binary-identity: a resumed bank must be the same VERIFIER, not just
+        // the same bytes at the same path. Legacy banks carry an empty string
+        // and are compared on the fields they do have, exactly as the backend
+        // and host fields already work.
+        && (existing.build_id.is_empty() || existing.build_id == desired.build_id)
         && existing.build_provenance == desired.build_provenance
         && existing.target_os == desired.target_os
         && existing.target_arch == desired.target_arch;
     if !same_run {
         bail!(
             "cannot safely --resume: year, VNN-LIB version, timeout cap, configuration content, \
-             executable, build provenance, or target differs from the pinned manifest; use a \
-             new output bank"
+             executable, binary identity, build provenance, or target differs from the pinned \
+             manifest; use a new output bank.\n  banked: {}\n  current: {}",
+            if existing.build_id.is_empty() {
+                "<no binary identity recorded>"
+            } else {
+                existing.build_id.as_str()
+            },
+            desired.build_id,
+        );
+    }
+    let desired_arm = desired
+        .arm
+        .as_ref()
+        .context("current sweep plan is missing its required explicit-arm seal")?;
+    let desired_ambient_schema = desired
+        .ambient_env_schema
+        .as_deref()
+        .context("current sweep plan is missing its required ambient-environment schema")?;
+    if desired_ambient_schema != crate::flight::AMBIENT_ENV_SCHEMA {
+        bail!(
+            "current sweep plan uses unsupported ambient-environment schema {:?}; expected {:?}",
+            desired_ambient_schema,
+            crate::flight::AMBIENT_ENV_SCHEMA,
+        );
+    }
+    let desired_ambient = desired
+        .ambient_env
+        .as_ref()
+        .context("current sweep plan is missing its required ambient-environment seal")?;
+    if existing.arm.as_ref().is_some_and(|arm| arm != desired_arm) {
+        bail!(
+            "cannot safely --resume: this bank was measured with explicit arm {:?}, but the \
+             current request is {:?}; rows from mixed treatment arms cannot share a bank. Use a \
+             new output bank.",
+            existing.arm,
+            desired.arm,
+        );
+    }
+    // #instance-selection-seal. `instances_csv` fingerprints only the full
+    // source corpus. A bank resumed with `--limit 4` after starting with
+    // `--limit 8` (or with another exact selector file) would otherwise remain
+    // byte-for-byte compatible here while silently measuring a different row
+    // set. Manifests predating this field adopt the current request once, just
+    // like the binary/backend/host seals; a recorded request must match.
+    if existing.instance_selection.is_some()
+        && existing.instance_selection != desired.instance_selection
+    {
+        bail!(
+            "cannot safely --resume: this bank was measured with instance selection {:?}, but \
+             the current request is {:?}; rows from different subsets cannot share a bank. Use \
+             a new output bank.",
+            existing.instance_selection,
+            desired.instance_selection,
         );
     }
     // A bank half-measured on cuda and half on cpu-only/metal is exactly the
@@ -1075,9 +2111,34 @@ fn merge_resume_manifest(
     // without is two different verifiers wearing one bank's name, and nothing
     // downstream can tell them apart -- `run_instance` only adds to the child
     // environment, so the export is inherited silently by every row. A legacy
-    // manifest (empty map) adopts the current set rather than blocking resume,
-    // exactly as the backend and host fields do; a RECORDED set must match.
-    if !existing.ambient_env.is_empty() && existing.ambient_env != desired.ambient_env {
+    // manifest has no ambient schema. Its map, even when present, used an older
+    // capture contract and is not current proof. An unknown present schema is
+    // refused; a current v3 schema makes an empty map affirmative cleanliness.
+    let existing_ambient_is_current = match existing.ambient_env_schema.as_deref() {
+        Some(schema) if schema == crate::flight::AMBIENT_ENV_SCHEMA => true,
+        Some(schema) => {
+            bail!(
+                "cannot safely --resume: this bank uses unsupported ambient-environment schema \
+                 {:?}; expected {:?}",
+                schema,
+                crate::flight::AMBIENT_ENV_SCHEMA,
+            );
+        }
+        None => false,
+    };
+    if existing_ambient_is_current && existing.ambient_env.is_none() {
+        bail!(
+            "cannot safely --resume: this bank claims ambient-environment schema {:?} but has no \
+             ambient_env seal",
+            crate::flight::AMBIENT_ENV_SCHEMA,
+        );
+    }
+    if existing_ambient_is_current
+        && existing
+            .ambient_env
+            .as_ref()
+            .is_some_and(|ambient| ambient != desired_ambient)
+    {
         let render = |env: &BTreeMap<String, String>| {
             env.iter()
                 .map(|(name, value)| format!("{name}={value}"))
@@ -1086,10 +2147,11 @@ fn merge_resume_manifest(
         };
         bail!(
             "cannot safely --resume: this bank was measured with a different ambient lever set              [{}] than the current environment provides [{}]; rows from mixed arms are not              comparable. Unset the difference or use a new output bank.",
-            render(&existing.ambient_env),
-            render(&desired.ambient_env)
+            render(existing.ambient_env.as_ref().expect("checked present")),
+            render(desired_ambient)
         );
     }
+    validate_retained_execution_seals(&existing, desired, state)?;
     // Same rule for host identity: two machines can both detect "metal" and
     // still have incomparable timings (M-series laptop vs Mac Studio). The
     // cgan parity sweep proved this the hard way — a sealed 636s UNSAT from
@@ -1105,6 +2167,11 @@ fn merge_resume_manifest(
     }
 
     let mut merged = existing;
+    if merged.build_id.is_empty() {
+        // Legacy bank: adopt the current identity so rows from here on name
+        // their verifier, instead of the bank staying unattributable forever.
+        merged.build_id.clone_from(&desired.build_id);
+    }
     if merged.compute_backend.is_empty() {
         // Legacy bank: adopt the detected regime so rows from here on are
         // attributed, instead of staying unrecorded forever.
@@ -1112,6 +2179,81 @@ fn merge_resume_manifest(
     }
     if merged.host.is_empty() {
         merged.host = desired.host.clone();
+    }
+    if merged.arm.is_none() {
+        merged.arm.clone_from(&desired.arm);
+    }
+    if merged.ambient_env_schema.is_none() {
+        merged
+            .ambient_env_schema
+            .clone_from(&desired.ambient_env_schema);
+        merged.ambient_env.clone_from(&desired.ambient_env);
+    }
+    if merged.instance_selection.is_none() {
+        // Legacy bank: make this resume's explicit selection authoritative from
+        // now on instead of leaving the bank permanently unsealed.
+        merged
+            .instance_selection
+            .clone_from(&desired.instance_selection);
+    }
+    for (category, identity) in &desired.selected_rows {
+        match merged.selected_rows.get(category) {
+            Some(previous) if previous != identity => {
+                bail!(
+                    "cannot safely --resume: selected row set changed for category {category:?} \
+                     (banked count/digest: {}/{}, current: {}/{}); use a new output bank",
+                    previous.count,
+                    previous.sha256,
+                    identity.count,
+                    identity.sha256,
+                );
+            }
+            Some(_) => {}
+            None => {
+                // Compatible category expansion, or a one-category-at-a-time
+                // migration of a legacy bank. Omitted historical categories
+                // deliberately remain absent rather than receiving a seal this
+                // process could not prove.
+                merged
+                    .selected_rows
+                    .insert(category.clone(), identity.clone());
+            }
+        }
+    }
+    if merged.selected_row_inputs_schema.is_none()
+        && merged
+            .selected_rows
+            .keys()
+            .any(|category| !desired.selected_row_inputs.contains_key(category))
+    {
+        bail!(
+            "cannot safely --resume this legacy bank: it has selected-row provenance for a \
+             category omitted from the current plan, but no resolved input-content seal for \
+             that category. Include every historical category or use a new output bank."
+        );
+    }
+    for (category, seals) in &desired.selected_row_inputs {
+        match merged.selected_row_inputs.get(category) {
+            Some(previous) if previous != seals => {
+                bail!(
+                    "cannot safely --resume: resolved ONNX/VNN-LIB content changed for selected \
+                     category {category:?} while its CSV row identity stayed the same; use a new \
+                     output bank"
+                );
+            }
+            Some(_) => {}
+            None => {
+                // Safe only for a newly planned category or an empty/error-only
+                // legacy bank. `validate_retained_input_seals` above already
+                // refused every reusable historical row that lacks this proof.
+                merged
+                    .selected_row_inputs
+                    .insert(category.clone(), seals.clone());
+            }
+        }
+    }
+    if merged.selected_row_inputs_schema.is_none() {
+        merged.selected_row_inputs_schema = Some(SELECTED_ROW_INPUTS_SCHEMA.to_string());
     }
     for (category, fingerprint) in &desired.instances_csv {
         match merged.instances_csv.get(category) {
@@ -1129,6 +2271,7 @@ fn merge_resume_manifest(
             }
         }
     }
+    validate_selected_row_input_manifest(&merged, "merged")?;
     Ok(merged)
 }
 
@@ -1145,13 +2288,113 @@ struct PlannedInstance {
     /// Unselected rows stay in the plan because `--resume` validates persisted
     /// state against the whole pinned `instances.csv`, not against the subset.
     selected: bool,
+    /// Exact resolved bytes this selected row is allowed to use.
+    ///
+    /// Unselected rows intentionally carry no input seal: they are retained in
+    /// the plan only to validate semantic identity/order and are never executed.
+    inputs: Option<ResolvedInstanceInputs>,
+}
+
+/// Python `measured_row_set_identity` tuple, including the occurrence that
+/// distinguishes duplicate official rows and the source CSV index that pins
+/// their position.
+type SelectedRowSetEntry = (String, String, String, usize, usize);
+
+fn selected_row_set_identity(entries: &[SelectedRowSetEntry]) -> Result<SemanticSetIdentity> {
+    semantic_set_identity(MEASURED_ROW_SET_IDENTITY_SCHEMA, entries)
+}
+
+fn selected_rows_for_plan(
+    plan: &[PlannedInstance],
+) -> Result<BTreeMap<String, SemanticSetIdentity>> {
+    let mut rows_by_category = BTreeMap::<String, Vec<SelectedRowSetEntry>>::new();
+    for entry in plan {
+        let rows = rows_by_category.entry(entry.category.clone()).or_default();
+        if entry.selected {
+            rows.push((
+                entry.identity.0.clone(),
+                entry.identity.1.clone(),
+                entry.identity.2.clone(),
+                entry.identity.3,
+                entry.instance_index,
+            ));
+        }
+    }
+    rows_by_category
+        .into_iter()
+        .map(|(category, rows)| Ok((category, selected_row_set_identity(&rows)?)))
+        .collect()
+}
+
+fn selected_row_inputs_for_plan(
+    plan: &[PlannedInstance],
+) -> Result<BTreeMap<String, Vec<SelectedRowInputSeal>>> {
+    let mut seals = BTreeMap::<String, Vec<SelectedRowInputSeal>>::new();
+    for entry in plan {
+        let category = seals.entry(entry.category.clone()).or_default();
+        if !entry.selected {
+            continue;
+        }
+        let inputs = entry.inputs.clone().with_context(|| {
+            format!(
+                "selected row {:?} has no resolved input-content seal",
+                entry.identity
+            )
+        })?;
+        category.push(SelectedRowInputSeal {
+            onnx: entry.instance.onnx_field.clone(),
+            vnnlib: entry.instance.vnnlib_field.clone(),
+            occurrence: entry.identity.3,
+            instance_index: entry.instance_index,
+            inputs,
+        });
+    }
+    for category in seals.values_mut() {
+        category.sort_by(|left, right| {
+            left.instance_index
+                .cmp(&right.instance_index)
+                .then_with(|| left.occurrence.cmp(&right.occurrence))
+                .then_with(|| left.onnx.cmp(&right.onnx))
+                .then_with(|| left.vnnlib.cmp(&right.vnnlib))
+        });
+    }
+    Ok(seals)
+}
+
+/// Re-hash a planned row immediately before reuse/launch and, for a fresh
+/// child, again before banking its outcome.
+fn verify_planned_inputs(entry: &PlannedInstance, context: &str) -> Result<()> {
+    let expected = entry.inputs.as_ref().with_context(|| {
+        format!(
+            "selected row {:?} has no input-content seal before {context}",
+            entry.identity
+        )
+    })?;
+    // Deliberately fresh, with no cross-row metadata memo. The adversarial case
+    // is an in-place replacement whose field strings, file size, and coarse
+    // mtime can all remain unchanged.
+    let found = fingerprint_instance_inputs(
+        &entry.base,
+        &entry.instance,
+        &mut InputFingerprintMemo::new(),
+    )
+    .with_context(|| format!("re-resolve input files before {context}"))?;
+    if &found != expected {
+        bail!(
+            "selected row {:?} changed resolved ONNX/VNN-LIB content before {context}; the \
+             sweep plan sealed different file paths or hashes. Refusing to retain or mix rows; \
+             restore the inputs or start a new bank.",
+            entry.identity,
+        );
+    }
+    Ok(())
 }
 
 fn build_plan(
     opts: &SweepOptions,
     categories: Vec<(String, PathBuf)>,
-    exe: &Path,
-    effective_configs_dir: Option<&Path>,
+    binary: &crate::build_id::BinaryIdentity,
+    preset_search_dirs: &[PathBuf],
     selectors: Option<&[InstanceSelector]>,
 ) -> Result<(Vec<PlannedInstance>, SweepManifest)> {
     let mut plan = Vec::new();
@@ -1159,6 +2402,7 @@ fn build_plan(
     let mut instances_fingerprints = BTreeMap::new();
     let wanted = selectors.map(|selectors| selectors.iter().cloned().collect::<HashSet<_>>());
     let mut matched = HashSet::new();
+    let mut input_fingerprints = InputFingerprintMemo::new();
 
     for (category, category_dir) in categories {
         let Some(csv_path) = instances_csv_for(&category_dir, opts.vnnlib_version)? else {
@@ -1192,10 +2436,7 @@ fn build_plan(
             // A selector names a model/property pair, so it selects EVERY
             // occurrence of that pair — an `instances.csv` that repeats a row
             // means it, and half of a repeated row is not the row.
-            let selected = match &wanted {
-                Some(wanted) => wanted.contains(&base_identity),
-                None => index < take,
-            };
+            let selected = instance_is_selected(wanted.as_ref(), &base_identity, index, take);
             if selected && wanted.is_some() {
                 matched.insert(base_identity.clone());
             }
@@ -1207,6 +2448,14 @@ fn build_plan(
             let budget_secs = capped_from.map_or(instance.budget_secs, |_| {
                 opts.timeout_cap.unwrap_or(instance.budget_secs)
             });
+            let inputs = selected
+                .then(|| {
+                    fingerprint_instance_inputs(&base, &instance, &mut input_fingerprints)
+                        .with_context(|| {
+                            format!("seal resolved inputs for category {category:?} row {index}")
+                        })
+                })
+                .transpose()?;
             plan.push(PlannedInstance {
                 identity,
                 category: category.clone(),
@@ -1216,6 +2465,7 @@ fn build_plan(
                 budget_secs,
                 capped_from,
                 selected,
+                inputs,
             });
         }
     }
@@ -1224,23 +2474,34 @@ fn build_plan(
         let names = instances_fingerprints.keys().cloned().collect::<Vec<_>>();
         ensure_every_selector_matched(selectors, &matched, &names)?;
     }
+    let selected_rows = selected_rows_for_plan(&plan)?;
+    let selected_row_inputs = selected_row_inputs_for_plan(&plan)?;
 
     let manifest = SweepManifest {
         schema_version: SWEEP_MANIFEST_SCHEMA_VERSION,
         year: opts.year,
         vnnlib_version: opts.vnnlib_version,
         timeout_cap: opts.timeout_cap,
-        configs: effective_configs_dir
-            .map(|dir| fingerprint_tree(dir, "configuration directory"))
-            .transpose()?,
-        executable: fingerprint_file(exe, "ny executable")?,
+        configs: fingerprint_preset_dirs(preset_search_dirs)?,
+        executable: fingerprint_from_binary_identity(binary)?,
+        build_id: binary.canonical_line(),
         build_provenance: crate::VNNCOMP_BUILD_PROVENANCE.to_string(),
         target_os: std::env::consts::OS.to_string(),
         target_arch: std::env::consts::ARCH.to_string(),
         compute_backend: crate::compute_backend::detect().summary.clone(),
         host: crate::compute_backend::host().summary(),
-        ambient_env: crate::flight::ambient_env_from(std::env::vars()),
+        arm: Some(canonical_arm(&opts.arm)),
+        ambient_env_schema: Some(crate::flight::AMBIENT_ENV_SCHEMA.to_string()),
+        // Reuse flight v3's presence-preserving `vars_os()` snapshot. Calling
+        // `std::env::vars()` here would panic on one non-Unicode entry while
+        // claiming the same ambient schema as the lossy-but-visible flight
+        // record, and could leave manifest/cache provenance weaker than rows.
+        ambient_env: Some(crate::flight::ambient_env_snapshot()),
         witness_dir: None,
+        instance_selection: Some(requested_instance_selection(opts.limit, selectors)?),
+        selected_rows,
+        selected_row_inputs_schema: Some(SELECTED_ROW_INPUTS_SCHEMA.to_string()),
+        selected_row_inputs,
         instances_csv: instances_fingerprints,
     };
     Ok((plan, manifest))
@@ -1266,6 +2527,13 @@ fn validate_state_against_plan(state: &SweepState, plan: &[PlannedInstance]) -> 
                  selected instances.csv"
             )
         })?;
+        if !entry.selected {
+            bail!(
+                "cannot safely --resume {identity:?}: this bank already contains a row outside \
+                 the current instance selection. A legacy unsealed bank may only adopt a \
+                 selection compatible with every row it has measured; use a new output bank"
+            );
+        }
         let official_budget = row.capped_from.unwrap_or(row.budget_secs);
         if row.budget_secs != entry.budget_secs
             || row.capped_from != entry.capped_from
@@ -1283,6 +2551,53 @@ fn validate_state_against_plan(state: &SweepState, plan: &[PlannedInstance]) -> 
                 entry.budget_secs,
                 entry.capped_from
             );
+        }
+    }
+    Ok(())
+}
+
+/// Prove that historical categories omitted from the current invocation do not
+/// make a one-time legacy selection adoption lie.
+///
+/// Banks may intentionally accumulate categories across resumes, so the normal
+/// plan validator ignores persisted categories not requested this time. A
+/// legacy manifest has no selection seal to protect those rows, however. `All`
+/// is compatible by definition. `Limit` and `Exact` both require the omitted
+/// category to be loaded: old metadata rows default a missing `instance_index`
+/// to zero, so the stored number alone is not proof that a pre-index row belonged
+/// to a first-N prefix, and exact membership likewise needs the selector join.
+fn validate_legacy_selection_adoption(
+    state: &SweepState,
+    plan: &[PlannedInstance],
+    selection: &InstanceSelection,
+) -> Result<()> {
+    let planned_categories = plan
+        .iter()
+        .map(|entry| entry.category.as_str())
+        .collect::<HashSet<_>>();
+    for (identity, row) in state {
+        if planned_categories.contains(row.category.as_str()) {
+            continue;
+        }
+        match selection {
+            InstanceSelection::All => {}
+            InstanceSelection::Limit { per_category } => {
+                bail!(
+                    "cannot safely --resume legacy row {identity:?}: category {:?} is omitted \
+                     from the current plan, so membership in adopted --limit {per_category} \
+                     cannot be proven (pre-index rows deserialize an absent index as zero); \
+                     include the category or use a new output bank",
+                    row.category,
+                );
+            }
+            InstanceSelection::Exact { .. } => {
+                bail!(
+                    "cannot safely --resume legacy row {identity:?}: category {:?} is omitted \
+                     from the current plan, so membership in the adopted exact --instances \
+                     selection cannot be proven; include the category or use a new output bank",
+                    row.category,
+                );
+            }
         }
     }
     Ok(())
@@ -1541,6 +2856,39 @@ fn read_flight_sidecar(result_file: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&body).ok()
 }
 
+/// Cross-check a child's self-reported compiled stamp against the executable
+/// seal that selected its private copy.
+///
+/// A missing sidecar remains best-effort by the flight-recorder contract (hard
+/// stops can prevent it). Once a parseable sidecar exists, however, a missing or
+/// different build id is affirmative contradictory provenance and may not be
+/// banked or served from cache.
+fn validate_child_build_receipt(
+    flight: Option<&serde_json::Value>,
+    expected_build_stamp: &str,
+    context: &str,
+) -> Result<()> {
+    let Some(flight) = flight else {
+        return Ok(());
+    };
+    let observed = flight
+        .get("build_id")
+        .and_then(serde_json::Value::as_str)
+        .with_context(|| {
+            format!(
+                "{context} has a child flight record without a string build_id; refusing \
+                 contradictory executable provenance"
+            )
+        })?;
+    if observed != expected_build_stamp {
+        bail!(
+            "{context} child flight build identity differs from the early executable seal\n  \
+             expected: {expected_build_stamp}\n  observed: {observed}"
+        );
+    }
+    Ok(())
+}
+
 /// Everything one child run hands back to the banking loop.
 struct InstanceOutcome {
     verdict: SweepVerdict,
@@ -1685,15 +3033,19 @@ fn run_instance(
 
 /// The process-wide half of a [`cache::CacheKey`], captured once per sweep.
 ///
-/// Read from the DESIRED manifest, never from a resumed one. A legacy bank
-/// carries an empty `compute_backend`/`host`/`ambient_env` and `--resume`
-/// deliberately lets it adopt the current values; keying a cache off the merged
-/// manifest would therefore address rows under an environment this process is
-/// not running in. The desired manifest describes the run that is about to
-/// happen, which is exactly what a verdict is a function of.
+/// Read from the DESIRED manifest, never from a resumed one. A legacy bank may
+/// lack `compute_backend`/`host`/`ambient_env` and `--resume` can adopt current
+/// values only after the retained row provenance is compatible; keying a cache
+/// off the merged manifest would nevertheless describe historical state rather
+/// than the process about to run. The desired manifest is the cache input.
 #[derive(Debug, Clone)]
 struct CacheIdentity {
     exe_sha256: String,
+    /// #binary-identity. `exe_sha256` alone would already refuse a swapped
+    /// binary, but the identity line also separates two builds that hash the
+    /// same file path from different feature tiers or commits in a future
+    /// reproducible-build world, and it is what a human reads in the manifest.
+    build_id: String,
     build_provenance: String,
     configs_sha256: String,
     compute_backend: String,
@@ -1701,10 +3053,52 @@ struct CacheIdentity {
     ambient_env: BTreeMap<String, String>,
 }
 
+/// Content digest used by cache-key v7 for the complete ONNX dependency
+/// closure. Paths are deliberately excluded: cache identity follows bytes and
+/// logical external-data locations, while the manifest retains canonical paths
+/// for audit and resume checks.
+fn onnx_cache_input_digest(models: &[ModelInputFingerprint]) -> Result<String> {
+    #[derive(Serialize)]
+    struct Closure<'a> {
+        schema: &'a str,
+        models: Vec<(Option<&'a str>, &'a str, Vec<(&'a str, &'a str)>)>,
+    }
+
+    let mut cache_models = Vec::with_capacity(models.len());
+    for model in models {
+        let dependencies = model
+            .external_data
+            .as_deref()
+            .context("ONNX cache input has no affirmative external-data closure")?;
+        cache_models.push((
+            model.label.as_deref(),
+            model.artifact.sha256.as_str(),
+            dependencies
+                .iter()
+                .map(|dependency| {
+                    (
+                        dependency.location.as_str(),
+                        dependency.artifact.sha256.as_str(),
+                    )
+                })
+                .collect(),
+        ));
+    }
+    let canonical = serde_json::to_vec(&Closure {
+        schema: ONNX_CACHE_INPUT_SCHEMA,
+        models: cache_models,
+    })
+    .context("serialize complete ONNX cache input")?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical);
+    Ok(finish_sha256(hasher))
+}
+
 impl CacheIdentity {
     fn from_manifest(manifest: &SweepManifest) -> Self {
         Self {
             exe_sha256: manifest.executable.sha256.clone(),
+            build_id: manifest.build_id.clone(),
             build_provenance: manifest.build_provenance.clone(),
             // "No configuration tree" is its own identity: the empty string is
             // not a sha256, so it cannot collide with a real digest.
@@ -1714,7 +3108,9 @@ impl CacheIdentity {
                 .map_or_else(String::new, |configs| configs.sha256.clone()),
             compute_backend: manifest.compute_backend.clone(),
             host: manifest.host.clone(),
-            ambient_env: manifest.ambient_env.clone(),
+            // `CacheIdentity` is built from the freshly planned (therefore
+            // presence-sealed) manifest, never directly from a legacy one.
+            ambient_env: manifest.ambient_env.clone().unwrap_or_default(),
         }
     }
 
@@ -1727,25 +3123,30 @@ impl CacheIdentity {
         &self,
         entry: &PlannedInstance,
         arm: &[(String, String)],
-        hashes: &mut cache::FileHashMemo,
     ) -> Option<cache::CacheKey> {
-        let (onnx, vnnlib) = resolve_instance_arguments(&entry.base, &entry.instance).ok()?;
+        let inputs = entry.inputs.as_ref()?;
+        // Relational rows are deliberately not cached. Their literal contains
+        // multiple independently labelled models, and the cache has never
+        // claimed a cross-process measurement contract for that protocol.
+        if inputs.onnx.len() != 1 || inputs.onnx[0].label.is_some() {
+            return None;
+        }
         cache::CacheKey::new(
             self.exe_sha256.clone(),
+            self.build_id.clone(),
             self.build_provenance.clone(),
             self.configs_sha256.clone(),
             // The category is an INPUT, not a label: it names the preset the
             // child loads and gates the category-fenced routes inside it.
             entry.category.clone(),
-            &onnx,
-            &vnnlib,
+            onnx_cache_input_digest(&inputs.onnx).ok()?,
+            inputs.vnnlib.sha256.clone(),
             entry.budget_secs,
             entry.capped_from,
             arm,
             self.compute_backend.clone(),
             self.host.clone(),
             self.ambient_env.clone(),
-            hashes,
         )
         .ok()
     }
@@ -1762,10 +3163,25 @@ fn serve_from_cache(
     verdict_cache: &cache::VerdictCache,
     key: &cache::CacheKey,
     entry: &PlannedInstance,
+    expected_build_stamp: &str,
 ) -> Option<(SweepRow, Option<String>)> {
     match verdict_cache.get(key) {
         Ok(measurement) => match serde_json::from_value::<SweepRow>(measurement.row) {
-            Ok(row) => Some((row, measurement.witness_text)),
+            Ok(row) => {
+                if let Err(error) = validate_child_build_receipt(
+                    row.flight.as_ref(),
+                    expected_build_stamp,
+                    "cached measurement",
+                ) {
+                    eprintln!(
+                        "[sweep-cache] {}: {} refused ({error}); measuring it fresh",
+                        entry.category, entry.instance.vnnlib_field
+                    );
+                    None
+                } else {
+                    Some((row, measurement.witness_text))
+                }
+            }
             Err(_) => None,
         },
         Err(cache::MissReason::NotPresent) => None,
@@ -1780,6 +3196,9 @@ fn serve_from_cache(
 }
 
 pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
+    // State WHICH VERIFIER is about to run, before anything else. This is the
+    // line that was missing on 2026-08-21 (#binary-identity).
+    crate::build_id::log_once();
     // State the compute regime before planning: it is sealed into the
     // manifest, and a human watching the sweep should not have to wait for
     // the first instance to learn which regime is being measured.
@@ -1815,27 +3234,63 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
         .transpose()?;
 
     let exe = std::env::current_exe().context("locate the running ny executable")?;
-    let effective_configs_dir = opts
+    // One authoritative binary identity, captured before configuration/plan
+    // provenance is derived. Everything below — manifest, cache namespace,
+    // human-readable build id, child receipt expectation — projects from this
+    // guard instead of reopening the mutable build target independently.
+    let identity_guard = crate::build_id::BinaryIdentityGuard::seal(&exe)
+        .context("seal the measuring ny binary before planning the sweep")?;
+    let scratch = tempfile::Builder::new()
+        .prefix("ny-sweep-")
+        .tempdir()
+        .context("create private sweep workspace")?;
+    let child_exe = sealed_executable_copy(&identity_guard, scratch.path())?;
+    let configs_root = opts
         .configs_dir
         .clone()
+        .or_else(super::vnncomp::configs_dir_from_env)
         .or_else(|| {
-            std::env::var_os("NY_CONFIGS_DIR")
-                .map(PathBuf::from)
-                .filter(|path| path.is_dir())
-        })
-        .or_else(|| {
-            let mut starts = vec![exe.clone()];
+            let mut starts = vec![identity_guard.sealed().path.clone()];
             if let Ok(cwd) = std::env::current_dir() {
                 starts.push(cwd);
             }
             super::vnncomp::auto_derive_configs_dir(&starts)
         });
+    // #year-scoped-preset: a corpus sweep names its VNN-COMP year explicitly.
+    // Passing the parent `configs/` directory through to the native child used
+    // to re-enter its yearless newest-first resolver, so once vnncomp26 existed
+    // a 2025 safenlp_2024 sweep silently loaded the 2026 preset. Scope the child
+    // to exactly `vnncompYY`; if a configuration root was found/requested but
+    // that year is absent, fail before measuring a single row.
+    let effective_configs_dir = configs_root
+        .as_deref()
+        .map(|root| {
+            super::vnncomp::benchmark_configs_dir(root, opts.year).with_context(|| {
+                format!(
+                    "configuration root {} has no exact vnncomp{:02} directory for the requested \
+                     VNN-COMP {} corpus; refusing newest-year fallback",
+                    root.display(),
+                    opts.year % 100,
+                    opts.year,
+                )
+            })
+        })
+        .transpose()?;
+    // #sweep-preset-parity: the exact-year check above is the fail-closed gate
+    // (a corpus whose year directory is absent is not measurable). Preset
+    // RESOLUTION then walks that year and every OLDER one, newest-first —
+    // byte-for-byte the order the scored `run_instance.sh` path walks for the
+    // newest corpus, and still blind to any NEWER directory for an older one.
+    let preset_search_dirs = configs_root
+        .as_deref()
+        .map(|root| super::vnncomp::benchmark_preset_search_dirs(root, opts.year))
+        .unwrap_or_default();
     let categories = selected_categories(opts.year, &opts.categories)?;
     let (plan, desired_manifest) = build_plan(
         opts,
         categories,
-        &exe,
-        effective_configs_dir.as_deref(),
+        identity_guard.sealed(),
+        &preset_search_dirs,
         selectors.as_deref(),
     )?;
     let cache_identity = CacheIdentity::from_manifest(&desired_manifest);
@@ -1844,11 +3299,6 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_VERDICT_CACHE_DIR));
     let verdict_cache = cache::VerdictCache::new(cache_dir.clone(), opts.cache);
-    let mut cache_hashes = cache::FileHashMemo::default();
-    let scratch = tempfile::Builder::new()
-        .prefix("ny-sweep-")
-        .tempdir()
-        .context("create private sweep workspace")?;
 
     let output_path = opts.output.clone().unwrap_or_else(|| {
         PathBuf::from(format!("reports/sweeps/vnncomp{}-results.csv", opts.year))
@@ -1898,8 +3348,18 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
         match (metadata_path.exists(), manifest_path.exists()) {
             (true, true) => {
                 let state = metadata_state(&metadata_path)?;
-                let manifest =
-                    merge_resume_manifest(read_manifest(&manifest_path)?, &desired_manifest)?;
+                let existing_manifest = read_manifest(&manifest_path)?;
+                let adopts_legacy_selection = existing_manifest.instance_selection.is_none();
+                if adopts_legacy_selection {
+                    validate_legacy_selection_adoption(
+                        &state,
+                        &plan,
+                        desired_manifest.instance_selection.as_ref().context(
+                            "current sweep plan is missing its required instance-selection seal",
+                        )?,
+                    )?;
+                }
+                let manifest = merge_resume_manifest(existing_manifest, &desired_manifest, &state)?;
                 if let Some(category) = state
                     .values()
                     .map(|row| row.category.as_str())
@@ -1911,6 +3371,14 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
                     );
                 }
                 validate_state_against_plan(&state, &plan)?;
+                if adopts_legacy_selection {
+                    eprintln!(
+                        "[sweep] warning: legacy manifest had no row-selection seal; adopting \
+                         {:?}. Existing rows all belong to this selection, and future changes \
+                         will be refused.",
+                        manifest.instance_selection
+                    );
+                }
                 (state, manifest)
             }
             (false, false) if !output_path.exists() => (BTreeMap::new(), desired_manifest),
@@ -1952,10 +3420,61 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
         publish_state(&metadata_path, &output_path, &state)?;
     }
 
+    // Every child below executes `child_exe`, the private read/execute-only copy
+    // proven against the ONE early guard. The mutable source path may now be
+    // rebuilt without changing which verifier this already-planned bank runs.
+    if !opts.dry_run && !opts.json {
+        println!("  binary: {}", identity_guard.sealed().short());
+    }
+    if !opts.json {
+        match &effective_configs_dir {
+            Some(dir) => println!(
+                "  configs: {} (exact VNN-COMP {} preset directory)",
+                dir.display(),
+                opts.year
+            ),
+            None => println!(
+                "  configs: none (VNN-COMP {} runs use auto defaults)",
+                opts.year
+            ),
+        }
+    }
+    // #sweep-preset-parity: scope each child to the directory that actually
+    // holds ITS category's preset. A category whose preset ships in the exact
+    // year directory is unchanged; one whose preset ships only in an older
+    // year directory now loads that file, which is what the scored run loads.
+    // A category with no preset at or before this year keeps the exact-year
+    // directory and therefore keeps auto defaults, unchanged.
+    let mut category_configs_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
+    if let Some(root) = configs_root.as_deref() {
+        for entry in plan.iter().filter(|entry| entry.selected) {
+            if category_configs_dirs.contains_key(&entry.category) {
+                continue;
+            }
+            if let Some(dir) = super::vnncomp::sweep_preset_dir(root, opts.year, &entry.category) {
+                category_configs_dirs.insert(entry.category.clone(), dir);
+            }
+        }
+    }
+    if !opts.json {
+        for (category, dir) in &category_configs_dirs {
+            if Some(dir.as_path()) != effective_configs_dir.as_deref() {
+                println!(
+                    "  preset[{category}]: {} (no vnncomp{:02} preset; taking the scored path's \
+                     newest-first fallback)",
+                    dir.display(),
+                    opts.year % 100
+                );
+            }
+        }
+    }
+
     let sweep_started = Instant::now();
     let mut cache_hits = 0_usize;
     let mut cache_misses = 0_usize;
+    let expected_child_build_stamp = identity_guard.sealed().stamp.canonical_line();
     for entry in plan.iter().filter(|entry| entry.selected) {
+        verify_planned_inputs(entry, "considering resume reuse or execution")?;
         let reusable = state
             .get(&entry.identity)
             .is_some_and(|row| row.verdict != SweepVerdict::Error);
@@ -1982,11 +3501,11 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
         // from the accounting: hits + misses must equal the rows this loop
         // considered, or the summary cannot be read as evidence of anything.
         let cache_key = (opts.cache != cache::CacheMode::Off)
-            .then(|| cache_identity.key_for(entry, &opts.arm, &mut cache_hashes))
+            .then(|| cache_identity.key_for(entry, &opts.arm))
             .flatten();
-        let served = cache_key
-            .as_ref()
-            .and_then(|key| serve_from_cache(&verdict_cache, key, entry));
+        let served = cache_key.as_ref().and_then(|key| {
+            serve_from_cache(&verdict_cache, key, entry, &expected_child_build_stamp)
+        });
         if opts.cache != cache::CacheMode::Off {
             if served.is_some() {
                 cache_hits += 1;
@@ -1998,6 +3517,11 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
         let from_cache = served.is_some();
         let row = match served {
             Some((cached, witness_text)) => {
+                // Close the interval around cache lookup. A same-path edit
+                // after the preflight check must not be banked under the
+                // planned hashes even though the cached verdict itself is for
+                // those older bytes.
+                verify_planned_inputs(entry, "banking a cached verdict")?;
                 // The MEASUREMENT is the cached row's; the IDENTITY is this
                 // plan's. The key carries the category (it selects the preset,
                 // so it is an input) but deliberately NOT the row position: one
@@ -2043,15 +3567,27 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
             }
             None => {
                 let outcome = run_instance(
-                    &exe,
+                    &child_exe,
                     &entry.category,
                     &entry.base,
                     &entry.instance,
                     entry.budget_secs,
-                    effective_configs_dir.as_deref(),
+                    category_configs_dirs
+                        .get(&entry.category)
+                        .map(PathBuf::as_path)
+                        .or(effective_configs_dir.as_deref()),
                     scratch.path(),
                     &opts.arm,
                 )?;
+                validate_child_build_receipt(
+                    outcome.flight.as_ref(),
+                    &expected_child_build_stamp,
+                    "fresh measurement",
+                )?;
+                // Detect edits that landed while the child was running. The
+                // verdict is not published or cached unless the resolved files
+                // still hash to the exact pre-run plan.
+                verify_planned_inputs(entry, "banking a fresh verdict")?;
                 // Every banked sat row carries its witness disposition: a
                 // retained record, or an explicit null the summary counts.
                 // Non-sat rows carry no witness field at all.
@@ -2232,6 +3768,78 @@ pub(crate) fn run_sweep(opts: &SweepOptions) -> Result<SweepSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Most manifest-unit tests exercise already sealed inputs and need no
+    /// historical rows. Tests of legacy execution-seal adoption call the parent
+    /// function directly with an adversarial state.
+    fn merge_resume_manifest(
+        existing: SweepManifest,
+        desired: &SweepManifest,
+    ) -> Result<SweepManifest> {
+        super::merge_resume_manifest(existing, desired, &SweepState::new())
+    }
+
+    fn external_tensor(name: &str, location: &str) -> ny_onnx::onnx_proto::TensorProto {
+        ny_onnx::onnx_proto::TensorProto {
+            dims: vec![1],
+            data_type: 1,
+            name: name.to_string(),
+            external_data: vec![ny_onnx::onnx_proto::StringStringEntryProto {
+                key: "location".into(),
+                value: location.into(),
+            }],
+            data_location: 1,
+            ..Default::default()
+        }
+    }
+
+    fn write_test_onnx(path: &Path, initializer_locations: &[&str], attribute_locations: &[&str]) {
+        let initializer = initializer_locations
+            .iter()
+            .enumerate()
+            .map(|(index, location)| external_tensor(&format!("initializer_{index}"), location))
+            .collect();
+        let attributes = attribute_locations
+            .iter()
+            .enumerate()
+            .map(|(index, location)| ny_onnx::onnx_proto::AttributeProto {
+                name: format!("attribute_{index}"),
+                r#type: ny_onnx::onnx_proto::attribute_type::TENSOR,
+                t: Some(external_tensor(
+                    &format!("attribute_tensor_{index}"),
+                    location,
+                )),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let nodes = (!attributes.is_empty())
+            .then(|| ny_onnx::onnx_proto::NodeProto {
+                name: "constant_node".into(),
+                attribute: attributes,
+                ..Default::default()
+            })
+            .into_iter()
+            .collect();
+        let model = ny_onnx::onnx_proto::ModelProto {
+            graph: Some(ny_onnx::onnx_proto::GraphProto {
+                name: "dependency_seal_test".into(),
+                initializer,
+                node: nodes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = model.encode_to_vec();
+        if path.extension().and_then(std::ffi::OsStr::to_str) == Some("gz") {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&encoded).expect("compress test ONNX");
+            std::fs::write(path, encoder.finish().expect("finish test ONNX gzip"))
+                .expect("write test ONNX gzip");
+        } else {
+            std::fs::write(path, encoded).expect("write test ONNX");
+        }
+    }
 
     #[test]
     fn parses_single_model_rows() {
@@ -2767,6 +4375,44 @@ mod tests {
         }
     }
 
+    fn planned_row(
+        category: &str,
+        onnx: &str,
+        vnnlib: &str,
+        occurrence: usize,
+        instance_index: usize,
+        selected: bool,
+    ) -> PlannedInstance {
+        PlannedInstance {
+            identity: (category.into(), onnx.into(), vnnlib.into(), occurrence),
+            category: category.into(),
+            base: PathBuf::from("."),
+            instance: SweepInstance {
+                onnx_field: onnx.into(),
+                vnnlib_field: vnnlib.into(),
+                budget_secs: 10,
+            },
+            instance_index,
+            budget_secs: 10,
+            capped_from: None,
+            selected,
+            inputs: selected.then(|| ResolvedInstanceInputs {
+                onnx: vec![ModelInputFingerprint {
+                    label: None,
+                    artifact: ArtifactFingerprint {
+                        canonical_path: format!("/corpus/{category}/{onnx}"),
+                        sha256: format!("onnx-{onnx}"),
+                    },
+                    external_data: Some(Vec::new()),
+                }],
+                vnnlib: ArtifactFingerprint {
+                    canonical_path: format!("/corpus/{category}/{vnnlib}"),
+                    sha256: format!("vnnlib-{vnnlib}"),
+                },
+            }),
+        }
+    }
+
     #[test]
     fn authoritative_metadata_preserves_duplicate_occurrences_during_error_retry() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2901,6 +4547,7 @@ mod tests {
             budget_secs: 5,
             capped_from: Some(10),
             selected: true,
+            inputs: None,
         }];
         let mut state = SweepState::new();
         state.insert(identity, metadata_row("c", 0, SweepVerdict::Unsat));
@@ -2908,6 +4555,130 @@ mod tests {
             validate_state_against_plan(&state, &plan).is_err(),
             "an uncapped persisted row must not enter a capped bank"
         );
+    }
+
+    #[test]
+    fn legacy_adoption_refuses_rows_outside_the_current_exact_or_limit_selection() {
+        let row_identity: InstanceSelector =
+            ("c".into(), "model.onnx".into(), "property.vnnlib".into());
+        let other = HashSet::from([("c".into(), "other.onnx".into(), "other.vnnlib".into())]);
+        for (label, instance_index, selected) in [
+            (
+                "exact",
+                0,
+                instance_is_selected(Some(&other), &row_identity, 0, usize::MAX),
+            ),
+            ("limit", 1, instance_is_selected(None, &row_identity, 1, 1)),
+        ] {
+            assert!(!selected, "test fixture must be outside {label} selection");
+            let identity = (
+                row_identity.0.clone(),
+                row_identity.1.clone(),
+                row_identity.2.clone(),
+                0,
+            );
+            let plan = vec![PlannedInstance {
+                identity: identity.clone(),
+                category: "c".into(),
+                base: PathBuf::from("."),
+                instance: SweepInstance {
+                    onnx_field: row_identity.1.clone(),
+                    vnnlib_field: row_identity.2.clone(),
+                    budget_secs: 10,
+                },
+                instance_index,
+                budget_secs: 10,
+                capped_from: None,
+                selected,
+                inputs: None,
+            }];
+            let mut row = metadata_row("c", 0, SweepVerdict::Unsat);
+            row.instance_index = instance_index;
+            let state = SweepState::from([(identity, row)]);
+            let error = validate_state_against_plan(&state, &plan)
+                .expect_err("legacy adoption must not relabel existing rows");
+            assert!(error
+                .to_string()
+                .contains("outside the current instance selection"));
+        }
+    }
+
+    #[test]
+    fn legacy_adoption_checks_rows_from_categories_omitted_by_this_resume() {
+        let mut old_row = metadata_row("old", 0, SweepVerdict::Unsat);
+        old_row.instance_index = 1;
+        let state = SweepState::from([(
+            (
+                "old".into(),
+                "model.onnx".into(),
+                "property.vnnlib".into(),
+                0,
+            ),
+            old_row,
+        )]);
+        let plan = vec![PlannedInstance {
+            identity: ("current".into(), "m.onnx".into(), "p.vnnlib".into(), 0),
+            category: "current".into(),
+            base: PathBuf::from("."),
+            instance: SweepInstance {
+                onnx_field: "m.onnx".into(),
+                vnnlib_field: "p.vnnlib".into(),
+                budget_secs: 10,
+            },
+            instance_index: 0,
+            budget_secs: 10,
+            capped_from: None,
+            selected: true,
+            inputs: None,
+        }];
+
+        validate_legacy_selection_adoption(&state, &plan, &InstanceSelection::All)
+            .expect("all rows is compatible with accumulated historical categories");
+        let limit_error = validate_legacy_selection_adoption(
+            &state,
+            &plan,
+            &InstanceSelection::Limit { per_category: 2 },
+        )
+        .expect_err("an omitted category cannot prove whether its index was recorded");
+        assert!(limit_error
+            .to_string()
+            .contains("pre-index rows deserialize an absent index as zero"));
+
+        let exact = exact_selection("current,m.onnx,p.vnnlib\n");
+        let exact_error = validate_legacy_selection_adoption(&state, &plan, &exact)
+            .expect_err("an omitted category's exact membership cannot be reconstructed");
+        assert!(exact_error.to_string().contains("cannot be proven"));
+    }
+
+    #[test]
+    fn pre_index_legacy_row_cannot_masquerade_as_a_limit_prefix_member() {
+        let row = metadata_row("old", 0, SweepVerdict::Unsat);
+        let mut json = serde_json::to_value(row).expect("row JSON");
+        json.as_object_mut()
+            .expect("row object")
+            .remove("instance_index");
+        let legacy: SweepRow =
+            serde_json::from_value(json).expect("pre-index metadata remains readable");
+        assert_eq!(
+            legacy.instance_index, 0,
+            "this default is why the omitted category cannot prove Limit membership"
+        );
+        let identity = (
+            legacy.category.clone(),
+            legacy.onnx.clone(),
+            legacy.vnnlib.clone(),
+            legacy.occurrence,
+        );
+        let state = SweepState::from([(identity, legacy)]);
+        let plan = vec![planned_row("current", "m.onnx", "p.vnnlib", 0, 0, true)];
+
+        let error = validate_legacy_selection_adoption(
+            &state,
+            &plan,
+            &InstanceSelection::Limit { per_category: 1 },
+        )
+        .expect_err("defaulted index zero is not affirmative first-one provenance");
+        assert!(error.to_string().contains("include the category"));
     }
 
     /// #arm-sealing: a resume must REFUSE when the ambient lever set differs.
@@ -2919,10 +4690,10 @@ mod tests {
     #[test]
     fn resume_refuses_a_different_ambient_lever_set() {
         let mut sealed = test_manifest(None);
-        sealed.ambient_env = BTreeMap::from([(
+        sealed.ambient_env = Some(BTreeMap::from([(
             "NY_ROOT_COMPREHENSIVE_GPU_INTERM_CROWN".to_string(),
             "1".to_string(),
-        )]);
+        )]));
         let desired = test_manifest(None); // empty ambient set
         let error = merge_resume_manifest(sealed, &desired)
             .expect_err("a resume under a different arm must refuse");
@@ -2942,10 +4713,19 @@ mod tests {
     /// already use, so old banks stay resumable.
     #[test]
     fn resume_allows_a_legacy_bank_with_no_sealed_ambient_set() {
-        let legacy = test_manifest(None); // ambient_env empty == legacy
+        let mut legacy = test_manifest(None);
+        legacy.ambient_env_schema = None;
+        // Pre-v2 manifests may already contain an ambient map; without the
+        // schema token it is still legacy capture, not current proof.
+        legacy.ambient_env = Some(BTreeMap::new());
         let mut desired = test_manifest(None);
-        desired.ambient_env = BTreeMap::from([("OMP_NUM_THREADS".to_string(), "1".to_string())]);
-        merge_resume_manifest(legacy, &desired).expect("a legacy bank must remain resumable");
+        desired.ambient_env = Some(BTreeMap::from([(
+            "OMP_NUM_THREADS".to_string(),
+            "1".to_string(),
+        )]));
+        let merged =
+            merge_resume_manifest(legacy, &desired).expect("an empty legacy bank is safe to adopt");
+        assert_eq!(merged.ambient_env, desired.ambient_env);
     }
 
     /// An identical ambient set resumes cleanly.
@@ -2953,10 +4733,660 @@ mod tests {
     fn resume_allows_an_identical_ambient_lever_set() {
         let arm = BTreeMap::from([("OMP_NUM_THREADS".to_string(), "1".to_string())]);
         let mut sealed = test_manifest(None);
-        sealed.ambient_env = arm.clone();
+        sealed.ambient_env = Some(arm.clone());
         let mut desired = test_manifest(None);
-        desired.ambient_env = arm;
+        desired.ambient_env = Some(arm);
         merge_resume_manifest(sealed, &desired).expect("same arm must resume");
+    }
+
+    #[test]
+    fn affirmative_empty_execution_seals_are_present_and_refuse_drift() {
+        let clean = test_manifest(None);
+        let json = serde_json::to_value(&clean).expect("manifest JSON");
+        assert_eq!(json["arm"], serde_json::json!([]));
+        assert_eq!(
+            json["ambient_env_schema"],
+            crate::flight::AMBIENT_ENV_SCHEMA
+        );
+        assert_eq!(json["ambient_env"], serde_json::json!({}));
+
+        let mut dirty = test_manifest(None);
+        dirty.ambient_env = Some(BTreeMap::from([(
+            "NY_MARGIN_ROW_CLASSWISE".to_string(),
+            "1".to_string(),
+        )]));
+        let error = merge_resume_manifest(clean, &dirty).expect_err(
+            "a clean current bank must not masquerade as legacy and adopt contamination",
+        );
+        assert!(error.to_string().contains("ambient lever set"));
+
+        let mut unknown = test_manifest(None);
+        unknown.ambient_env_schema = Some("ny-cli/ambient-env/v999".into());
+        let error = merge_resume_manifest(unknown, &test_manifest(None))
+            .expect_err("an unknown present ambient schema must never be treated as legacy");
+        assert!(error
+            .to_string()
+            .contains("unsupported ambient-environment schema"));
+
+        let mut legacy_json = json;
+        let object = legacy_json.as_object_mut().expect("manifest object");
+        object.remove("arm");
+        object.remove("ambient_env_schema");
+        let legacy: SweepManifest =
+            serde_json::from_value(legacy_json).expect("pre-seal manifest remains readable");
+        assert!(
+            legacy.arm.is_none()
+                && legacy.ambient_env_schema.is_none()
+                && legacy.ambient_env == Some(BTreeMap::new())
+        );
+    }
+
+    #[test]
+    fn sealed_manifest_refuses_a_different_explicit_arm() {
+        let mut existing = test_manifest(None);
+        existing.arm = Some(vec![("NY_MARGIN_ROW_LRU".into(), "16".into())]);
+        let mut desired = test_manifest(None);
+        desired.arm = Some(vec![("NY_MARGIN_ROW_LRU".into(), "128".into())]);
+
+        let error = merge_resume_manifest(existing, &desired)
+            .expect_err("a partial bank cannot resume under another --lever treatment");
+        assert!(error.to_string().contains("explicit arm"));
+    }
+
+    #[test]
+    fn legacy_explicit_arm_adoption_requires_every_retained_row_to_match() {
+        let arm = canonical_arm(&[
+            ("NY_MARGIN_ROW_PARALLEL".into(), "8".into()),
+            ("NY_MARGIN_ROW_LRU".into(), "16".into()),
+        ]);
+        let mut legacy = test_manifest(None);
+        legacy.arm = None;
+        let mut desired = test_manifest(None);
+        desired.arm = Some(arm.clone());
+
+        let identity = ("c".into(), "model.onnx".into(), "property.vnnlib".into(), 0);
+        let mut matching = metadata_row("c", 0, SweepVerdict::Unsat);
+        matching.arm = arm.iter().rev().cloned().collect();
+        matching.flight = Some(serde_json::json!({
+            "ambient_env_schema": crate::flight::AMBIENT_ENV_SCHEMA,
+            "ambient_env": {
+                "NY_MARGIN_ROW_LRU": "16",
+                "NY_MARGIN_ROW_PARALLEL": "8",
+                "OMP_NUM_THREADS": "1"
+            }
+        }));
+        let state = SweepState::from([(identity.clone(), matching)]);
+        let merged = super::merge_resume_manifest(legacy.clone(), &desired, &state)
+            .expect("row arm proves a canonical legacy adoption");
+        assert_eq!(merged.arm, Some(arm));
+
+        let mismatched = metadata_row("c", 0, SweepVerdict::Unsat);
+        let state = SweepState::from([(identity, mismatched)]);
+        let error = super::merge_resume_manifest(legacy, &desired, &state)
+            .expect_err("a baseline row cannot be relabeled as a treatment");
+        assert!(error
+            .to_string()
+            .contains("retained measurement records explicit arm"));
+    }
+
+    #[test]
+    fn legacy_ambient_adoption_requires_exact_child_flight_provenance() {
+        let mut legacy = test_manifest(None);
+        legacy.ambient_env_schema = None;
+        // A pre-v3 manifest map is readable but cannot itself prove that every
+        // Rayon worker-count variable was absent; only the row's v3 flight can
+        // do that.
+        legacy.ambient_env = Some(BTreeMap::new());
+        let desired = test_manifest(None);
+        let identity = ("c".into(), "model.onnx".into(), "property.vnnlib".into(), 0);
+
+        let mut matching = metadata_row("c", 0, SweepVerdict::Unsat);
+        matching.flight = Some(serde_json::json!({
+            "ambient_env_schema": crate::flight::AMBIENT_ENV_SCHEMA,
+            "ambient_env": {"OMP_NUM_THREADS": "1"}
+        }));
+        let state = SweepState::from([(identity.clone(), matching)]);
+        let merged = super::merge_resume_manifest(legacy.clone(), &desired, &state)
+            .expect("the child flight proves the effective clean environment");
+        assert_eq!(merged.ambient_env, Some(BTreeMap::new()));
+        assert_eq!(
+            merged.ambient_env_schema.as_deref(),
+            Some(crate::flight::AMBIENT_ENV_SCHEMA)
+        );
+
+        let mut pre_v3 = metadata_row("c", 0, SweepVerdict::Unsat);
+        pre_v3.flight = Some(serde_json::json!({
+            "schema_version": 3,
+            "ambient_env_schema": "ny-cli/ambient-env/v2",
+            "ambient_env": {"OMP_NUM_THREADS": "1"}
+        }));
+        let state = SweepState::from([(identity.clone(), pre_v3)]);
+        let error = super::merge_resume_manifest(legacy.clone(), &desired, &state)
+            .expect_err("a v2 flight omitted deprecated Rayon worker-count state");
+        assert!(error.to_string().contains("pre-v3 captures"));
+
+        let mut contaminated = metadata_row("c", 0, SweepVerdict::Unsat);
+        contaminated.flight = Some(serde_json::json!({
+            "ambient_env_schema": crate::flight::AMBIENT_ENV_SCHEMA,
+            "ambient_env": {
+                "NY_MARGIN_ROW_CLASSWISE": "1",
+                "OMP_NUM_THREADS": "1"
+            }
+        }));
+        let state = SweepState::from([(identity.clone(), contaminated)]);
+        let error = super::merge_resume_manifest(legacy.clone(), &desired, &state)
+            .expect_err("undeclared ambient contamination cannot be adopted as clean");
+        assert!(error.to_string().contains("NY_MARGIN_ROW_CLASSWISE"));
+
+        let missing_flight = metadata_row("c", 0, SweepVerdict::Unsat);
+        let state = SweepState::from([(identity, missing_flight)]);
+        let error = super::merge_resume_manifest(legacy, &desired, &state)
+            .expect_err("a retained verdict without flight provenance must fail closed");
+        assert!(error.to_string().contains("no child flight record"));
+    }
+
+    #[test]
+    fn current_manifest_seals_are_rechecked_against_every_retained_measurement() {
+        let sealed = test_manifest(None);
+        let desired = sealed.clone();
+        let identity = ("c".into(), "model.onnx".into(), "property.vnnlib".into(), 0);
+
+        let mut matching = metadata_row("c", 0, SweepVerdict::Unsat);
+        matching.flight = Some(serde_json::json!({
+            "ambient_env_schema": crate::flight::AMBIENT_ENV_SCHEMA,
+            "ambient_env": {"OMP_NUM_THREADS": "1"}
+        }));
+        let state = SweepState::from([(identity.clone(), matching)]);
+        super::merge_resume_manifest(sealed.clone(), &desired, &state)
+            .expect("a retained row matching both current seals resumes");
+
+        let mut mixed_arm = metadata_row("c", 0, SweepVerdict::Unsat);
+        mixed_arm.arm = vec![("NY_MARGIN_ROW_LRU".into(), "128".into())];
+        let state = SweepState::from([(identity.clone(), mixed_arm)]);
+        let error = super::merge_resume_manifest(sealed.clone(), &desired, &state)
+            .expect_err("a sealed manifest must not hide a row measured under another arm");
+        assert!(error.to_string().contains("expected bank arm"));
+
+        let mut contaminated = metadata_row("c", 0, SweepVerdict::Unsat);
+        contaminated.flight = Some(serde_json::json!({
+            "ambient_env_schema": crate::flight::AMBIENT_ENV_SCHEMA,
+            "ambient_env": {
+                "NY_MARGIN_ROW_CLASSWISE": "1",
+                "OMP_NUM_THREADS": "1"
+            }
+        }));
+        let state = SweepState::from([(identity.clone(), contaminated)]);
+        let error = super::merge_resume_manifest(sealed.clone(), &desired, &state)
+            .expect_err("a sealed manifest must not hide ambient-contaminated rows");
+        assert!(error.to_string().contains("NY_MARGIN_ROW_CLASSWISE"));
+
+        let mut pre_v3 = metadata_row("c", 0, SweepVerdict::Unsat);
+        pre_v3.flight = Some(serde_json::json!({
+            "schema_version": 3,
+            "ambient_env_schema": "ny-cli/ambient-env/v2",
+            "ambient_env": {"OMP_NUM_THREADS": "1"}
+        }));
+        let state = SweepState::from([(identity, pre_v3)]);
+        let error = super::merge_resume_manifest(sealed, &desired, &state)
+            .expect_err("a current manifest token cannot launder a pre-v3 row flight");
+        assert!(error.to_string().contains("pre-v3 captures"));
+    }
+
+    fn exact_selection(body: &str) -> InstanceSelection {
+        let selectors = parse_instance_selectors(body).expect("valid exact selector");
+        requested_instance_selection(None, Some(&selectors)).expect("selection identity")
+    }
+
+    #[test]
+    fn exact_selector_identity_is_order_insensitive_and_python_compatible() {
+        let forward = exact_selection(
+            "c,m.onnx,p.vnnlib\n\
+             d,x.onnx,q.vnnlib\n",
+        );
+        let reordered = exact_selection(
+            "# comments and row order are not selection semantics\n\
+             d,x.onnx,q.vnnlib\n\
+             c,m.onnx,p.vnnlib\n",
+        );
+        assert_eq!(forward, reordered);
+
+        let manifest_shape = serde_json::to_value(&forward).expect("selection JSON");
+        assert_eq!(manifest_shape["mode"], "exact");
+        assert_eq!(manifest_shape["identity"]["count"], 2);
+        assert_eq!(
+            manifest_shape["identity"]["schema"],
+            INSTANCE_SELECTOR_IDENTITY_SCHEMA
+        );
+
+        let InstanceSelection::Exact { identity } = forward else {
+            panic!("an --instances request must be exact");
+        };
+        assert_eq!(identity.schema, INSTANCE_SELECTOR_IDENTITY_SCHEMA);
+        assert_eq!(identity.count, 2);
+        assert_eq!(
+            identity.sha256,
+            // Python `json.dumps(..., ensure_ascii=False, sort_keys=True,
+            // separators=(\",\", \":\"))`, locked so the search harness and
+            // native manifest cannot silently drift apart.
+            "158b2b4f72e17e621f7981fc7273a11d4b1aaf0f1502506cbdfb151f5e30b83b"
+        );
+    }
+
+    #[test]
+    fn selected_row_seals_match_python_and_distinguish_partial_duplicate_sets() {
+        let plan = vec![
+            planned_row("c", "m.onnx", "p.vnnlib", 0, 2, true),
+            planned_row("c", "m.onnx", "p.vnnlib", 1, 5, true),
+            planned_row("c", "unselected.onnx", "q.vnnlib", 0, 7, false),
+            // A planned category with no selected rows is a proven empty set,
+            // not missing legacy provenance.
+            planned_row("d", "x.onnx", "q.vnnlib", 0, 0, false),
+        ];
+        let sealed = selected_rows_for_plan(&plan).expect("selected row seals");
+        assert_eq!(sealed.len(), 2);
+
+        let c = &sealed["c"];
+        assert_eq!(c.schema, MEASURED_ROW_SET_IDENTITY_SCHEMA);
+        assert_eq!(
+            c.count, 2,
+            "both duplicate corpus occurrences must be sealed"
+        );
+        assert_eq!(
+            c.sha256,
+            // Python `measured_row_set_identity` over
+            // [(c,m,p,0,2), (c,m,p,1,5)].
+            "99a3767547dda44cff5878fbd1a592f85ca38a271f704b69095ca5cc7a60be53"
+        );
+        let d = &sealed["d"];
+        assert_eq!(d.count, 0);
+        assert_eq!(
+            d.sha256,
+            "abea9155bcec1da8b43764abb29a251959149de590fb283625f3559ab8a5071a"
+        );
+
+        let partial =
+            selected_row_set_identity(&[("c".into(), "m.onnx".into(), "p.vnnlib".into(), 0, 2)])
+                .expect("partial row seal");
+        assert_eq!(
+            partial.sha256,
+            "fdbb96ef4ecaeba8e80eb8f2c6c0155d24b6a1841102269468a00dfc198c2f35"
+        );
+        assert_ne!(
+            c, &partial,
+            "equal selector intent cannot make a partial bank look like the full duplicate set"
+        );
+
+        let reversed = selected_row_set_identity(&[
+            ("c".into(), "m.onnx".into(), "p.vnnlib".into(), 1, 5),
+            ("c".into(), "m.onnx".into(), "p.vnnlib".into(), 0, 2),
+        ])
+        .expect("reordered row seal");
+        assert_eq!(c, &reversed, "plan enumeration order is not set identity");
+    }
+
+    #[test]
+    fn resolved_input_seal_detects_in_place_model_and_property_edits() {
+        let category = tempfile::tempdir().expect("category");
+        std::fs::create_dir_all(category.path().join("onnx")).expect("onnx dir");
+        std::fs::create_dir_all(category.path().join("vnnlib")).expect("vnnlib dir");
+        let first = category.path().join("onnx/f.onnx");
+        let second = category.path().join("onnx/g.onnx");
+        let property = category.path().join("vnnlib/p.vnnlib");
+        write_test_onnx(&first, &[], &[]);
+        write_test_onnx(&second, &[], &[]);
+        std::fs::write(&property, b"CCCC").expect("property");
+        let instance = SweepInstance {
+            onnx_field: "[('f', 'onnx/f.onnx'), ('g', 'onnx/g.onnx')]".into(),
+            vnnlib_field: "vnnlib/p.vnnlib".into(),
+            budget_secs: 10,
+        };
+        let inputs = fingerprint_instance_inputs(
+            category.path(),
+            &instance,
+            &mut InputFingerprintMemo::new(),
+        )
+        .expect("initial content seal");
+        assert_eq!(inputs.onnx.len(), 2, "every relational member is sealed");
+        assert_eq!(inputs.onnx[0].label.as_deref(), Some("f"));
+        assert_eq!(inputs.onnx[1].label.as_deref(), Some("g"));
+        let entry = PlannedInstance {
+            identity: (
+                "relational".into(),
+                instance.onnx_field.clone(),
+                instance.vnnlib_field.clone(),
+                0,
+            ),
+            category: "relational".into(),
+            base: category.path().to_path_buf(),
+            instance,
+            instance_index: 0,
+            budget_secs: 10,
+            capped_from: None,
+            selected: true,
+            inputs: Some(inputs),
+        };
+        verify_planned_inputs(&entry, "unchanged test row").expect("unchanged inputs verify");
+
+        let original_second = std::fs::read(&second).expect("read second model");
+        let mut changed_second = original_second.clone();
+        let last = changed_second.last_mut().expect("nonempty encoded model");
+        *last ^= 1;
+        // Same path and same byte length: identity must come from CONTENT, not
+        // the CSV field, size, or a coarse metadata cache.
+        std::fs::write(&second, changed_second).expect("mutate relational member in place");
+        let error = verify_planned_inputs(&entry, "reusing an old verdict")
+            .expect_err("an in-place ONNX edit must invalidate resume reuse");
+        assert!(error
+            .to_string()
+            .contains("changed resolved ONNX/VNN-LIB content"));
+
+        std::fs::write(&second, original_second).expect("restore model");
+        verify_planned_inputs(&entry, "after model restore").expect("restored model verifies");
+        std::fs::write(&property, b"EEEE").expect("mutate property in place");
+        let error = verify_planned_inputs(&entry, "banking a fresh verdict")
+            .expect_err("an in-place VNN-LIB edit must invalidate the measured row");
+        assert!(error
+            .to_string()
+            .contains("changed resolved ONNX/VNN-LIB content"));
+    }
+
+    #[test]
+    fn resolved_input_seal_and_cache_digest_include_external_onnx_data() {
+        let category = tempfile::tempdir().expect("category");
+        std::fs::create_dir_all(category.path().join("onnx/nested")).expect("onnx dir");
+        std::fs::create_dir_all(category.path().join("vnnlib")).expect("vnnlib dir");
+        let model = category.path().join("onnx/model.onnx.gz");
+        let first_sidecar = category.path().join("onnx/weights.data");
+        let second_sidecar = category.path().join("onnx/nested/constants.data");
+        let property = category.path().join("vnnlib/p.vnnlib");
+        std::fs::write(&first_sidecar, b"AAAA").expect("first sidecar");
+        std::fs::write(&second_sidecar, b"BBBB").expect("second sidecar");
+        std::fs::write(&property, b"(assert true)").expect("property");
+        // The initializer and AttributeProto.t share one sidecar. The closure is
+        // set-like, so that file appears once beside the distinct nested file.
+        write_test_onnx(
+            &model,
+            &["weights.data", "nested/constants.data"],
+            &["./weights.data"],
+        );
+        let instance = SweepInstance {
+            onnx_field: "onnx/model.onnx.gz".into(),
+            vnnlib_field: "vnnlib/p.vnnlib".into(),
+            budget_secs: 10,
+        };
+        let inputs = fingerprint_instance_inputs(
+            category.path(),
+            &instance,
+            &mut InputFingerprintMemo::new(),
+        )
+        .expect("seal gzipped external-data model");
+        let dependencies = inputs.onnx[0]
+            .external_data
+            .as_ref()
+            .expect("affirmative external-data closure");
+        assert_eq!(
+            dependencies
+                .iter()
+                .map(|dependency| dependency.location.as_str())
+                .collect::<Vec<_>>(),
+            ["nested/constants.data", "weights.data"],
+            "initializer and attribute dependencies are normalized, sorted, and deduplicated"
+        );
+        let original_cache_digest =
+            onnx_cache_input_digest(&inputs.onnx).expect("initial cache input digest");
+        let entry = PlannedInstance {
+            identity: (
+                "external".into(),
+                instance.onnx_field.clone(),
+                instance.vnnlib_field.clone(),
+                0,
+            ),
+            category: "external".into(),
+            base: category.path().to_path_buf(),
+            instance,
+            instance_index: 0,
+            budget_secs: 10,
+            capped_from: None,
+            selected: true,
+            inputs: Some(inputs),
+        };
+        verify_planned_inputs(&entry, "unchanged external-data row")
+            .expect("unchanged closure verifies");
+
+        std::fs::write(&first_sidecar, b"CCCC").expect("mutate sidecar in place");
+        let changed = fingerprint_instance_inputs(
+            category.path(),
+            &entry.instance,
+            &mut InputFingerprintMemo::new(),
+        )
+        .expect("seal changed sidecar");
+        assert_ne!(
+            original_cache_digest,
+            onnx_cache_input_digest(&changed.onnx).expect("changed cache input digest"),
+            "a sidecar-only edit must select a different cache entry"
+        );
+        let error = verify_planned_inputs(&entry, "reusing a sidecar-backed verdict")
+            .expect_err("a sidecar-only edit must invalidate resume/cache reuse");
+        assert!(
+            error
+                .to_string()
+                .contains("changed resolved ONNX/VNN-LIB content"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn manifest_exposes_and_compares_selected_row_input_hashes() {
+        let existing = test_manifest(None);
+        let json = serde_json::to_value(&existing).expect("manifest JSON");
+        assert_eq!(
+            json["selected_row_inputs_schema"],
+            SELECTED_ROW_INPUTS_SCHEMA
+        );
+        assert_eq!(
+            json["selected_row_inputs"]["c"][0]["inputs"]["onnx"][0]["artifact"]["sha256"],
+            "model-bytes"
+        );
+        assert_eq!(
+            json["selected_row_inputs"]["c"][0]["inputs"]["onnx"][0]["external_data"],
+            serde_json::json!([]),
+            "schema v2 must affirmatively seal even an empty external-data closure"
+        );
+        assert_eq!(
+            json["selected_row_inputs"]["c"][0]["inputs"]["vnnlib"]["sha256"],
+            "property-bytes"
+        );
+
+        let mut changed = existing.clone();
+        changed
+            .selected_row_inputs
+            .get_mut("c")
+            .expect("category")
+            .get_mut(0)
+            .expect("row")
+            .inputs
+            .onnx
+            .get_mut(0)
+            .expect("model")
+            .artifact
+            .sha256 = "different-model-bytes".into();
+        let error = merge_resume_manifest(existing, &changed)
+            .expect_err("same CSV row over changed bytes must not resume");
+        assert!(
+            error.to_string().contains("content changed"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn legacy_retained_verdict_without_input_hashes_fails_closed() {
+        let desired = test_manifest(None);
+        let mut legacy_json = serde_json::to_value(&desired).expect("manifest JSON");
+        let object = legacy_json.as_object_mut().expect("manifest object");
+        object.remove("selected_row_inputs_schema");
+        object.remove("selected_row_inputs");
+        let legacy: SweepManifest =
+            serde_json::from_value(legacy_json).expect("legacy manifest parses");
+        let identity = ("c".into(), "model.onnx".into(), "property.vnnlib".into(), 0);
+        let state = SweepState::from([(identity, metadata_row("c", 0, SweepVerdict::Unsat))]);
+        let error = super::merge_resume_manifest(legacy.clone(), &desired, &state)
+            .expect_err("today's bytes cannot prove what a legacy verdict measured");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot adopt today's file bytes retroactively"),
+            "unexpected refusal: {error}"
+        );
+
+        let error_only = SweepState::from([(
+            ("c".into(), "model.onnx".into(), "property.vnnlib".into(), 0),
+            metadata_row("c", 0, SweepVerdict::Error),
+        )]);
+        let migrated = super::merge_resume_manifest(legacy, &desired, &error_only)
+            .expect("an error is retried, never reused as a measurement");
+        assert_eq!(
+            migrated.selected_row_inputs_schema.as_deref(),
+            Some(SELECTED_ROW_INPUTS_SCHEMA)
+        );
+    }
+
+    #[test]
+    fn selected_row_input_v1_or_missing_external_closure_fails_closed() {
+        let mut v1 = test_manifest(None);
+        v1.selected_row_inputs_schema = Some("ny-cli/selected-row-inputs/v1".into());
+        let error = validate_selected_row_input_manifest(&v1, "legacy")
+            .expect_err("v1 cannot prove that a model had no external tensor data");
+        assert!(
+            error.to_string().contains("expected"),
+            "unexpected refusal: {error:#}"
+        );
+
+        let mut missing_json = serde_json::to_value(test_manifest(None)).expect("manifest JSON");
+        missing_json["selected_row_inputs"]["c"][0]["inputs"]["onnx"][0]
+            .as_object_mut()
+            .expect("model seal")
+            .remove("external_data");
+        let missing: SweepManifest =
+            serde_json::from_value(missing_json).expect("presence-sensitive legacy manifest");
+        let error = validate_selected_row_input_manifest(&missing, "tampered")
+            .expect_err("schema v2 cannot infer an omitted closure as empty");
+        assert!(
+            error
+                .to_string()
+                .contains("no affirmative ONNX external-data closure"),
+            "unexpected refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn resume_allows_the_same_exact_selector_and_refuses_a_different_one() {
+        let selection = exact_selection("c,m.onnx,p.vnnlib\n");
+        let mut existing = test_manifest(None);
+        existing.instance_selection = Some(selection.clone());
+        let mut same = test_manifest(None);
+        same.instance_selection = Some(selection);
+        merge_resume_manifest(existing.clone(), &same).expect("same selector resumes");
+
+        let mut different = test_manifest(None);
+        different.instance_selection = Some(exact_selection("c,m.onnx,other.vnnlib\n"));
+        let error = merge_resume_manifest(existing, &different)
+            .expect_err("a different exact subset must not enter the bank");
+        assert!(
+            error.to_string().contains("instance selection"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_a_limit_change_but_allows_the_same_limit() {
+        let mut existing = test_manifest(None);
+        existing.instance_selection = Some(InstanceSelection::Limit { per_category: 4 });
+        let same = existing.clone();
+        merge_resume_manifest(existing.clone(), &same).expect("same first-N selection resumes");
+
+        let mut different = test_manifest(None);
+        different.instance_selection = Some(InstanceSelection::Limit { per_category: 8 });
+        let error = merge_resume_manifest(existing, &different)
+            .expect_err("changing --limit must not change a bank's measured prefix");
+        assert!(error.to_string().contains("instance selection"));
+    }
+
+    #[test]
+    fn a_legacy_manifest_adopts_the_current_selection_once() {
+        let mut json = serde_json::to_value(test_manifest(None)).expect("manifest JSON");
+        json.as_object_mut()
+            .expect("manifest object")
+            .remove("instance_selection");
+        let legacy: SweepManifest =
+            serde_json::from_value(json).expect("pre-selection manifest remains readable");
+        assert!(legacy.instance_selection.is_none());
+
+        let selection = exact_selection("c,m.onnx,p.vnnlib\n");
+        let mut desired = test_manifest(None);
+        desired.instance_selection = Some(selection.clone());
+        let merged = merge_resume_manifest(legacy, &desired)
+            .expect("a legacy bank adopts this resume's explicit selection");
+        assert_eq!(merged.instance_selection, Some(selection));
+    }
+
+    #[test]
+    fn a_legacy_manifest_adopts_only_currently_proven_category_row_seals() {
+        let mut legacy = test_manifest(None);
+        legacy.instances_csv.insert(
+            "old".into(),
+            ArtifactFingerprint {
+                canonical_path: "/corpus/old/instances.csv".into(),
+                sha256: "old-instances".into(),
+            },
+        );
+        let mut json = serde_json::to_value(legacy).expect("legacy manifest JSON");
+        json.as_object_mut()
+            .expect("manifest object")
+            .remove("selected_rows");
+        json.as_object_mut()
+            .expect("manifest object")
+            .remove("selected_row_inputs_schema");
+        json.as_object_mut()
+            .expect("manifest object")
+            .remove("selected_row_inputs");
+        let legacy: SweepManifest =
+            serde_json::from_value(json).expect("pre-row-seal manifest remains readable");
+        assert!(legacy.selected_rows.is_empty());
+
+        // This invocation planned only c. Its seal is provable and adopted;
+        // historical category old stays deliberately unsealed rather than
+        // receiving a digest for rows this process never loaded.
+        let desired = test_manifest(None);
+        let merged = merge_resume_manifest(legacy, &desired).expect("legacy row-seal migration");
+        assert!(merged.selected_rows.contains_key("c"));
+        assert!(!merged.selected_rows.contains_key("old"));
+        assert!(merged.instances_csv.contains_key("old"));
+    }
+
+    #[test]
+    fn an_exact_selector_selects_every_duplicate_corpus_occurrence() {
+        let selector: InstanceSelector = ("c".into(), "m.onnx".into(), "p.vnnlib".into());
+        let wanted = HashSet::from([selector.clone()]);
+        let corpus = [selector.clone(), selector.clone()];
+        assert_eq!(
+            corpus
+                .iter()
+                .enumerate()
+                .filter(|(index, row)| instance_is_selected(Some(&wanted), row, *index, 0))
+                .count(),
+            2,
+            "a pair selector names the row, so every official duplicate occurrence runs"
+        );
+
+        let identity =
+            exact_instance_selection_identity(&[selector.clone()]).expect("one semantic selector");
+        assert_eq!(
+            identity.count, 1,
+            "selector count is semantic; duplicate multiplicity is pinned by instances.csv"
+        );
+        let mut occurrences = HashMap::new();
+        assert_eq!(occurrence_identity(&mut occurrences, selector.clone()).3, 0);
+        assert_eq!(occurrence_identity(&mut occurrences, selector).3, 1);
     }
 
     fn test_manifest(cap: Option<u64>) -> SweepManifest {
@@ -2970,13 +5400,52 @@ mod tests {
                 canonical_path: "/bin/ny".into(),
                 sha256: "exe".into(),
             },
+            build_id: "NY_BUILD_ID_V1 version=0.3.4745 features=mip exe=exe".into(),
             build_provenance: "sealed".into(),
             target_os: "linux".into(),
             target_arch: "x86_64".into(),
             compute_backend: "cuda [test]".into(),
             host: "gb10-test | Test CPU | 20 cores | 128 GiB".into(),
-            ambient_env: BTreeMap::new(),
+            arm: Some(Vec::new()),
+            ambient_env_schema: Some(crate::flight::AMBIENT_ENV_SCHEMA.to_string()),
+            ambient_env: Some(BTreeMap::new()),
             witness_dir: None,
+            instance_selection: Some(InstanceSelection::All),
+            selected_rows: BTreeMap::from([(
+                "c".into(),
+                selected_row_set_identity(&[(
+                    "c".into(),
+                    "model.onnx".into(),
+                    "property.vnnlib".into(),
+                    0,
+                    0,
+                )])
+                .expect("selected rows identity"),
+            )]),
+            selected_row_inputs_schema: Some(SELECTED_ROW_INPUTS_SCHEMA.to_string()),
+            selected_row_inputs: BTreeMap::from([(
+                "c".into(),
+                vec![SelectedRowInputSeal {
+                    onnx: "model.onnx".into(),
+                    vnnlib: "property.vnnlib".into(),
+                    occurrence: 0,
+                    instance_index: 0,
+                    inputs: ResolvedInstanceInputs {
+                        onnx: vec![ModelInputFingerprint {
+                            label: None,
+                            artifact: ArtifactFingerprint {
+                                canonical_path: "/corpus/c/model.onnx".into(),
+                                sha256: "model-bytes".into(),
+                            },
+                            external_data: Some(Vec::new()),
+                        }],
+                        vnnlib: ArtifactFingerprint {
+                            canonical_path: "/corpus/c/property.vnnlib".into(),
+                            sha256: "property-bytes".into(),
+                        },
+                    },
+                }],
+            )]),
             instances_csv: BTreeMap::from([(
                 "c".into(),
                 ArtifactFingerprint {
@@ -2994,9 +5463,12 @@ mod tests {
     #[test]
     fn cache_identity_carries_the_ambient_arm_and_a_distinct_no_configs_digest() {
         let mut manifest = test_manifest(None);
-        manifest.ambient_env = BTreeMap::from([("NY_ROOT_GEMM".to_string(), "faer".to_string())]);
+        manifest.ambient_env = Some(BTreeMap::from([(
+            "NY_ROOT_GEMM".to_string(),
+            "faer".to_string(),
+        )]));
         let identity = CacheIdentity::from_manifest(&manifest);
-        assert_eq!(identity.ambient_env, manifest.ambient_env);
+        assert_eq!(identity.ambient_env, manifest.ambient_env.clone().unwrap());
         assert_eq!(identity.exe_sha256, "exe");
         assert_eq!(identity.host, manifest.host);
         assert!(
@@ -3041,25 +5513,186 @@ mod tests {
                 budget_secs: 100,
                 capped_from: None,
                 selected: true,
+                inputs: Some(ResolvedInstanceInputs {
+                    onnx: vec![ModelInputFingerprint {
+                        label: None,
+                        artifact: ArtifactFingerprint {
+                            canonical_path: format!("/{category}/m.onnx"),
+                            sha256: "same-model".into(),
+                        },
+                        external_data: Some(Vec::new()),
+                    }],
+                    vnnlib: ArtifactFingerprint {
+                        canonical_path: format!("/{category}/p.vnnlib"),
+                        sha256: "same-property".into(),
+                    },
+                }),
             });
         }
 
         let identity = CacheIdentity::from_manifest(&test_manifest(None));
-        let mut hashes = cache::FileHashMemo::default();
-        let digest_of = |entry: &PlannedInstance, hashes: &mut cache::FileHashMemo| {
+        let digest_of = |entry: &PlannedInstance| {
             identity
-                .key_for(entry, &[], hashes)
+                .key_for(entry, &[])
                 .expect("both rows are keyable")
                 .digest()
                 .expect("digest")
         };
-        let a = digest_of(&planned[0], &mut hashes);
-        let b = digest_of(&planned[1], &mut hashes);
+        let a = digest_of(&planned[0]);
+        let b = digest_of(&planned[1]);
         assert_ne!(
             a, b,
             "the category selects the preset the child loads; serving across it \
              is a verdict for a run that never happened"
         );
+    }
+
+    #[test]
+    fn manifest_refuses_resume_under_a_different_binary_identity() {
+        // #binary-identity. A bank half-measured by `0.3.4745 features=mip` and
+        // half by `0.3.4746 features=mip,cuda` is two verifiers wearing one
+        // bank's name — the 2026-08-21 failure, in resume form. The refusal
+        // must print BOTH ids, because "they differ" is not actionable.
+        let existing = test_manifest(None);
+        let mut desired = test_manifest(None);
+        desired.build_id = "NY_BUILD_ID_V1 version=0.3.4746 features=mip,cuda exe=exe".into();
+        let error = merge_resume_manifest(existing, &desired)
+            .expect_err("resume must not mix verifiers in one bank");
+        let rendered = error.to_string();
+        assert!(rendered.contains("binary identity"), "{rendered}");
+        assert!(rendered.contains("version=0.3.4745"), "{rendered}");
+        assert!(rendered.contains("version=0.3.4746"), "{rendered}");
+
+        // Banks written before #binary-identity recorded nothing; they adopt
+        // the current identity rather than being locked out of resume forever,
+        // exactly as the backend and host fields already do.
+        let mut legacy = test_manifest(None);
+        legacy.build_id = String::new();
+        let merged = merge_resume_manifest(legacy, &desired).expect("legacy bank resumes");
+        assert_eq!(
+            merged.build_id,
+            "NY_BUILD_ID_V1 version=0.3.4746 features=mip,cuda exe=exe"
+        );
+    }
+
+    #[test]
+    fn a_swept_bank_seals_the_identity_of_the_binary_that_measured_it() {
+        // The manifest must carry a READABLE identity, not only a digest.
+        // `executable.sha256` already content-addressed the file on
+        // 2026-08-21 and still could not tell anyone that the cuda binary had
+        // become a mip-only wgpu one.
+        let identity = crate::build_id::BinaryIdentity::current().expect("identity");
+        let line = identity.canonical_line();
+        assert!(line.contains(&format!("version={}", identity.stamp.version)));
+        assert!(line.contains(&format!("features={}", identity.stamp.features)));
+        assert!(line.contains(&format!("exe={}", identity.exe_sha256)));
+
+        // And the cache must not serve a row measured by another verifier.
+        let key = |build_id: &str| {
+            cache::CacheKey::new(
+                "exe".into(),
+                build_id.into(),
+                "sealed".into(),
+                "cfg".into(),
+                "acasxu_2023".into(),
+                "onnx-closure".into(),
+                "vnnlib".into(),
+                100,
+                None,
+                &[],
+                "cuda".into(),
+                "gb10".into(),
+                BTreeMap::new(),
+            )
+            .expect("key")
+            .digest()
+            .expect("digest")
+        };
+        assert_ne!(
+            key("NY_BUILD_ID_V1 version=0.3.4745 features=mip"),
+            key("NY_BUILD_ID_V1 version=0.3.4745 features=mip,cuda"),
+            "two feature tiers must not share a cache entry"
+        );
+    }
+
+    #[test]
+    fn private_executable_copy_stays_bound_to_the_one_early_guard() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let scratch = tempfile::tempdir().expect("private scratch");
+        let source = source_dir.path().join("ny-under-test");
+        std::fs::write(&source, b"first executable bytes").expect("source executable");
+        let guard = crate::build_id::BinaryIdentityGuard::seal(&source).expect("early guard");
+        let copied = sealed_executable_copy(&guard, scratch.path()).expect("private copy");
+
+        let manifest_fingerprint =
+            fingerprint_from_binary_identity(guard.sealed()).expect("manifest projection");
+        assert_eq!(manifest_fingerprint.sha256, guard.sealed().exe_sha256);
+        assert_eq!(
+            manifest_fingerprint.canonical_path,
+            guard.sealed().path.to_str().expect("UTF-8 source")
+        );
+        assert_ne!(
+            Path::new(&manifest_fingerprint.canonical_path),
+            copied,
+            "the ephemeral child path is not durable manifest provenance"
+        );
+        assert_eq!(
+            fingerprint_file(&copied, "copied executable")
+                .expect("copy fingerprint")
+                .sha256,
+            guard.sealed().exe_sha256
+        );
+
+        // Replacing the live build target after setup changes neither the
+        // bytes nor the path every child will execute.
+        std::fs::write(&source, b"second executable bytes").expect("replace source");
+        assert!(guard.reverify("adversarial source replacement").is_err());
+        assert_eq!(
+            fingerprint_file(&copied, "copied executable after source replacement")
+                .expect("copy fingerprint")
+                .sha256,
+            manifest_fingerprint.sha256
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copied)
+                .expect("copy metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o500, "private child path must not be writable");
+        }
+        #[cfg(not(unix))]
+        assert!(std::fs::metadata(&copied)
+            .expect("copy metadata")
+            .permissions()
+            .readonly());
+    }
+
+    #[test]
+    fn child_flight_receipt_must_match_the_early_binary_stamp() {
+        let expected = crate::build_id::BuildStamp::current().canonical_line();
+        let matching = serde_json::json!({"build_id": expected});
+        validate_child_build_receipt(Some(&matching), &expected, "matching child")
+            .expect("matching receipt");
+        validate_child_build_receipt(None, &expected, "hard stop without sidecar")
+            .expect("missing best-effort sidecar remains allowed");
+
+        let mismatched = serde_json::json!({
+            "build_id": "NY_BUILD_STAMP_V1 version=other stamp=other"
+        });
+        let error = validate_child_build_receipt(Some(&mismatched), &expected, "fresh measurement")
+            .expect_err("a different child binary must not be banked");
+        assert!(error
+            .to_string()
+            .contains("differs from the early executable seal"));
+
+        let malformed = serde_json::json!({"schema_version": 3});
+        let error = validate_child_build_receipt(Some(&malformed), &expected, "cached measurement")
+            .expect_err("a present sidecar cannot omit its program identity");
+        assert!(error.to_string().contains("without a string build_id"));
     }
 
     #[test]
@@ -3117,8 +5750,64 @@ mod tests {
                 sha256: "other".into(),
             },
         );
+        let d_rows =
+            selected_row_set_identity(&[("d".into(), "x.onnx".into(), "q.vnnlib".into(), 0, 0)])
+                .expect("category d selected rows");
+        desired.selected_rows.insert("d".into(), d_rows.clone());
+        desired.selected_row_inputs.insert(
+            "d".into(),
+            vec![SelectedRowInputSeal {
+                onnx: "x.onnx".into(),
+                vnnlib: "q.vnnlib".into(),
+                occurrence: 0,
+                instance_index: 0,
+                inputs: ResolvedInstanceInputs {
+                    onnx: vec![ModelInputFingerprint {
+                        label: None,
+                        artifact: ArtifactFingerprint {
+                            canonical_path: "/corpus/d/x.onnx".into(),
+                            sha256: "x-model".into(),
+                        },
+                        external_data: Some(Vec::new()),
+                    }],
+                    vnnlib: ArtifactFingerprint {
+                        canonical_path: "/corpus/d/q.vnnlib".into(),
+                        sha256: "q-property".into(),
+                    },
+                },
+            }],
+        );
         let merged = merge_resume_manifest(existing, &desired).expect("compatible expansion");
         assert_eq!(merged.instances_csv.len(), 2);
+        assert_eq!(merged.selected_rows.len(), 2);
+        assert_eq!(merged.selected_rows["d"], d_rows);
+    }
+
+    #[test]
+    fn manifest_refuses_a_changed_selected_row_set_in_an_existing_category() {
+        let existing = test_manifest(None);
+        let mut desired = test_manifest(None);
+        desired.selected_rows.insert(
+            "c".into(),
+            selected_row_set_identity(&[(
+                "c".into(),
+                "model.onnx".into(),
+                "property.vnnlib".into(),
+                1,
+                5,
+            )])
+            .expect("different c row set"),
+        );
+        let changed = desired
+            .selected_row_inputs
+            .get_mut("c")
+            .and_then(|seals| seals.first_mut())
+            .expect("c input seal");
+        changed.occurrence = 1;
+        changed.instance_index = 5;
+        let error = merge_resume_manifest(existing, &desired)
+            .expect_err("same category cannot silently reuse a different partial bank");
+        assert!(error.to_string().contains("selected row set changed"));
     }
 
     #[test]
@@ -3603,10 +6292,9 @@ mod tests {
             wrapper_vars,
             "`ny benchmarks run` and {} disagree on the scored environment. A sweep \
              that does not reproduce the submission environment measures a different \
-             verifier than the one being submitted; these knobs can only turn a \
-             budget-edge timeout into an already-certified UNSAT, so the divergence \
-             shows up as a phantom capability limit. Update `submission_environment` \
-             (or move a category-scoped setting into that category's preset).",
+             performance regime than the submitted verifier. Update \
+             `submission_environment` (or move a verdict-affecting category setting \
+             into that category's typed preset).",
             wrapper.display()
         );
     }

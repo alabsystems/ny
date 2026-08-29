@@ -198,6 +198,16 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: <output-dir>/evidence/<track>)"
         ),
     )
+    parser.add_argument(
+        "--ce-falsified-watchlist",
+        type=Path,
+        default=SCRIPT_PATH.with_name("ce_falsified_extended_v1.json"),
+        help=(
+            "extended-track CE-falsified watchlist JSON "
+            "(default: alongside this script; rebuild with "
+            "ce_falsified_watchlist.py build)"
+        ),
+    )
     return parser
 
 
@@ -760,6 +770,45 @@ def _require_validation_dependencies() -> None:
             ) from error
 
 
+def _load_ce_falsified_watchlist(track: str, path: Path) -> dict[tuple[str, str], dict]:
+    """(onnx, vnnlib) -> watchlist entry for the extended CE-falsified rows.
+
+    The regular 16 tracks already refuse an ``unsat`` promotion whose published
+    ZERO-TOL truth is ``violated`` (``regular_bank_evidence.py``: "UNSAT
+    promotion requires published holds truth"), but that truth comes from
+    ``longtable.tex``, which tabulates only the SCORED categories.  The extended
+    tracks were blind here.  ``ce_falsified_watchlist.py`` supplies the same
+    signal for them, derived from the per-tool ``(v)`` markers plus the
+    organizer's own falsifier credit — never from ``True Result:``, which labels
+    a tolerance-graded counterexample ``unsat``.
+
+    Fails closed: an unreadable or unverified watchlist stops the bank rather
+    than banking blind.
+    """
+    module_path = SCRIPT_PATH.with_name("ce_falsified_watchlist.py").resolve(strict=True)
+    module_name = f"_ny_extended_bank_watchlist_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise BankValidationError(f"could not load watchlist module: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+    try:
+        watchlist = module.load_watchlist(path)
+    except (OSError, ValueError, module.WatchlistError) as error:
+        raise BankValidationError(
+            f"CE-falsified watchlist is unusable ({path}): {error}"
+        ) from error
+    return {
+        (onnx, vnnlib): entry
+        for (entry_track, onnx, vnnlib), entry in watchlist.items()
+        if entry_track == track
+    }
+
+
 def _load_validator() -> Any:
     # Deliberately delayed until a reproduced SAT needs validation.  In
     # particular, argparse --help does not import NumPy or ONNX Runtime.
@@ -808,6 +857,11 @@ def _resolve_cli(args: argparse.Namespace) -> argparse.Namespace:
             args.evidence_root, repo_root, args.evidence_root
         )
     args.sweep_results_csv = args.sweep_results_csv.expanduser().resolve()
+    args.ce_falsified_watchlist = _resolve_from_repo(
+        args.ce_falsified_watchlist,
+        repo_root,
+        SCRIPT_PATH.with_name("ce_falsified_extended_v1.json"),
+    )
     return args
 
 
@@ -876,6 +930,7 @@ def bank(args: argparse.Namespace) -> int:
         ("NY executable", args.ny_bin),
         ("AY executable", args.ay_bin),
         ("counterexample validator", SCRIPT_PATH.with_name("vnnlib_ce.py")),
+        ("CE-falsified watchlist", args.ce_falsified_watchlist),
     ]
     for instance in bound.values():
         destination_inputs.extend(
@@ -893,6 +948,11 @@ def bank(args: argparse.Namespace) -> int:
     output_rows: list[list[str]] = []
     sat_count = unsat_count = other_count = invalid_count = lost_count = 0
     breaches: list[tuple[str, str, str]] = []
+    # Bank-time CE-falsified refusal for the extended tracks (the regular 16
+    # already have one via published ZERO-TOL truth). Loaded before any row is
+    # written so an unusable watchlist stops the bank instead of banking blind.
+    ce_falsified = _load_ce_falsified_watchlist(args.track, args.ce_falsified_watchlist)
+    falsified_refusals: list[tuple[str, str, dict]] = []
 
     for (onnx, vnnlib), instance in sorted(bound.items()):
         row = instance.row
@@ -1081,8 +1141,24 @@ def bank(args: argparse.Namespace) -> int:
                 output_rows.append([args.track, onnx, vnnlib, "unknown", row.seconds])
                 lost_count += 1
         elif row.verdict == "unsat":
-            output_rows.append([args.track, onnx, vnnlib, "unsat", row.seconds])
-            unsat_count += 1
+            falsified = ce_falsified.get((onnx, vnnlib))
+            if falsified is not None:
+                # The field produced an organizer-ACCEPTED counterexample here.
+                # An `unsat` on this row is not a capability win, it is a -150.
+                print(
+                    f"  !!! CE-FALSIFIED: ny=unsat on a row the field falsified: "
+                    f"{Path(vnnlib).name} :: falsifiers="
+                    f"{','.join(falsified['falsifiers'])} "
+                    f"(organizer row {falsified['row_id']}, index {falsified['index']}"
+                    f"; True Result line reads {falsified['true_result_line']!r})"
+                )
+                falsified_refusals.append((onnx, vnnlib, falsified))
+                output_rows.append(
+                    [args.track, onnx, vnnlib, "unknown", row.seconds]
+                )
+            else:
+                output_rows.append([args.track, onnx, vnnlib, "unsat", row.seconds])
+                unsat_count += 1
         else:
             output_rows.append([args.track, onnx, vnnlib, "unknown", row.seconds])
             other_count += 1
@@ -1099,7 +1175,12 @@ def bank(args: argparse.Namespace) -> int:
     print(
         f"{args.track}: sat={sat_count} (all full-spec in-box validated) "
         f"unsat={unsat_count} unknown/other={other_count} "
-        f"NOT-REPRODUCED={lost_count} INVALID-SAT={invalid_count} -> {args.output}"
+        f"NOT-REPRODUCED={lost_count} INVALID-SAT={invalid_count} "
+        f"CE-FALSIFIED-REFUSED={len(falsified_refusals)} -> {args.output}"
+    )
+    print(
+        f"CE-FALSIFIED WATCHLIST: {len(ce_falsified)} field-falsified instance(s) "
+        f"known for {args.track}; refused {len(falsified_refusals)} unsat row(s)."
     )
     print(
         "*** MOAT BREACH: invalid sat CE — INVESTIGATE ***"
@@ -1109,7 +1190,11 @@ def bank(args: argparse.Namespace) -> int:
             "counterexample validation record."
         )
     )
-    return 3 if breaches else 0
+    if breaches:
+        return 3
+    # Distinct from the invalid-SAT breach: the rows were REFUSED, so the output
+    # CSV is safe, but a run that hit the watchlist must not exit silently.
+    return 4 if falsified_refusals else 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

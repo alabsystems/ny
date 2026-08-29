@@ -35,12 +35,18 @@ extern crate blas_src;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // Command handlers live in sibling modules to keep bootstrap and execution concerns separate.
+mod build_id;
 mod commands;
 mod compute_backend;
 mod config;
 mod flight;
 mod plan_resolver;
 mod preset;
+// #lever-reachability: the typed preset ROUTE for env-gated verdict-affecting
+// levers, and the single bridge that writes every promoted cell before any lane
+// starts. `run_instance.sh` exports no `NY_*`, so a gate without a
+// typed key is dead code on a scored run.
+mod preset_gates;
 mod subcommands;
 
 pub(crate) use subcommands::{
@@ -310,19 +316,58 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Canonical binary identity (#binary-identity) — the one thing to compare
+    // before trusting any measurement: derived version, feature tier, backend
+    // class, impl markers, commit + dirty digest, and (for `--build-id`) the
+    // sha256 of these exact bytes. Intercepted before clap and logging so both
+    // stay side-effect free and derivable WITHOUT running a verification.
+    //
+    // Two forms, because their COSTS differ by three orders of magnitude:
+    //   --build-stamp  compiled fields only, no I/O. For per-instance use.
+    //   --build-id     also hashes the executable (~0.1 s on a 133 MB release
+    //                  binary, far more in a debug build). Pay it once per
+    //                  sweep, never once per scored row.
+    // See `crates/ny-cli/src/build_id.rs`.
+    {
+        let mut args = std::env::args_os().skip(1);
+        match args.next() {
+            Some(first)
+                if first == *std::ffi::OsStr::new("--build-id")
+                    || first == *std::ffi::OsStr::new("build-id") =>
+            {
+                return build_id::run_cli(&args.collect::<Vec<_>>(), true);
+            }
+            Some(first)
+                if first == *std::ffi::OsStr::new("--build-stamp")
+                    || first == *std::ffi::OsStr::new("build-stamp") =>
+            {
+                return build_id::run_cli(&args.collect::<Vec<_>>(), false);
+            }
+            _ => {}
+        }
+    }
+
     // Machine-readable compiled-feature report (`ny --build-info`). A plain
     // build (no cuda/mip) silently measures 0 on the GPU-dependent categories,
     // so scripts/measure_ny_scorecard.sh probes this line and refuses to
     // measure unless both features are compiled in. Intercepted before clap
     // parsing and logging setup so the output stays a single stable, greppable
     // stdout line with no side effects (no CUDA/adapter probing happens here).
+    //
+    // The version here is the DERIVED one
+    // (`<major>.<minor>.<rev-list count>[+dirty…]`), not the frozen
+    // `Cargo.toml` patch: every consumer that logged `ny 0.3.0` for the whole
+    // campaign now logs something that actually differs between builds. The
+    // second line is the free identity stamp, so
+    // a script that already captures `--build-info` gains it at no cost.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--build-info")) {
         println!(
             "ny {} features: cuda={} mip={}",
-            env!("CARGO_PKG_VERSION"),
+            build_id::DISPLAY_VERSION,
             if cfg!(feature = "cuda") { "on" } else { "off" },
             if cfg!(feature = "mip") { "on" } else { "off" },
         );
+        println!("{}", build_id::current_line());
         return Ok(());
     }
 
@@ -777,6 +822,20 @@ fn run() -> Result<()> {
             }
         }
     }
+
+    // #margin-row-gpu-eft: register the injected device executor for the
+    // margin-row certified GPU backward lane (NY_MARGIN_ROW_GPU_BACKWARD=1,
+    // default OFF). Registration is UNCONDITIONAL and free: the closure runs
+    // at most once, on the lane's first ARMED admission, and only then builds
+    // the lane's DEDICATED WgpuDevice (deliberately not the process-global
+    // sweep device — the lane's R3 no-shared-fate contract). A dark lane
+    // never constructs anything; a failed construction latches the lane's
+    // channel dead and the unchanged CPU backward runs bit-for-bit.
+    ny_propagate::margin_row::set_margin_row_lane_gpu_factory(|| {
+        ny_gpu::MarginRowLaneDevice::new().ok().map(|device| {
+            std::sync::Arc::new(device) as std::sync::Arc<dyn ny_core::MarginRowLaneGpu>
+        })
+    });
 
     match cuda_startup_action {
         CudaStartupAction::RegisterFactories => {}
@@ -1754,6 +1813,18 @@ fn run() -> Result<()> {
         }
         Commands::Tutorial { topic } => {
             commands::tutorial::run(topic.as_ref())?;
+        }
+        Commands::Claims(args) => {
+            // The running process already knows its own compiled stamp, so
+            // pass it rather than re-invoking `target/release/ny` by path:
+            // the whole point of #binary-identity is that a path is not an
+            // identity. `BuildStamp::current()` is free (no file hashing).
+            let stamp = build_id::current_line();
+            let binary = ny_claims::BinaryFacts::from_identity_line(stamp, "the running ny");
+            let code = ny_claims::cli::run(&args, binary)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
     }
 

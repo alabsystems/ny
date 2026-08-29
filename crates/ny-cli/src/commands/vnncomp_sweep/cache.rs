@@ -56,7 +56,7 @@
 //! measurement, never to an error and never to a stale hit.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -104,6 +104,10 @@ pub(crate) struct CacheKey {
     /// an un-bumped change silently serves rows keyed under the old meaning.
     v: u32,
     exe_sha256: String,
+    /// #binary-identity: the canonical `NY_BUILD_ID_V1` line of the measuring
+    /// binary. `exe_sha256` addresses the FILE; this addresses the PROGRAM —
+    /// derived version, feature tier, backend class, commit + dirty digest.
+    build_id: String,
     build_provenance: String,
     configs_sha256: String,
     /// The benchmark category, which is an INPUT to the child, not a label.
@@ -116,6 +120,9 @@ pub(crate) struct CacheKey {
     /// to one entry, and a single cold `--cache read-write` sweep over such a
     /// corpus served the second category the first's verdict.
     category: String,
+    /// Digest of the complete ONNX input closure: the container plus every
+    /// resolved external tensor-data file. Key v7 changed this from the
+    /// container file's digest, because a sidecar can change independently.
     onnx_sha256: String,
     vnnlib_sha256: String,
     budget_secs: u64,
@@ -131,7 +138,10 @@ pub(crate) struct CacheKey {
     /// while appearing nowhere in `arm` — two sweeps differing only by an
     /// exported `NY_*` var hashed identically, and the second would have been
     /// served the first's verdicts. That is precisely the "confident wrong
-    /// measurement" this cache is otherwise built to avoid.
+    /// measurement" this cache is otherwise built to avoid. Key v6 fixes the
+    /// meaning of this map to `ny-cli/ambient-env/v3` (NY_*, OMP, and both
+    /// current/deprecated Rayon worker-count variables); pre-v6 maps did not
+    /// capture `RAYON_RS_NUM_CPUS` and are not reusable.
     ambient_env: BTreeMap<String, String>,
     compute_backend: String,
     host: String,
@@ -141,19 +151,22 @@ impl CacheKey {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         exe_sha256: String,
+        build_id: String,
         build_provenance: String,
         configs_sha256: String,
         category: String,
-        onnx: &Path,
-        vnnlib: &Path,
+        onnx_sha256: String,
+        vnnlib_sha256: String,
         budget_secs: u64,
         capped_from: Option<u64>,
         arm: &[(String, String)],
         compute_backend: String,
         host: String,
         ambient_env: BTreeMap<String, String>,
-        hashes: &mut FileHashMemo,
     ) -> Result<Self> {
+        if onnx_sha256.is_empty() || vnnlib_sha256.is_empty() {
+            anyhow::bail!("cache input digests must not be empty");
+        }
         let mut arm = arm.to_vec();
         arm.sort();
         Ok(Self {
@@ -165,13 +178,34 @@ impl CacheKey {
             // was unknown, and a cross-category hit is a verdict for an instance
             // that was never measured — worse than no cache at all. Same rule:
             // the bump is the invalidation.
-            v: 3,
+            //
+            // v4 adds `build_id` (#binary-identity). Every v3 digest described
+            // a run whose verifier was identified only by a file digest, which
+            // cannot be read and does not survive the mutable-path swap the
+            // 2026-08-21 re-sweep was poisoned by. Same rule: the bump is the
+            // invalidation.
+            //
+            // v5 invalidates the implicit pre-Rayon ambient capture. A v4
+            // empty map could mean either a clean process or one shaped by
+            // RAYON_NUM_THREADS, so it cannot share a content address with the
+            // explicit `ny-cli/ambient-env/v2` clean seal.
+            //
+            // v6 invalidates the incomplete Rayon capture. rayon-core 1.13
+            // still honors deprecated RAYON_RS_NUM_CPUS when
+            // RAYON_NUM_THREADS is absent, so a v5 empty map was not proof of
+            // the contextual margin-row parallel baseline.
+            //
+            // v7 changes `onnx_sha256` from the top-level model file digest to
+            // a digest of the complete resolved ONNX dependency closure. Every
+            // older entry may have omitted mutable external tensor-data files.
+            v: 7,
             exe_sha256,
+            build_id,
             build_provenance,
             configs_sha256,
             category,
-            onnx_sha256: hashes.hash(onnx)?,
-            vnnlib_sha256: hashes.hash(vnnlib)?,
+            onnx_sha256,
+            vnnlib_sha256,
             budget_secs,
             capped_from,
             arm,
@@ -187,38 +221,6 @@ impl CacheKey {
         let mut hasher = Sha256::new();
         hasher.update(&canonical);
         Ok(format!("{:x}", hasher.finalize()))
-    }
-}
-
-/// Memoized file hashing.
-///
-/// A 100 MB ONNX is hashed once per sweep rather than once per row. Keyed on
-/// `(path, len, mtime)` so an edited model is re-hashed rather than being served
-/// under its old digest — the whole point of content addressing would be lost if
-/// a stale mtime could pin an old hash.
-#[derive(Debug, Default)]
-pub(crate) struct FileHashMemo {
-    seen: BTreeMap<(PathBuf, u64, i64), String>,
-}
-
-impl FileHashMemo {
-    pub(crate) fn hash(&mut self, path: &Path) -> Result<String> {
-        let meta = std::fs::metadata(path)
-            .with_context(|| format!("stat {} for cache key", path.display()))?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs() as i64);
-        let memo_key = (path.to_path_buf(), meta.len(), mtime);
-        if let Some(found) = self.seen.get(&memo_key) {
-            return Ok(found.clone());
-        }
-        let mut hasher = Sha256::new();
-        super::hash_file_into(path, &mut hasher)?;
-        let digest = format!("{:x}", hasher.finalize());
-        self.seen.insert(memo_key, digest.clone());
-        Ok(digest)
     }
 }
 
@@ -417,8 +419,9 @@ mod tests {
             .collect();
         arm.sort();
         CacheKey {
-            v: 3,
+            v: 7,
             exe_sha256: "exe".into(),
+            build_id: "NY_BUILD_ID_V1 version=0.3.4745 features=mip".into(),
             build_provenance: "sealed".into(),
             configs_sha256: "cfg".into(),
             category: category.to_string(),
@@ -489,6 +492,36 @@ mod tests {
         assert_ne!(
             clean, exported,
             "a lever exported into the parent shell changes what is measured"
+        );
+    }
+
+    /// Even an empty ambient map changed meaning when v3 began capturing the
+    /// deprecated RAYON_RS_NUM_CPUS fallback. The version byte is the
+    /// cache-wide invalidation for every v5 entry whose apparent cleanliness
+    /// cannot be proven.
+    #[test]
+    fn ambient_v3_contract_invalidates_incomplete_rayon_v5_keys() {
+        let current = key_with(100, &[]);
+        let mut incomplete_rayon = current.clone();
+        incomplete_rayon.v = 5;
+        assert_eq!(current.v, 7);
+        assert_ne!(
+            current.digest().unwrap(),
+            incomplete_rayon.digest().unwrap(),
+            "v5 entries omitted RAYON_RS_NUM_CPUS and must miss"
+        );
+    }
+
+    #[test]
+    fn external_data_closure_invalidates_container_only_v6_keys() {
+        let current = key_with(100, &[]);
+        let mut container_only = current.clone();
+        container_only.v = 6;
+        assert_eq!(current.v, 7);
+        assert_ne!(
+            current.digest().unwrap(),
+            container_only.digest().unwrap(),
+            "v6 entries could omit ONNX external tensor-data files and must miss"
         );
     }
 

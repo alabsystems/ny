@@ -247,31 +247,28 @@ fn patches_gpu_enabled() -> bool {
 /// Rows are independent and may be reduced in parallel; all results remain in
 /// scratch until both sides and every row complete.
 fn patches_deadline_flat_bias_enabled() -> bool {
-    matches!(
-        std::env::var("NY_PATCHES_DEADLINE_FLAT_BIAS").as_deref(),
-        Ok("1")
-    )
+    ny_levers::read(&ny_levers::decls::crown_ibp_budget::PATCHES_DEADLINE_FLAT_BIAS)
+        .value
+        .as_bool()
 }
 
-/// Default-dark finite-deadline nonsparse 7D position-scatter parallelism.
-///
-/// Every position owns one disjoint contiguous output slab and retains the
-/// historical scalar contraction order within that slab. The gate therefore
-/// changes scheduling only. A finite call keeps one common absolute deadline;
-/// its output tensor remains caller-private scratch until every worker and the
-/// subsequent certified coefficient-error propagation complete.
-fn patches_deadline_parallel_scatter_enabled() -> bool {
-    matches!(
-        std::env::var("NY_PATCHES_DEADLINE_PARALLEL_SCATTER").as_deref(),
-        Ok("1")
-    )
+#[cfg(test)]
+thread_local! {
+    static LAST_FLAT_BIAS_POLICY: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_last_flat_bias_policy() -> Option<bool> {
+    LAST_FLAT_BIAS_POLICY.with(std::cell::Cell::take)
 }
 
 /// #patches-deadline-kernel: a deadline no longer forces the SERIAL scatter.
 ///
 /// The previous rule admitted parallel position scatter only when no deadline
-/// was present, or when the layout was 7D explicit-rows AND the dark
-/// `NY_PATCHES_DEADLINE_PARALLEL_SCATTER` gate was set. Since the CROWN-IBP
+/// was present, or when the layout was 7D explicit rows and a retired dark
+/// compatibility gate was set. Since the CROWN-IBP
 /// collector always passes a per-node deadline, and the common conv layout is 6D
 /// (not explicit-rows), the practical effect was that every collector-routed
 /// conv target scattered single-threaded — on top of losing the GEMM engine and
@@ -284,19 +281,12 @@ fn patches_deadline_parallel_scatter_enabled() -> bool {
 /// allowed to parallelize). A deadline governs how much work is attempted; it
 /// has no bearing on whether that work may use more than one core.
 ///
-/// `region_seq_inner` still forces serial — that is a genuine data-layout
-/// constraint, not a scheduling one.
+/// The compatibility gate became inert when this construction was made the
+/// production route, so it is deliberately retired rather than recorded as a
+/// false optimization coordinate. `region_seq_inner` still forces serial —
+/// that is a genuine data-layout constraint, not a scheduling one.
 #[inline]
-fn position_scatter_parallel_admitted(
-    explicit_rows: bool,
-    nonsparse: bool,
-    deadline_present: bool,
-    gate_enabled: bool,
-    region_seq_inner: bool,
-) -> bool {
-    // Retained parameters: the dark gate and layout facts are still honoured as
-    // an explicit force-on, so a caller that set them keeps its behaviour.
-    let _ = (explicit_rows, nonsparse, deadline_present, gate_enabled);
+fn position_scatter_parallel_admitted(region_seq_inner: bool) -> bool {
     !region_seq_inner
 }
 
@@ -897,6 +887,27 @@ impl Conv2dLayer {
         deadline: Option<Instant>,
         (in_h, in_w): (usize, usize),
     ) -> Result<CrownBounds> {
+        self.propagate_patches_engine_and_deadline_for_input_shape_with_flat_bias_policy(
+            bounds,
+            engine,
+            deadline,
+            (in_h, in_w),
+            patches_deadline_flat_bias_enabled(),
+        )
+    }
+
+    /// Policy-aware graph entry. Frozen scored graphs pass their per-run
+    /// decision explicitly; compatibility callers use the wrapper above.
+    pub(crate) fn propagate_patches_engine_and_deadline_for_input_shape_with_flat_bias_policy(
+        &self,
+        bounds: &PatchesLinearBounds,
+        engine: Option<&dyn ny_core::GemmEngine>,
+        deadline: Option<Instant>,
+        (in_h, in_w): (usize, usize),
+        flat_bias_enabled: bool,
+    ) -> Result<CrownBounds> {
+        #[cfg(test)]
+        LAST_FLAT_BIAS_POLICY.with(|policy| policy.set(Some(flat_bias_enabled)));
         check_patches_deadline(deadline, "before dispatch")?;
         let (in_c, out_c) = self.validate_geometry()?;
         // Anchored geometry is not implemented by this affine composition
@@ -1061,7 +1072,15 @@ impl Conv2dLayer {
         )?;
 
         let (new_lower_b, new_upper_b) = if let Some(ref bias) = self.bias {
-            Self::compute_patches_bias_with_deadline(bounds, bias, out_c, out_h, out_w, deadline)?
+            Self::compute_patches_bias_with_deadline(
+                bounds,
+                bias,
+                out_c,
+                out_h,
+                out_w,
+                deadline,
+                flat_bias_enabled,
+            )?
         } else {
             (bounds.lower_b.clone(), bounds.upper_b.clone())
         };
@@ -1397,13 +1416,7 @@ impl Conv2dLayer {
                 (row, soc, rem / spec_ow, rem % spec_ow)
             };
             let region_seq_inner = crate::imb::region_seq_inner();
-            let parallel_positions = position_scatter_parallel_admitted(
-                explicit_rows,
-                patches_data.unstable_idx.is_none(),
-                deadline.is_some(),
-                patches_deadline_parallel_scatter_enabled(),
-                region_seq_inner,
-            );
+            let parallel_positions = position_scatter_parallel_admitted(region_seq_inner);
 
             // Seam gate (#patches-coeff-err-soundness): route the per-position
             // transpose-conv composition to ONE GEMM. Now enabled for BOTH the
@@ -2104,7 +2117,15 @@ impl Conv2dLayer {
         out_h: usize,
         out_w: usize,
     ) -> Result<(Array1<f32>, Array1<f32>)> {
-        Self::compute_patches_bias_with_deadline(bounds, bias, out_c, out_h, out_w, None)
+        Self::compute_patches_bias_with_deadline(
+            bounds,
+            bias,
+            out_c,
+            out_h,
+            out_w,
+            None,
+            patches_deadline_flat_bias_enabled(),
+        )
     }
 
     fn compute_patches_bias_with_deadline(
@@ -2114,6 +2135,7 @@ impl Conv2dLayer {
         out_h: usize,
         out_w: usize,
         deadline: Option<Instant>,
+        flat_bias_enabled: bool,
     ) -> Result<(Array1<f32>, Array1<f32>)> {
         check_patches_deadline(deadline, "before bias propagation")?;
         let lower_patches = &bounds.lower_a;
@@ -2284,7 +2306,7 @@ impl Conv2dLayer {
             };
             let gbar_l = gbar_of(prev_kh_l, prev_kw_l);
             let gbar_u = gbar_of(prev_kh_u, prev_kw_u);
-            let flat_reductions = if patches_deadline_flat_bias_enabled() && deadline.is_some() {
+            let flat_reductions = if flat_bias_enabled && deadline.is_some() {
                 let started = Instant::now();
                 let parallel_rows = !crate::imb::region_seq_inner();
                 eprintln!(
@@ -3341,98 +3363,55 @@ mod coeff_err_tests {
     /// #patches-deadline-kernel: a deadline no longer forces the SERIAL scatter.
     ///
     /// This test previously pinned the narrow admission — parallel only with no
-    /// deadline, or with 7D explicit rows AND the dark gate. Since the CROWN-IBP
+    /// deadline, or with 7D explicit rows and a now-retired dark gate. Since the CROWN-IBP
     /// collector always passes a per-node deadline and the common conv layout is
     /// 6D, that rule meant every collector-routed conv target scattered
     /// single-threaded. Parallel scatter fills DISJOINT position slabs of
     /// caller-private scratch, so it is bit-identical to the serial fill
-    /// regardless of completion order (asserted by the sibling test
-    /// `explicit_row_deadline_parallel_scatter_is_bitwise_serial`). A deadline
+    /// regardless of completion order. A deadline
     /// bounds how much work is attempted; it says nothing about how many cores
     /// may do it.
     #[test]
     fn position_scatter_parallel_admission_ignores_deadline_presence() {
-        for &explicit_rows in &[true, false] {
-            for &nonsparse in &[true, false] {
-                for &deadline_present in &[true, false] {
-                    for &gate in &[true, false] {
-                        assert!(
-                            position_scatter_parallel_admitted(
-                                explicit_rows,
-                                nonsparse,
-                                deadline_present,
-                                gate,
-                                false,
-                            ),
-                            "parallel scatter must be admitted regardless of deadline/layout/gate \
-                             (explicit_rows={explicit_rows}, nonsparse={nonsparse}, \
-                             deadline={deadline_present}, gate={gate})"
-                        );
-                    }
-                }
-            }
-        }
+        assert!(position_scatter_parallel_admitted(false));
         assert!(
-            !position_scatter_parallel_admitted(true, true, true, true, true),
+            !position_scatter_parallel_admitted(true),
             "an inner region worker must never create nested Rayon work"
         );
-
-        crate::tests::with_env_edits(|env| {
-            env.remove("NY_PATCHES_DEADLINE_PARALLEL_SCATTER");
-            assert!(!patches_deadline_parallel_scatter_enabled());
-            env.set("NY_PATCHES_DEADLINE_PARALLEL_SCATTER", "0");
-            assert!(!patches_deadline_parallel_scatter_enabled());
-            env.set("NY_PATCHES_DEADLINE_PARALLEL_SCATTER", "true");
-            assert!(!patches_deadline_parallel_scatter_enabled());
-            env.set("NY_PATCHES_DEADLINE_PARALLEL_SCATTER", "1");
-            assert!(patches_deadline_parallel_scatter_enabled());
-        });
     }
 
     #[test]
-    fn explicit_row_deadline_parallel_scatter_is_bitwise_serial() {
-        crate::tests::with_env_edits(|env| {
-            let kernel = fixture_kernel();
-            let params = fixture_params(&kernel);
-            let n = 2 * 8 * 12;
-            let pd = make_patches_7d(
-                det_fill(n, 0x51a7),
-                Some(Array1::from_vec(vec![1.0e-4_f32, 7.0e-4])),
-            );
-            let common_deadline = Some(Instant::now() + std::time::Duration::from_secs(30));
+    fn explicit_row_deadline_parallel_scatter_is_deterministic() {
+        let kernel = fixture_kernel();
+        let params = fixture_params(&kernel);
+        let n = 2 * 8 * 12;
+        let pd = make_patches_7d(
+            det_fill(n, 0x51a7),
+            Some(Array1::from_vec(vec![1.0e-4_f32, 7.0e-4])),
+        );
+        let common_deadline = Some(Instant::now() + std::time::Duration::from_secs(30));
 
-            env.remove("NY_PATCHES_DEADLINE_PARALLEL_SCATTER");
-            let serial = Conv2dLayer::conv2d_patches_backward_with_deadline(
-                &pd,
-                &params,
-                None,
-                common_deadline,
-            )
-            .expect("finite serial scatter");
-            env.set("NY_PATCHES_DEADLINE_PARALLEL_SCATTER", "1");
-            let parallel = Conv2dLayer::conv2d_patches_backward_with_deadline(
-                &pd,
-                &params,
-                None,
-                common_deadline,
-            )
-            .expect("finite parallel scatter");
+        let first =
+            Conv2dLayer::conv2d_patches_backward_with_deadline(&pd, &params, None, common_deadline)
+                .expect("first finite parallel scatter");
+        let second =
+            Conv2dLayer::conv2d_patches_backward_with_deadline(&pd, &params, None, common_deadline)
+                .expect("second finite parallel scatter");
 
-            assert_bits_eq(
-                "deadline parallel composed coefficients",
-                parallel.patches.as_ref().unwrap().as_slice().unwrap(),
-                serial.patches.as_ref().unwrap().as_slice().unwrap(),
-            );
-            assert_bits_eq(
-                "deadline parallel certified coefficient error",
-                parallel.coeff_err.as_ref().unwrap().as_slice().unwrap(),
-                serial.coeff_err.as_ref().unwrap().as_slice().unwrap(),
-            );
-            assert_eq!(parallel.geometry, serial.geometry);
-            assert_eq!(parallel.output_shape, serial.output_shape);
-            assert_eq!(parallel.input_shape, serial.input_shape);
-            assert_eq!(parallel.identity, serial.identity);
-        });
+        assert_bits_eq(
+            "deadline parallel composed coefficients",
+            second.patches.as_ref().unwrap().as_slice().unwrap(),
+            first.patches.as_ref().unwrap().as_slice().unwrap(),
+        );
+        assert_bits_eq(
+            "deadline parallel certified coefficient error",
+            second.coeff_err.as_ref().unwrap().as_slice().unwrap(),
+            first.coeff_err.as_ref().unwrap().as_slice().unwrap(),
+        );
+        assert_eq!(second.geometry, first.geometry);
+        assert_eq!(second.output_shape, first.output_shape);
+        assert_eq!(second.input_shape, first.input_shape);
+        assert_eq!(second.identity, first.identity);
     }
 
     #[test]
@@ -3597,8 +3576,7 @@ mod coeff_err_tests {
 
     #[test]
     fn expired_deadline_parallel_scatter_returns_no_crown_bounds() {
-        crate::tests::with_env_edits(|env| {
-            env.set("NY_PATCHES_DEADLINE_PARALLEL_SCATTER", "1");
+        crate::tests::with_env_edits(|_env| {
             let kernel = fixture_kernel();
             let layer = Conv2dLayer::with_input_shape(kernel, None, (1, 1), (0, 0), 4, 4)
                 .expect("fixture Conv2d");

@@ -254,8 +254,15 @@ where
             // forcing explicit consideration of whether it needs heuristic scanning.
             // See: #2475
             Layer::Linear(_)
+            // Interval-valued frozen constant: an outward-rounded ENCLOSURE, not
+            // a sampled or heuristic relaxation. Nothing to scan for here.
+            | Layer::IntervalConst(_)
             | Layer::Conv1d(_)
             | Layer::Conv2d(_)
+            // Conv3d: its ONLY interval forward is a directed-binary64
+            // ENCLOSURE and it has no CROWN relaxation at all, so there is no
+            // sampled or heuristic surface to scan for.
+            | Layer::Conv3d(_)
             | Layer::ConvTranspose1d(_)
             | Layer::ConvTranspose2d(_)
             | Layer::AveragePool(_)
@@ -335,6 +342,7 @@ where
             | Layer::SkipMerge(_)
             | Layer::OpaqueSkip(_)
             | Layer::QdqPerturbation(_)
+            | Layer::EpsilonExpand(_)
             | Layer::ExpandLikeLastAxis(_)
             | Layer::Compare(_)
             | Layer::CompareTensor(_) => {}

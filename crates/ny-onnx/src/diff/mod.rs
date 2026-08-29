@@ -41,8 +41,9 @@ pub use engine::{diff_models, diff_models_bytes};
 /// ONNX Runtime inference helpers, including intermediate-output exposure and a
 /// session-reuse forward for repeated evaluations.
 pub use inference::{
-    expose_intermediate_outputs, read_input_shape_maybe_gzip, run_inference, run_inference_bytes,
-    run_inference_with_intermediates, run_inference_with_intermediates_bytes, OrtForward,
+    expose_intermediate_outputs, read_input_shape_maybe_gzip, read_input_shapes_maybe_gzip,
+    run_inference, run_inference_bytes, run_inference_with_intermediates,
+    run_inference_with_intermediates_bytes, OrtForward,
 };
 /// Input/output loading helpers for model metadata and `.npy` tensors.
 pub use io::{load_model_info, load_model_info_bytes, load_npy};

@@ -4121,6 +4121,10 @@ fn independently_recheck_original_objectives_batched(
                     None,
                     true,
                     true,
+                    // #dist-shift-5291: no typed preset relaxation here — the
+                    // replay-authority recheck keeps its own deadline
+                    // authority; only the env override can drop it, as before.
+                    None,
                 ) {
                     Ok(result) => Some((result, engine_route)),
                     Err(error) => {
@@ -6363,6 +6367,7 @@ fn build_subgraph_to_node(graph: &GraphNetwork, target: &str) -> Option<GraphNet
     let ancestors = graph.all_ancestors().ok()?;
     let retained = ancestors.get(target)?; // topological order, includes target
     let mut sub = GraphNetwork::new();
+    sub.inherit_frozen_levers_from(graph);
     for name in retained {
         let node = graph.nodes.get(name)?;
         sub.try_add_node(GraphNode::new(
@@ -6384,6 +6389,8 @@ fn build_subgraph_to_node(graph: &GraphNetwork, target: &str) -> Option<GraphNet
         sub.set_crown_ibp_per_node_time_budget(crate::types::CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(cap),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         });
     }
     Some(sub)
@@ -6407,6 +6414,7 @@ fn build_tail(graph: &GraphNetwork, seam: &str) -> Option<GraphNetwork> {
     let exec = graph.exec_order().ok()?;
     let output = graph.output_node.clone();
     let mut sub = GraphNetwork::new();
+    sub.inherit_frozen_levers_from(graph);
     for name in exec {
         if name.as_str() == seam || !desc.contains(name) {
             continue;

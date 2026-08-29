@@ -185,6 +185,16 @@ impl crate::registry::Strategy for SpecialPoints {
     ) -> Proposal {
         let started = std::time::Instant::now();
         let mut effort = Effort::default();
+        // #falsify-ceiling-authority: see the companion note in `square::search`.
+        // `admit` already refuses `spec.free_dims > SPECIAL_MAX_FREE_DIMS` and
+        // copies that constant into `params.free_dims_ceiling`, so this branch
+        // is unreachable on every production path and nothing changes. It makes
+        // the threaded ceiling BIND, so a narrowed per-slice ceiling is honoured
+        // instead of silently ignored.
+        if domain.free_dims() > budget.params.free_dims_ceiling {
+            effort.wall = started.elapsed();
+            return Proposal::Exhausted(effort);
+        }
         let patterns = Self::patterns(domain);
 
         for chunk in patterns.chunks(budget.batch.max(1)) {

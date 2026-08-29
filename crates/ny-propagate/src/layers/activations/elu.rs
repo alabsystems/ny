@@ -6,7 +6,7 @@ use ny_core::{NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor};
 
 use super::elu_family::{elu_family_linear_relaxation, EluFamilyParams};
-use super::validate::validate_positive_finite;
+use super::validate::validate_nonnegative_finite;
 use super::LinearRelaxation;
 use crate::bounds::nan_propagating_max;
 use crate::layers::common::{impl_elementwise_activation, BoundPropagation};
@@ -23,9 +23,16 @@ pub struct EluLayer {
 
 impl EluLayer {
     /// Validate and create a new ELU layer with the given alpha.
+    ///
+    /// `alpha = 0` is admitted: ELU with alpha = 0 is exactly ReLU (y = x for
+    /// x >= 0, y = 0·(exp(x) − 1) = 0 for x < 0), which the IBP endpoint
+    /// mapping encloses exactly up to one outward ULP on the negative-branch
+    /// upper endpoint. Negative alpha stays refused — it makes the negative
+    /// branch decreasing, so ELU is no longer monotone and the pointwise
+    /// endpoint mapping would invert bounds (#2779).
     pub fn try_new(alpha: f32) -> Result<Self> {
         Ok(Self {
-            alpha: validate_positive_finite(alpha, "EluLayer", "alpha")?,
+            alpha: validate_nonnegative_finite(alpha, "EluLayer", "alpha")?,
         })
     }
 
@@ -50,15 +57,20 @@ impl BoundPropagation for EluLayer {
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         let alpha = self.alpha;
-        // Guard: ELU requires alpha > 0 for sound bound propagation.
+        // Guard: ELU IBP requires alpha >= 0 for sound bound propagation.
         // - alpha < 0: f(x<0) = alpha*(exp(x)-1) is decreasing (non-monotone
         //   overall), so pointwise IBP produces lower > upper. (#2779)
-        // - alpha = 0: f(x<0) = 0 (degenerate constant); CROWN relaxation
-        //   assumes alpha > 0 for convexity. Reject as likely config error.
+        // - alpha = 0 is ADMITTED: ELU degenerates to exactly ReLU (the
+        //   negative branch is identically 0·(exp(x) − 1) = 0). The monotone
+        //   endpoint mapping below stays sound and near-exact: the negative
+        //   branch evaluates to -0.0, the -alpha floor clamp pins the LOWER
+        //   endpoint to exactly -0.0 = 0 (including at x = -inf, where
+        //   0·(exp(-inf) − 1) = -0.0), and the upper endpoint sits one
+        //   outward ULP above 0.
         // - non-finite alpha: prevents NaN/Inf propagation.
-        if !alpha.is_finite() || alpha <= 0.0 {
+        if !alpha.is_finite() || alpha < 0.0 {
             return Err(NyError::InvalidSpec(format!(
-                "EluLayer requires finite positive alpha, got {}",
+                "EluLayer requires finite non-negative alpha (negative alpha makes ELU non-monotone), got {}",
                 alpha,
             )));
         }
@@ -127,10 +139,19 @@ impl BoundPropagation for EluLayer {
 ///
 /// Ref: alpha-beta-CROWN auto_LiRPA/operators/nonlinear.py (ELU relaxation)
 pub(crate) fn elu_linear_relaxation(l: f32, u: f32, alpha: f32) -> LinearRelaxation {
-    // Guard: alpha < 0 makes ELU non-monotone; alpha = 0 is degenerate;
-    // non-finite alpha causes NaN/Inf. Return conservative (-inf, +inf). (#2779)
-    if !alpha.is_finite() || alpha <= 0.0 {
+    // Guard: alpha < 0 makes ELU non-monotone; non-finite alpha causes
+    // NaN/Inf. Return conservative (-inf, +inf). (#2779)
+    //
+    if !alpha.is_finite() || alpha < 0.0 {
         return LinearRelaxation::nan_fallback();
+    }
+    // alpha == 0 IS ReLU, exactly: the positive branch is `x` and the negative
+    // branch is `0 * (exp(x) - 1) = 0` for every finite x. Route to the
+    // certified ReLU relaxation rather than the elu-family one (whose
+    // soundness argument assumes scale > 0) — identical functions, so the
+    // ReLU proof transfers verbatim, and CROWN stays tight instead of vacuous.
+    if alpha == 0.0 {
+        return super::relu::relu_linear_relaxation(l, u);
     }
 
     let alpha64 = alpha as f64;
@@ -160,6 +181,7 @@ impl EluLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::assert_relaxation_sound_exact;
     use crate::LinearBounds;
     use ndarray::{Array1, Array2, ArrayD, IxDyn};
     use proptest::prelude::ProptestConfig;
@@ -180,10 +202,17 @@ mod tests {
 
     #[test]
     fn test_try_new_rejects_invalid_alpha_2551() {
-        for alpha in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        for alpha in [-1.0, f32::NAN, f32::INFINITY] {
             let err = EluLayer::try_new(alpha).expect_err("invalid alpha should be rejected");
             assert!(matches!(err, NyError::InvalidSpec(_)));
         }
+    }
+
+    /// alpha = 0 is exactly ReLU and is admitted at the layer constructor.
+    #[test]
+    fn test_try_new_accepts_zero_alpha_exact_relu() {
+        let layer = EluLayer::try_new(0.0).expect("alpha = 0 (exact ReLU) must be admitted");
+        assert_eq!(layer.alpha, 0.0);
     }
 
     #[test]
@@ -561,14 +590,18 @@ mod tests {
             "negative alpha should be InvalidSpec, got: {err:?}"
         );
 
-        // alpha = 0.0: degenerate, f(x < 0) = 0 constant
+        // alpha = 0.0 is exact ReLU and now ADMITTED: on the purely negative
+        // interval the true output is {0}; the enclosure is [0, 0] up to the
+        // single outward ULP the directed rounding adds to the upper endpoint.
         let layer_zero = EluLayer { alpha: 0.0 };
-        let err = layer_zero
+        let out = layer_zero
             .propagate_ibp(&input)
-            .expect_err("zero alpha should error");
+            .expect("alpha = 0 (exact ReLU) must propagate");
+        assert_eq!(out.lower()[[0]], 0.0, "ReLU(x < 0) lower is exactly 0");
         assert!(
-            matches!(err, NyError::InvalidSpec(_)),
-            "zero alpha should be InvalidSpec, got: {err:?}"
+            out.upper()[[0]] >= 0.0 && out.upper()[[0]] <= f32::MIN_POSITIVE,
+            "ReLU(x < 0) upper must enclose 0 within one outward ULP, got {}",
+            out.upper()[[0]]
         );
 
         // alpha = NaN
@@ -605,13 +638,6 @@ mod tests {
         assert_eq!(r.upper_slope, 0.0);
         assert_eq!(r.upper_intercept, f32::INFINITY);
 
-        // alpha = 0.0
-        let r = elu_linear_relaxation(-1.0, 1.0, 0.0);
-        assert_eq!(r.lower_slope, 0.0);
-        assert_eq!(r.lower_intercept, f32::NEG_INFINITY);
-        assert_eq!(r.upper_slope, 0.0);
-        assert_eq!(r.upper_intercept, f32::INFINITY);
-
         // alpha = NaN
         let r = elu_linear_relaxation(-1.0, 1.0, f32::NAN);
         assert_eq!(r.lower_slope, 0.0);
@@ -625,6 +651,34 @@ mod tests {
         assert_eq!(r.lower_intercept, f32::NEG_INFINITY);
         assert_eq!(r.upper_slope, 0.0);
         assert_eq!(r.upper_intercept, f32::INFINITY);
+    }
+
+    /// `alpha == 0` IS ReLU exactly (`0 * (exp(x) - 1) = 0`), so the relaxation
+    /// routes to the certified ReLU one instead of the vacuous fallback — the
+    /// same lines, and sound by identity of the two functions.
+    #[test]
+    fn test_relaxation_alpha_zero_is_the_relu_relaxation() {
+        for (l, u) in [(-1.0_f32, 1.0_f32), (-3.0, 0.5), (0.25, 2.0), (-2.0, -0.5)] {
+            let r = elu_linear_relaxation(l, u, 0.0);
+            let relu = super::super::relu::relu_linear_relaxation(l, u);
+            assert_eq!(r.lower_slope, relu.lower_slope, "[{l}, {u}]");
+            assert_eq!(r.lower_intercept, relu.lower_intercept, "[{l}, {u}]");
+            assert_eq!(r.upper_slope, relu.upper_slope, "[{l}, {u}]");
+            assert_eq!(r.upper_intercept, relu.upper_intercept, "[{l}, {u}]");
+            assert!(r.lower_intercept.is_finite() && r.upper_intercept.is_finite());
+
+            // Soundness at sample points: the lines must bracket ELU(x, 0) = ReLU(x).
+            for k in 0..=32 {
+                let x = l + (u - l) * (k as f32) / 32.0;
+                let y = x.max(0.0);
+                let lo = r.lower_slope * x + r.lower_intercept;
+                let hi = r.upper_slope * x + r.upper_intercept;
+                assert!(
+                    lo <= y + 1e-6 && y <= hi + 1e-6,
+                    "[{l}, {u}] x={x}: {lo} <= {y} <= {hi}"
+                );
+            }
+        }
     }
 
     /// Regression test for #2779: verify that the specific example from the
@@ -743,6 +797,40 @@ mod tests {
         );
     }
 
+    /// alpha = 0 (exact ReLU): the IBP enclosure matches ReLU semantics on a
+    /// crossing interval and on a saturated [-inf, +inf] box.
+    #[test]
+    fn test_ibp_zero_alpha_is_exact_relu() {
+        let layer = EluLayer::new(0.0);
+
+        // Crossing interval [-2, 3]: ReLU range is [0, 3].
+        let input = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![-2.0]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![3.0]).unwrap(),
+        )
+        .unwrap();
+        let out = layer.propagate_ibp(&input).unwrap();
+        assert_eq!(out.lower()[[0]], 0.0, "ReLU lower on [-2, 3] is exactly 0");
+        assert_eq!(out.upper()[[0]], 3.0, "ReLU upper on [-2, 3] is exactly 3");
+
+        // Saturated box: ReLU(-inf) = 0 (lower pinned by the -alpha = -0 floor
+        // clamp), ReLU(+inf) = +inf.
+        let saturated = BoundedTensor::new_allow_infinite(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::NEG_INFINITY]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![f32::INFINITY]).unwrap(),
+        )
+        .unwrap();
+        let out = layer
+            .propagate_ibp(&saturated)
+            .expect("saturated input must propagate through alpha = 0 ELU");
+        assert_eq!(out.lower()[[0]], 0.0, "ReLU(-inf) limit is exactly 0");
+        assert!(
+            out.upper()[[0]].is_infinite() && out.upper()[[0]].is_sign_positive(),
+            "ReLU(+inf) limit is +inf, got {}",
+            out.upper()[[0]]
+        );
+    }
+
     // ── NaN alpha absorption regression tests (#2714) ─────────────────
 
     #[test]
@@ -779,6 +867,117 @@ mod tests {
             x
         } else {
             alpha * (x.exp() - 1.0)
+        }
+    }
+
+    /// ZERO-tolerance f64 pin on the CONSTANT / SATURATING branches, across
+    /// several alphas. Companion to `proptest_elu_relaxation_strict_soundness`
+    /// below, which structurally cannot reach any of these: it draws finite
+    /// `l, u` and then `prop_assume!`s the coefficients finite, and every branch
+    /// exercised here requires an infinite endpoint or a deep tail.
+    ///
+    /// What the deep-tail samples pin, and why it matters even though ELU's own
+    /// saturation is exact: at x = -20, -50, -100, -1000 the certified lower
+    /// bound IS the saturation constant `-alpha`, and `elu_f64_reference` there
+    /// evaluates to exactly `-f64::from(alpha)`. So this asserts, at zero
+    /// tolerance, that the published asymptote is not one ULP on the wrong side
+    /// — the exact property SELU's twin got wrong (its asymptote is a PRODUCT,
+    /// so round-to-nearest could and did land above the true infimum).
+    ///
+    /// ELU's `positive_slope` is 1.0, so the `l = -inf, u > 0` endpoint witness
+    /// `1.0 * u` is exact and is not the failure mode SELU has there. Covering
+    /// it anyway is what makes this a control rather than a coincidence.
+    #[test]
+    fn elu_saturating_branches_are_exact_in_f64() {
+        for alpha in [0.5f32, 1.0, 2.0] {
+            let alpha64 = f64::from(alpha);
+            let reference = move |x: f64| elu_f64_reference(x, alpha64);
+
+            let cases: [(f32, f32, &[f64], &str); 5] = [
+                (
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                    &[-1000.0, -100.0, -50.0, -20.0, -1.0, 0.0, 1.0, 100.0],
+                    "ELU [-inf, +inf]",
+                ),
+                (
+                    f32::NEG_INFINITY,
+                    0.0,
+                    &[-1000.0, -100.0, -50.0, -20.0, -1.0, 0.0],
+                    "ELU [-inf, 0]",
+                ),
+                (
+                    f32::NEG_INFINITY,
+                    -5.0,
+                    &[-1000.0, -100.0, -50.0, -20.0, -5.0],
+                    "ELU [-inf, -5]",
+                ),
+                (
+                    f32::NEG_INFINITY,
+                    3.0,
+                    &[-1000.0, -100.0, -50.0, -20.0, 0.0, 1.5, 3.0],
+                    "ELU [-inf, 3]",
+                ),
+                (
+                    f32::NEG_INFINITY,
+                    100.0,
+                    &[-1000.0, -100.0, -50.0, -20.0, 0.0, 100.0],
+                    "ELU [-inf, 100]",
+                ),
+            ];
+
+            for (l, u, samples, name) in cases {
+                let label = format!("{name} alpha={alpha}");
+                let r = elu_linear_relaxation(l, u, alpha);
+                // Non-vacuity: the helper deliberately does not assert it, and
+                // the (0, -inf, 0, +inf) fallback passes every sample.
+                assert_eq!(
+                    r.lower_slope, 0.0,
+                    "{label}: expected a CONSTANT lower bound"
+                );
+                assert_eq!(
+                    r.upper_slope, 0.0,
+                    "{label}: expected a CONSTANT upper bound"
+                );
+                assert!(
+                    r.lower_intercept.is_finite(),
+                    "{label}: lower intercept went vacuous ({})",
+                    r.lower_intercept
+                );
+                assert_relaxation_sound_exact(l, u, r, &reference, samples, &label);
+            }
+
+            // l finite, u = +inf: tangent lower, +inf upper plane.
+            let r = elu_linear_relaxation(-100.0, f32::INFINITY, alpha);
+            assert!(
+                r.upper_intercept.is_infinite() && r.upper_intercept.is_sign_positive(),
+                "ELU [-100, +inf] alpha={alpha}: upper must be the +inf plane, got {}",
+                r.upper_intercept
+            );
+            assert_relaxation_sound_exact(
+                -100.0,
+                f32::INFINITY,
+                r,
+                &reference,
+                &[-100.0, -50.0, -20.0, -1.0, 0.0, 1.0, 100.0],
+                &format!("ELU [-100, +inf] alpha={alpha}"),
+            );
+
+            // Finite deep tail: the chord slope has underflowed to zero and the
+            // published constants sit directly on the asymptote.
+            let r = elu_linear_relaxation(-1000.0, -900.0, alpha);
+            assert!(
+                r.lower_intercept.is_finite() && r.upper_intercept.is_finite(),
+                "ELU [-1000, -900] alpha={alpha}: went vacuous ({r:?})"
+            );
+            assert_relaxation_sound_exact(
+                -1000.0,
+                -900.0,
+                r,
+                &reference,
+                &[-1000.0, -950.0, -900.0],
+                &format!("ELU [-1000, -900] alpha={alpha}"),
+            );
         }
     }
 

@@ -60,6 +60,61 @@ CATEGORY = "cgan_2023"
 ONNX = "onnx/model.onnx"
 VNNLIB = "vnnlib/property.vnnlib"
 RUN_ID = "sealed-fixture"
+FAST_GRAD_PREDICATE = (
+    "ny-exec-v1.pgd-fast-gradient-parameter-engaged."
+    "NY_PGD_FAST_GRAD.0=ran"
+)
+FIXTURE_SEARCH_SPACE_PAYLOAD = {
+    "schema": "ny-levers/search-space/v6",
+    "axes": [
+        {
+            "name": "NY_PGD_FAST_GRAD",
+            "domain": "bool",
+            "values": ["0", "1"],
+            "class": "VerdictAffecting",
+            "deliver": "preset:attack.pgd_fast_grad",
+            "why": "fixture execution-predicate axis",
+            "absence_baseline": {"kind": "declaration_default"},
+            "category_prefixes": [],
+            "preset_baseline_keys": ["attack.pgd_fast_grad"],
+        }
+    ],
+    "edges": [],
+    "unsafe": [],
+    "instrument_only": [],
+    "test_only": [],
+    "declarations": {
+        "NY_PGD_FAST_GRAD": {
+            "kind": "Bool",
+            "default": "1",
+            "min": None,
+            "max": None,
+            "members": None,
+        }
+    },
+}
+FIXTURE_SEARCH_SPACE_JSON = json.dumps(
+    FIXTURE_SEARCH_SPACE_PAYLOAD, sort_keys=True, separators=(",", ":")
+)
+
+
+def _fixture_solver_script(
+    search_space_payload: dict[str, object] | None = None,
+) -> str:
+    search_space_json = json.dumps(
+        search_space_payload or FIXTURE_SEARCH_SPACE_PAYLOAD,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        "#!/bin/sh\n"
+        'if [ "$1" = "benchmarks" ] && [ "$2" = "space" ] '
+        '&& [ "$3" = "--json" ]; then\n'
+        f"  printf '%s\\n' '{search_space_json}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
 PRODUCTION_OFFICIAL_HASHES = dict(promote.evidence.OFFICIAL_ARTIFACT_SHA256)
 PRODUCTION_RESCORE_HASHES = dict(promote.evidence.ORGANIZER_RESCORE_ARTIFACT_SHA256)
 PRODUCTION_RESULTS_REPOSITORY_PINS = (
@@ -111,6 +166,37 @@ def _restore_official_hash_pins(
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _fixture_binary_build_id(executable_sha256: str) -> dict[str, object]:
+    fields = {
+        "version": "0.3.1",
+        "features": "none",
+        "backend": "wgpu",
+        "markers": "margin-row-gpu-eft-impl-v9",
+        "commit": "a" * 40,
+        "dirty": "false",
+        "revision": "1",
+        "source": "clean",
+        "profile": "release",
+        "target": "fixture-target",
+        "rustc": "1.90.0",
+        "stamp": "1" * 64,
+        "exe": executable_sha256,
+    }
+    fields["id"] = hashlib.sha256(
+        f"{provenance.BUILD_ID_SCHEMA}\n{fields['stamp']}\n{fields['exe']}\n".encode(
+            "ascii"
+        )
+    ).hexdigest()
+    line = " ".join(
+        [provenance.BUILD_ID_SCHEMA]
+        + [
+            f"{field}={fields[field]}"
+            for field in provenance.BUILD_ID_CANONICAL_FIELDS
+        ]
+    )
+    return {"schema": provenance.BUILD_ID_SCHEMA, "line": line, "fields": fields}
 
 
 def _write_json(path: Path, value: object) -> tuple[str, int]:
@@ -250,8 +336,44 @@ def _fixture(
     ambiguous_onnx_payload: bool = False,
     source_extra_files: dict[str, bytes] | None = None,
     containment_profile: str | None = "gb10-80g",
-    current_flight: bool = False,
+    current_flight: bool = True,
+    execution_predicate: str | None = None,
+    execution_search_space_payload: dict[str, object] | None = None,
+    execution_values: dict[str, str] | None = None,
+    execution_typed_values: dict[str, object] | None = None,
+    execution_receipt_values: dict[str, object] | None = None,
+    execution_event: dict[str, object] | None = None,
+    execution_evidence_profile: str | None = None,
 ) -> dict[str, Path | promote.PromotionRequest]:
+    if execution_predicate is None:
+        execution_predicate = FAST_GRAD_PREDICATE
+    if execution_search_space_payload is None:
+        execution_search_space_payload = FIXTURE_SEARCH_SPACE_PAYLOAD
+    if execution_values is None:
+        execution_values = {"NY_PGD_FAST_GRAD": "0"}
+    if execution_typed_values is None:
+        execution_typed_values = {
+            "NY_PGD_FAST_GRAD": {"type": "boolean", "value": False}
+        }
+    if execution_receipt_values is None:
+        execution_receipt_values = {"NY_PGD_FAST_GRAD": False}
+    if execution_event is None:
+        execution_event = {
+            "method": "pgd_fast_gradient_execution",
+            "status": "ran",
+            "reason": (
+                "schema=ny-cli/pgd-fast-gradient-execution/v1 "
+                "phase=terminal route=conjunctive configured=false "
+                "decisions=1 fast_attempts=0 fast_selected=0 "
+                "certified_selected=1 spsa_selected=0"
+            ),
+            "at_secs": 0.0,
+        }
+    if execution_evidence_profile is None:
+        execution_evidence_profile = provenance.EXECUTION_EVIDENCE_PROFILE
+    assert set(execution_values) == set(execution_typed_values)
+    assert set(execution_values) == set(execution_receipt_values)
+
     benchmark_repo = tmp_path / "benchmark-repo"
     benchmark = benchmark_repo / "benchmarks"
     instances = benchmark / CATEGORY / "instances.csv"
@@ -280,11 +402,15 @@ def _fixture(
     official = _official_fixture(tmp_path, target_truth=target_truth)
 
     source_repo = tmp_path / "source"
-    configs = source_repo / "configs"
+    configs = source_repo / "configs" / "vnncomp25"
     configs.mkdir(parents=True)
-    (configs / "fixture.yaml").write_text("fixture: true\n", encoding="utf-8")
+    (configs / f"{CATEGORY}.yaml").write_text(
+        "fixture: true\n", encoding="utf-8"
+    )
     solver_path = source_repo / "solver"
-    solver_path.write_bytes(b"canonical solver fixture\n")
+    solver_path.write_text(
+        _fixture_solver_script(execution_search_space_payload), encoding="utf-8"
+    )
     solver_path.chmod(0o755)
     for relative, data in (source_extra_files or {}).items():
         extra = source_repo.joinpath(*relative.split("/"))
@@ -297,6 +423,7 @@ def _fixture(
         )
         assert behaviour_epoch is not None
         os.utime(solver_path, None)
+        _git(source_repo, "update-index", "--refresh")
         assert int(solver_path.stat().st_mtime) >= behaviour_epoch
     full_archive = Path(f"{source_repo}.full-source.tar.gz")
     _git(
@@ -414,12 +541,22 @@ def _fixture(
     if current_flight:
         measurement.update(
             {
+                "execution_evidence_profile": execution_evidence_profile,
                 "flight_record_file": f'{measurement["result_file"]}.flight.json',
                 "flight_record_capture": (
                     promote.evidence.FLIGHT_RECORD_CAPTURE_POLICY
                 ),
             }
         )
+        measurement["solver_environment"]["values"].update(execution_values)
+        measurement["solver_environment_overrides"].update(execution_values)
+        for name, value in (
+            ("OMP_NUM_THREADS", "1"),
+            ("RAYON_NUM_THREADS", "2"),
+            ("RAYON_RS_NUM_CPUS", "3"),
+        ):
+            measurement["solver_environment"]["values"][name] = value
+            measurement["solver_environment_overrides"][name] = value
     containment: dict[str, object] = {"fixture": True}
     if containment_profile is not None:
         containment["containment_profile"] = containment_profile
@@ -439,6 +576,7 @@ def _fixture(
         solver_binary["build_coherence"] = provenance._capture_build_coherence(
             source_repo, solver_path
         )
+        solver_binary["build_id"] = _fixture_binary_build_id(solver_digest)
     start = {
         "schema": "ny_measurement_start_v1",
         "run_id": RUN_ID,
@@ -460,10 +598,41 @@ def _fixture(
         "provenance_tools": {"git": git_identity},
         "rust_toolchain": {"fixture": True},
         "measurement": measurement,
-        "environment": {},
+        "environment": (
+            {
+                "allowlist_schema": "ny_measurement_environment_v1",
+                "values": {
+                    "NY_MEASURE_REQUIRE_FLIGHT_EVENT": execution_predicate,
+                    **execution_values,
+                    "OMP_NUM_THREADS": "1",
+                    "RAYON_NUM_THREADS": "2",
+                    "RAYON_RS_NUM_CPUS": "3",
+                },
+                "typed_values": {
+                    "NY_MEASURE_REQUIRE_FLIGHT_EVENT": (
+                        provenance.parse_execution_predicate_requirement(
+                            execution_predicate
+                        )
+                    ),
+                    **execution_typed_values,
+                },
+            }
+            if current_flight
+            else {}
+        ),
         "host": {"containment": containment},
         "host_state": {},
     }
+    if current_flight:
+        search_space_contract = provenance._search_space_contract_from_payload(
+            execution_search_space_payload, source="promotion fixture"
+        )
+        measurement["search_space_contract"] = search_space_contract
+        measurement["execution_predicate_assignment"] = (
+            provenance.build_execution_predicate_assignment(
+                start["environment"], search_space_contract
+            )
+        )
     start_digest, start_size = _write_json(start_path, start)
 
     instance = artifact_root / CATEGORY / "00001-fixture"
@@ -598,10 +767,15 @@ def _fixture(
         ambient = {
             name: value
             for name, value in measurement["solver_environment"]["values"].items()
-            if name.startswith("NY_") or name == "OMP_NUM_THREADS"
+            if name.startswith("NY_")
+            or name
+            in {"OMP_NUM_THREADS", "RAYON_NUM_THREADS", "RAYON_RS_NUM_CPUS"}
         }
         flight_record = {
             "schema_version": 3,
+            "build_id": provenance.flight_build_stamp_for_binary_build_id(
+                solver_binary["build_id"]
+            ),
             "backend_kind": "cpu-only",
             "backend_summary": "fixture CPU backend",
             "host": {
@@ -614,10 +788,33 @@ def _fixture(
             "load_avg_at_end": [0.0, 0.0, 0.0],
             "category": CATEGORY,
             "budget_secs": timeout,
+            "ambient_env_schema": "ny-cli/ambient-env/v3",
             "ambient_env": ambient,
-            "levers": {"status": "not_materialized"},
+            "levers": {
+                "status": "resolved",
+                "receipt": {
+                    "schema": "ny-levers/receipt/v3",
+                    "lever_count": len(execution_receipt_values),
+                    "env_present": len(execution_receipt_values),
+                    "env_accepted": len(execution_receipt_values),
+                    "env_rejected": 0,
+                    "env_ignored": 0,
+                    "levers": [
+                        {
+                            "name": name,
+                            "value": execution_receipt_values[name],
+                            "source": "legacy_env",
+                            "bucket": "debug",
+                            "moat": "high",
+                            "provenance": "unmeasured",
+                            "env_utf8": True,
+                        }
+                        for name in sorted(execution_receipt_values)
+                    ],
+                },
+            },
             "events": [
-                {"method": "fixture", "status": "ran", "at_secs": 0.0},
+                execution_event,
                 {
                     "method": "run_complete",
                     "status": "complete",
@@ -626,12 +823,7 @@ def _fixture(
                 },
             ],
         }
-        flight_bytes = json.dumps(
-            flight_record,
-            ensure_ascii=False,
-            indent=2,
-            allow_nan=False,
-        ).encode("utf-8")
+        flight_bytes = promote.evidence._flight_record_source_bytes(flight_record)
         metadata["flight_record"] = {
             "status": "captured",
             "source_sha256": _sha(flight_bytes),
@@ -2117,11 +2309,514 @@ def test_current_start_and_embedded_flight_sat_replay_are_compatible(
         monkeypatch,
         official_result="correct",
     )
+    real_probe = provenance._capture_binary_search_space_contract
+    probes: list[Path] = []
+
+    def counted_probe(binary: Path, **kwargs):
+        probes.append(binary)
+        return real_probe(binary, **kwargs)
+
+    monkeypatch.setattr(
+        provenance, "_capture_binary_search_space_contract", counted_probe
+    )
 
     plan = promote.build_plan(fixture["request"])
 
     assert plan.summary["verdict"] == "sat"
     assert plan.summary["policy"] == "exact_2025_zero_tol_replay_correct_v1"
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+    assert promote.evidence.validate_start_schema_profile(start) == (
+        promote.evidence.CURRENT_EXECUTION_START_PROFILE
+    )
+    assert {
+        "OMP_NUM_THREADS",
+        "RAYON_NUM_THREADS",
+        "RAYON_RS_NUM_CPUS",
+    } <= set(metadata["flight_record"]["record"]["ambient_env"])
+    assert len(probes) == 1
+
+
+def _make_fixture_flight_partial(metadata: dict[str, object]) -> None:
+    capture = metadata["flight_record"]
+    assert isinstance(capture, dict)
+    record = capture["record"]
+    assert isinstance(record, dict)
+    events = record["events"]
+    assert isinstance(events, list)
+    reason = (
+        "in-process watchdog hard stop at budget+grace; timeout committed"
+    )
+    flushed_at = 121.0
+    # Metadata JSON sorts nested keys, so the canonical source reconstructor,
+    # not Python insertion order, owns the Rust FlightRecord field sequence.
+    record["record_status"] = {
+        "status": "partial_hard_stop",
+        "reason": reason,
+        "flushed_at_secs": flushed_at,
+    }
+    events[-1] = {
+        "method": "run_incomplete",
+        "status": "incomplete",
+        "reason": reason,
+        "at_secs": flushed_at,
+    }
+    source = promote.evidence._flight_record_source_bytes(record)
+    capture["source_sha256"] = _sha(source)
+    capture["size_bytes"] = len(source)
+
+
+def test_current_partial_hard_stop_is_readable_source_bound_and_not_promotable(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, verdict="timeout", current_flight=True)
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+    _make_fixture_flight_partial(metadata)
+
+    assert promote.evidence.validate_flight_record_binding(
+        start=start, metadata=metadata
+    ) == promote.evidence.CURRENT_EXECUTION_START_PROFILE
+    source = promote.evidence._flight_record_source_bytes(
+        metadata["flight_record"]["record"]
+    )
+    assert source.startswith(
+        b'{\n  "schema_version": 3,\n  "record_status": {\n'
+    )
+
+    with pytest.raises(
+        promote.evidence.EvidenceError,
+        match="partial hard-stop.*not regular-bank promotion-eligible",
+    ):
+        promote.evidence._validate_row_artifacts(
+            root=tmp_path,
+            start_path=fixture["start"],
+            start_digest="0" * 64,
+            start=start,
+            benchmark=None,
+            occurrence=None,
+            raw_record={},
+            metadata_path=fixture["metadata"],
+            metadata=metadata,
+        )
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    (
+        "partial_status_extra_key",
+        "run_complete_present",
+        "incomplete_reason_mismatch",
+        "incomplete_time_mismatch",
+        "decided_verdict",
+        "unresolved_verdict_is_accepted",
+        "captured_source_mismatch",
+    ),
+)
+def test_current_partial_hard_stop_rejects_malformed_or_unbound_shapes(
+    tmp_path: Path, malformation: str
+) -> None:
+    fixture = _fixture(tmp_path, verdict="timeout", current_flight=True)
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+    _make_fixture_flight_partial(metadata)
+    capture = metadata["flight_record"]
+    record = capture["record"]
+    if malformation == "partial_status_extra_key":
+        record["record_status"]["future"] = True
+    elif malformation == "run_complete_present":
+        record["events"].insert(
+            -1,
+            {
+                "method": "run_complete",
+                "status": "complete",
+                "reason": "timeout",
+                "at_secs": 120.0,
+            },
+        )
+    elif malformation == "incomplete_reason_mismatch":
+        record["events"][-1]["reason"] = "different hard stop"
+    elif malformation == "incomplete_time_mismatch":
+        record["events"][-1]["at_secs"] = 120.0
+    elif malformation == "decided_verdict":
+        # A partial (hard-stopped) record may accompany any UNRESOLVED verdict,
+        # but never a DECIDED one — you cannot have decided sat/unsat from a run
+        # that never finished. Was `"unknown"` under the name
+        # `non_timeout_verdict`, asserting a narrower rule than the validator
+        # ever meant: 43bf84976 (2026-08-26) replaced a hard-coded
+        # `solver_verdict != "timeout"` with the long-standing
+        # UNRESOLVED_LITERAL_VERDICTS = {timeout, unknown, error}, because
+        # ee35bf01c made the root-objective DeadlineExceeded arm publish
+        # `unknown` where it had published `timeout`. That commit could not run
+        # this file ("it imports pytest"), so this case was left asserting the
+        # pre-widening contract and went red. `unsat` keeps the case testing the
+        # boundary that IS still enforced.
+        metadata["solver_verdict"] = "unsat"
+    elif malformation == "unresolved_verdict_is_accepted":
+        metadata["solver_verdict"] = "unknown"
+    elif malformation == "captured_source_mismatch":
+        capture["source_sha256"] = "0" * 64
+    if malformation != "captured_source_mismatch":
+        source = promote.evidence._flight_record_source_bytes(record)
+        capture["source_sha256"] = _sha(source)
+        capture["size_bytes"] = len(source)
+
+    if malformation == "unresolved_verdict_is_accepted":
+        # Not a malformation: the POSITIVE half of the same rule. Without it a
+        # future narrowing back to timeout-only would leave every case above
+        # still green, since they only assert that something is refused.
+        promote.evidence.validate_flight_record_binding(
+            start=start, metadata=metadata
+        )
+        return
+
+    with pytest.raises(promote.evidence.EvidenceError):
+        promote.evidence.validate_flight_record_binding(
+            start=start, metadata=metadata
+        )
+
+
+def test_current_profile_requires_an_exact_full_solver_build_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, current_flight=True)
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+
+    missing = json.loads(json.dumps(start))
+    del missing["solver_binary"]["build_id"]
+    with pytest.raises(promote.evidence.EvidenceError, match="canonical"):
+        promote.evidence.validate_start_schema_profile(missing)
+
+    extra = json.loads(json.dumps(start))
+    extra["solver_binary"]["build_id"]["unexpected"] = True
+    with pytest.raises(promote.evidence.EvidenceError, match="build identity"):
+        promote.evidence.validate_start_schema_profile(extra)
+
+    inconsistent = json.loads(json.dumps(start))
+    old_id = inconsistent["solver_binary"]["build_id"]["fields"]["id"]
+    inconsistent["solver_binary"]["build_id"]["fields"]["id"] = "0" * 64
+    inconsistent["solver_binary"]["build_id"]["line"] = inconsistent[
+        "solver_binary"
+    ]["build_id"]["line"].replace(f"id={old_id}", f"id={'0' * 64}")
+    with pytest.raises(promote.evidence.EvidenceError, match="digest"):
+        promote.evidence.validate_start_schema_profile(inconsistent)
+
+
+def test_current_profile_binds_embedded_flight_stamp_to_full_solver_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, current_flight=True)
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+    flight = metadata["flight_record"]
+    flight["record"]["build_id"] = (
+        "NY_BUILD_STAMP_V1 version=other stamp=" + "0" * 64
+    )
+    source = promote.evidence._flight_record_source_bytes(flight["record"])
+    flight["source_sha256"] = _sha(source)
+    flight["size_bytes"] = len(source)
+
+    with pytest.raises(promote.evidence.EvidenceError, match="build stamp differs"):
+        promote.evidence.validate_flight_record_binding(
+            start=start, metadata=metadata
+        )
+
+
+def test_current_profile_requires_exact_assignment_and_registry_shapes(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, current_flight=True)
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    assert promote.evidence.validate_start_schema_profile(start) == (
+        promote.evidence.CURRENT_EXECUTION_START_PROFILE
+    )
+
+    malformed = []
+    missing_assignment = json.loads(json.dumps(start))
+    del missing_assignment["measurement"]["execution_predicate_assignment"]
+    malformed.append(missing_assignment)
+    extra_assignment_field = json.loads(json.dumps(start))
+    extra_assignment_field["measurement"]["execution_predicate_assignment"][
+        "future"
+    ] = True
+    malformed.append(extra_assignment_field)
+    missing_contract = json.loads(json.dumps(start))
+    del missing_contract["measurement"]["search_space_contract"]
+    malformed.append(missing_contract)
+    extra_contract_field = json.loads(json.dumps(start))
+    extra_contract_field["measurement"]["search_space_contract"]["future"] = True
+    malformed.append(extra_contract_field)
+    invented_contrast = json.loads(json.dumps(start))
+    invented_contrast["measurement"]["execution_predicate_assignment"][
+        "contrast_id"
+    ] = "0" * 16
+    malformed.append(invented_contrast)
+
+    for candidate in malformed:
+        with pytest.raises(promote.evidence.EvidenceError):
+            promote.evidence.validate_start_schema_profile(candidate)
+
+    downgraded = json.loads(json.dumps(start))
+    downgraded_assignment = downgraded["measurement"][
+        "execution_predicate_assignment"
+    ]
+    downgraded_assignment["schema"] = (
+        provenance.LEGACY_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+    )
+    del downgraded_assignment["runtime_context_assignment"]
+    del downgraded_assignment["runtime_context_source_assignment"]
+    with pytest.raises(
+        promote.evidence.EvidenceError,
+        match="does not match its evidence profile",
+    ):
+        promote.evidence.validate_start_schema_profile(downgraded)
+
+    historical = json.loads(json.dumps(downgraded))
+    historical["measurement"]["execution_evidence_profile"] = (
+        provenance.LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE
+    )
+    assert promote.evidence.validate_start_schema_profile(historical) == (
+        promote.evidence.CURRENT_EXECUTION_START_PROFILE
+    )
+
+
+def test_joint_profile_revalidates_every_requested_axis_before_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirement = (
+        "ny-exec-v2.margin-row-policy-parameter-engaged."
+        "NY_MARGIN_ROW_BETA_COLS.4,NY_MARGIN_ROW_BETA_PERCOL.1=ran"
+    )
+    payload = {
+        "schema": "ny-levers/search-space/v6",
+        "axes": [
+            {
+                "name": name,
+                "domain": "grid",
+                "values": values,
+                "class": "VerdictAffecting",
+                "deliver": f"preset:attack.{name.lower()}",
+                "why": "promotion joint execution fixture",
+                "absence_baseline": {"kind": "declaration_default"},
+                "category_prefixes": [],
+                "preset_baseline_keys": [f"attack.{name.lower()}"],
+            }
+            for name, values in (
+                ("NY_MARGIN_ROW_BETA_COLS", ["1", "4", "8", "16", "32"]),
+                ("NY_MARGIN_ROW_BETA_PERCOL", ["0", "1"]),
+            )
+        ],
+        "edges": [],
+        "unsafe": [],
+        "instrument_only": [],
+        "test_only": [],
+        "declarations": {
+            name: {
+                "kind": "UsizeTrimmed" if name.endswith("COLS") else "Bool",
+                "default": "8" if name.endswith("COLS") else "0",
+                "min": None,
+                "max": None,
+                "members": None,
+            }
+            for name in ("NY_MARGIN_ROW_BETA_COLS", "NY_MARGIN_ROW_BETA_PERCOL")
+        },
+    }
+    event = {
+        "method": "margin_row_policy_execution",
+        "status": "ran",
+        "reason": (
+            "schema=ny-cli/margin-row-policy-execution/v1 phase=terminal "
+            "outcome=unknown beta_per_column=true beta_columns=4 "
+            "column_retire=false parallel_prebuild=false "
+            "beta_per_column_evals=3 beta_columns_binding_evals=2 "
+            "beta_columns_max_candidates=7 newly_retired_columns=0 "
+            "inherited_retirement_evals=0 parallel_prebuild_batches=0 "
+            "parallel_prebuild_domains=0 policy_mismatch=false"
+        ),
+        "at_secs": 0.0,
+    }
+    fixture = _fixture(
+        tmp_path,
+        current_flight=True,
+        execution_predicate=requirement,
+        execution_search_space_payload=payload,
+        execution_values={
+            "NY_MARGIN_ROW_BETA_COLS": "4",
+            "NY_MARGIN_ROW_BETA_PERCOL": "1",
+        },
+        execution_typed_values={
+            "NY_MARGIN_ROW_BETA_COLS": {"type": "nonnegative_integer", "value": 4},
+            "NY_MARGIN_ROW_BETA_PERCOL": {"type": "boolean", "value": True},
+        },
+        execution_receipt_values={
+            "NY_MARGIN_ROW_BETA_COLS": 4,
+            "NY_MARGIN_ROW_BETA_PERCOL": True,
+        },
+        execution_event=event,
+        execution_evidence_profile=provenance.JOINT_EXECUTION_EVIDENCE_PROFILE,
+    )
+    real_probe = provenance._capture_binary_search_space_contract
+    probes: list[Path] = []
+
+    def counted_probe(binary: Path, **kwargs):
+        probes.append(binary)
+        return real_probe(binary, **kwargs)
+
+    monkeypatch.setattr(
+        provenance, "_capture_binary_search_space_contract", counted_probe
+    )
+    plan = promote.build_plan(fixture["request"])
+    assert plan.summary["verdict"] == "unsat"
+    assert len(probes) == 1
+
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+
+    assert promote.evidence.validate_start_schema_profile(start) == (
+        promote.evidence.CURRENT_EXECUTION_START_PROFILE
+    )
+    assert promote.evidence.validate_flight_record_binding(
+        start=start, metadata=metadata
+    ) == promote.evidence.CURRENT_EXECUTION_START_PROFILE
+
+    scalar_profile_joint_assignment = json.loads(json.dumps(start))
+    scalar_profile_joint_assignment["measurement"][
+        "execution_evidence_profile"
+    ] = provenance.EXECUTION_EVIDENCE_PROFILE
+    with pytest.raises(
+        promote.evidence.EvidenceError,
+        match="does not match its evidence profile",
+    ):
+        promote.evidence.validate_start_schema_profile(
+            scalar_profile_joint_assignment
+        )
+
+    dark_axis = json.loads(json.dumps(metadata))
+    capture = dark_axis["flight_record"]
+    record = capture["record"]
+    record["events"][0]["reason"] = record["events"][0]["reason"].replace(
+        "beta_columns_binding_evals=2", "beta_columns_binding_evals=0"
+    )
+    source = promote.evidence._flight_record_source_bytes(record)
+    capture["source_sha256"] = _sha(source)
+    capture["size_bytes"] = len(source)
+    with pytest.raises(
+        promote.evidence.EvidenceError,
+        match="NY_MARGIN_ROW_BETA_COLS=4",
+    ):
+        promote.evidence.validate_flight_record_binding(
+            start=start, metadata=dark_axis
+        )
+
+
+def test_legacy_scalar_execution_profile_is_readable_but_not_promotable(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, current_flight=True)
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+    start["measurement"]["execution_evidence_profile"] = (
+        provenance.LEGACY_EXECUTION_EVIDENCE_PROFILE
+    )
+    del start["measurement"]["execution_predicate_assignment"]
+    del start["measurement"]["search_space_contract"]
+
+    assert promote.evidence.validate_flight_record_binding(
+        start=start, metadata=metadata
+    ) == promote.evidence.LEGACY_SINGLE_EXECUTION_START_PROFILE
+    with pytest.raises(promote.evidence.EvidenceError, match="not promotion-eligible"):
+        promote.evidence._validate_row_artifacts(
+            root=tmp_path,
+            start_path=fixture["start"],
+            start_digest="0" * 64,
+            start=start,
+            benchmark=None,
+            occurrence=None,
+            raw_record={},
+            metadata_path=fixture["metadata"],
+            metadata=metadata,
+        )
+
+
+def test_august_build_identity_profiles_remain_readable_but_ineligible(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, current_flight=True)
+    current_start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    current_metadata = json.loads(
+        fixture["metadata"].read_text(encoding="utf-8")
+    )
+
+    flight_start = json.loads(json.dumps(current_start))
+    del flight_start["measurement"]["execution_evidence_profile"]
+    del flight_start["measurement"]["execution_predicate_assignment"]
+    del flight_start["measurement"]["search_space_contract"]
+    assert promote.evidence.validate_flight_record_binding(
+        start=flight_start, metadata=current_metadata
+    ) == promote.evidence.FLIGHT_BUILD_ID_START_PROFILE
+
+    with pytest.raises(promote.evidence.EvidenceError, match="not promotion-eligible"):
+        promote.evidence._validate_row_artifacts(
+            root=tmp_path,
+            start_path=fixture["start"],
+            start_digest="0" * 64,
+            start=flight_start,
+            benchmark=None,
+            occurrence=None,
+            raw_record={},
+            metadata_path=fixture["metadata"],
+            metadata=current_metadata,
+        )
+
+    no_flight_start = json.loads(json.dumps(flight_start))
+    del no_flight_start["measurement"]["flight_record_capture"]
+    del no_flight_start["measurement"]["flight_record_file"]
+    no_flight_metadata = json.loads(json.dumps(current_metadata))
+    del no_flight_metadata["flight_record"]
+    assert promote.evidence.validate_flight_record_binding(
+        start=no_flight_start, metadata=no_flight_metadata
+    ) == promote.evidence.BUILD_ID_START_PROFILE
+
+
+def test_august_build_identity_profiles_reject_partial_or_unknown_shapes(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, current_flight=True)
+    current = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    historical = json.loads(json.dumps(current))
+    del historical["measurement"]["execution_evidence_profile"]
+    del historical["measurement"]["execution_predicate_assignment"]
+    del historical["measurement"]["search_space_contract"]
+
+    malformed_profiles = []
+    missing_coherence = json.loads(json.dumps(historical))
+    del missing_coherence["solver_binary"]["build_coherence"]
+    malformed_profiles.append(missing_coherence)
+    partial_flight = json.loads(json.dumps(historical))
+    del partial_flight["measurement"]["flight_record_file"]
+    malformed_profiles.append(partial_flight)
+    unknown_solver_field = json.loads(json.dumps(historical))
+    unknown_solver_field["solver_binary"]["unexpected"] = True
+    malformed_profiles.append(unknown_solver_field)
+
+    for malformed in malformed_profiles:
+        with pytest.raises(promote.evidence.EvidenceError, match="canonical"):
+            promote.evidence.validate_start_schema_profile(malformed)
+
+
+def test_pre_profile_evidence_is_readable_but_not_promotion_eligible(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path, current_flight=False)
+    start = json.loads(fixture["start"].read_text(encoding="utf-8"))
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+
+    assert promote.evidence.validate_flight_record_binding(
+        start=start, metadata=metadata
+    ) == promote.evidence.LEGACY_START_PROFILE
+    with pytest.raises(promote.evidence.EvidenceError, match="not promotion-eligible"):
+        promote.build_plan(fixture["request"])
 
 
 def test_strict_exact_2025_sat_enters_only_with_complete_dynamic_rescore(

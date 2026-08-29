@@ -19,13 +19,13 @@ use super::routing::{
 use super::BetaCrownModel;
 use super::{
     apply_instance_overrides, apply_vgg_abcrown_bound_mode, attack_steering_route,
-    count_perturbed_inputs, effective_engine_phase_budget, effective_interm_transfer,
-    effective_upfront_pgd, effective_upfront_pgd_with_vgg, require_deferred_pgd_consumer,
-    resolve_deferred_pgd_owner, resolve_internal_authority_deadline, resolve_overall_deadline,
-    resolve_pgd_attack, resolve_preset_config, resolve_vgg_abcrown_decision,
-    root_post_c_survivor_enabled_from_value, terminal_peel_policy, AppliedTerminalPeel,
-    AttackSteeringRoute, BetaCrownInstanceOverrides, BetaCrownPresetSnapshot, CganInputLeafRoute,
-    DeferredPgdOwner, SharedAttackGemmOnly, TerminalPeelPolicy,
+    configured_deadline_strictly_wins, count_perturbed_inputs, effective_engine_phase_budget,
+    effective_interm_transfer, effective_upfront_pgd, effective_upfront_pgd_with_vgg,
+    require_deferred_pgd_consumer, resolve_deferred_pgd_owner, resolve_internal_authority_deadline,
+    resolve_overall_deadline, resolve_pgd_attack, resolve_pgd_exact_vjp, resolve_preset_config,
+    resolve_vgg_abcrown_decision, root_post_c_survivor_enabled_from_value, terminal_peel_policy,
+    AppliedTerminalPeel, AttackSteeringRoute, BetaCrownInstanceOverrides, BetaCrownPresetSnapshot,
+    CganInputLeafRoute, DeferredPgdOwner, SharedAttackGemmOnly, TerminalPeelPolicy,
 };
 use crate::commands::backend::BackendRequestSource;
 use crate::preset::{apply_preset, load_preset, PresetConfig};
@@ -79,20 +79,31 @@ fn spec_with_clause(constraints: Vec<OutputConstraint>) -> VnnLibSpec {
 fn typed_instance_override_arms_only_sparse_root_crown() {
     let mut config = BetaCrownConfig::default();
     let baseline = serde_json::to_value(&config).unwrap();
-    apply_instance_overrides(&mut config, &BetaCrownInstanceOverrides::default());
+    let exact_vjp = config.pgd_exact_vjp;
+    apply_instance_overrides(
+        &mut config,
+        &BetaCrownInstanceOverrides {
+            pgd_exact_vjp: Some(exact_vjp),
+            ..BetaCrownInstanceOverrides::default()
+        },
+    )
+    .unwrap();
     assert_eq!(
         serde_json::to_value(&config).unwrap(),
         baseline,
         "default interactive route must be unchanged"
     );
 
+    let exact_vjp = config.pgd_exact_vjp;
     apply_instance_overrides(
         &mut config,
         &BetaCrownInstanceOverrides {
+            pgd_exact_vjp: Some(exact_vjp),
             root_sparse_interm_crown: true,
             ..BetaCrownInstanceOverrides::default()
         },
-    );
+    )
+    .unwrap();
     assert!(config.root_sparse_interm_crown);
     assert_eq!(config.root_sparse_interm_crown_max_secs, 2);
     assert_eq!(config.root_sparse_interm_crown_max_dim, 8_192);
@@ -101,16 +112,181 @@ fn typed_instance_override_arms_only_sparse_root_crown() {
 }
 
 #[test]
-fn typed_cgan_route_arms_only_the_input_leaf_consult() {
-    let mut config = BetaCrownConfig::default();
-    let baseline = config.clone();
+fn typed_instance_override_freezes_kfsb_certificate_reuse() {
+    let mut config = BetaCrownConfig {
+        kfsb_cert_reuse: true,
+        ..BetaCrownConfig::default()
+    };
     apply_instance_overrides(
         &mut config,
         &BetaCrownInstanceOverrides {
+            kfsb_cert_reuse_armed: Some(false),
+            ..BetaCrownInstanceOverrides::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        config.kfsb_cert_reuse,
+        "configured treatment remains visible"
+    );
+    assert_eq!(config.kfsb_cert_reuse_runtime, Some(false));
+    assert!(!config.kfsb_cert_reuse_armed());
+}
+
+#[test]
+fn frozen_kfsb_certificate_receipt_value_remains_runtime_authority() {
+    let raw = ny_levers::RawLeverInputs::capture_with(ny_levers::all(), |name| {
+        (name == ny_levers::decls::kfsb::MO_KFSB_CERT_REUSE.name)
+            .then(|| std::ffi::OsString::from("0"))
+    });
+    let levers = ny_levers::LeverSet::resolve_layered(ny_levers::all(), &raw, |decl| {
+        std::ptr::eq(decl, &raw const ny_levers::decls::kfsb::MO_KFSB_CERT_REUSE)
+            .then_some(ny_levers::LeverValue::Bool(true))
+    })
+    .expect("typed certificate-reuse preset is admissible");
+    assert_eq!(
+        levers.source(&ny_levers::decls::kfsb::MO_KFSB_CERT_REUSE),
+        ny_levers::Source::LegacyEnv
+    );
+    assert!(!levers.is_armed(&ny_levers::decls::kfsb::MO_KFSB_CERT_REUSE));
+
+    ny_test_utils::env::with_serialized_env_vars(&[("NY_MO_KFSB_CERT_REUSE", "1")], || {
+        let mut config = BetaCrownConfig {
+            kfsb_cert_reuse: true,
+            ..BetaCrownConfig::default()
+        };
+        apply_instance_overrides(
+            &mut config,
+            &BetaCrownInstanceOverrides {
+                kfsb_cert_reuse_armed: Some(
+                    levers.is_armed(&ny_levers::decls::kfsb::MO_KFSB_CERT_REUSE),
+                ),
+                ..BetaCrownInstanceOverrides::default()
+            },
+        )
+        .unwrap();
+        assert!(config.kfsb_cert_reuse, "typed preset remains visible");
+        assert!(
+            !config.kfsb_cert_reuse_armed(),
+            "later live environment mutation must not overrule the frozen receipt value"
+        );
+    });
+}
+
+#[test]
+fn frozen_chunk_wave_guard_remains_runtime_authority() {
+    let decl = &ny_levers::decls::crown_ibp_budget::NO_CHUNK_WAVE_PAR;
+    let wave_levers = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(
+        ny_levers::all(),
+        |name| (name == decl.name).then(|| "0".to_owned()),
+    ));
+    let frozen_wave =
+        crate::commands::vnncomp::chunk_wave_parallel_enabled_from_levers(&wave_levers);
+    assert!(frozen_wave, "exact zero must admit the experimental wave");
+
+    ny_test_utils::env::with_serialized_env_vars(&[(decl.name, "1")], || {
+        let mut config = BetaCrownConfig::default();
+        apply_instance_overrides(
+            &mut config,
+            &BetaCrownInstanceOverrides {
+                frozen_levers: Some(std::sync::Arc::clone(&wave_levers)),
+                chunk_wave_parallel_enabled: Some(frozen_wave),
+                ..BetaCrownInstanceOverrides::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            config.chunk_wave_parallel_enabled,
+            "a later live guard must not overrule the frozen scored decision"
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            config.frozen_levers.as_ref().expect("authority attached"),
+            &wave_levers,
+        ));
+    });
+
+    let sequential_levers = ny_levers::LeverSet::freeze_with(ny_levers::all(), |_| None);
+    let frozen_sequential =
+        crate::commands::vnncomp::chunk_wave_parallel_enabled_from_levers(&sequential_levers);
+    assert!(
+        !frozen_sequential,
+        "the production default must be sequential"
+    );
+    ny_test_utils::env::with_serialized_env_vars(&[(decl.name, "0")], || {
+        let mut config = BetaCrownConfig::default();
+        apply_instance_overrides(
+            &mut config,
+            &BetaCrownInstanceOverrides {
+                chunk_wave_parallel_enabled: Some(frozen_sequential),
+                ..BetaCrownInstanceOverrides::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !config.chunk_wave_parallel_enabled,
+            "a later live rollback must not overrule the frozen scored guard"
+        );
+    });
+}
+
+#[test]
+fn postbab_reserve_configured_deadline_must_strictly_win_every_authority() {
+    let now = Instant::now();
+    let configured = now + Duration::from_secs(10);
+    let later = now + Duration::from_secs(11);
+    let earlier = now + Duration::from_secs(9);
+
+    assert!(configured_deadline_strictly_wins(
+        Some(configured),
+        None,
+        false,
+        None,
+    ));
+    assert!(configured_deadline_strictly_wins(
+        Some(configured),
+        Some(later),
+        true,
+        Some(later),
+    ));
+    for (authoritative, owns_deferred, frozen) in [
+        (Some(configured), false, None),
+        (Some(earlier), false, None),
+        (Some(later), true, Some(configured)),
+        (Some(later), true, Some(earlier)),
+        (Some(later), true, None),
+    ] {
+        assert!(
+            !configured_deadline_strictly_wins(
+                Some(configured),
+                authoritative,
+                owns_deferred,
+                frozen,
+            ),
+            "ties, earlier authorities, and missing deferred authority must fail closed"
+        );
+    }
+    assert!(!configured_deadline_strictly_wins(
+        None,
+        Some(later),
+        false,
+        None,
+    ));
+}
+
+#[test]
+fn typed_cgan_route_arms_only_the_input_leaf_consult() {
+    let mut config = BetaCrownConfig::default();
+    let baseline = config.clone();
+    let exact_vjp = config.pgd_exact_vjp;
+    apply_instance_overrides(
+        &mut config,
+        &BetaCrownInstanceOverrides {
+            pgd_exact_vjp: Some(exact_vjp),
             cgan_input_leaf_route: Some(CganInputLeafRoute::Cgan2023),
             ..BetaCrownInstanceOverrides::default()
         },
-    );
+    )
+    .unwrap();
     assert!(config.input_split_input_leaf_oracle);
     let mut expected = baseline;
     expected.input_split_input_leaf_oracle = true;
@@ -119,6 +295,33 @@ fn typed_cgan_route_arms_only_the_input_leaf_consult() {
         serde_json::to_value(&expected).unwrap(),
         "the typed category route must not change any other verifier policy"
     );
+}
+
+#[test]
+fn exact_vjp_instance_override_separates_compat_resolver_from_frozen_scored_policy() {
+    let current = ny_propagate::ExactVjpPgdConfig::default();
+    let frozen = ny_propagate::ExactVjpPgdConfig {
+        batch_width: Some(52),
+        ..current
+    };
+    let scored = resolve_pgd_exact_vjp(current, Some(frozen), |_| {
+        panic!("the scored frozen policy must not consult the compatibility resolver")
+    })
+    .unwrap();
+    assert_eq!(scored, frozen);
+
+    let compatibility = ny_propagate::ExactVjpPgdConfig {
+        prefer_exact_batched: false,
+        ..current
+    };
+    let mut resolver_input = None;
+    let interactive = resolve_pgd_exact_vjp(current, None, |received| {
+        resolver_input = Some(received);
+        Ok(compatibility)
+    })
+    .unwrap();
+    assert_eq!(resolver_input, Some(current));
+    assert_eq!(interactive, compatibility);
 }
 
 #[test]

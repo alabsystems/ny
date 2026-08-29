@@ -13,6 +13,7 @@ mod bound_transpose;
 mod bound_transpose_patches;
 mod ops;
 mod ops_gemm;
+mod ops_ibp_blocked;
 mod ops_ibp_fwd;
 mod ops_ibp_gemm;
 mod ops_transpose_fwd;
@@ -22,6 +23,8 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use bound_patches::take_last_flat_bias_policy;
 #[cfg(test)]
 pub(crate) use bound_transpose_patches::ConvTransposePatchesDeadlineFailpoint;
 #[cfg(test)]

@@ -389,6 +389,7 @@ fn extract_prefix(graph: &GraphNetwork, target: &str) -> Option<GraphNetwork> {
         }
     }
     let mut prefix = GraphNetwork::new();
+    prefix.inherit_frozen_levers_from(graph);
     // node_names() preserves insertion (topological) order.
     for name in graph.node_names() {
         if needed.contains(name) {

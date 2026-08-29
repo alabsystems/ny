@@ -86,6 +86,54 @@ attack:
   # falls back to the declaration default.
   bnn_ste_pgd: true
 
+  # UPFRONT ATTACK PROBE-FIRST (#upfront-probe-first, override
+  # `NY_UPFRONT_ATTACK_PROBE_FIRST`). Consult the EXISTING upfront DLR-APGD
+  # falsification lane ONCE at the TOP of the attack slice under a 5 s cap,
+  # ahead of the two BNN lanes above, instead of only behind them.
+  #
+  # WHAT THIS DECIDES IS ORDER, NOT CAPABILITY. No lane is added and none is
+  # removed: on a miss the LP sign-space and STE-PGD lanes run afterwards in
+  # today's order under today's windows, and the ordinary uncapped upfront
+  # consultation still happens behind them. The probe is charged against the
+  # same `attack_start` subtraction every attack-slice lane pays, so it cannot
+  # push branch-and-bound past the scored deadline.
+  #
+  # WHY, MEASURED. Twelve `model_30` eps>=3 rows are ORDER-limited, not
+  # budget-limited and not capability-limited: the lane that wins them needs
+  # 1-2 exact gradient steps and 2-3 ORT forwards, but it runs THIRD, so the
+  # verdict lands in the LAST 0.2% of the wall behind an LP walk that exhausts
+  # (or refuses in 0.02 s on `max_free_units`) and an STE-PGD lane that burns
+  # its full 240 s cap. That prefix contributes nothing to those verdicts and
+  # is the only route by which host load can lose them.
+  #
+  # MEASURED at the official 480 s budget on ALL 45 rows, dark vs armed, arms
+  # interleaved per row, 2026-08-21 (see
+  # reports/measured-2026/traffic_signs_recognition_2023_NOTES.md):
+  #   * 0 rows lost. 15 rows won by the probe, 12 of them the `model_30`
+  #     eps>=3 instances, which move from t=242-336 s to t=1.4-5.6 s.
+  #   * Family summed solve time 7558 s -> 5335 s (-29%).
+  #   * On the 30 rows the probe CANNOT win it costs the CAP AND NOTHING MORE:
+  #     measured 5.00-5.03 s on all 30, including the three `model_30` eps=1
+  #     rows the LP walk owns, which keep their winner and a bit-identical
+  #     search (78 flips / 311 LP solves on `idx_1703`, both arms).
+  #   * Worst-case wall is UNMOVED: dark 468.65 s, armed 468.70 s of 480 s.
+  #     On rows that exhaust their budget the probe DISPLACES seconds instead
+  #     of adding them, so it does not narrow the margin to
+  #     `enforce_budget_overrun`.
+  # This is a LATENCY result, not a solved-row result: 36/45 on both arms. It
+  # is banked because this family TIES alpha-beta-CROWN at 36/45, where the
+  # time term is the only one left, and because it removes the load-inflation
+  # loss mode from twelve rows ny already scores.
+  #
+  # SOUNDNESS. Unchanged, because the probe IS the existing lane: it returns a
+  # claimed counterexample INPUT and never a verdict, so it cannot produce a
+  # false `unsat`, and a candidate becomes a `sat` only by passing the
+  # UNCHANGED `gate_sat_with_trusted_oracle` (real ONNX Runtime forward on the
+  # ORIGINAL model + true-f64 recheck). A candidate the gate drops falls
+  # through to the ordinary slice. `NY_UPFRONT_ATTACK_PROBE_FIRST` still wins
+  # where present: `1` arms, `0` disarms this key.
+  upfront_attack_probe_first: true
+
 bab:
   batch_size: 64
   branching:
@@ -94,6 +142,9 @@ bab:
     # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
     candidates: 5
     reduceop: max
+    # Exact wave-selector mirrors for governed search; runtime is unchanged.
+    kfsb_multi_candidates: 5
+    kfsb_multi_reduceop: max
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100

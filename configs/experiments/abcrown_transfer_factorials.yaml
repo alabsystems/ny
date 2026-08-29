@@ -282,6 +282,22 @@ experiments:
       - name: kfsb_candidates_7
         overrides:
           bab.branching.candidates: 7
+      # Isolate the historical multi-objective Min-vs-Max question. The base
+      # TinyImageNet preset leaves the wave selector off, so both arms must pin
+      # the same typed master and K=10; comparing Min directly to baseline or
+      # the broader upstream bundle would confound reducer with admission/K.
+      - name: kfsb_multi_reduce_max
+        overrides:
+          bab.branching.kfsb_multi: true
+          bab.branching.kfsb_multi_candidates: 10
+          bab.branching.kfsb_multi_reduceop: max
+        disposition: default_off_execution_control
+      - name: kfsb_multi_reduce_min
+        overrides:
+          bab.branching.kfsb_multi: true
+          bab.branching.kfsb_multi_candidates: 10
+          bab.branching.kfsb_multi_reduceop: min
+        disposition: default_off_execution_treatment
       - name: beta_iterations_8
         overrides:
           bab.beta_crown.iterations: 8
@@ -303,6 +319,11 @@ experiments:
           # treatment executes the upstream kFSB recipe rather than falling
           # back to NY's historical intercept-only multi-objective brancher.
           bab.branching.kfsb_multi: true
+          # The base TinyImageNet preset has dedicated wave K=10. Pin the
+          # treatment's dedicated parameters explicitly so generic upstream
+          # candidates=7/reduceop=max cannot silently execute a different wave.
+          bab.branching.kfsb_multi_candidates: 7
+          bab.branching.kfsb_multi_reduceop: max
           bab.alpha_crown.lr_alpha: 0.25
           bab.alpha_crown.iterations: 20
           bab.beta_crown.lr_alpha: 0.1

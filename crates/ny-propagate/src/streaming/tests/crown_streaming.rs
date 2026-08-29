@@ -847,8 +847,12 @@ fn streaming_crown_ibp_fallback_on_degradation_3082() {
         assert!(l <= u, "inverted interval: lower {l} > upper {u}");
     }
 
-    // If IBP produced finite bounds, the streaming result should match
-    // (since degraded CROWN falls back to IBP)
+    // If IBP produced finite bounds, the streaming result must ENCLOSE the
+    // plain-IBP one (degraded CROWN falls back to IBP). Not equality: the
+    // streaming forward applies the certified per-node float-rounding widening
+    // that the graph driver's sound path applies (Linear: in_features + 2 ULPs,
+    // 1 ULP elsewhere), so a streamed box is legitimately a hair WIDER than the
+    // un-widened plain-IBP box. Narrower would be the bug.
     if ibp_finite {
         for (&sl, &il) in streaming_result
             .lower()
@@ -856,8 +860,8 @@ fn streaming_crown_ibp_fallback_on_degradation_3082() {
             .zip(ibp_result.lower().iter())
         {
             assert!(
-                (sl - il).abs() < 1e-5,
-                "streaming lower should match IBP on fallback: streaming={sl}, ibp={il}"
+                sl <= il,
+                "streaming lower must enclose IBP on fallback: streaming={sl}, ibp={il}"
             );
         }
         for (&su, &iu) in streaming_result
@@ -866,8 +870,8 @@ fn streaming_crown_ibp_fallback_on_degradation_3082() {
             .zip(ibp_result.upper().iter())
         {
             assert!(
-                (su - iu).abs() < 1e-5,
-                "streaming upper should match IBP on fallback: streaming={su}, ibp={iu}"
+                su >= iu,
+                "streaming upper must enclose IBP on fallback: streaming={su}, ibp={iu}"
             );
         }
     }

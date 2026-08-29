@@ -14,6 +14,7 @@ use crate::network::core::{
     extract_relu_gpu_layer_with_alpha, try_extract_single_gpu_layer, GraphNetwork, NETWORK_INPUT,
 };
 
+use crate::network::SoleCarrierWitness;
 use ndarray::{ArrayD, IxDyn};
 use ny_core::{GemmEngine, GpuCrownSeed, Result};
 use ny_tensor::BoundedTensor;
@@ -53,15 +54,25 @@ impl GraphNetwork {
         alpha_state: &GraphAlphaState,
         engine: Option<&dyn GemmEngine>,
         deadline: Option<Instant>,
+        // #gpu-suffix-frontier: this shortcut CONCRETIZES the suffix and ends
+        // the DAG backward walk. Taking it while any sibling branch is still
+        // pending drops that branch's rows to zero and publishes a false
+        // certified bound. The witness is unforgeable and is issued only by
+        // `CrownMergeAccumulator::sole_carrier_witness`, so this precondition
+        // cannot be forgotten by a future caller.
+        _sole_carrier: &SoleCarrierWitness,
     ) -> Result<Option<BoundedTensor>> {
         // The legacy GPU shortcut builds a host seed, input endpoint copies,
         // and an extracted layer Vec with infallible O(N) operations. A GPU
         // deadline receipt cannot authorize work that happens before dispatch.
         // Keep finite requests on the cooperatively pollable CPU relation path;
         // no-deadline GPU behavior remains unchanged.
-        // #gpu-suffix-expiry: default-off, byte-identical unarmed. See
-        // `sound_gpu_gate::gpu_suffix_declines_under_finite_authority` — armed, a
-        // live deadline with headroom no longer forces the CPU relation path.
+        // #gpu-suffix-expiry: decided by `PATCHES_FINITE_EXPIRY`, which SHIPS
+        // ARMED (`DefaultSpec::Bool(true)`). See
+        // `sound_gpu_gate::gpu_suffix_declines_under_finite_authority` — armed
+        // (the default), a live deadline with headroom no longer forces the CPU
+        // relation path; `NY_PATCHES_FINITE_EXPIRY=0` restores the presence
+        // refusal byte-identically.
         if let Some(limit) = deadline {
             if Instant::now() >= limit {
                 return Err(ny_core::NyError::DeadlineExceeded(
@@ -136,6 +147,27 @@ impl GraphNetwork {
                 }
             };
 
+        // #gpu-suffix-coeff-err (SOUNDNESS, fail-closed). `GpuCrownSeed` has NO
+        // field for the certified coefficient-error channel, so everything the
+        // relation carries in `lower_a_err`/`upper_a_err` would be dropped here
+        // and the midpoint A/b would reach the device as if it were EXACT.
+        //
+        // `Layer::Linear`, `Conv2d`, `IntervalConst` and friends all declare
+        // `propagates_coeff_err()`, so this channel is a real carrier, not a
+        // theoretical one. The sibling CPU frontier
+        // (`bounds::target_backward::fold_output_conditioned_additional_seed_error_for_cpu`)
+        // already discharges-or-refuses at exactly this seam; this path had
+        // neither check. Refuse and fall back to the proven-sound CPU backward
+        // instead of seeding a device with an under-charged relation.
+        if !gpu_suffix_seed_is_err_free(node_lb) {
+            debug!(
+                node_name = node_name,
+                "Alpha-CROWN GPU suffix: relation carries certified coefficient error that the \
+                 device seed cannot represent; falling back to CPU backward"
+            );
+            return Ok(None);
+        }
+
         let seed = GpuCrownSeed {
             lower_a: node_lb.lower_a().iter().copied().collect::<Vec<_>>().into(),
             upper_a: node_lb.upper_a().iter().copied().collect::<Vec<_>>().into(),
@@ -188,7 +220,23 @@ impl GraphNetwork {
         };
         Ok(BoundedTensor::new(lower, upper).ok())
     }
+}
 
+/// Whether a relation may be handed to a `GpuCrownSeed` without losing a
+/// certified enclosure.
+///
+/// `GpuCrownSeed` transports only the midpoint relation (`lower_a`/`upper_a`/
+/// `lower_b`/`upper_b`). A relation carrying `lower_a_err`/`upper_a_err` has a
+/// certified per-coefficient error that the device cannot charge, so seeding
+/// from it would publish a bound TIGHTER than the relation actually justifies.
+///
+/// This is the fail-closed half of the audit: the seam does not account for the
+/// error, so it must refuse in its presence.
+pub(super) fn gpu_suffix_seed_is_err_free(node_lb: &LinearBounds) -> bool {
+    !node_lb.has_coeff_err()
+}
+
+impl GraphNetwork {
     /// Walk backward from `node_name` extracting GPU layers until NETWORK_INPUT.
     ///
     /// Returns `None` if any node in the chain is non-extractable.

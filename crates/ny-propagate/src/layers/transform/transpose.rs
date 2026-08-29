@@ -46,6 +46,27 @@ impl TransposeLayer {
     /// Create a batched transpose that swaps the last two dimensions.
     /// For 3D input (batch, m, n), produces (batch, n, m).
     /// For 4D input (a, b, m, n), produces (a, b, n, m).
+    ///
+    /// This is the **only** constructor that yields the empty-`axes` sentinel,
+    /// which [`Self::resolve_perm`] reads as "swap the final two axes at
+    /// whatever rank arrives".
+    ///
+    /// # Producers (do not delete as unreachable)
+    ///
+    /// Nothing inside the ny workspace calls this, so a workspace-scoped orphan
+    /// scan reports it dead. It is not: the callers live in the sibling `nn`
+    /// repo, which depends on `ny-propagate` by path —
+    /// `nn/crates/nn-verify/src/graph_tensor_matmul.rs` builds four of these
+    /// while lowering `MatMul` with a weight on the left (transpose → `Linear`
+    /// → transpose), and rank-agnostic swap-last-two is exactly what that
+    /// lowering needs, since it runs at both the 2-D and the per-batch-slice
+    /// rank.
+    ///
+    /// ny's own ONNX converter deliberately does **not** produce this sentinel:
+    /// `ny-build/src/convert/reshape.rs` materializes an explicit permutation
+    /// and routes around the empty vector, because ONNX's *omitted* `perm`
+    /// means "reverse all axes", and reusing the sentinel for it silently
+    /// changed every rank > 2 Transpose. Keep the two meanings apart.
     pub fn batched_transpose() -> Self {
         // Axes will be computed dynamically based on input dimension
         Self {

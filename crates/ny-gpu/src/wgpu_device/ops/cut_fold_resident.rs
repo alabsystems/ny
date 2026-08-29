@@ -6,8 +6,8 @@
 //! multi-neuron cuts into the SOUND GPU-resident resnet CROWN backward
 //! (`docs/CERTIFIED_CUT_CROWN_DESIGN.md` §C2).
 //!
-//! The fold ENTRY (`ResidentCutFold`), its global registry, and the dark gate
-//! now live in `ny-core` (`ny_core::resident_cut_fold`) so that `ny-propagate`
+//! The fold ENTRY (`ResidentCutFold`) and its global registry now live in
+//! `ny-core` (`ny_core::resident_cut_fold`) so that `ny-propagate`
 //! — which drives the resident backward but depends on `ny-gpu` only as a
 //! dev-dependency (cycle avoidance) — can WRITE the fold through the shared
 //! `ny-core` dependency, while THIS crate's resident backward READS it. The
@@ -28,11 +28,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 // Shared registry (writer = ny-propagate, reader = ny-gpu backward). Re-exported
-// so `ny_gpu::wgpu_device::{ResidentCutFold, set/clear/active/enabled}` resolve
+// so `ny_gpu::wgpu_device::{ResidentCutFold, set/clear/active}` resolve
 // exactly as before the ny-core move.
 pub use ny_core::resident_cut_fold::{
     active_resident_cut_fold, clear_resident_cut_fold, head_resident_retarget_enabled,
-    resident_cut_fold_enabled, set_resident_cut_fold, ResidentCutFold,
+    set_resident_cut_fold, ResidentCutFold,
 };
 
 /// C2b capture: the LOWER-side coefficient frontier at the fold ReLU (the
@@ -114,7 +114,6 @@ mod tests {
         // Serialized env scope (clippy env wall); pre-test state restored on
         // exit.
         ny_test_utils::env::with_env_edits(|env| {
-            env.remove("NY_CUT_FOLD_RESIDENT");
             env.remove("NY_MULTINEURON_STEM");
             set_resident_cut_fold(ResidentCutFold {
                 coeffs: vec![(3, 0.5)],
@@ -123,11 +122,9 @@ mod tests {
                 sound_round: true,
             });
             assert!(active_resident_cut_fold().is_none());
-
-            env.set("NY_CUT_FOLD_RESIDENT", "1");
             assert!(
                 active_resident_cut_fold().is_none(),
-                "legacy env plus public registry must not grant resident proof authority"
+                "public registry state must not grant resident proof authority"
             );
 
             reset_resident_cut_fold_applied_count();

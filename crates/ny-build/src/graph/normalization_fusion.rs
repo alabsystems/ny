@@ -144,6 +144,16 @@ fn build_fused_instance_norm(
     ) else {
         return Ok(None);
     };
+    // Same DATA-VARIANCE gate `ny_propagate`'s `validate_norm_eps` applies,
+    // for the same reason: the fused layer divides by `sqrt(var + eps)` with
+    // `var` computed from the input, so an input box containing a constant
+    // vector makes the denominator `sqrt(eps)`. Declining the fusion (rather
+    // than erroring) is the fail-closed answer HERE: the unfused Sub/Pow/
+    // ReduceMean/Add/Sqrt/Div chain is still propagated soundly, layer by
+    // layer, so a sub-floor eps simply does not earn the fused fast path.
+    // The constant-variance exception is BatchNorm, gated per channel on
+    // `var + eps > 0` in `BatchNormLayer::new`; `ny-trace-bridge` mirrors
+    // both rules at the trace boundary.
     if !eps.is_finite() || eps < NORMALIZATION_MIN_EPS {
         return Ok(None);
     }

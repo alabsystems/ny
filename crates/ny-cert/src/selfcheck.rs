@@ -26,33 +26,97 @@ use core::contracts::ensures;
 use trust::ensures;
 
 /// Why a certificate failed local verification.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckError {
     /// Premise/constraint and multiplier counts differ.
-    #[error("length mismatch: {0} constraints vs {1} multipliers")]
     LengthMismatch(usize, usize),
     /// A multiplier was negative.
-    #[error("multiplier {0} is negative")]
     MultiplierNegative(usize),
     /// The combination did not cancel all variables.
-    #[error("residual still has variable coefficients: {0:?}")]
     UncancelledVariables(Vec<String>),
     /// The residual did not establish the claimed fact.
-    #[error("residual does not establish the conclusion")]
     NotEstablished,
     /// A chain step does not restate the previous step's conclusion as a premise.
-    #[error("chain break at step {0}: previous conclusion is not a premise")]
     ChainBreak(usize),
     /// An entailment chain was empty.
-    #[error("entailment chain must contain at least one step")]
     EmptyChain,
     /// The conclusion was not a single inequality (e.g. an `Eq`, which normalizes
     /// to two `≤` parts). Entailment conclusions must be a single inequality.
-    #[error("entailment conclusion must be a single inequality, got {0} normalized parts")]
     NonInequalityConclusion(usize),
     /// Exact arithmetic failure.
-    #[error(transparent)]
-    Rat(#[from] RatError),
+    Rat(RatError),
+}
+
+// Hand-written replacements for the `thiserror::Error` derive (removed so that
+// ny-cert carries no proc-macro dependency and the bignum stack can itself be
+// verified rather than assumed). The message strings below are byte-identical to
+// the former `#[error("…")]` attributes — they appear in certificates and test
+// assertions and must not be reworded.
+impl core::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CheckError::LengthMismatch(constraints, multipliers) => write!(
+                f,
+                "length mismatch: {0} constraints vs {1} multipliers",
+                constraints, multipliers
+            ),
+            CheckError::MultiplierNegative(idx) => {
+                write!(f, "multiplier {0} is negative", idx)
+            }
+            CheckError::UncancelledVariables(vars) => {
+                write!(f, "residual still has variable coefficients: {0:?}", vars)
+            }
+            CheckError::NotEstablished => {
+                write!(f, "residual does not establish the conclusion")
+            }
+            CheckError::ChainBreak(idx) => write!(
+                f,
+                "chain break at step {0}: previous conclusion is not a premise",
+                idx
+            ),
+            CheckError::EmptyChain => {
+                write!(f, "entailment chain must contain at least one step")
+            }
+            CheckError::NonInequalityConclusion(parts) => write!(
+                f,
+                "entailment conclusion must be a single inequality, got {0} normalized parts",
+                parts
+            ),
+            // Was `#[error(transparent)]`: the derive forwards `Display`
+            // verbatim to the wrapped error, adding no text of its own.
+            CheckError::Rat(e) => core::fmt::Display::fmt(e, f),
+        }
+    }
+}
+
+impl core::error::Error for CheckError {
+    /// Per-variant `source()` exactly as the derive produced it: every variant
+    /// without a `#[from]`/`#[source]` field is a chain root (`None`), and the
+    /// one `#[error(transparent)] Rat(#[from] RatError)` variant *forwards* to
+    /// the inner error's own `source()` rather than returning `Some(inner)` —
+    /// that is what `#[error(transparent)]` generates, and `RatError` is itself
+    /// a chain root, so this is `None` today for every input. Forwarding (not
+    /// `Some`) keeps the error chain byte-for-byte what it was.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            CheckError::Rat(e) => core::error::Error::source(e),
+            CheckError::LengthMismatch(..)
+            | CheckError::MultiplierNegative(..)
+            | CheckError::UncancelledVariables(..)
+            | CheckError::NotEstablished
+            | CheckError::ChainBreak(..)
+            | CheckError::EmptyChain
+            | CheckError::NonInequalityConclusion(..) => None,
+        }
+    }
+}
+
+/// Replaces the `#[from]` on `CheckError::Rat`, so `?` on a [`RatError`] still
+/// converts (`combine`/`add_scaled` rely on it).
+impl From<RatError> for CheckError {
+    fn from(source: RatError) -> Self {
+        CheckError::Rat(source)
+    }
 }
 
 /// A constraint normalized to `coeffs · x  (<|≤)  constant`.
@@ -214,8 +278,29 @@ pub fn check_entailment(cert: &EntailmentCertificate) -> Result<(Rat, Rat), Chec
     // unreachable by construction — the inner `ok` check admits only
     // `combined.constant <=|< conclusion.constant` — so this is
     // behavior-identical, fail-closed hardening.
-    let (d, c) = match check_entailment_inner(cert) {
-        Ok(pair) => pair,
+    // Carry the payload through an `Option` — a DIFFERENT type from this
+    // function's own `Result<_, CheckError>` — before destructuring it.
+    //
+    // MEASURED, not guessed. A `TRUST_LENWITNESS_DEBUG=1` probe traced every
+    // return path of this function and of `check_chain`, which proves. The
+    // discriminator is exact:
+    //     check_chain        0 paths with `_0 def=NONE (Call-dest)`
+    //     check_entailment   1 path  (bb27->bb28)
+    //     check_farkas       1 path  (bb27->bb28)
+    //     check_branch_tree  1 path  (bb32->bb33)
+    // When `inner()` returns the SAME `Result<_, E>` this wrapper does, the
+    // optimizer recognises the tail `Ok((d, c))` as a reconstruction of the
+    // value it just destructured and forwards the ORIGINAL Result instead of
+    // rebuilding one. `_0` then bottoms out at a Call dest, no in-body wrapper
+    // aggregate exists on that path, and the discr gate fails closed — leaving
+    // the `#[ensures]` ungrounded. `check_chain` escapes only because its
+    // payload arrives in an `Option<(Rat, Rat)>`, so no such forward is
+    // type-correct.
+    //
+    // The `Err` arm was already hardened against the mirror-image problem (see
+    // `err_barrier` below); this is the same fix for the `Ok` side.
+    let carried: Option<(Rat, Rat)> = match check_entailment_inner(cert) {
+        Ok(pair) => Some(pair),
         // `crate::err_barrier` (identity, `#[inline(never)]`): a fresh in-body
         // `Err` aggregate, not a whole-`Result` forward the return-grounding
         // lane cannot see (nor a const-promoted+merged unit variant).
@@ -225,6 +310,14 @@ pub fn check_entailment(cert: &EntailmentCertificate) -> Result<(Rat, Rat), Chec
             }
             return Err(crate::err_barrier(e));
         }
+    };
+    // `None` is UNREACHABLE: the `Err` arm above returns, so every path that
+    // reaches here stored `Some`. It reuses an error this function already
+    // constructs rather than a fresh one, so the arm adds no call and no
+    // allocation for the verifier to discharge.
+    let (d, c) = match carried {
+        Some(pair) => pair,
+        None => return Err(crate::err_barrier(CheckError::NotEstablished)),
     };
     if d > c {
         if poisoned() {
@@ -432,8 +525,12 @@ pub fn check_farkas(cert: &FarkasCertificate) -> Result<Rat, CheckError> {
     // inner `contradiction` check admits only `!is_positive` (strict) /
     // `is_negative` (non-strict) constants, and both imply `!is_positive` —
     // so this is behavior-identical, fail-closed hardening.
-    let c = match check_farkas_inner(cert) {
-        Ok(c) => c,
+    // `Option` carrier: see the identical note in `check_entailment` above. A
+    // `TRUST_LENWITNESS_DEBUG=1` probe traced one return path here (bb27->bb28)
+    // whose `_0 def=NONE (Call-dest)`, against zero such paths in `check_chain`,
+    // which proves.
+    let carried: Option<Rat> = match check_farkas_inner(cert) {
+        Ok(c) => Some(c),
         // `crate::err_barrier` (identity, `#[inline(never)]`): a fresh in-body
         // `Err` aggregate, not a whole-`Result` forward the return-grounding
         // lane cannot see (nor a const-promoted+merged unit variant).
@@ -443,6 +540,12 @@ pub fn check_farkas(cert: &FarkasCertificate) -> Result<Rat, CheckError> {
             }
             return Err(crate::err_barrier(e));
         }
+    };
+    // UNREACHABLE: the `Err` arm returns, so every path here stored `Some`.
+    // Reuses an error this function already constructs, adding no call.
+    let c = match carried {
+        Some(c) => c,
+        None => return Err(crate::err_barrier(CheckError::NotEstablished)),
     };
     if c.is_positive() {
         if poisoned() {

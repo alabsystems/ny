@@ -110,7 +110,7 @@ fn alpha_entry(flight: &Value) -> &Value {
     assert_eq!(flight["levers"]["status"], "resolved");
     assert_eq!(
         flight["levers"]["receipt"]["schema"],
-        "ny-levers/receipt/v2"
+        "ny-levers/receipt/v3"
     );
     flight["levers"]["receipt"]["levers"]
         .as_array()

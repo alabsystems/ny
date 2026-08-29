@@ -161,7 +161,7 @@ impl PgdAttacker<'_> {
 
         for restart in 0..self.config().num_restarts {
             // Deadline check (#3109)
-            if self.config().past_deadline() {
+            if self.past_deadline() {
                 break;
             }
 
@@ -261,7 +261,7 @@ impl PgdAttacker<'_> {
                     return None;
                 }
                 // Deadline check (#3109)
-                if self.config().past_deadline() {
+                if self.past_deadline() {
                     return None;
                 }
 

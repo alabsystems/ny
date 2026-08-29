@@ -645,6 +645,10 @@ impl BetaCrownVerifier {
                 &mut child.beta_state,
                 &targets,
                 ctx.conjunctive,
+                // relu_split_route: the graph-sequential frontier eval is a
+                // relu-split lane too, but its pins predate delta-form —
+                // conservative false until its own A/B (doc-scoped).
+                false,
                 &pruned_cached_las,
                 true,
                 cuda_beta_spsa_frontier,

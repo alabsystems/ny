@@ -20,6 +20,13 @@
 //! `ny_api::layers`, `ny_api::model`, `ny_api::verify`, and
 //! `ny_api::parallel`. `ny_api::prelude::*` is the one curated wildcard
 //! option for consumers that want a convenience import.
+//!
+//! The optional `gpu` feature (OFF by default) adds `ny_api::gpu`: a real
+//! `ny-gpu` edge so a consumer can name and construct ny's typed GPU verdict
+//! request. It is deliberately absent from the prelude — reaching a GPU
+//! authority transition should be visible at the call site as a
+//! `ny_api::gpu::` path. Reachability is not trust: ny qualifies every device
+//! by live measurement and refuses, typed, when a rung does not pass.
 
 /// Verification annotation types for attaching metadata to specs.
 pub use crate::annotation::{AnnotatedSpec, AnnotationConstraint, SpecBuilder};
@@ -34,7 +41,9 @@ pub use ny_core::{
 /// Soundness provenance types for tracking heuristic usage (#3119).
 pub use ny_core::{HeuristicUsed, SoundnessProvenance, VerificationSoundnessMode};
 /// Bounded tensor types from ny-tensor for specifying input regions.
-pub use ny_tensor::{BoundedScalar, BoundedTensor, GenericBounds};
+/// `BoundedTensor64` is the double-precision carrier consumed by the f64
+/// propagation helpers in [`verify`](crate::verify).
+pub use ny_tensor::{BoundedScalar, BoundedTensor, BoundedTensor64, GenericBounds};
 
 /// Verification annotation helpers: attach metadata (name/tags) to specs for external integrations.
 pub mod annotation;
@@ -50,6 +59,11 @@ pub mod graph;
 /// Curated layer types for external consumer APIs (requires `propagate` feature).
 #[cfg(feature = "propagate")]
 pub mod layers;
+/// The `NY_*` lever surface: discover what exists, deliver the `SafeToSearch`
+/// subset as typed data, and audit what the process environment is already
+/// contributing (requires `propagate` feature).
+#[cfg(feature = "propagate")]
+pub mod levers;
 /// Owned graph-build contract and model specification types (requires `propagate` feature).
 #[cfg(feature = "propagate")]
 pub mod model;
@@ -73,18 +87,42 @@ pub mod bab;
 #[cfg(feature = "cert")]
 pub mod cert;
 /// Complete MIP verification surface (ay; requires `complete`).
+///
+/// Carries both the curated `ny-mip` surface — encode/solve, LP and OBBT
+/// tightening, SMT-LIB export, star search, and the Farkas infeasibility-evidence
+/// producer — and the graph-level terminal
+/// ([`complete::verify_graph_complete_mip`]) that the
+/// [`ladder`] escalates into.
 #[cfg(feature = "complete")]
 pub mod complete;
-/// Operation soundness-coverage conformance: classify each `LayerType` by how
-/// soundly bound-propagation handles it. Always available (operates on ny-core types).
 pub mod conformance;
 /// DSP / audio graph helpers (e.g. Kokoro STFT) used by TTS verification (requires `propagate`).
 #[cfg(feature = "propagate")]
 pub mod dsp;
+/// Operation soundness-coverage conformance: classify each `LayerType` by how
+/// soundly bound-propagation handles it. Always available (operates on ny-core types).
+/// Process-wide compute-engine bootstrap (the CPU GEMM floor embedded
+/// consumers otherwise never install; requires `propagate`, which is where the
+/// installers live — a bootstrap that silently installed nothing would be a
+/// vacuous capability, so the module is absent instead).
+#[cfg(feature = "propagate")]
+pub mod engines;
 /// Network equivalence verification: prove ||f(x) - g(x)|| < eps via a
 /// difference network (requires `propagate` feature).
 #[cfg(feature = "propagate")]
 pub mod equivalence;
+/// GPU participation — reachable, measurement-qualified, fail-closed (requires
+/// the optional `gpu` feature, which is OFF by default).
+///
+/// Without `gpu`, `ny-gpu` is not in this crate's dependency graph and no
+/// facade consumer can name a ny GPU type. With it, the typed verdict request
+/// and the device that consumes it become reachable through `ny_api::gpu::*` —
+/// and ny still decides participation by live measurement, refusing with a
+/// typed report whenever a qualification rung does not pass. Read the module
+/// docs before using it: what a caller gets differs sharply by platform AND by
+/// which admission mode it names.
+#[cfg(feature = "gpu")]
+pub mod gpu;
 /// SOUND deterministic global Lipschitz certification in exact rational
 /// arithmetic — distinct from the optimistic estimate in [`probabilistic`]
 /// (requires `cert`; NY ext 2).
@@ -155,7 +193,8 @@ pub mod prelude {
     };
     #[cfg(feature = "propagate")]
     pub use crate::verify::{
-        GemmEngine, NaiveCpuGemmEngine, PropagationConfig, PropagationMethod, Verifier,
+        GemmEngine, MulBinaryRelaxationMode, NaiveCpuGemmEngine, PropagationConfig,
+        PropagationMethod, Verifier,
     };
     #[cfg(feature = "propagate")]
     pub use ny_core::FloatPrecision;

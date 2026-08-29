@@ -55,7 +55,7 @@ pub(super) fn validate_standard_schemas(
         &literals,
         &mut exemptions,
     )?;
-    super::structural_schema::validate_structural_schemas(
+    let authenticated = super::structural_schema::validate_structural_schemas(
         graph,
         opset_imports,
         &literals,
@@ -100,6 +100,7 @@ pub(super) fn validate_standard_schemas(
                 &mut raw_dtypes,
                 &literals,
                 &mut exemptions,
+                &authenticated,
             )?;
             continue;
         }

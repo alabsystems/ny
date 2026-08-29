@@ -262,6 +262,7 @@ fn test_bound_deferred_disjunctive_domains_batch_matches_independent_calls_4267(
         &BetaCrownConfig::default(),
         None,
         0,
+        None,
     )
     .expect("deferred grouped batch should match independent calls");
 
@@ -328,6 +329,7 @@ fn test_bound_deferred_disjunctive_domains_batch_uses_batched_kernel_with_mul_bi
         &BetaCrownConfig::default(),
         None,
         0,
+        None,
     )
     .expect("deferred disjunctive mulbinary rebound should use the batched kernel");
 
@@ -403,6 +405,7 @@ fn test_bound_deferred_disjunctive_domains_batch_override_path_applies_parent_fl
         &BetaCrownConfig::default(),
         None,
         0,
+        None,
     )
     .expect("override-backed deferred disjunctive batch should apply the parent floor");
 
@@ -569,6 +572,7 @@ fn linearizenn_grouped_reorder_root_crown_child_stacked_ibp_matches_conservative
         &config,
         None,
         None,
+        None,
         "LinearizeNN production-composition test",
         None,
     )
@@ -609,6 +613,7 @@ fn linearizenn_grouped_reorder_root_crown_child_stacked_ibp_matches_conservative
             None,
             ibp_enhancement,
             stacked_rebound,
+            None,
         )
         .expect("dense-spec child rebound should succeed")
     };

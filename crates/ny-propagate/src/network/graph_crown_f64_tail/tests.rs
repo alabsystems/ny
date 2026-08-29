@@ -558,10 +558,12 @@ fn expired_deadline_declines() {
 
 #[test]
 fn band_default_and_parse() {
-    // Default without env: 5e-3 (do not mutate process env in tests; just
-    // assert the default when the var is absent).
+    // Without env the ENV LAYER contributes nothing (`None`); the effective
+    // 5e-3 legacy default now lives beneath the typed key at
+    // `input_split::f64_tail::resolve_f64_tail_settings` (do not mutate
+    // process env in tests; just assert the env layer when absent).
     if std::env::var("NY_F64_TAIL_BAND").is_err() {
-        assert_eq!(f64_tail_band(), 5e-3);
+        assert_eq!(f64_tail_band_env(), None);
     }
 }
 
@@ -975,5 +977,471 @@ fn div_zero_spanning_denominator_declines() {
     assert!(
         anchors.is_err(),
         "zero-spanning denominator must fail anchor collection"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #cgan-f64-tail step B1/B2 oracles (design B §3.1-3.2): ConvTranspose2d and
+// BatchNorm arms vs a double-double reference, including the would-fail teeth
+// cases (output_padding mis-scatter; missing/γ-routed BN model-error charge).
+// ---------------------------------------------------------------------------
+
+fn bt3(lo: Vec<f32>, hi: Vec<f32>, shape: &[usize]) -> BoundedTensor {
+    BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(shape), lo).unwrap(),
+        ArrayD::from_shape_vec(IxDyn(shape), hi).unwrap(),
+    )
+    .expect("finite bounds")
+}
+
+/// Deterministic xorshift64 fill in `[-scale, scale)` (mirrors the
+/// `ops_transpose_fwd.rs` differential-test generator).
+fn det_fill(len: usize, seed: u64, scale: f32) -> Vec<f32> {
+    let mut rng = seed | 1;
+    (0..len)
+        .map(|_| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            #[allow(clippy::cast_precision_loss)]
+            let u = (rng as f32) / (u64::MAX as f32);
+            (u * 2.0 - 1.0) * scale
+        })
+        .collect()
+}
+
+/// Double-double ConvTranspose2d forward at a point (dilation 1): the
+/// reference scatter loop of `ops_transpose_fwd.rs` in Dd arithmetic on the
+/// EXACT f32->f64 widened parameters.
+#[allow(clippy::too_many_arguments)]
+fn dd_conv_transpose_forward(
+    x: &[f64],
+    kernel: &ArrayD<f32>,
+    bias: Option<&ndarray::Array1<f32>>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    output_padding: (usize, usize),
+    in_hw: (usize, usize),
+) -> Vec<f64> {
+    use ny_core::dd::{dd_add_f64, dd_fma, Dd};
+    let (in_c, out_c, kh, kw) = (
+        kernel.shape()[0],
+        kernel.shape()[1],
+        kernel.shape()[2],
+        kernel.shape()[3],
+    );
+    let (sh, sw) = stride;
+    let (ph, pw) = padding;
+    let (oph, opw) = output_padding;
+    let (in_h, in_w) = in_hw;
+    let out_h = (in_h - 1) * sh + kh + oph - 2 * ph;
+    let out_w = (in_w - 1) * sw + kw + opw - 2 * pw;
+    let mut y = vec![Dd::ZERO; out_c * out_h * out_w];
+    for ic in 0..in_c {
+        for iy in 0..in_h {
+            for ix in 0..in_w {
+                let xv = x[ic * in_h * in_w + iy * in_w + ix];
+                for oc in 0..out_c {
+                    for ki in 0..kh {
+                        for kj in 0..kw {
+                            let oy = (iy * sh + ki) as isize - ph as isize;
+                            let ox = (ix * sw + kj) as isize - pw as isize;
+                            if oy >= 0 && (oy as usize) < out_h && ox >= 0 && (ox as usize) < out_w
+                            {
+                                let o = oc * out_h * out_w + oy as usize * out_w + ox as usize;
+                                y[o] = dd_fma(y[o], xv, f64::from(kernel[[ic, oc, ki, kj]]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(b) = bias {
+        for oc in 0..out_c {
+            for s in 0..out_h * out_w {
+                let o = oc * out_h * out_w + s;
+                y[o] = dd_add_f64(y[o], f64::from(b[oc]));
+            }
+        }
+    }
+    y.into_iter().map(Dd::to_f64).collect()
+}
+
+/// `baked_hw = None` exercises the derived-from-parent-shape path (the loaded
+/// cgan DAG shape: the loader leaves `input_shape` unset — census-measured).
+fn conv_transpose_graph_baked(
+    kernel: ArrayD<f32>,
+    bias: Option<ndarray::Array1<f32>>,
+    stride: (usize, usize),
+    padding: (usize, usize),
+    output_padding: (usize, usize),
+    baked_hw: Option<(usize, usize)>,
+) -> GraphNetwork {
+    let mut layer = crate::layers::ConvTranspose2dLayer::new_full(
+        kernel,
+        bias,
+        stride,
+        padding,
+        (1, 1),
+        output_padding,
+    )
+    .expect("valid ConvTranspose2d geometry");
+    layer.input_shape = baked_hw;
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("ct", Layer::ConvTranspose2d(layer)));
+    graph.set_output("ct");
+    graph
+}
+
+/// Enclosure + point-box exactness oracle across ConvTranspose geometries:
+/// stride>1, padding, `output_padding in {0..stride-1}`, non-square kernels
+/// and inputs. TEETH (design §3.1): on a POINT box the walk is a pure affine
+/// evaluation whose envelope is ~gamma-tiny, so the certified lower must
+/// agree with the Dd reference to ~1e-6 — an arm that mis-scatters (e.g.
+/// drops `output_padding` from the geometry or flips the kernel layout)
+/// shifts whole kernel-tap magnitudes and fails BOTH the equality band and
+/// (on the unsound side) the enclosure assert.
+#[test]
+fn conv_transpose_arm_encloses_dd_reference_and_is_point_exact() {
+    // (in_c, out_c, kh, kw, sh, sw, ph, pw, oph, opw, in_h, in_w)
+    let geometries = [
+        (
+            1usize, 1usize, 2usize, 2usize, 1usize, 1usize, 0usize, 0usize, 0usize, 0usize, 3usize,
+            3usize,
+        ),
+        (2, 3, 3, 2, 2, 2, 1, 0, 1, 1, 3, 4),
+        (3, 2, 2, 3, 2, 3, 0, 1, 1, 2, 4, 3),
+        (2, 2, 4, 4, 3, 3, 2, 2, 2, 1, 3, 3),
+        (1, 4, 3, 3, 2, 2, 1, 1, 1, 0, 5, 2),
+    ];
+    for (g, &(in_c, out_c, kh, kw, sh, sw, ph, pw, oph, opw, in_h, in_w)) in
+        geometries.iter().enumerate()
+    {
+        let klen = in_c * out_c * kh * kw;
+        let kernel = ArrayD::from_shape_vec(
+            IxDyn(&[in_c, out_c, kh, kw]),
+            det_fill(klen, 0x5EED_0000 + g as u64, 1.5),
+        )
+        .unwrap();
+        let bias = ndarray::Array1::from_vec(det_fill(out_c, 0xB1A5_0000 + g as u64, 0.5));
+        // Alternate the baked-shape and derived-from-parent-shape paths so
+        // BOTH geometry sources go through the full oracle (the loaded cgan
+        // DAG uses the derived path).
+        let graph = conv_transpose_graph_baked(
+            kernel.clone(),
+            Some(bias.clone()),
+            (sh, sw),
+            (ph, pw),
+            (oph, opw),
+            (g % 2 == 0).then_some((in_h, in_w)),
+        );
+        let n_in = in_c * in_h * in_w;
+        let mid = det_fill(n_in, 0x1000 + g as u64, 0.8);
+        let rad = det_fill(n_in, 0x2000 + g as u64, 0.3)
+            .into_iter()
+            .map(f32::abs)
+            .collect::<Vec<_>>();
+        let lo: Vec<f32> = mid.iter().zip(&rad).map(|(m, r)| m - r).collect();
+        let hi: Vec<f32> = mid.iter().zip(&rad).map(|(m, r)| m + r).collect();
+        let input = bt3(lo.clone(), hi.clone(), &[in_c, in_h, in_w]);
+        let node_bounds = crate::network::collect_intermediate_bounds(&graph, &input, None, None)
+            .expect("anchors");
+        let out_h = (in_h - 1) * sh + kh + oph - 2 * ph;
+        let out_w = (in_w - 1) * sw + kw + opw - 2 * pw;
+        let out_len = out_c * out_h * out_w;
+        let mut spec = Array2::<f32>::zeros((2, out_len));
+        for j in 0..out_len {
+            spec[[0, j]] = 1.0;
+            spec[[1, j]] = if j % 2 == 0 { 1.0 } else { -1.0 };
+        }
+
+        let outcome = f64_tail_verify(
+            &graph,
+            &input,
+            &spec,
+            &[-1e9_f32, -1e9],
+            &[1, 1],
+            None,
+            Some(&node_bounds),
+            None,
+            None,
+        );
+        let row_lowers = match outcome {
+            F64TailOutcome::Verified { row_lowers } => row_lowers,
+            other => panic!("geometry {g}: expected Verified vs -1e9, got {other:?}"),
+        };
+
+        // Sampled corners + midpoint: every Dd-reference spec value must be
+        // >= the certified lower (the affine attains its min at a corner, but
+        // random corners suffice for an enclosure witness).
+        let mut rng: u64 = 0xC0FE_0000 + g as u64;
+        let mut sample_min = [f64::INFINITY; 2];
+        for s in 0..48 {
+            let x: Vec<f64> = (0..n_in)
+                .map(|j| {
+                    if s == 0 {
+                        f64::midpoint(f64::from(lo[j]), f64::from(hi[j]))
+                    } else {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        if rng & 1 == 0 {
+                            f64::from(lo[j])
+                        } else {
+                            f64::from(hi[j])
+                        }
+                    }
+                })
+                .collect();
+            let y = dd_conv_transpose_forward(
+                &x,
+                &kernel,
+                Some(&bias),
+                (sh, sw),
+                (ph, pw),
+                (oph, opw),
+                (in_h, in_w),
+            );
+            for r in 0..2 {
+                let v: f64 = (0..out_len).map(|j| f64::from(spec[[r, j]]) * y[j]).sum();
+                sample_min[r] = sample_min[r].min(v);
+            }
+        }
+        for r in 0..2 {
+            assert!(
+                row_lowers[r] <= sample_min[r] + 1e-9,
+                "geometry {g} row {r}: certified {l} exceeds Dd sample min {m}",
+                l = row_lowers[r],
+                m = sample_min[r]
+            );
+        }
+
+        // TEETH: point box => certified lower must MATCH the Dd reference.
+        let point = bt3(mid.clone(), mid.clone(), &[in_c, in_h, in_w]);
+        let point_bounds = crate::network::collect_intermediate_bounds(&graph, &point, None, None)
+            .expect("point anchors");
+        let outcome = f64_tail_verify(
+            &graph,
+            &point,
+            &spec,
+            &[-1e9_f32, -1e9],
+            &[1, 1],
+            None,
+            Some(&point_bounds),
+            None,
+            None,
+        );
+        let point_lowers = match outcome {
+            F64TailOutcome::Verified { row_lowers } => row_lowers,
+            other => panic!("geometry {g}: point box must verify vs -1e9, got {other:?}"),
+        };
+        let xp: Vec<f64> = mid.iter().map(|&v| f64::from(v)).collect();
+        let y = dd_conv_transpose_forward(
+            &xp,
+            &kernel,
+            Some(&bias),
+            (sh, sw),
+            (ph, pw),
+            (oph, opw),
+            (in_h, in_w),
+        );
+        for r in 0..2 {
+            let v: f64 = (0..out_len).map(|j| f64::from(spec[[r, j]]) * y[j]).sum();
+            assert!(
+                point_lowers[r] <= v + 1e-12,
+                "geometry {g} row {r}: point certified {l} above reference {v}",
+                l = point_lowers[r]
+            );
+            assert!(
+                v - point_lowers[r] < 1e-6,
+                "geometry {g} row {r}: point envelope too wide (mis-scatter?): ref {v} vs {l}",
+                l = point_lowers[r]
+            );
+        }
+    }
+}
+
+/// Non-unit dilation must decline fail-closed (support gate + arm agree).
+#[test]
+fn conv_transpose_dilation_declines() {
+    let kernel =
+        ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![1.0_f32, 0.5, -0.5, 0.25]).unwrap();
+    let mut layer =
+        crate::layers::ConvTranspose2dLayer::new_full(kernel, None, (2, 2), (0, 0), (2, 2), (0, 0))
+            .expect("dilated geometry constructs");
+    layer.input_shape = Some((3, 3));
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("ct", Layer::ConvTranspose2d(layer)));
+    graph.set_output("ct");
+    let n_in = 9;
+    let input = bt(&vec![-0.5_f32; n_in], &vec![0.5_f32; n_in]);
+    let input = {
+        let f = input.flatten();
+        bt3(
+            f.lower().iter().copied().collect(),
+            f.upper().iter().copied().collect(),
+            &[1, 3, 3],
+        )
+    };
+    // Support gate declines the whole pass regardless of anchors.
+    assert!(!graph_supports_f64_tail(&graph));
+    let spec = Array2::<f32>::ones((1, 5 * 5));
+    assert!(matches!(
+        f64_tail_verify(&graph, &input, &spec, &[-1e9], &[1], None, None, None, None),
+        F64TailOutcome::Unsupported
+    ));
+}
+
+/// BatchNorm arm oracle vs the REAL affine (design §3.2): the layer is built
+/// from raw statistics through `BatchNormLayer::new`, which certifies
+/// `scale_err`/`bias_err` radii around the stored f32 affine. The certified
+/// lower must therefore enclose the minimum of the REAL affine (f64 recompute
+/// of `gamma/sqrt(var+eps)`), not merely the stored f32 one — the FIX B1
+/// absolute model-error charge is what pays for the difference.
+#[test]
+fn batch_norm_arm_encloses_real_affine_reference() {
+    let c = 3usize;
+    let hw = 4usize; // [C, H, W] = [3, 2, 2]
+    let gamma = ArrayD::from_shape_vec(IxDyn(&[c]), vec![1.3_f32, -0.7, 2.1]).unwrap();
+    let beta = ArrayD::from_shape_vec(IxDyn(&[c]), vec![0.1_f32, -0.4, 0.25]).unwrap();
+    let mean = ArrayD::from_shape_vec(IxDyn(&[c]), vec![0.6_f32, -1.2, 3.4]).unwrap();
+    let var = ArrayD::from_shape_vec(IxDyn(&[c]), vec![0.9_f32, 2.3, 0.04]).unwrap();
+    let eps = 1e-5_f32;
+    let bn = crate::layers::BatchNormLayer::new(&gamma, &beta, &mean, &var, eps).expect("bn");
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("bn", Layer::BatchNorm(bn)));
+    graph.set_output("bn");
+
+    let n = c * hw;
+    let mid = det_fill(n, 0xB47C_0001, 2.0);
+    let rad: Vec<f32> = det_fill(n, 0xB47C_0002, 0.7)
+        .into_iter()
+        .map(f32::abs)
+        .collect();
+    let lo: Vec<f32> = mid.iter().zip(&rad).map(|(m, r)| m - r).collect();
+    let hi: Vec<f32> = mid.iter().zip(&rad).map(|(m, r)| m + r).collect();
+    let input = bt3(lo.clone(), hi.clone(), &[c, 2, 2]);
+    let node_bounds =
+        crate::network::collect_intermediate_bounds(&graph, &input, None, None).expect("anchors");
+
+    let mut spec = Array2::<f32>::zeros((2, n));
+    for j in 0..n {
+        spec[[0, j]] = 1.0;
+        spec[[1, j]] = if j % 2 == 0 { -1.5 } else { 0.5 };
+    }
+    let outcome = f64_tail_verify(
+        &graph,
+        &input,
+        &spec,
+        &[-1e9_f32, -1e9],
+        &[1, 1],
+        None,
+        Some(&node_bounds),
+        None,
+        None,
+    );
+    let row_lowers = match outcome {
+        F64TailOutcome::Verified { row_lowers } => row_lowers,
+        other => panic!("expected Verified vs -1e9, got {other:?}"),
+    };
+
+    // REAL affine reference in f64 (the exact-real coefficients to ~1e-16,
+    // i.e. far inside the certified radii): exact min per row over the box —
+    // the affine is separable, so the min picks the endpoint per coordinate.
+    let mut real_min = [0.0_f64; 2];
+    for r in 0..2 {
+        let mut acc = 0.0_f64;
+        for j in 0..n {
+            let ch = j / hw;
+            let s_real = f64::from(gamma[[ch]]) / (f64::from(var[[ch]]) + f64::from(eps)).sqrt();
+            let b_real = f64::from(beta[[ch]]) - f64::from(mean[[ch]]) * s_real;
+            let a = f64::from(spec[[r, j]]) * s_real;
+            let bias_term = f64::from(spec[[r, j]]) * b_real;
+            let (l, u) = (f64::from(lo[j]), f64::from(hi[j]));
+            acc += bias_term + if a >= 0.0 { a * l } else { a * u };
+        }
+        real_min[r] = acc;
+    }
+    for r in 0..2 {
+        assert!(
+            row_lowers[r] <= real_min[r] + 1e-9,
+            "row {r}: certified {l} must enclose the REAL-affine min {m}",
+            l = row_lowers[r],
+            m = real_min[r]
+        );
+        assert!(
+            real_min[r] - row_lowers[r] < 1e-3,
+            "row {r}: BN envelope unexpectedly wide: real {m} vs certified {l}",
+            l = row_lowers[r],
+            m = real_min[r]
+        );
+    }
+}
+
+/// QUANTITATIVE teeth for FIX B1 (the adversarial verdict's blocking fix):
+/// inflating `scale_err`/`bias_err` must move the certified lower DOWN by AT
+/// LEAST the full `Σ_j |a_j|·(scale_err·max(|lo_j|,|hi_j|) + bias_err)`
+/// product. The broken arm the verdict rejected (model error routed through
+/// the gamma-scaled shadow) moves the bound by ~1e-11 of the product and
+/// FAILS this assert; an arm that ignores the radii moves it by zero.
+#[test]
+fn batch_norm_inflated_scale_err_moves_bound_by_full_product() {
+    let c = 2usize;
+    let hw = 2usize;
+    let n = c * hw;
+    let scale = ArrayD::from_shape_vec(IxDyn(&[c]), vec![1.5_f32, -0.5]).unwrap();
+    let bias = ArrayD::from_shape_vec(IxDyn(&[c]), vec![0.25_f32, -0.75]).unwrap();
+    let lo = vec![-1.0_f32, 0.5, -2.0, 1.0];
+    let hi = vec![1.5_f32, 2.0, -0.5, 3.0];
+    let spec = arr2(&[[1.0_f32, -2.0, 0.5, 1.0]]);
+
+    let run = |scale_err: f32, bias_err: f32| -> f64 {
+        let mut bn = crate::layers::BatchNormLayer::from_scale_bias(scale.clone(), bias.clone())
+            .expect("bn");
+        bn.scale_err = ArrayD::from_shape_vec(IxDyn(&[c]), vec![scale_err; c]).unwrap();
+        bn.bias_err = ArrayD::from_shape_vec(IxDyn(&[c]), vec![bias_err; c]).unwrap();
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("bn", Layer::BatchNorm(bn)));
+        graph.set_output("bn");
+        let input = bt3(lo.clone(), hi.clone(), &[c, 1, 2]);
+        let node_bounds = crate::network::collect_intermediate_bounds(&graph, &input, None, None)
+            .expect("anchors");
+        match f64_tail_verify(
+            &graph,
+            &input,
+            &spec,
+            &[-1e9_f32],
+            &[1],
+            None,
+            Some(&node_bounds),
+            None,
+            None,
+        ) {
+            F64TailOutcome::Verified { row_lowers } => row_lowers[0],
+            other => panic!("expected Verified vs -1e9, got {other:?}"),
+        }
+    };
+
+    let l_zero = run(0.0, 0.0);
+    let (es, eb) = (0.125_f32, 0.0625_f32);
+    let l_infl = run(es, eb);
+    // Full product: Σ_j |a_j|·(es·max(|lo_j|,|hi_j|) + eb).
+    let mut product = 0.0_f64;
+    for j in 0..n {
+        let a = f64::from(spec[[0, j]]).abs();
+        let range = f64::from(lo[j]).abs().max(f64::from(hi[j]).abs());
+        product += a * (f64::from(es) * range + f64::from(eb));
+    }
+    let delta = l_zero - l_infl;
+    assert!(
+        delta >= product,
+        "inflated radii must move the certified lower by >= the FULL product: \
+         delta {delta} < product {product} (gamma-routed or missing charge)"
+    );
+    assert!(
+        delta <= product * (1.0 + 1e-9) + 1e-12,
+        "model charge should not grossly over-shoot on a single-node net: \
+         delta {delta} vs product {product}"
     );
 }

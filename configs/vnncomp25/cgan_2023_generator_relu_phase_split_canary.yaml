@@ -64,6 +64,7 @@ attack:
 
 bab:
   batch_size: 64
+  cgan_reclaim: true
   crown_ibp_per_node_cap_secs: 150
   phase_budget:
     disjunctive_pgd_fraction: 0.10

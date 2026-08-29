@@ -5,6 +5,7 @@
 use std::cell::Cell;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 
 use ndarray::{Array2, ArrayD, IxDyn};
 use ny_core::{GemmEngine, NyError, Result};
@@ -23,8 +24,18 @@ use super::super::shared::{
 };
 
 /// Per-sub-domain warm-start result for the grouped disjunctive loop.
-pub(super) type WarmDisjunctiveBoundsResult =
-    (Vec<(f32, f32)>, Option<LinearBounds>, GraphAlphaState);
+///
+/// The 4th element (design B step B3, FIX B4) is the warm-refined per-node
+/// bounds BUNDLED with the exact child box they were computed for — the
+/// anchor set the f64-tail survivor-polish hook must use (`anchor_source=
+/// warm-refined`); a tail anchored on freshly collected (looser) bounds
+/// produces a vacuous NotVerified.
+pub(super) type WarmDisjunctiveBoundsResult = (
+    Vec<(f32, f32)>,
+    Option<LinearBounds>,
+    GraphAlphaState,
+    super::super::f64_tail::F64TailAnchors,
+);
 
 /// Warm-start bound closure for an eager grouped-disjunctive child.
 pub(super) type WarmDisjunctiveComputeBoundsFn<'a> = dyn Fn(
@@ -117,6 +128,275 @@ impl Drop for WarmAlphaTelemetry {
     }
 }
 
+/// Parameters for the #cgan-polish near-miss survivor pass (`NY_CGAN_POLISH=1`).
+pub(super) struct PolishParams {
+    /// A child is polish-eligible when its worst-clause best-row gap exceeds
+    /// `-band` — the knife-edge population where cgan row 2 asymptotes
+    /// ~2e-4..3e-3 under the threshold while healthy splits arrive well below.
+    pub(super) band: f32,
+    /// Total alpha iterations for the polish re-bound. Informational here (the
+    /// closure's config carries the authoritative count); printed in telemetry.
+    pub(super) alpha_iterations: usize,
+}
+
+/// #cgan-polish (`NY_CGAN_POLISH=1`): one extra certified warm-alpha re-bound
+/// for near-miss survivors on the grouped-disjunctive EAGER lane.
+///
+/// WHY: the eager pass runs `input_split_alpha_iteration: 1`, and the
+/// warm-start optimization loop breaks at `iter == iterations - 1` BEFORE the
+/// first SPSA gradient — one iteration performs ZERO optimizer steps, so the
+/// whole BaB tree is bounded with the root's frozen alphas re-masked per
+/// child. This lane re-runs the SAME machinery
+/// (`compute_warm_start_crown_bounds_with_refined_alpha`) with enough
+/// iterations for real SPSA/Adam steps, only on children already inside the
+/// knife-edge band, and floor-merges the result so the bound can only
+/// tighten. The refined alphas seed the child's own children, compounding
+/// down the frontier.
+///
+/// The per-run counters mirror `WarmAlphaTelemetry`: a campaign is
+/// self-invalidating when the gate was armed but no polish call was reached
+/// (R9), and `gap_moved_sum`/`unstable_last` attribute a null (zero movement
+/// vs zero optimizable neurons) without another run.
+pub(super) struct SurvivorPolish<'a> {
+    params: PolishParams,
+    compute: &'a WarmDisjunctiveComputeBoundsFn<'a>,
+    attempts: Cell<usize>,
+    tightened: Cell<usize>,
+    closed: Cell<usize>,
+    failures: Cell<usize>,
+    gap_moved_sum: Cell<f64>,
+    unstable_last: Cell<usize>,
+}
+
+impl<'a> SurvivorPolish<'a> {
+    pub(super) fn new(
+        params: PolishParams,
+        compute: &'a WarmDisjunctiveComputeBoundsFn<'a>,
+    ) -> Self {
+        Self {
+            params,
+            compute,
+            attempts: Cell::new(0),
+            tightened: Cell::new(0),
+            closed: Cell::new(0),
+            failures: Cell::new(0),
+            gap_moved_sum: Cell::new(0.0),
+            unstable_last: Cell::new(0),
+        }
+    }
+
+    pub(super) fn compute(&self) -> &WarmDisjunctiveComputeBoundsFn<'a> {
+        self.compute
+    }
+
+    /// Knife-edge eligibility: finite gap strictly inside `(-band, ..]`.
+    /// Verified domains never reach this check (their screen returns first);
+    /// `NEG_INFINITY` (malformed/unbounded rows) is never in band.
+    pub(super) fn in_band(&self, gap: f32) -> bool {
+        gap.is_finite() && gap > -self.params.band
+    }
+
+    pub(super) fn record_attempt(&self, old_gap: f32, new_gap: f32, num_unstable: usize) {
+        self.attempts.set(self.attempts.get() + 1);
+        if new_gap > old_gap {
+            self.tightened.set(self.tightened.get() + 1);
+            self.gap_moved_sum
+                .set(self.gap_moved_sum.get() + f64::from(new_gap - old_gap));
+        }
+        self.unstable_last.set(num_unstable);
+        let attempts = self.attempts.get();
+        if attempts == 1 || attempts.is_power_of_two() {
+            eprintln!("{}", self.marker("progress"));
+        }
+    }
+
+    pub(super) fn record_closed(&self) {
+        self.closed.set(self.closed.get() + 1);
+        // A closure is the verdict-bearing event; always observable.
+        eprintln!("{}", self.marker("closed"));
+    }
+
+    pub(super) fn record_failure(&self) {
+        self.failures.set(self.failures.get() + 1);
+    }
+
+    fn marker(&self, status: &str) -> String {
+        format!(
+            "[cgan-polish] status={} band={:e} alpha_iterations={} attempts={} tightened={} closed={} failures={} gap_moved_sum={:.6e} unstable_last={}",
+            status,
+            self.params.band,
+            self.params.alpha_iterations,
+            self.attempts.get(),
+            self.tightened.get(),
+            self.closed.get(),
+            self.failures.get(),
+            self.gap_moved_sum.get(),
+            self.unstable_last.get(),
+        )
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (usize, usize, usize, usize, f64) {
+        (
+            self.attempts.get(),
+            self.tightened.get(),
+            self.closed.get(),
+            self.failures.get(),
+            self.gap_moved_sum.get(),
+        )
+    }
+}
+
+impl Drop for SurvivorPolish<'_> {
+    fn drop(&mut self) {
+        // Constructed only when armed, so the final line is unconditional:
+        // attempts=0 on an armed run is exactly the R9 signal that matters.
+        eprintln!("{}", self.marker("final"));
+    }
+}
+
+/// FIX B3 (#cgan-f64-tail B0): `NY_SLACK_PROBE` drain ON the disjunctive
+/// route, IN the executing thread. `SLACK_ACCUM` is `thread_local!`
+/// (`bounds/linear.rs`), and this route's child bounding runs synchronously on
+/// the calling thread inside the wrapped closure — draining at an outer seam
+/// could read zeros while penalties accrued on rayon workers, parking a live
+/// design on a vacuous number. Discard-drain BEFORE the bound isolates THIS
+/// bound's penalties; an empty/all-zero drain after a COMPLETED bound is
+/// loudly marked `PROBE-VACUOUS` (accrual escaped to another thread — the
+/// R9 assert demanded by the verdict) so the B0 reading can never silently
+/// mistake thread loss for a genuinely small envelope. Print-only, capped,
+/// default-off: with `NY_SLACK_PROBE` unset this is a single branch.
+fn slack_probe_scope<T>(tag: &str, run: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !crate::bounds::slack_probe_enabled() {
+        return run();
+    }
+    let _ = crate::bounds::slack_probe_take();
+    let out = run();
+    let slack = crate::bounds::slack_probe_take();
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static EMITTED: AtomicUsize = AtomicUsize::new(0);
+    const MAX_LINES: usize = 2000;
+    if EMITTED.fetch_add(1, Ordering::Relaxed) < MAX_LINES {
+        if out.is_ok() {
+            let nonzero = slack.iter().filter(|&&p| p > 0.0).count();
+            if slack.is_empty() || nonzero == 0 {
+                eprintln!(
+                    "[slack-probe] route=grouped-disjunctive tag={tag} PROBE-VACUOUS \
+                     (backward completed but this thread's accumulator drained empty; \
+                     cross-thread accrual — reading is NOT a small-envelope signal)"
+                );
+            } else {
+                let max = slack.iter().copied().fold(0.0f64, f64::max);
+                let sum: f64 = slack.iter().sum();
+                let mut top: Vec<(usize, f64)> = slack
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(_, p)| p > 0.0)
+                    .collect();
+                top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                top.truncate(3);
+                eprintln!(
+                    "[slack-probe] route=grouped-disjunctive tag={tag} rows={} nonzero={nonzero} \
+                     max_row_penalty={max:.6e} sum={sum:.6e} top={top:?}",
+                    slack.len()
+                );
+            }
+        } else {
+            eprintln!("[slack-probe] route=grouped-disjunctive tag={tag} bound-errored (drained, not reported)");
+        }
+    }
+    out
+}
+
+/// FIX-0 (#cgan-dark-tail): a per-child bound call slower than this many
+/// seconds gets one stderr line naming itself.
+///
+/// The median per-child bound on cgan row 2 is 0.13 s over ~1640 calls, while
+/// the tail runs ~70 s to >=285 s, so a >2 s call is already pathological. The
+/// line is therefore unconditional but rare and needs no gate — which is also
+/// why it is not one: a new env read would raise the ny-levers ratchet.
+const CHILD_BOUND_SLOW_SECS: f64 = 2.0;
+
+thread_local! {
+    /// FIX-0 telemetry ONLY: the input dimension whose split produced the child
+    /// currently being screened, published by `process_per_child_batch`
+    /// immediately before each `screen_disjunctive_child` call.
+    ///
+    /// Read by exactly one `eprintln!` and by nothing else — never by a bound,
+    /// an alpha, a clip or a verdict, so it carries no authority of any kind. A
+    /// thread that is never written reads `None` and the line prints
+    /// `split_dim=?`. Thread-local rather than global so a concurrent
+    /// verification job cannot cross-contaminate the label.
+    static CURRENT_SPLIT_DIM: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Publish the dimension the parent was split on, for the slow-child line.
+/// Telemetry only — see the `CURRENT_SPLIT_DIM` thread-local above.
+pub(super) fn set_current_split_dim(dim: Option<usize>) {
+    CURRENT_SPLIT_DIM.with(|cell| cell.set(dim));
+}
+
+fn current_split_dim() -> Option<usize> {
+    CURRENT_SPLIT_DIM.with(Cell::get)
+}
+
+/// FIX-0 (#cgan-dark-tail): name any per-child bound call that runs longer than
+/// [`CHILD_BOUND_SLOW_SECS`], with everything needed to attribute it.
+///
+/// `eprintln!` DELIBERATELY, not `tracing::info!`: this binary SWALLOWS `info!`
+/// on the scored route, which is precisely why a ~290 s tail — 32% of cgan's
+/// official 900 s budget, in 13/13 logs — stayed dark for weeks while the BaB
+/// trajectory (which prints only BETWEEN batches) showed nothing at all.
+///
+/// Print-only. Reads nothing that can change and writes nothing but stderr; it
+/// has no verdict surface.
+fn report_slow_child_bound(
+    started: Instant,
+    depth: usize,
+    step: &str,
+    route: &str,
+    child_input: &BoundedTensor,
+    errored: bool,
+) {
+    let elapsed = started.elapsed().as_secs_f64();
+    if elapsed < CHILD_BOUND_SLOW_SECS {
+        return;
+    }
+    // The box summary is only paid for on the pathological path.
+    let flat = child_input.flatten();
+    let dims = flat.lower().len();
+    let mut widest_dim = 0usize;
+    let mut max_width = 0.0f32;
+    let mut width_sum = 0.0f64;
+    for (d, (&l, &u)) in flat.lower().iter().zip(flat.upper().iter()).enumerate() {
+        let width = u - l;
+        width_sum += f64::from(width);
+        if width > max_width {
+            max_width = width;
+            widest_dim = d;
+        }
+    }
+    let mean_width = if dims == 0 {
+        0.0
+    } else {
+        width_sum / dims as f64
+    };
+    let split_dim = current_split_dim().map_or_else(|| "?".to_string(), |dim| dim.to_string());
+    eprintln!(
+        "[child-bound-slow] route=grouped-disjunctive-eager elapsed={elapsed:.3}s step={step} \
+         bound_route={route} depth={depth} split_dim={split_dim} dims={dims} \
+         widest_dim={widest_dim} max_width={max_width:.6e} mean_width={mean_width:.6e} \
+         errored={errored}"
+    );
+}
+
+/// Per-child bound with FIX-0 timing around it (#cgan-dark-tail).
+///
+/// Thin wrapper: all routing lives in [`compute_child_bounds_routed`], which
+/// reports back WHICH arm it took so the slow line can attribute the cost to
+/// `warm` / `frozen` / `frozen-fallback` without a second measurement.
+#[allow(clippy::too_many_arguments)]
 fn compute_child_bounds(
     child_input: &BoundedTensor,
     node_bounds: Option<&HashMap<String, BoundedTensor>>,
@@ -127,18 +407,59 @@ fn compute_child_bounds(
     warm_compute_bounds: Option<&WarmDisjunctiveComputeBoundsFn<'_>>,
     prior_alpha: Option<&Arc<GraphAlphaState>>,
     warm_alpha_telemetry: &WarmAlphaTelemetry,
+    depth: usize,
+    step: &str,
 ) -> Result<(
     Vec<(f32, f32)>,
     Option<LinearBounds>,
     Option<Arc<GraphAlphaState>>,
+    Option<super::super::f64_tail::F64TailAnchors>,
+)> {
+    let started = Instant::now();
+    let mut route = "frozen";
+    let out = compute_child_bounds_routed(
+        child_input,
+        node_bounds,
+        compute_bounds,
+        warm_compute_bounds,
+        prior_alpha,
+        warm_alpha_telemetry,
+        &mut route,
+    );
+    report_slow_child_bound(started, depth, step, route, child_input, out.is_err());
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_child_bounds_routed(
+    child_input: &BoundedTensor,
+    node_bounds: Option<&HashMap<String, BoundedTensor>>,
+    compute_bounds: &impl Fn(
+        &BoundedTensor,
+        Option<&HashMap<String, BoundedTensor>>,
+    ) -> Result<MultiObjBounds>,
+    warm_compute_bounds: Option<&WarmDisjunctiveComputeBoundsFn<'_>>,
+    prior_alpha: Option<&Arc<GraphAlphaState>>,
+    warm_alpha_telemetry: &WarmAlphaTelemetry,
+    route: &mut &'static str,
+) -> Result<(
+    Vec<(f32, f32)>,
+    Option<LinearBounds>,
+    Option<Arc<GraphAlphaState>>,
+    Option<super::super::f64_tail::F64TailAnchors>,
 )> {
     let (Some(warm), Some(prior_alpha)) = (warm_compute_bounds, prior_alpha) else {
-        let (obj_bounds, linear) = compute_bounds(child_input, node_bounds)?;
-        return Ok((obj_bounds, linear, prior_alpha.cloned()));
+        *route = "frozen";
+        let (obj_bounds, linear) =
+            slack_probe_scope("frozen", || compute_bounds(child_input, node_bounds))?;
+        return Ok((obj_bounds, linear, prior_alpha.cloned(), None));
     };
 
-    match warm(child_input, node_bounds, prior_alpha.as_ref()) {
-        Ok((obj_bounds, linear, refined_alpha)) => {
+    *route = "warm";
+    match slack_probe_scope("warm", || {
+        warm(child_input, node_bounds, prior_alpha.as_ref())
+    }) {
+        Ok((obj_bounds, linear, refined_alpha, anchors)) => {
             // Completion proves that the warm route executed and returned a
             // sound state. It does not imply that an optimizer step changed a
             // slope (the deadline may already have expired, for example).
@@ -147,6 +468,7 @@ fn compute_child_bounds(
                 obj_bounds,
                 linear,
                 Some(Arc::new(refined_alpha.into_warm_start_seed())),
+                Some(anchors),
             ))
         }
         Err(err) => {
@@ -154,6 +476,7 @@ fn compute_child_bounds(
             // retry the historical frozen-root-alpha bound and retain the prior
             // Arc as the next generation's seed. If that sound fallback also
             // fails, propagate its error (fail closed).
+            *route = "frozen-fallback";
             let emit_diagnostic = warm_alpha_telemetry.record_warm_failure();
             if emit_diagnostic {
                 eprintln!("{}", warm_alpha_telemetry.marker("warm-failure"));
@@ -164,7 +487,9 @@ fn compute_child_bounds(
                     "grouped-disjunctive warm-alpha bound failed; attempting frozen bound fallback"
                 );
             }
-            let (obj_bounds, linear) = compute_bounds(child_input, node_bounds)?;
+            let (obj_bounds, linear) = slack_probe_scope("frozen-fallback", || {
+                compute_bounds(child_input, node_bounds)
+            })?;
             warm_alpha_telemetry.record_frozen_fallback_completion();
             if emit_diagnostic {
                 eprintln!(
@@ -172,7 +497,7 @@ fn compute_child_bounds(
                     warm_alpha_telemetry.marker("frozen-fallback-complete")
                 );
             }
-            Ok((obj_bounds, linear, Some(prior_alpha.clone())))
+            Ok((obj_bounds, linear, Some(prior_alpha.clone()), None))
         }
     }
 }
@@ -312,6 +637,8 @@ pub(super) fn screen_disjunctive_child(
     ) -> Result<MultiObjBounds>,
     warm_compute_bounds: Option<&WarmDisjunctiveComputeBoundsFn<'_>>,
     warm_alpha_telemetry: &WarmAlphaTelemetry,
+    survivor_polish: Option<&SurvivorPolish<'_>>,
+    f64_tail_hook: Option<&super::super::f64_tail::F64TailHook<'_>>,
     parent_domain: &MultiObjInputDomain,
     queue: &mut BinaryHeap<MultiObjInputDomain>,
     lifecycle: &mut GraphBabLifecycle,
@@ -421,13 +748,16 @@ pub(super) fn screen_disjunctive_child(
         .iter()
         .map(|(lower, _)| *lower)
         .collect();
-    let (mut obj_bounds, mut linear, mut child_alpha) = compute_child_bounds(
+    let child_depth = parent_domain.depth + 1;
+    let (mut obj_bounds, mut linear, mut child_alpha, mut latest_anchors) = compute_child_bounds(
         &child_input,
         None,
         compute_bounds,
         warm_compute_bounds,
         parent_domain.inherited_alpha_state.as_ref(),
         warm_alpha_telemetry,
+        child_depth,
+        "pass0",
     )?;
     apply_running_lower_floor(&mut obj_bounds, &mut running_lower_floor);
     if disjunctive_domain_verified(&obj_bounds, thresholds, clause_sizes) {
@@ -456,13 +786,15 @@ pub(super) fn screen_disjunctive_child(
                         return Ok(());
                     }
                     child_input = clipped;
-                    (obj_bounds, linear, child_alpha) = compute_child_bounds(
+                    (obj_bounds, linear, child_alpha, latest_anchors) = compute_child_bounds(
                         &child_input,
                         None,
                         compute_bounds,
                         warm_compute_bounds,
                         child_alpha.as_ref(),
                         warm_alpha_telemetry,
+                        child_depth,
+                        "post-relaxed-clip",
                     )?;
                     apply_running_lower_floor(&mut obj_bounds, &mut running_lower_floor);
                     if disjunctive_domain_verified(&obj_bounds, thresholds, clause_sizes) {
@@ -499,13 +831,15 @@ pub(super) fn screen_disjunctive_child(
                                 None
                             }
                         };
-                    (obj_bounds, linear, child_alpha) = compute_child_bounds(
+                    (obj_bounds, linear, child_alpha, latest_anchors) = compute_child_bounds(
                         &child_input,
                         complete_clip_node_bounds.as_ref(),
                         compute_bounds,
                         warm_compute_bounds,
                         child_alpha.as_ref(),
                         warm_alpha_telemetry,
+                        child_depth,
+                        "post-complete-clip",
                     )?;
                     apply_running_lower_floor(&mut obj_bounds, &mut running_lower_floor);
                     if disjunctive_domain_verified(&obj_bounds, thresholds, clause_sizes) {
@@ -514,6 +848,100 @@ pub(super) fn screen_disjunctive_child(
                         return Ok(());
                     }
                 }
+            }
+        }
+    }
+
+    // #cgan-polish (NY_CGAN_POLISH=1): the eager pass above ran the preset's
+    // 1 alpha-iteration, which performs ZERO SPSA steps (the warm-start loop
+    // breaks before the first gradient), so this child's bound rests on the
+    // root's frozen alphas. If the child survived INSIDE the knife-edge band,
+    // re-bound it once through the same certified warm-alpha machinery with
+    // real optimizer steps, floor-merged so the bound can only tighten, and
+    // let the stepped alphas seed its children. SOUND: each polish iterate
+    // keeps alpha in [0,1]; the bound is the same complete
+    // CROWN-with-IBP-fallback pass over the same sub-box; the running floor
+    // is a component-wise max of sound lower bounds. Any polish error keeps
+    // the already-computed sound pass-0 bounds (fail-open to the status quo).
+    if let (Some(polish), Some(seed)) = (survivor_polish, child_alpha.clone()) {
+        let gap = disjunctive_domain_priority(&obj_bounds, thresholds, clause_sizes);
+        if polish.in_band(gap) {
+            // FIX-0 (#cgan-dark-tail): the polish re-bound is a THIRD per-child
+            // bound call on this child, with more alpha iterations than the
+            // eager pass, so it gets the same slow-call attribution.
+            let polish_started = Instant::now();
+            let polish_out = slack_probe_scope("polish", || {
+                (polish.compute())(&child_input, None, seed.as_ref())
+            });
+            report_slow_child_bound(
+                polish_started,
+                child_depth,
+                "polish",
+                "warm-polish",
+                &child_input,
+                polish_out.is_err(),
+            );
+            match polish_out {
+                Ok((polished_bounds, polished_linear, refined_alpha, polished_anchors)) => {
+                    let mut polished_bounds = polished_bounds;
+                    apply_running_lower_floor(&mut polished_bounds, &mut running_lower_floor);
+                    let new_gap =
+                        disjunctive_domain_priority(&polished_bounds, thresholds, clause_sizes);
+                    polish.record_attempt(gap, new_gap, refined_alpha.num_unstable());
+                    obj_bounds = polished_bounds;
+                    // Keep the pass-0 linear bounds if the polish pass fell
+                    // back to a linear-free route: the SB split heuristic on
+                    // the queued child should not lose its signal to a lever
+                    // whose only job is tightening the scalar bounds.
+                    if polished_linear.is_some() {
+                        linear = polished_linear;
+                    }
+                    child_alpha = Some(Arc::new(refined_alpha.into_warm_start_seed()));
+                    latest_anchors = Some(polished_anchors);
+                    if disjunctive_domain_verified(&obj_bounds, thresholds, clause_sizes) {
+                        polish.record_closed();
+                        lifecycle.domains_verified += 1;
+                        return Ok(());
+                    }
+                }
+                Err(_) => polish.record_failure(),
+            }
+        }
+    }
+
+    // #cgan-f64-tail step B4: the survivor-polish-seam escalation. A child
+    // that survived every f32 pass INSIDE the exact band gets one certified
+    // f64 re-bound anchored on the SAME warm-refined node bounds its own f32
+    // pass used (FIX B4: box+anchors travel in one struct — the pass runs on
+    // `anchors.child_input`, so cross-box reuse is unrepresentable; anchors
+    // from a pre-clip pass are a SUPERSET box, whose certified rows verify the
+    // clipped child a fortiori and merge only monotonically). Skipped without
+    // warm anchors (`anchor_source=warm-refined` is a hard requirement of the
+    // measurement protocol — a collected-anchor escalation here would read as
+    // "exact doesn't help" vacuously). Merge discipline: `escalate_merge`
+    // reuses `certified_fresh_rows` + `tighten_obj_lower_bounds`, then the
+    // running floor + grouped funnel re-check below decide — the f32 verdict
+    // machinery, untouched.
+    if let (Some(hook), Some(anchors)) = (f64_tail_hook, latest_anchors.as_ref()) {
+        let gap = disjunctive_domain_priority(&obj_bounds, thresholds, clause_sizes);
+        // FIX-0 (#cgan-dark-tail): the f64 escalation is the FOURTH per-child
+        // bound seam. It already caps itself at a 10 s call slice, so a line
+        // here is the check on that claim rather than a suspicion.
+        let tail_started = Instant::now();
+        let merged = hook.escalate_merge(anchors, &mut obj_bounds, gap);
+        report_slow_child_bound(
+            tail_started,
+            child_depth,
+            "f64-tail-hook",
+            "f64-exact",
+            &child_input,
+            false,
+        );
+        if merged {
+            apply_running_lower_floor(&mut obj_bounds, &mut running_lower_floor);
+            if disjunctive_domain_verified(&obj_bounds, thresholds, clause_sizes) {
+                lifecycle.domains_verified += 1;
+                return Ok(());
             }
         }
     }
@@ -547,6 +975,14 @@ mod tests {
     use crate::bounds::LinearBounds;
     use crate::layers::ReLULayer;
     use crate::{GraphNetwork, GraphNode, Layer, LinearLayer};
+
+    /// Minimal anchors bundle for closure-driven tests: an empty node-bounds
+    /// map on a unit box (never consumed — the hook is `None` in these tests).
+    fn test_anchors() -> super::super::super::f64_tail::F64TailAnchors {
+        let unit = BoundedTensor::new(arr1(&[0.0_f32]).into_dyn(), arr1(&[0.0_f32]).into_dyn())
+            .expect("unit anchors box");
+        super::super::super::f64_tail::F64TailAnchors::bundle_for(&unit, HashMap::new())
+    }
 
     fn complete_reorder_test_graph() -> GraphNetwork {
         let mut graph = GraphNetwork::new();
@@ -630,7 +1066,7 @@ mod tests {
             BoundedTensor::new(arr1(&[-1.0_f32]).into_dyn(), arr1(&[1.0_f32]).into_dyn())
                 .expect("finite child bounds");
         let mut queue = BinaryHeap::new();
-        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
         let mut domains_verified_by_clip = 0usize;
         let warm_alpha_telemetry = WarmAlphaTelemetry::new(false);
 
@@ -645,6 +1081,8 @@ mod tests {
             compute_bounds,
             None,
             &warm_alpha_telemetry,
+            None,
+            None,
             &parent_domain,
             &mut queue,
             &mut lifecycle,
@@ -720,7 +1158,7 @@ mod tests {
 
         let graph = complete_reorder_test_graph();
         let mut queue = BinaryHeap::new();
-        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
         let mut domains_verified_by_clip = 0usize;
         let warm_alpha_telemetry = WarmAlphaTelemetry::new(false);
 
@@ -735,6 +1173,8 @@ mod tests {
             &|_, _| panic!("IBP-first early exit must not call compute_bounds"),
             None,
             &warm_alpha_telemetry,
+            None,
+            None,
             &parent_domain,
             &mut queue,
             &mut lifecycle,
@@ -790,7 +1230,7 @@ mod tests {
 
         let graph = complete_reorder_test_graph();
         let mut queue = BinaryHeap::new();
-        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
         let mut domains_verified_by_clip = 0usize;
         let warm_alpha_telemetry = WarmAlphaTelemetry::new(false);
 
@@ -805,6 +1245,8 @@ mod tests {
             &|_, _| panic!("reorder path must not call compute_bounds"),
             None,
             &warm_alpha_telemetry,
+            None,
+            None,
             &parent_domain,
             &mut queue,
             &mut lifecycle,
@@ -903,7 +1345,7 @@ mod tests {
         let child_input = eager_child_input();
         let frozen_calls = Cell::new(0usize);
         let telemetry = WarmAlphaTelemetry::new(false);
-        let (obj_bounds, linear, child_alpha) = compute_child_bounds(
+        let (obj_bounds, linear, child_alpha, _anchors) = compute_child_bounds(
             &child_input,
             None,
             &|_, _| {
@@ -913,6 +1355,8 @@ mod tests {
             None,
             None,
             &telemetry,
+            0,
+            "test",
         )
         .expect("default frozen bound should succeed");
 
@@ -945,11 +1389,12 @@ mod tests {
                 vec![(0.1_f32, 0.8_f32), (0.2_f32, 0.9_f32)],
                 None,
                 GraphAlphaState::default(),
+                test_anchors(),
             ))
         };
         let telemetry = WarmAlphaTelemetry::new(true);
         let mut queue = BinaryHeap::new();
-        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
         let mut domains_verified_by_clip = 0usize;
 
         screen_disjunctive_child(
@@ -965,6 +1410,8 @@ mod tests {
             },
             Some(&warm),
             &telemetry,
+            None,
+            None,
             &parent,
             &mut queue,
             &mut lifecycle,
@@ -1012,7 +1459,7 @@ mod tests {
         };
         let telemetry = WarmAlphaTelemetry::new(true);
         let mut queue = BinaryHeap::new();
-        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
         let mut domains_verified_by_clip = 0usize;
 
         screen_disjunctive_child(
@@ -1029,6 +1476,8 @@ mod tests {
             },
             Some(&warm),
             &telemetry,
+            None,
+            None,
             &parent,
             &mut queue,
             &mut lifecycle,
@@ -1073,6 +1522,8 @@ mod tests {
             Some(&warm),
             Some(&parent_alpha),
             &telemetry,
+            0,
+            "test",
         );
 
         assert!(result.is_err(), "frozen fallback failure must fail closed");
@@ -1116,11 +1567,12 @@ mod tests {
                 vec![(-1.0_f32, 1.0_f32), (-1.0_f32, 1.0_f32)],
                 Some(default_grouped_linear_bounds()),
                 GraphAlphaState::default(),
+                test_anchors(),
             ))
         };
         let telemetry = WarmAlphaTelemetry::new(true);
         let mut queue = BinaryHeap::new();
-        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
         let mut domains_verified_by_clip = 0usize;
 
         screen_disjunctive_child(
@@ -1136,6 +1588,8 @@ mod tests {
             },
             Some(&warm),
             &telemetry,
+            None,
+            None,
             &parent,
             &mut queue,
             &mut lifecycle,
@@ -1208,7 +1662,7 @@ mod tests {
         };
         let telemetry = WarmAlphaTelemetry::new(false);
         let mut queue = BinaryHeap::new();
-        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
         let mut domains_verified_by_clip = 0usize;
 
         screen_disjunctive_child(
@@ -1222,6 +1676,8 @@ mod tests {
             &compute,
             None,
             &telemetry,
+            None,
+            None,
             &parent,
             &mut queue,
             &mut lifecycle,
@@ -1259,7 +1715,7 @@ mod tests {
             panic!("reordered grouped-disjunctive screening must remain frozen")
         };
         let mut queue = BinaryHeap::new();
-        let mut lifecycle = GraphBabLifecycle::new(std::time::Instant::now());
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
         let mut domains_verified_by_clip = 0usize;
 
         screen_disjunctive_child(
@@ -1275,6 +1731,8 @@ mod tests {
             },
             Some(&warm),
             &telemetry,
+            None,
+            None,
             &parent,
             &mut queue,
             &mut lifecycle,
@@ -1294,5 +1752,324 @@ mod tests {
             Arc::ptr_eq(carried, &parent_alpha),
             "reordered screening must preserve the exact parent alpha Arc"
         );
+    }
+
+    // ---- #cgan-polish (NY_CGAN_POLISH=1) ----
+
+    fn polish_params() -> PolishParams {
+        PolishParams {
+            band: 5e-3,
+            alpha_iterations: 3,
+        }
+    }
+
+    #[test]
+    fn test_polish_band_is_finite_and_strict() {
+        let noop = |_: &BoundedTensor,
+                    _: Option<&HashMap<String, BoundedTensor>>,
+                    _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            panic!("in_band must not invoke the closure")
+        };
+        let polish = SurvivorPolish::new(polish_params(), &noop);
+        assert!(polish.in_band(-0.002), "knife-edge gap is in band");
+        assert!(polish.in_band(0.0), "exact-threshold graze is in band");
+        assert!(!polish.in_band(-0.006), "healthy split gap is out of band");
+        assert!(!polish.in_band(f32::NEG_INFINITY), "malformed rows are out");
+        assert!(!polish.in_band(f32::NAN), "NaN is out");
+    }
+
+    /// In-band survivor + tighter polish bounds => the domain CLOSES in the
+    /// screen (verified, nothing queued) and every counter records it.
+    #[test]
+    fn test_polish_closes_an_in_band_survivor() {
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            enable_relaxed_clip: false,
+            reorder_bab: false,
+            ..Default::default()
+        });
+        let graph = complete_reorder_test_graph();
+        let child_input = eager_child_input();
+        let parent_alpha = Arc::new(GraphAlphaState::default());
+        let parent = eager_parent_domain(&child_input, None, parent_alpha);
+        let warm = |_: &BoundedTensor,
+                    _: Option<&HashMap<String, BoundedTensor>>,
+                    _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            Ok((
+                vec![(0.1_f32, 1.0_f32), (0.2_f32, 1.0_f32)],
+                None,
+                GraphAlphaState::default(),
+                test_anchors(),
+            ))
+        };
+        let polish_calls = Cell::new(0usize);
+        let polish_compute = |_: &BoundedTensor,
+                              _: Option<&HashMap<String, BoundedTensor>>,
+                              _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            polish_calls.set(polish_calls.get() + 1);
+            Ok((
+                vec![(0.302_f32, 1.0_f32), (0.352_f32, 1.0_f32)],
+                None,
+                GraphAlphaState::default(),
+                test_anchors(),
+            ))
+        };
+        let telemetry = WarmAlphaTelemetry::new(true);
+        let polish = SurvivorPolish::new(polish_params(), &polish_compute);
+        let mut queue = BinaryHeap::new();
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
+        let mut domains_verified_by_clip = 0usize;
+
+        // Parent floor (0.3 / 0.35) against thresholds (0.301 / 0.351): the
+        // pass-0 gap is -0.001 (in band); the polish crosses both thresholds.
+        screen_disjunctive_child(
+            &verifier,
+            &graph,
+            child_input,
+            &arr2(&[[1.0_f32], [-1.0_f32]]),
+            &[0.301_f32, 0.351_f32],
+            &[1, 1],
+            None,
+            &|_, _| -> Result<MultiObjBounds> {
+                panic!("frozen bounds must not run after a completed warm call")
+            },
+            Some(&warm),
+            &telemetry,
+            Some(&polish),
+            None,
+            &parent,
+            &mut queue,
+            &mut lifecycle,
+            &mut domains_verified_by_clip,
+        )
+        .expect("polish screen should succeed");
+
+        assert_eq!(polish_calls.get(), 1, "in-band survivor must be polished");
+        assert_eq!(
+            lifecycle.domains_verified, 1,
+            "polish must close the domain"
+        );
+        assert!(queue.is_empty(), "closed domain must not be queued");
+        let (attempts, tightened, closed, failures, gap_moved) = polish.snapshot();
+        assert_eq!((attempts, tightened, closed, failures), (1, 1, 1, 0));
+        assert!(
+            gap_moved > 0.0,
+            "closing polish must record positive gap movement"
+        );
+    }
+
+    /// A looser polish result must be FLOORED back to the pass-0 bounds (the
+    /// running component-wise max), never regress the child, and the child is
+    /// queued with the polish's refined alpha as its seed.
+    #[test]
+    fn test_polish_looser_result_is_floored_and_child_carries_refined_alpha() {
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            enable_relaxed_clip: false,
+            reorder_bab: false,
+            ..Default::default()
+        });
+        let graph = complete_reorder_test_graph();
+        let child_input = eager_child_input();
+        let parent_alpha = Arc::new(GraphAlphaState::default());
+        let parent = eager_parent_domain(&child_input, None, parent_alpha);
+        let warm = |_: &BoundedTensor,
+                    _: Option<&HashMap<String, BoundedTensor>>,
+                    _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            Ok((
+                vec![(0.1_f32, 1.0_f32), (0.2_f32, 1.0_f32)],
+                None,
+                GraphAlphaState::default(),
+                test_anchors(),
+            ))
+        };
+        let polish_compute = |_: &BoundedTensor,
+                              _: Option<&HashMap<String, BoundedTensor>>,
+                              _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            Ok((
+                vec![(0.0_f32, 1.0_f32), (0.0_f32, 1.0_f32)],
+                None,
+                GraphAlphaState::default(),
+                test_anchors(),
+            ))
+        };
+        let telemetry = WarmAlphaTelemetry::new(true);
+        let polish = SurvivorPolish::new(polish_params(), &polish_compute);
+        let mut queue = BinaryHeap::new();
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
+        let mut domains_verified_by_clip = 0usize;
+
+        screen_disjunctive_child(
+            &verifier,
+            &graph,
+            child_input,
+            &arr2(&[[1.0_f32], [-1.0_f32]]),
+            &[0.301_f32, 0.351_f32],
+            &[1, 1],
+            None,
+            &|_, _| -> Result<MultiObjBounds> {
+                panic!("frozen bounds must not run after a completed warm call")
+            },
+            Some(&warm),
+            &telemetry,
+            Some(&polish),
+            None,
+            &parent,
+            &mut queue,
+            &mut lifecycle,
+            &mut domains_verified_by_clip,
+        )
+        .expect("polish screen should succeed");
+
+        assert_eq!(lifecycle.domains_verified, 0);
+        let child = queue.pop().expect("unresolved child should be queued");
+        assert_eq!(
+            child.obj_bounds,
+            vec![(0.3_f32, 1.0_f32), (0.35_f32, 1.0_f32)],
+            "looser polish bounds must be floored back to the running max"
+        );
+        let (attempts, tightened, closed, failures, gap_moved) = polish.snapshot();
+        assert_eq!((attempts, tightened, closed, failures), (1, 0, 0, 0));
+        assert_eq!(gap_moved, 0.0);
+        assert!(
+            child.inherited_alpha_state.is_some(),
+            "child must still carry an alpha seed for its own children"
+        );
+    }
+
+    /// Out-of-band children keep the full-speed 1-iteration pass: the polish
+    /// closure must not run at all.
+    #[test]
+    fn test_polish_skips_out_of_band_children() {
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            enable_relaxed_clip: false,
+            reorder_bab: false,
+            ..Default::default()
+        });
+        let graph = complete_reorder_test_graph();
+        let child_input = eager_child_input();
+        let parent_alpha = Arc::new(GraphAlphaState::default());
+        let parent = eager_parent_domain(&child_input, None, parent_alpha);
+        let warm = |_: &BoundedTensor,
+                    _: Option<&HashMap<String, BoundedTensor>>,
+                    _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            Ok((
+                vec![(0.1_f32, 1.0_f32), (0.2_f32, 1.0_f32)],
+                None,
+                GraphAlphaState::default(),
+                test_anchors(),
+            ))
+        };
+        let polish_compute = |_: &BoundedTensor,
+                              _: Option<&HashMap<String, BoundedTensor>>,
+                              _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            panic!("out-of-band child must not be polished")
+        };
+        let telemetry = WarmAlphaTelemetry::new(true);
+        let polish = SurvivorPolish::new(polish_params(), &polish_compute);
+        let mut queue = BinaryHeap::new();
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
+        let mut domains_verified_by_clip = 0usize;
+
+        // Thresholds 0.4/0.4: floored gap is -0.1 — far outside the band.
+        screen_disjunctive_child(
+            &verifier,
+            &graph,
+            child_input,
+            &arr2(&[[1.0_f32], [-1.0_f32]]),
+            &[0.4_f32, 0.4_f32],
+            &[1, 1],
+            None,
+            &|_, _| -> Result<MultiObjBounds> {
+                panic!("frozen bounds must not run after a completed warm call")
+            },
+            Some(&warm),
+            &telemetry,
+            Some(&polish),
+            None,
+            &parent,
+            &mut queue,
+            &mut lifecycle,
+            &mut domains_verified_by_clip,
+        )
+        .expect("screen should succeed without polishing");
+
+        assert_eq!(queue.len(), 1);
+        let (attempts, tightened, closed, failures, _) = polish.snapshot();
+        assert_eq!((attempts, tightened, closed, failures), (0, 0, 0, 0));
+    }
+
+    /// A polish error keeps the sound pass-0 bounds and queues the child —
+    /// fail-open to the status quo, counted as a failure.
+    #[test]
+    fn test_polish_error_keeps_pass0_bounds() {
+        let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+            enable_relaxed_clip: false,
+            reorder_bab: false,
+            ..Default::default()
+        });
+        let graph = complete_reorder_test_graph();
+        let child_input = eager_child_input();
+        let parent_alpha = Arc::new(GraphAlphaState::default());
+        let parent = eager_parent_domain(&child_input, None, parent_alpha);
+        let warm = |_: &BoundedTensor,
+                    _: Option<&HashMap<String, BoundedTensor>>,
+                    _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            Ok((
+                vec![(0.1_f32, 1.0_f32), (0.2_f32, 1.0_f32)],
+                None,
+                GraphAlphaState::default(),
+                test_anchors(),
+            ))
+        };
+        let polish_compute = |_: &BoundedTensor,
+                              _: Option<&HashMap<String, BoundedTensor>>,
+                              _: &GraphAlphaState|
+         -> Result<WarmDisjunctiveBoundsResult> {
+            Err(NyError::InvalidSpec("forced polish failure".to_string()))
+        };
+        let telemetry = WarmAlphaTelemetry::new(true);
+        let polish = SurvivorPolish::new(polish_params(), &polish_compute);
+        let mut queue = BinaryHeap::new();
+        let mut lifecycle = GraphBabLifecycle::new(Instant::now());
+        let mut domains_verified_by_clip = 0usize;
+
+        screen_disjunctive_child(
+            &verifier,
+            &graph,
+            child_input,
+            &arr2(&[[1.0_f32], [-1.0_f32]]),
+            &[0.301_f32, 0.351_f32],
+            &[1, 1],
+            None,
+            &|_, _| -> Result<MultiObjBounds> {
+                panic!("frozen bounds must not run after a completed warm call")
+            },
+            Some(&warm),
+            &telemetry,
+            Some(&polish),
+            None,
+            &parent,
+            &mut queue,
+            &mut lifecycle,
+            &mut domains_verified_by_clip,
+        )
+        .expect("a polish error must not fail the screen");
+
+        assert_eq!(lifecycle.domains_verified, 0);
+        let child = queue.pop().expect("child must still be queued");
+        assert_eq!(
+            child.obj_bounds,
+            vec![(0.3_f32, 1.0_f32), (0.35_f32, 1.0_f32)],
+            "pass-0 floored bounds must survive a polish error"
+        );
+        let (attempts, tightened, closed, failures, _) = polish.snapshot();
+        assert_eq!((attempts, tightened, closed, failures), (0, 0, 0, 1));
     }
 }

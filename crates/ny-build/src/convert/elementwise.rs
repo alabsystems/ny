@@ -6,11 +6,12 @@ use ndarray::{Array1, ArrayD, IxDyn};
 use ny_core::{LayerType, NyError, Result};
 use ny_propagate::layers::{
     AbsLayer, ArctanLayer, CausalSoftmaxLayer, CeilLayer, CeluLayer, ClipLayer, CompareLayer,
-    CompareOp, CompareTensorLayer, CosLayer, EluLayer, ErfLayer, ExpLayer, FloorLayer, GELULayer,
-    GeluApproximation, HardSigmoidLayer, HardSwishLayer, LeakyReLULayer, LogLayer, LogSoftmaxLayer,
-    MishLayer, MulConstantLayer, PReluLayer, ReLULayer, ReciprocalLayer, RoundLayer, SeluLayer,
-    ShrinkLayer, SiLULayer, SigmoidLayer, SignLayer, SinLayer, SnakeLayer, SoftmaxLayer,
-    SoftplusLayer, SoftsignLayer, SqrtLayer, TanLayer, TanhLayer, ThresholdedReluLayer, TruncLayer,
+    CompareOp, CompareTensorLayer, CosLayer, EluLayer, EpsilonExpandLayer, ErfLayer, ExpLayer,
+    FloorLayer, GELULayer, GeluApproximation, HardSigmoidLayer, HardSwishLayer, LeakyReLULayer,
+    LogLayer, LogSoftmaxLayer, MishLayer, MulConstantLayer, PReluLayer, ReLULayer, ReciprocalLayer,
+    RoundLayer, SeluLayer, ShrinkLayer, SiLULayer, SigmoidLayer, SignLayer, SinLayer, SnakeLayer,
+    SoftmaxLayer, SoftplusLayer, SoftsignLayer, SqrtLayer, TanLayer, TanhLayer,
+    ThresholdedReluLayer, TruncLayer,
 };
 use ny_propagate::Layer;
 use std::str::FromStr;
@@ -59,6 +60,30 @@ fn validate_positive_finite_param(
     if !value.is_finite() || value <= 0.0 {
         return Err(NyError::ModelLoad(format!(
             "{op_name} {node_name} invalid {param_name} {value}: {param_name} must be finite and > 0"
+        )));
+    }
+    Ok(value)
+}
+
+/// Validate a scale parameter whose layer admits `0` as an exact degenerate
+/// case but not a negative value.
+///
+/// Used by `Elu` and `HardSigmoid`, whose ny-propagate layers now accept
+/// `alpha = 0` (ELU degenerates to exactly ReLU; HardSigmoid to the exact
+/// constant `clamp(beta, 0, 1)`) while still refusing negative alpha, which
+/// flips monotonicity and would invert the IBP endpoint mapping. Keeping the
+/// converter's gate stricter than the layer's would refuse ONNX models the
+/// verifier can handle exactly; keeping it looser would admit the unsound
+/// negative case, so the two gates must agree.
+fn validate_non_negative_finite_param(
+    op_name: &str,
+    node_name: &str,
+    param_name: &str,
+    value: f32,
+) -> Result<f32> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(NyError::ModelLoad(format!(
+            "{op_name} {node_name} invalid {param_name} {value}: {param_name} must be finite and >= 0"
         )));
     }
     Ok(value)
@@ -383,6 +408,36 @@ fn scalar_compare_constant(
 }
 
 impl ConvertContext<'_> {
+    /// EpsilonExpand: y = x + e with e in [-epsilon, +epsilon] element-wise.
+    ///
+    /// Input[0]: data tensor. Input[1]: per-element epsilon tensor, carried as
+    /// a constant weight (the nn bridge passes per-dimension epsilons this
+    /// way, like Embedding midpoints) and applied to the data tensor's
+    /// trailing dimensions; a rank-0 scalar means one uniform radius.
+    /// `EpsilonExpandLayer::try_new` validates the radii (finite, >= 0).
+    pub(crate) fn convert_epsilon_expand(&self, spec: &LayerSpec) -> Result<Layer> {
+        if spec.inputs.len() != 2 || spec.inputs.iter().any(String::is_empty) {
+            return Err(NyError::ModelLoad(format!(
+                "EpsilonExpand {} requires exactly two non-empty inputs (data, epsilons), got {:?}",
+                spec.name, spec.inputs
+            )));
+        }
+        if let Some((name, value)) = spec.attributes.iter().next() {
+            return Err(NyError::ModelLoad(format!(
+                "EpsilonExpand {} has unsupported attribute {name}={value:?}",
+                spec.name
+            )));
+        }
+        let epsilon_name = &spec.inputs[1];
+        let epsilons = self.constant_value(epsilon_name).ok_or_else(|| {
+            NyError::UnsupportedOp(format!(
+                "EpsilonExpand {} epsilon input '{}' must be a constant weight tensor; dynamic epsilons are not represented",
+                spec.name, epsilon_name
+            ))
+        })?;
+        Ok(Layer::EpsilonExpand(EpsilonExpandLayer::try_new(epsilons)?))
+    }
+
     pub(crate) fn convert_elementwise(&self, spec: &LayerSpec) -> Result<Option<Layer>> {
         match spec.layer_type {
             LayerType::ReLU => Ok(Some(Layer::ReLU(ReLULayer))),
@@ -506,7 +561,9 @@ impl ConvertContext<'_> {
                     Some(AttributeValue::Float(v)) => *v,
                     _ => 1.0,
                 };
-                let alpha = validate_positive_finite_param("Elu", &spec.name, "alpha", alpha)?;
+                // alpha = 0 admitted: EluLayer::try_new accepts it and IBP
+                // treats it as exactly ReLU. Negative alpha stays refused.
+                let alpha = validate_non_negative_finite_param("Elu", &spec.name, "alpha", alpha)?;
                 let layer = EluLayer::new(alpha);
                 Ok(Some(Layer::Elu(layer)))
             }
@@ -565,8 +622,11 @@ impl ConvertContext<'_> {
                     Some(AttributeValue::Float(v)) => *v,
                     _ => 0.5,
                 };
+                // alpha = 0 admitted: HardSigmoidLayer::try_new accepts it and
+                // both IBP and CROWN handle the exact constant
+                // clamp(beta, 0, 1). Negative alpha stays refused.
                 let alpha =
-                    validate_positive_finite_param("HardSigmoid", &spec.name, "alpha", alpha)?;
+                    validate_non_negative_finite_param("HardSigmoid", &spec.name, "alpha", alpha)?;
                 let beta = validate_finite_param("HardSigmoid", &spec.name, "beta", beta)?;
                 let layer = HardSigmoidLayer::new(alpha, beta);
                 Ok(Some(Layer::HardSigmoid(layer)))

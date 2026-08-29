@@ -46,6 +46,12 @@ impl BetaCrownVerifier {
             Layer::Linear(linear) => linear
                 .propagate_linear_with_engine(output_bounds, engine)
                 .map(|cow| cow.into_owned()),
+            // Interval-valued frozen constant: same scalar backward as every
+            // other affine layer, with the enclosure discharged into the
+            // certified coefficient-error channel.
+            Layer::IntervalConst(ic) => ic
+                .propagate_linear(output_bounds)
+                .map(std::borrow::Cow::into_owned),
             Layer::ReLU(_) => self.relu_backward_with_alpha_beta(
                 output_bounds,
                 pre_bounds,
@@ -159,7 +165,14 @@ impl BetaCrownVerifier {
             }
             // === All other layers: exhaustive trait dispatch (#3424) ===
             // Every variant listed — no catch-all. Compiler catches new variants.
-            Layer::Slice(_)
+            //
+            // Conv3d belongs HERE, not beside Conv1d/Conv2d above: it has no
+            // certified rank-3-spatial transposed convolution, so its
+            // `propagate_linear` returns `UnsupportedOp` and this fallback
+            // concretizes the node to IBP constant bounds — sound, and the same
+            // treatment every other IBP-only layer gets.
+            Layer::Conv3d(_)
+            | Layer::Slice(_)
             | Layer::Gather(_)
             | Layer::ScatterNd(_)
             | Layer::Add(_)
@@ -170,6 +183,7 @@ impl BetaCrownVerifier {
             | Layer::SkipMerge(_)
             | Layer::OpaqueSkip(_)
             | Layer::QdqPerturbation(_)
+            | Layer::EpsilonExpand(_)
             | Layer::MulBinary(_)
             | Layer::Where(_)
             | Layer::Div(_)

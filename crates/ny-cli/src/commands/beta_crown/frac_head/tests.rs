@@ -216,6 +216,19 @@ fn synthetic_model() -> GraphNetwork {
     graph
 }
 
+#[test]
+fn extracted_fractional_head_prefix_retains_frozen_authority() {
+    let frozen = std::sync::Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |_| None));
+    let mut graph = synthetic_model();
+    graph.set_frozen_levers(Some(std::sync::Arc::clone(&frozen)));
+
+    let prefix = extract_prefix(&graph, "a_relu").expect("valid synthetic prefix");
+    assert!(std::sync::Arc::ptr_eq(
+        prefix.frozen_levers().expect("prefix retains authority"),
+        &frozen,
+    ));
+}
+
 fn spec_with(constraint: OutputConstraint) -> VnnLibSpec {
     let mut spec = VnnLibSpec::new();
     spec.num_inputs = 2;

@@ -192,7 +192,14 @@ fn plain_forward_fallback(
     reason: CrownIbpFallbackReason,
 ) -> Result<CrownBackwardResult> {
     let bounds = if deadline.is_some() {
-        clone_plain_forward_bounds_with_deadline(forward_bounds, deadline)?
+        // #cgan-reclaim item 5: the publication of an already-certified,
+        // already-resident enclosure must not be refused for expiry. See
+        // `cgan_reclaim::fallback_publication_deadline` — the memory receipt
+        // inside the clone is unchanged, only the wall-clock refusal is lifted.
+        clone_plain_forward_bounds_with_deadline(
+            forward_bounds,
+            crate::cgan_reclaim::fallback_publication_deadline(deadline, "dag-crown-forward"),
+        )?
     } else {
         graph.propagate_ibp(input)?
     };
@@ -875,7 +882,15 @@ impl GraphNetworkCrownExt for GraphNetwork {
                 );
             }
 
-            if crown_backward_layers.is_some_and(|max_layers| backward_steps >= max_layers) {
+            // `crown_backward_layers` exists to escape the Conv2d backward cost;
+            // on a conv-free graph it only loosens the bound. See
+            // `crate::crown_backward_cap`.
+            let effective_backward_layers = crate::crown_backward_cap::effective_backward_cap(
+                crown_backward_layers,
+                self.has_conv_layers(),
+                "GraphNetwork DAG-CROWN",
+            );
+            if effective_backward_layers.is_some_and(|max_layers| backward_steps >= max_layers) {
                 info!(
                     "GraphNetwork DAG-CROWN: truncating backward after {} nodes at frontier '{}'",
                     backward_steps, node_name

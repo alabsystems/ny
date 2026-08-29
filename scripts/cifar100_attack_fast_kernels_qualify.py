@@ -100,7 +100,10 @@ MINIMUM_PROMOTION_GAINS = 9
 CATEGORY = "cifar100_2024"
 FLIGHT_SCHEMA_VERSION = 3
 SUPPORTED_FLIGHT_SCHEMA_VERSIONS = frozenset({2, FLIGHT_SCHEMA_VERSION})
-LEVER_RECEIPT_SCHEMA = "ny-levers/receipt/v2"
+LEVER_RECEIPT_SCHEMA = "ny-levers/receipt/v3"
+SUPPORTED_LEVER_RECEIPT_SCHEMAS = frozenset(
+    {"ny-levers/receipt/v2", LEVER_RECEIPT_SCHEMA}
+)
 LEVER_SOURCES = frozenset(
     {"default", "config", "legacy_env", "legacy_env_rejected"}
 )
@@ -877,7 +880,7 @@ def _valid_v3_lever_state(
         return False
 
     receipt = value["receipt"]
-    expected_fields = {
+    base_fields = {
         "schema",
         "lever_count",
         "env_present",
@@ -885,16 +888,22 @@ def _valid_v3_lever_state(
         "env_rejected",
         "levers",
     }
+    if not isinstance(receipt, dict):
+        return False
+    schema = receipt.get("schema")
+    if schema not in SUPPORTED_LEVER_RECEIPT_SCHEMAS:
+        return False
+    expected_fields = base_fields | ({"env_ignored"} if schema == LEVER_RECEIPT_SCHEMA else set())
     if not isinstance(receipt, dict) or set(receipt) != expected_fields:
         return False
-    if receipt["schema"] != LEVER_RECEIPT_SCHEMA:
-        return False
-    count_fields = (
+    count_fields = [
         "lever_count",
         "env_present",
         "env_accepted",
         "env_rejected",
-    )
+    ]
+    if schema == LEVER_RECEIPT_SCHEMA:
+        count_fields.append("env_ignored")
     if any(
         type(receipt[field]) is not int or receipt[field] < 0
         for field in count_fields
@@ -920,6 +929,9 @@ def _valid_v3_lever_state(
         "provenance",
     }
     optional_entry_fields = {"rejected_raw", "env_utf8"}
+    if schema == LEVER_RECEIPT_SCHEMA:
+        optional_entry_fields.add("ignored_raw")
+    ignored = 0
     for entry in levers:
         if (
             not isinstance(entry, dict)
@@ -958,11 +970,23 @@ def _valid_v3_lever_state(
             return False
         if not _valid_lever_value(entry["value"]):
             return False
-        env_backed = source in source_counts
+        has_ignored_raw = "ignored_raw" in entry
+        env_backed = source in source_counts or has_ignored_raw
         if env_backed != (name in ambient_env):
             return False
-        if source == "legacy_env":
-            if "rejected_raw" in entry or type(entry.get("env_utf8")) is not bool:
+        if has_ignored_raw:
+            if (
+                schema != LEVER_RECEIPT_SCHEMA
+                or source not in {"default", "config"}
+                or "rejected_raw" in entry
+                or not isinstance(entry.get("ignored_raw"), str)
+                or type(entry.get("env_utf8")) is not bool
+                or entry["ignored_raw"] != ambient_env[name]
+            ):
+                return False
+            ignored += 1
+        elif source == "legacy_env":
+            if set(entry) & {"rejected_raw", "ignored_raw"} or type(entry.get("env_utf8")) is not bool:
                 return False
         elif source == "legacy_env_rejected":
             if (
@@ -979,10 +1003,12 @@ def _valid_v3_lever_state(
 
     accepted = source_counts["legacy_env"]
     rejected = source_counts["legacy_env_rejected"]
+    expected_ignored = receipt.get("env_ignored", 0)
     return (
         receipt["env_accepted"] == accepted
         and receipt["env_rejected"] == rejected
-        and receipt["env_present"] == accepted + rejected
+        and expected_ignored == ignored
+        and receipt["env_present"] == accepted + rejected + ignored
     )
 
 

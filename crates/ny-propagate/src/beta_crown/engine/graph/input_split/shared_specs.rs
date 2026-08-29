@@ -68,21 +68,38 @@ pub(crate) fn compute_crown_or_ibp_bounds_batched_specs(
     crown_backward_layers: Option<usize>,
     ibp_enhancement: bool,
     stacked_rebound: bool,
+    nested_deadline: Option<bool>,
 ) -> Result<BatchedSpecBounds> {
-    if let Some(result) = try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
-        graph,
-        input_bounds_batch,
-        spec_matrix,
-        engine,
-        alpha_node_bounds,
-        alpha_state,
-        mul_binary_alphas,
-        deadline,
-        crown_backward_layers,
-        ibp_enhancement,
-        stacked_rebound,
-    )? {
-        return Ok(result);
+    // The batched backward kernel does not yet apply the post-CROWN joint
+    // `ReduceSum(A * B)` intersection performed by the scalar evaluator in
+    // `bounds_eval.rs`.  Letting an armed joint relaxation take this fast path
+    // would silently bypass the lever on reordered dense-spec rebounds.  Treat
+    // it as an unsupported batched feature until the kernel has a joint-capable
+    // result stage; the existing per-domain fallback below is shrink-only,
+    // sound, and already runs the joint hook.  The shipped OFF arm enters the
+    // byte-identical historical fast-path call.
+    let joint_bilinear_armed = crate::joint_bilinear::joint_bilinear_armed();
+    let joint_bilinear_requires_scalar = joint_bilinear_armed
+        && input_bounds_batch
+            .iter()
+            .any(|input| crate::joint_bilinear::joint_bilinear_may_apply(graph, input));
+    if !joint_bilinear_requires_scalar {
+        if let Some(result) = try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
+            graph,
+            input_bounds_batch,
+            spec_matrix,
+            engine,
+            alpha_node_bounds,
+            alpha_state,
+            mul_binary_alphas,
+            deadline,
+            crown_backward_layers,
+            ibp_enhancement,
+            stacked_rebound,
+            nested_deadline,
+        )? {
+            return Ok(result);
+        }
     }
 
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -91,6 +108,8 @@ pub(crate) fn compute_crown_or_ibp_bounds_batched_specs(
         domains = input_bounds_batch.len(),
         mul_binary_alphas = mul_binary_alphas.is_some(),
         crown_backward_layers = crown_backward_layers.is_some(),
+        joint_bilinear_armed,
+        joint_bilinear_requires_scalar,
         "input_split: batched kernel gated, falling back to rayon par_iter"
     );
 
@@ -152,6 +171,7 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
     crown_backward_layers: Option<usize>,
     ibp_enhancement: bool,
     stacked_rebound: bool,
+    nested_deadline: Option<bool>,
 ) -> Result<Option<BatchedSpecBounds>> {
     // Gate: fall back to rayon par_iter for features the batched kernel
     // doesn't yet support.
@@ -300,22 +320,36 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
     // unpollable GEMM is entered" and dense convs fall back to a direct scalar
     // CPU contraction. Row 7 spends ~584 s in this phase.
     //
-    // `NY_INPUT_SPLIT_NESTED_DEADLINE=0` restores the pre-`6f49a660` shape for
-    // the A/B ONLY. It is diagnostic: dropping the deadline removes this
-    // rebound's interruptibility, so it must never be the shipped default.
-    // Declared as an OPT-OUT: the shipped arm is `true` (keep the deadline), and
-    // only an exact "0" disarms it, so `!as_bool()` is the drop. The chokepoint
-    // resolves any other present value back to the shipped default, which is the
-    // safe direction for a lever whose off-arm removes interruptibility.
-    use ny_levers::decls::dark_probes::{INPUT_SPLIT_NESTED_DEADLINE, INPUT_SPLIT_PROBE};
-    let drop_nested_deadline = !ny_levers::read(&INPUT_SPLIT_NESTED_DEADLINE)
-        .value
-        .as_bool();
+    // `NY_INPUT_SPLIT_NESTED_DEADLINE=0` restores the pre-`6f49a660` shape.
+    // Historically diagnostic-only; #dist-shift-5291 adds the TYPED preset
+    // layer `bab.branching.input_split.nested_deadline` (threaded here as
+    // `nested_deadline`), so a category whose per-batch rebound cost is
+    // known-small can ship the relaxation, with wall-clock safety provided by
+    // the OUTER BaB loop's own deadline poll between batches plus the harness
+    // per-instance budget. Layering (ny_levers::read_over_config): env
+    // overrides in BOTH directions (`0` drop / `1` keep), absent env defers
+    // to the preset field, absent both keeps the declaration default (keep).
+    // A present-but-malformed env token resolves to the declaration default
+    // (keep) and SUPPRESSES the preset — the safe direction for a lever whose
+    // off-arm removes interruptibility.
+    use ny_levers::decls::dark_probes::INPUT_SPLIT_PROBE;
+    let (drop_nested_deadline, nested_deadline_source) = nested_deadline_dropped(nested_deadline);
     verifier.config.alpha_config.deadline = if drop_nested_deadline { None } else { deadline };
+    if drop_nested_deadline {
+        // R9 engagement fingerprint: once per process, unconditional, so any
+        // scored log carries the lever's own observable move (and its source).
+        static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+        ANNOUNCED.call_once(|| {
+            eprintln!(
+                "[input-split-rebound] nested deadline DROPPED (source: {nested_deadline_source}): \
+                 rebound bounds run under the OUTER BaB deadline only"
+            );
+        });
+    }
     if ny_levers::read(&INPUT_SPLIT_PROBE).value.as_bool() {
         eprintln!(
             "[input-split-rebound] domains={n} deadline_finite={} dropped={drop_nested_deadline} \
-             stacked_rebound={stacked_rebound}",
+             source={nested_deadline_source} stacked_rebound={stacked_rebound}",
             deadline.is_some()
         );
     }
@@ -360,4 +394,79 @@ fn try_compute_crown_or_ibp_bounds_batched_specs_with_batched_backward(
             materialize_elapsed_s: stage_timing.map(|timing| timing.materialize_elapsed_s),
         },
     }))
+}
+
+/// Resolve the nested-rebound deadline authority (#dist-shift-5291).
+///
+/// Layering is `ny_levers::read_over_config`: `NY_INPUT_SPLIT_NESTED_DEADLINE`
+/// first (`0` = drop, `1` = keep), then the typed preset field
+/// (`BetaCrownConfig::input_split_nested_deadline`, `Some(false)` = drop),
+/// then the declaration default (keep). Returns `(drop, source)` where
+/// `source` is the resolved layer's receipt name (`legacy-env` / `config` /
+/// `default` / `legacy-env-rejected`).
+fn nested_deadline_dropped(cfg: Option<bool>) -> (bool, &'static str) {
+    let (enabled, source) = crate::preset_gates::input_split_nested_deadline_enabled(cfg);
+    (!enabled, source)
+}
+
+#[cfg(test)]
+mod nested_deadline_tests {
+    use ny_levers::decls::dark_probes::INPUT_SPLIT_NESTED_DEADLINE;
+    use ny_levers::{read_over_config_with, LeverValue, Source};
+
+    /// The pure layering rule this chokepoint depends on, pinned against the
+    /// REAL declaration via the `read_over_config_with` test seam (no process
+    /// environment mutation). `drop == !value`.
+    fn drop_with(env: Option<&str>, cfg: Option<bool>) -> (bool, Source) {
+        let resolved = read_over_config_with(
+            &INPUT_SPLIT_NESTED_DEADLINE,
+            |_| env.map(str::to_owned),
+            cfg.map(LeverValue::Bool),
+        )
+        .expect("Bool config value is always admissible");
+        (!resolved.value.as_bool(), resolved.source)
+    }
+
+    #[test]
+    fn default_keeps_the_nested_deadline() {
+        assert_eq!(drop_with(None, None), (false, Source::Default));
+    }
+
+    #[test]
+    fn preset_false_drops_without_env() {
+        // The dist_shift ship shape: `nested_deadline: false` in the preset,
+        // zero env.
+        assert_eq!(drop_with(None, Some(false)), (true, Source::Config));
+    }
+
+    #[test]
+    fn preset_true_keeps_explicitly() {
+        assert_eq!(drop_with(None, Some(true)), (false, Source::Config));
+    }
+
+    #[test]
+    fn env_zero_overrides_preset_keep() {
+        // The historical diagnostic A/B still works under a keep-preset.
+        assert_eq!(drop_with(Some("0"), Some(true)), (true, Source::LegacyEnv));
+    }
+
+    #[test]
+    fn env_one_overrides_preset_drop() {
+        // The kill switch for a shipped relaxation: `=1` restores the
+        // deadline-carrying arm even where the preset says drop.
+        assert_eq!(
+            drop_with(Some("1"), Some(false)),
+            (false, Source::LegacyEnv)
+        );
+    }
+
+    #[test]
+    fn malformed_env_suppresses_preset_and_keeps() {
+        // A typo'd token must resolve to the SAFE arm (keep the deadline),
+        // not silently fall through to the preset relaxation.
+        assert_eq!(
+            drop_with(Some("true"), Some(false)),
+            (false, Source::LegacyEnvRejected)
+        );
+    }
 }

@@ -4,6 +4,9 @@
 
 //! Core CROWN-IBP per-node tightening loop (#3596, #3499).
 
+use crate::network::crown_quality::crown_gain_stat;
+#[cfg(test)]
+use crate::network::crown_quality::CrownGainStat;
 use crate::types::{
     BoundsProvenance, CrownIbpFallbackEvent, CrownIbpFallbackReason, GraphCrownIbpBoundsResult,
 };
@@ -380,11 +383,11 @@ fn collector_forced_walk_estimate_secs(node: &str) -> Option<f64> {
 }
 
 use super::target_backward::{
-    crown_cut_segment_from_env, CrownCutContext, ObjectiveChunkRoutePlan,
-    PartialCrownDeadlineSalvagePolicy,
+    CrownCutContext, ObjectiveChunkRoutePlan, PartialCrownDeadlineSalvagePolicy,
 };
 // Used by the dense-prefix work estimator and this module's focused tests.
 use crate::layers::Layer;
+use crate::network::core::graph::CrownIbpRuntimePolicy;
 use crate::network::core::{GraphNetwork, GraphTargetShapeContract};
 
 /// Collection strategy snapshot supplied by the typed alpha configuration.
@@ -536,10 +539,14 @@ impl GraphNetwork {
         deadline_is_hard: bool,
         engine: Option<&dyn ny_core::GemmEngine>,
         min_width_to_tighten: Option<f32>,
+        cut_segment: usize,
+        published_margin_indices: Option<std::sync::Arc<[usize]>>,
         downstream_resweep: bool,
         deadline_salvage_policy: PartialCrownDeadlineSalvagePolicy,
         collection_mode: CrownIbpCollectionMode,
+        cgan_narrow_target_max_rows: Option<usize>,
         prefix_cost_admission_enabled: bool,
+        runtime_policy: CrownIbpRuntimePolicy,
     ) -> Result<GraphCrownIbpBoundsResult> {
         self.collect_crown_ibp_bounds_core_inner_with_cut_segment_and_prefix_cost_policy(
             input,
@@ -548,19 +555,21 @@ impl GraphNetwork {
             deadline_is_hard,
             engine,
             min_width_to_tighten,
-            crown_cut_segment_from_env(),
+            cut_segment,
+            published_margin_indices,
             downstream_resweep,
             deadline_salvage_policy,
             collection_mode,
+            cgan_narrow_target_max_rows,
             prefix_cost_admission_enabled,
+            runtime_policy,
         )
     }
 
     /// Explicit-cut-segment variant of the core loop (#crown-cut-segment).
     /// `cut_segment = 0` disables cuts (byte-identical full-prefix backward).
-    /// Production always enters through the env-reading wrapper above; the
-    /// soundness oracle injects the segment directly so it never mutates the
-    /// process-global environment that cargo's parallel test threads share.
+    /// Production snapshots the segment before cache lookup; the soundness
+    /// oracle injects it directly so parallel tests never mutate global state.
     #[cfg(test)]
     pub(crate) fn collect_crown_ibp_bounds_core_inner_with_cut_segment(
         &self,
@@ -608,10 +617,13 @@ impl GraphNetwork {
             engine,
             min_width_to_tighten,
             cut_segment,
+            crate::output_margin_seed::published_margin_indices(),
             downstream_resweep,
             deadline_salvage_policy,
             collection_mode,
+            None,
             budget_policy::prefix_cost_admission_enabled(),
+            self.crown_ibp_runtime_policy(),
         )
     }
 
@@ -625,12 +637,22 @@ impl GraphNetwork {
         engine: Option<&dyn ny_core::GemmEngine>,
         min_width_to_tighten: Option<f32>,
         cut_segment: usize,
+        published_margin_indices: Option<std::sync::Arc<[usize]>>,
         downstream_resweep: bool,
         deadline_salvage_policy: PartialCrownDeadlineSalvagePolicy,
         collection_mode: CrownIbpCollectionMode,
+        cgan_narrow_target_max_rows: Option<usize>,
         prefix_cost_admission_enabled: bool,
+        runtime_policy: CrownIbpRuntimePolicy,
     ) -> Result<GraphCrownIbpBoundsResult> {
+        let honest_provenance_enabled = runtime_policy.honest_provenance_enabled;
         let exec_order = self.exec_order()?;
+        let margin_subset_indices = |output_dim| {
+            crate::output_margin_seed::margin_subset_indices_from_published(
+                published_margin_indices.as_ref(),
+                output_dim,
+            )
+        };
 
         // Linear-chain graphs can reuse the sequential `Network` CROWN-IBP
         // collector, which already contains the #3599 GPU partial-backward
@@ -922,16 +944,22 @@ impl GraphNetwork {
         // its scatter semantics.
         let margin_subset_engaged = resolve_collection_output_node(self, exec_order)
             .and_then(|output_node| ibp_bounds.get(&output_node))
-            .is_some_and(|bound| {
-                crate::output_margin_seed::margin_subset_indices(bound.len()).is_some()
-            });
+            .is_some_and(|bound| margin_subset_indices(bound.len()).is_some());
         let row_subset_engaged = sparse_plan_engaged || margin_subset_engaged;
         let cpu_dense_chain = engine.is_none() && self.try_to_sequential_network().is_some();
         // The sequential collector does not implement intermediate cut
         // concretization.  An explicitly armed cut policy must therefore stay
         // on the graph-native route; otherwise every segment value silently
         // produces the gate-off result on CPU Linear/ReLU chains.
+        // #cgan-narrow-target-budget: the sequential collector has no notion of
+        // DECLINING a demanded target, so an armed row ceiling must stay on the
+        // graph-native route where the decline is implemented — the same
+        // contract that keeps `min_width_to_tighten` off this fast path
+        // (both change WHICH nodes are tightened). `None` (the shipped
+        // default) leaves the fast-path decision byte-identical.
         if cut_segment == 0
+            && cgan_narrow_target_max_rows.is_none()
+            && !runtime_policy.requires_graph_native_chunk_execution()
             && sequential_fast_path_allowed(
                 row_subset_engaged,
                 engine.is_some(),
@@ -952,6 +980,7 @@ impl GraphNetwork {
                 &ibp_bounds,
                 engine,
                 deadline,
+                runtime_policy,
             )? {
                 if sparse_interm_diag {
                     eprintln!("[NY_SPARSE_INTERM_DIAG_V1] collector_route=sequential");
@@ -1036,9 +1065,7 @@ impl GraphNetwork {
             };
             let out_node = out_node.as_str();
             let out_shape = (out_shape[0], out_shape[1], out_shape[2]);
-            let indices = crate::output_margin_seed::margin_subset_indices(
-                out_shape.0 * out_shape.1 * out_shape.2,
-            )?;
+            let indices = margin_subset_indices(out_shape.0 * out_shape.1 * out_shape.2)?;
             let objective = crate::spec_influence_cone::objective_box(&indices, out_shape)?;
             let shape_of = |name: &str| -> Option<(usize, usize, usize)> {
                 let s = ibp_bounds.get(name)?.shape();
@@ -1204,6 +1231,45 @@ impl GraphNetwork {
                 demand_set.contains(node_name) && width_eligible && has_sparse_work
             })
             .collect();
+
+        // #cgan-narrow-target-budget: decline demanded targets wider than the
+        // configured row ceiling.
+        //
+        // The per-node time slice below is proportional to objective-row count,
+        // so on the official cGAN rows the generator targets (up to 28,800 and
+        // 61,504 rows) draw ~86% of the collection budget. Measured offline
+        // against an ORT-sampled envelope, those targets are already within
+        // 1.02-1.13x of exact under the forward-linear seed the cascade starts
+        // from, while the narrow discriminator targets they starve are where
+        // the root over-approximation is actually manufactured.
+        //
+        // Declining a target is a SCHEDULING decision only: it keeps the
+        // caller-supplied baseline enclosure for that node, which the collector
+        // already holds and already publishes under the shrink-only contract.
+        // No bound is widened and no bound is tightened by this branch, so
+        // proof authority is unchanged whichever way the ceiling is set.
+        if let Some(max_rows) = cgan_narrow_target_max_rows {
+            let mut declined = 0usize;
+            let mut retained = 0usize;
+            for (index, node_name) in exec_order.iter().enumerate() {
+                if !global_budget_candidate_mask[index] {
+                    continue;
+                }
+                let rows = ibp_bounds.get(node_name).map_or(0, BoundedTensor::len);
+                if rows > max_rows {
+                    global_budget_candidate_mask[index] = false;
+                    declined += 1;
+                } else {
+                    retained += 1;
+                }
+            }
+            info!(
+                "[cgan-narrow-target-budget] armed max_rows={max_rows} \
+                 mode={collection_mode:?} declined={declined} retained={retained} \
+                 targets; declined targets keep the caller-supplied baseline enclosure"
+            );
+        }
+
         let chunk_aware_budget = budget_policy::crown_chunk_aware_budget_enabled();
 
         // Resolve the subset seed exactly as the execution path below does.
@@ -1219,7 +1285,7 @@ impl GraphNetwork {
                 let existing_subset_indices = margin_subset_output_node
                     .as_deref()
                     .filter(|output_node| *output_node == node_name)
-                    .and_then(|_| crate::output_margin_seed::margin_subset_indices(ibp_bound.len()))
+                    .and_then(|_| margin_subset_indices(ibp_bound.len()))
                     .or_else(|| {
                         let cones = influence_cones.as_ref()?;
                         let shape = ibp_bound.shape();
@@ -1251,16 +1317,14 @@ impl GraphNetwork {
                 );
                 let subset_is_sparse = sparse_relu_plan.is_some();
                 subset_indices.and_then(|indices| {
-                    if !subset_is_sparse
-                        || subset_seed_fits_dense_budget(
+                    if subset_is_sparse
+                        && !subset_seed_fits_dense_budget(
                             is_patches_target,
                             indices.len(),
                             ibp_bound.len(),
                             collector_route_subset_budget_bytes(budget),
                         )
                     {
-                        Some(indices)
-                    } else {
                         info!(
                             "#sparse-relu-rows: node '{}' selected {}/{} rows, but its dense \
                              selector pair exceeds the {} byte budget; using the existing \
@@ -1270,8 +1334,50 @@ impl GraphNetwork {
                             ibp_bound.len(),
                             budget,
                         );
-                        None
+                        return None;
                     }
+                    // #subset-forfeits-patches: a STRICT subset of a
+                    // patches-eligible target is materialized as a dense
+                    // `[k x dim]` seed and densifies the whole walk. Keep the
+                    // virtual patches identity instead unless that dense seed
+                    // is genuinely cheap.
+                    //
+                    // EXEMPT the atomic selected target. Its route is a typed
+                    // strategy decision, not an opportunistic cone: the comment
+                    // above already states that "the typed target owns an exact
+                    // authority boundary", and `compose_target_subset_indices`
+                    // deliberately hands it the sparse rows untouched by any
+                    // margin/cone subset. Re-routing it here would silently
+                    // withdraw the strategy the caller selected
+                    // (`#cgan-sparse-target-complete`). yolo_2023 never engages
+                    // an atomic target, so this exemption does not affect the
+                    // measurement this guard was built from.
+                    if subset_patches_guard_enabled()
+                        && !is_atomic_selected_target
+                        && subset_forfeits_patches_route(
+                            is_patches_target,
+                            indices.len(),
+                            ibp_bound.len(),
+                        )
+                    {
+                        info!(
+                            "#subset-forfeits-patches: node '{}' selected {}/{} rows, but the \
+                             strict-subset seed materializes a dense {} byte pair and forfeits \
+                             the virtual patches identity this target is eligible for; taking \
+                             the full-width PATCHES backward instead (set {}=0 to restore)",
+                            node_name,
+                            indices.len(),
+                            ibp_bound.len(),
+                            crate::network::crown_memory::dense_pair_bytes(
+                                indices.len(),
+                                ibp_bound.len()
+                            )
+                            .map_or_else(|| "overflow".to_string(), |b| b.to_string()),
+                            SUBSET_PATCHES_GUARD_ENV,
+                        );
+                        return None;
+                    }
+                    Some(indices)
                 })
             };
 
@@ -1325,6 +1431,8 @@ impl GraphNetwork {
                                 execution,
                                 deadline.is_some(),
                                 cut_ctx.is_some(),
+                                runtime_policy.chunk_wave_parallel_enabled,
+                                runtime_policy.chunk_adaptive_growth_enabled,
                             )
                         });
                         Some(ChunkAwareCollectorRoute {
@@ -1361,6 +1469,15 @@ impl GraphNetwork {
         // target (BatchNorm_11 = 28,800 dims) gets enough time to COMPLETE on the
         // first pass instead of degrading to IBP and forcing redundant
         // re-collections. Non-candidates carry weight 0.0.
+        //
+        // #target-cost-weight: the row count is a COST proxy that is measurably
+        // wrong. On cgan row 7 it hands the 28,800-row BatchNorm_11 54% of a
+        // 405 s window while two discriminator convs share 2.9%, and measured
+        // secs/row across those same targets spans 27x — because a shallow wide
+        // target and a deep narrow one walk completely different prefixes.
+        // `demanded_rows_by_index` is retained so the corrected model below can
+        // price each candidate's ACTUAL walk.
+        let mut demanded_rows_by_index: Vec<usize> = vec![0; exec_order.len()];
         let mut global_budget_candidate_weights: Vec<f64> = exec_order
             .iter()
             .zip(global_budget_candidate_mask.iter())
@@ -1385,6 +1502,7 @@ impl GraphNetwork {
                                 .as_deref()
                                 .map_or_else(|| b.len(), <[usize]>::len)
                         });
+                        demanded_rows_by_index[index] = demanded_rows;
                         budget_policy::demanded_target_work_weight(
                             demanded_rows,
                             route.and_then(|route| route.scheduling_plan),
@@ -1395,6 +1513,115 @@ impl GraphNetwork {
                     .unwrap_or(0.0)
             })
             .collect();
+        // #target-cost-weight: correct the COST MODEL from `rows` to
+        // `rows x prefix`, using the same MAC estimator the walk-admission gate
+        // already trusts (`collector_walk_macs_with_shapes`, #cprime-admission)
+        // — the one place in this file that knows what a backward walk from
+        // THIS target actually costs. All-or-nothing: one admitted candidate the
+        // estimator cannot price leaves every weight at today's value.
+        //
+        // SCHEDULING ONLY. Nothing here reaches a bound's value: it moves the
+        // per-node DEADLINE and nothing else. A target that still completes
+        // publishes the identical CROWN∩IBP box; a target that no longer
+        // completes takes the unchanged overrun path and keeps its certified
+        // IBP fallback.
+        //
+        // MUTUALLY EXCLUSIVE with M1's chunk-aware inflation, deliberately.
+        // `objective_fixed_wave_work_weight` multiplies rows by `wave_count`
+        // for exactly the reason this correction exists — the prefix is
+        // REPLAYED and the row count cannot see it. Composing the two would
+        // charge the same replay twice, and that composition has never been
+        // measured. M1 is env-only (`NY_CROWN_CHUNK_AWARE_BUDGET=1`, which
+        // `run_instance.sh` never exports), so this exclusion cannot fire in
+        // competition; it only keeps a hand A/B from silently stacking two
+        // cost models.
+        let prefix_cost_weighted =
+            budget_policy::prefix_cost_weighting_enabled(&per_node_time_budget)
+                && !chunk_aware_budget;
+        if budget_policy::prefix_cost_weighting_enabled(&per_node_time_budget)
+            && chunk_aware_budget
+        {
+            eprintln!(
+                "[target-cost-weight] declined: M1 chunk-aware weighting is armed and \
+                 already inflates for prefix replay — refusing to charge it twice"
+            );
+        }
+        let mut prefix_cost_multipliers: Option<Vec<f64>> = None;
+        if prefix_cost_weighted {
+            let row_weights_before = global_budget_candidate_weights.clone();
+            let costs: Vec<Option<f64>> = exec_order
+                .iter()
+                .enumerate()
+                .map(|(index, node_name)| {
+                    let rows = demanded_rows_by_index[index];
+                    self.collector_walk_macs_with_shapes(node_name, rows, Some(&ibp_bounds))
+                        .and_then(|macs| budget_policy::prefix_cost_per_row(macs, rows))
+                })
+                .collect();
+            let admitted: Vec<bool> = global_budget_candidate_weights
+                .iter()
+                .map(|weight| *weight > 0.0)
+                .collect();
+            match budget_policy::prefix_cost_multipliers(&costs, &admitted) {
+                Some(multipliers) => {
+                    let mut moved = 0usize;
+                    let mut widest = 1.0f64;
+                    for (weight, multiplier) in global_budget_candidate_weights
+                        .iter_mut()
+                        .zip(multipliers.iter())
+                    {
+                        if *weight > 0.0 && (*multiplier - 1.0).abs() > f64::EPSILON {
+                            moved += 1;
+                            widest = widest.max(*multiplier);
+                        }
+                        *weight *= *multiplier;
+                    }
+                    // THE LEVER'S OWN OBSERVABLE. `eprintln!` and not `info!`:
+                    // the vnncomp tracing filter SWALLOWS info!, and a lever
+                    // whose only evidence is swallowed reads as dark on exactly
+                    // the runs that matter. Same convention as
+                    // `[root-joint-interm-alpha]` / `[bounds-profile]`.
+                    let admitted_count = admitted.iter().filter(|a| **a).count();
+                    eprintln!(
+                        "[target-cost-weight] armed: repriced {moved}/{admitted_count} \
+                         admitted targets by rows x prefix (widest multiplier \
+                         {widest:.2}x)"
+                    );
+                    // The REALLOCATION itself, per target, so an A/B can be read
+                    // off the log instead of inferred: share_before is the row
+                    // model's share of the window, share_after is this model's.
+                    let before: f64 = row_weights_before.iter().sum();
+                    let after: f64 = global_budget_candidate_weights.iter().sum();
+                    if before > 0.0 && after > 0.0 {
+                        for (index, node_name) in exec_order.iter().enumerate() {
+                            let was = row_weights_before[index];
+                            if was <= 0.0 {
+                                continue;
+                            }
+                            eprintln!(
+                                "[target-cost-weight] node={node_name} rows={} \
+                                 share_before={:.4} share_after={:.4} mult={:.2}x",
+                                demanded_rows_by_index[index],
+                                was / before,
+                                global_budget_candidate_weights[index] / after,
+                                multipliers[index],
+                            );
+                        }
+                    }
+                    prefix_cost_multipliers = Some(multipliers);
+                }
+                None => {
+                    eprintln!(
+                        "[target-cost-weight] declined: at least one admitted target has \
+                         no MAC estimate (unmodelled op or zero demanded rows) — keeping \
+                         the historical row weights unchanged"
+                    );
+                }
+            }
+        }
+        // #target-cost-weight: an inflated weight must never masquerade as node
+        // WIDTH — `dim_scaled_cap_secs` is quadratic in that argument.
+        let separate_cap_dims = chunk_aware_budget || prefix_cost_multipliers.is_some();
         #[cfg(test)]
         for (index, node_name) in exec_order.iter().enumerate() {
             let raw_rows = ibp_bounds.get(node_name).map_or(0, BoundedTensor::len);
@@ -1506,7 +1733,7 @@ impl GraphNetwork {
                             let cap_dims = budget_policy::weighted_budget_cap_dims(
                                 weight,
                                 *rows as f64,
-                                chunk_aware_budget,
+                                separate_cap_dims,
                             );
                             (weight, cap_dims)
                         })
@@ -1954,6 +2181,10 @@ impl GraphNetwork {
             // eligible tightening targets, then clamp with the #4413 cap.
             let patches_per_node = patches_budget
                 .remaining_deadline(is_patches_target, budget_policy::MIN_PER_NODE_BUDGET_SECS);
+            // #skip-log-names-the-deciding-term: the weighted share that the floor
+            // test actually rejected, recorded so the skip log can print IT rather
+            // than the equal share, which is a different number.
+            let mut rejected_weighted_secs: Option<f64> = None;
             let mut per_node_deadline = if is_atomic_selected_target {
                 // No equal-share/adaptive cap: this is the one target the typed
                 // root strategy selected, so it owns the complete remaining
@@ -1981,7 +2212,14 @@ impl GraphNetwork {
                     let cap_dims = budget_policy::weighted_budget_cap_dims(
                         this_weight,
                         ibp_bound.len() as f64,
-                        chunk_aware_budget,
+                        separate_cap_dims,
+                    );
+                    rejected_weighted_secs = budget_policy::weighted_per_node_budget_secs_unfloored(
+                        remaining_secs,
+                        remaining_weight_sum,
+                        this_weight,
+                        cap_dims,
+                        &per_node_time_budget,
                     );
                     let per_node_secs = budget_policy::compute_weighted_per_node_budget_secs(
                         remaining_secs,
@@ -2022,30 +2260,36 @@ impl GraphNetwork {
                 debug!(
                     "CROWN-IBP DAG: node '{}' per-node budget {:.1}s < {:.1}s floor ({} tightening targets remain, {:.1}s left), using IBP",
                     node_name,
-                    if remaining_global_candidates == 0 {
-                        0.0
-                    } else {
-                        remaining_secs / remaining_global_candidates as f64
-                    },
+                    rejected_weighted_secs.unwrap_or(0.0),
                     per_node_floor_secs,
                     remaining_global_candidates,
                     remaining_secs,
                 );
                 skip_count += 1;
                 crown_ibp_bounds.insert(node_name.clone(), ibp_bound.clone());
+                // #per-node-floor-label: this target NEVER RAN. Recording it as
+                // `PerNodeDeadlineExceeded` (what this site did for weeks) makes
+                // a below-floor REFUSAL indistinguishable from a genuine mid-walk
+                // overrun in every log line and every provenance histogram.
                 provenance.insert(
                     node_name.clone(),
                     BoundsProvenance::ForwardFallback(
-                        CrownIbpFallbackReason::PerNodeDeadlineExceeded,
+                        CrownIbpFallbackReason::PerNodeBudgetBelowFloor,
                     ),
                 );
                 fallback_events.push(CrownIbpFallbackEvent {
                     layer_index,
                     layer_type,
-                    reason: CrownIbpFallbackReason::PerNodeDeadlineExceeded,
+                    reason: CrownIbpFallbackReason::PerNodeBudgetBelowFloor,
                     details: format!(
-                        "node '{}' per-node budget below {:.1}s floor ({} tightening targets remain)",
-                        node_name, per_node_floor_secs, remaining_global_candidates,
+                        "node '{}' REFUSED before any backward step: per-node share {:.3}s is \
+                         below the {:.1}s floor ({} tightening targets remain, {:.1}s of \
+                         collection window left) — the walk did not run and did not overrun",
+                        node_name,
+                        rejected_weighted_secs.unwrap_or(0.0),
+                        per_node_floor_secs,
+                        remaining_global_candidates,
+                        remaining_secs,
                     ),
                 });
                 continue;
@@ -2326,9 +2570,7 @@ impl GraphNetwork {
             let is_output_node = margin_subset_output_node
                 .as_deref()
                 .is_some_and(|output_node| output_node == node_name.as_str());
-            if is_output_node
-                && crate::output_margin_seed::margin_subset_indices(ibp_bound.len()).is_none()
-            {
+            if is_output_node && margin_subset_indices(ibp_bound.len()).is_none() {
                 info!(
                     "#margin-subset-seed: OUTPUT node '{}' (dim={}) takes the FULL-WIDTH seed \
                      ({} identity pair bytes). Cause: {}.",
@@ -2560,12 +2802,21 @@ impl GraphNetwork {
                     effective_target_rows,
                     collector_budget_route(subset_was_planned, false),
                 );
+                // #target-cost-weight: this site REPLACES the planned weight with
+                // the full-dense one, so it must re-apply the same prefix-cost
+                // multiplier the planner applied — otherwise a runtime fail-open
+                // silently reverts this one target to raw-row pricing while every
+                // other candidate stays repriced, and the denominator they share
+                // stops meaning one thing.
                 let full_weight = budget_policy::demanded_target_work_weight(
                     effective_target_rows,
                     chunk_aware_route.and_then(|route| route.scheduling_plan),
                     true,
                     true,
-                );
+                ) * prefix_cost_multipliers
+                    .as_ref()
+                    .and_then(|multipliers| multipliers.get(layer_index).copied())
+                    .unwrap_or(1.0);
                 if let Some(weight) = global_budget_candidate_weights.get_mut(layer_index) {
                     *weight = full_weight;
                 }
@@ -2706,6 +2957,7 @@ impl GraphNetwork {
                     is_patches_target,
                     deadline_salvage_policy,
                     expected_fixed_waves,
+                    runtime_policy,
                 );
                 if matches!(
                     &result,
@@ -2832,9 +3084,7 @@ impl GraphNetwork {
                             // can be compared against the number that reaches
                             // `check_spec` — which is what identifies WHICH pass
                             // produces the deciding bound.
-                            if let Some(indices) =
-                                crate::output_margin_seed::margin_subset_indices(ibp_bound.len())
-                            {
+                            if let Some(indices) = margin_subset_indices(ibp_bound.len()) {
                                 for &idx in indices.iter() {
                                     let row = |b: &BoundedTensor| -> (f64, f64) {
                                         (
@@ -2868,7 +3118,7 @@ impl GraphNetwork {
                         // claim about it. Integer counts only -- no width sum, so
                         // no summation-order or GEMM-thread-count sensitivity.
                         let gain = crown_gain_stat(ibp_bound, &crown_bound);
-                        let vacuous = honest_provenance_enabled() && gain.is_vacuous();
+                        let vacuous = honest_provenance_enabled && gain.is_vacuous();
                         let intersection = intersect_completed_crown_target(
                             ibp_bound,
                             &crown_bound,
@@ -2938,7 +3188,7 @@ impl GraphNetwork {
                                     // but report it, because a node that spends a
                                     // full backward walk to lose ground is a
                                     // strategy signal, not a resource shortfall.
-                                    if honest_provenance_enabled() && gain.is_regressed() {
+                                    if honest_provenance_enabled && gain.is_regressed() {
                                         info!(
                                             "CROWN-IBP DAG: node '{}' CROWN result REGRESSED -- \
                                              finite, but materially WIDER than IBP on {}/{} \
@@ -3488,6 +3738,80 @@ fn subset_seed_fits_dense_budget(
             .is_some_and(|required| required <= budget_bytes)
 }
 
+/// `NY_SUBSET_PATCHES_GUARD=0` restores the pre-#subset-forfeits-patches
+/// routing byte-for-byte (a patches-eligible target may again be hijacked into
+/// a dense k-row subset seed of any size). Default-ON.
+const SUBSET_PATCHES_GUARD_ENV: &str = "NY_SUBSET_PATCHES_GUARD";
+
+fn subset_patches_guard_enabled() -> bool {
+    match std::env::var_os(SUBSET_PATCHES_GUARD_ENV) {
+        Some(value) => value != "0" && !value.is_empty(),
+        None => true,
+    }
+}
+
+/// #subset-forfeits-patches: would taking this row subset DESTROY the
+/// memory-light patches backward the target would otherwise get?
+///
+/// `subset_seed_fits_dense_budget` short-circuits on `patches_seed`, on the
+/// assumption that a patches-eligible target's subset seed is itself virtual
+/// (free). That assumption holds for exactly ONE shape of subset:
+/// [`super::target_backward::build_subset_seed`] emits
+/// `PatchesLinearBounds::sparse_identity` only when the rows are the COMPLETE
+/// output grid in flat order. For a STRICT subset it emits a dense
+/// `[k x target_dim]` selection matrix instead — and the walk is then dense for
+/// its whole length, because the 7-D `try_dense_spatial_patches_reentry` lift
+/// costs `k * out_dim * in_c` (a further `in_c`x over the dense pair it is
+/// meant to replace) and is refused.
+///
+/// MEASURED on yolo_2023 / TinyYOLO_prop_000005 (2026-08-07, this branch's
+/// baseline), where the two routes ran side by side inside one collection:
+///
+/// - `Conv_1`, cone 40,000/43,264 rows: the dense seed (13.84 GB) EXCEEDED the
+///   Dense budget, the subset was refused, the target took the full-width
+///   patches backward and COMPLETED in 6.120 s — the only one of 8 demanded
+///   targets to keep CROWN authority.
+/// - `Conv_5`, cone 33,856/43,264 rows: the dense seed (11.72 GB) FIT under the
+///   12.88 GB budget, so it was taken; the 7-D re-entry then asked for
+///   187,487,485,952 B and was declined, and the dense walk did not finish a
+///   single backward step in 28.465 s.
+/// - `Conv_12` (6,400/10,816) and `Conv_20` (1,568/5,408) took the same dense
+///   route and also exceeded their per-node deadline (22.509 s / 13.853 s),
+///   after which `Add_8`, `Add_15`, `Conv_25` and `Flatten_30` were skipped as
+///   hopeless-class because the collection budget was gone.
+///
+/// Net: 7/8 demanded targets fell back to IBP, and the ONLY difference between
+/// the target that completed and the ones that did not was whether the dense
+/// subset seed happened to fit the memory budget. Fitting a multi-GiB seed is
+/// not a reason to prefer it.
+///
+/// So refuse the subset when all of:
+///   * the full-width fallback WOULD start in patches (`is_patches_target`), so
+///     refusing costs nothing but the extra rows — the seed is virtual;
+///   * the subset is STRICT, i.e. `build_subset_seed` will materialize dense;
+///   * that dense pair is not cheap, judged by the SAME crossover the patches
+///     cost-admission already uses ([`super::patches_target::patches_cost_admission_threshold_bytes`],
+///     128 MiB at the compiled default).
+///
+/// SOUND either way, and not a tightness trade in the risky direction: the
+/// full-width backward computes the SAME per-row relaxation for a SUPERSET of
+/// the subset's rows (row-independence is the premise the subset seed itself
+/// rests on — see the `#margin-subset-seed` comment in the collection loop).
+/// Rows the cone would have dropped keep CROWN instead of IBP, so the collected
+/// map is tighter-or-equal, never tighter-than-true.
+fn subset_forfeits_patches_route(
+    is_patches_target: bool,
+    selected_rows: usize,
+    target_dim: usize,
+) -> bool {
+    if !is_patches_target || selected_rows >= target_dim {
+        return false;
+    }
+    let threshold = super::patches_target::patches_cost_admission_threshold_bytes();
+    crate::network::crown_memory::dense_pair_bytes(selected_rows, target_dim)
+        .is_none_or(|required| required > threshold)
+}
+
 #[cfg(test)]
 mod prefix_cost_work_tests {
     use super::{
@@ -3940,156 +4264,6 @@ mod downstream_resweep_tests {
 // #margin-subset-seed: `scatter_margin_rows_over_bounds` moved to
 // `crate::output_margin_seed` so the root CROWN backward and the DAG alpha
 // per-iteration backward share the exact same scatter (#margin-subset-alpha).
-/// `NY_CROWN_HONEST_PROVENANCE=0` restores the pre-#crown-honest-provenance
-/// behavior exactly: `Crown` is written unconditionally and `mark_tight` is
-/// ungated. Default ON -- the failure it detects is invisible today.
-fn honest_provenance_enabled() -> bool {
-    std::env::var("NY_CROWN_HONEST_PROVENANCE").ok().as_deref() != Some("0")
-}
-
-/// Percentage of finite IBP elements a CROWN result must have turned non-finite
-/// to count as vacuous. Not 100: one lucky finite row out of 21,125 must not be
-/// able to mask a relation that exploded everywhere else.
-const VACUOUS_LOST_MIN_PERCENT: usize = 99;
-
-/// Percentage of improvable elements a vacuous CROWN result may still have
-/// materially tightened. Not 0, for the same reason in the other direction.
-const VACUOUS_TIGHTENED_MAX_PERCENT: usize = 1;
-
-/// Relative width reduction below which a "tightening" is floating-point noise
-/// rather than a bound improvement (#crown-honest-provenance).
-const MATERIAL_TIGHTEN_REL_EPS: f32 = 1e-3;
-
-/// Percentage of improvable elements on which the RAW CROWN box must be
-/// materially wider than IBP before the node is reported as REGRESSED.
-const REGRESSED_WIDENED_MIN_PERCENT: usize = 99;
-
-/// Realized quality of ONE completed CROWN target, measured against the forward
-/// IBP box it is about to be intersected with (#crown-honest-provenance).
-///
-/// Every field is an INTEGER COUNT over elements, so the value is independent of
-/// summation order and of GEMM thread count -- unlike a width SUM. The existing
-/// `#crown-gain-probe` computes exactly such a sum and filters non-finite values
-/// out of it, so a fully vacuous CROWN scores `crown_width = 0`, i.e. "infinite
-/// gain". That statistic INVERTS on precisely the case it was written to catch,
-/// which is why the decision does not use it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CrownGainStat {
-    /// Elements whose IBP interval has BOTH endpoints finite -- the only ones on
-    /// which CROWN can be OBSERVED to have destroyed information.
-    ibp_finite: usize,
-    /// Subset of `ibp_finite` whose IBP interval is non-degenerate (`iu > il`) --
-    /// the only ones CROWN could have tightened at all.
-    improvable: usize,
-    /// Subset of `ibp_finite` where a CROWN endpoint is NOT finite.
-    crown_lost: usize,
-    /// Elements where the INTERSECTED width is smaller than the IBP width by more
-    /// than `MATERIAL_TIGHTEN_REL_EPS` of it.
-    tightened_material: usize,
-    /// Elements where the RAW CROWN interval is materially WIDER than the IBP one
-    /// it was supposed to improve (#crown-honest-provenance).
-    ///
-    /// Measured against the raw CROWN box, NOT the intersection: the intersection
-    /// clamps to IBP and so can never look worse, which is exactly how a
-    /// regressing node hides. `Conv_20` on TinyYOLO / yolo_2023 (2026-07-29)
-    /// returns a FINITE CROWN of width 520.61 against an IBP width of 136.93 at
-    /// the only row that can decide the instance -- 3.8x WORSE. It is not
-    /// vacuous (nothing went infinite), the stored bound is rescued by the
-    /// intersection, and every existing signal therefore calls it a success.
-    widened_material: usize,
-}
-
-impl CrownGainStat {
-    /// The completed CROWN result contributed NOTHING to this node.
-    ///
-    /// All three conjuncts are load-bearing:
-    ///
-    /// * `ibp_finite > 0` -- on an unbounded sub-domain the IBP box is infinite
-    ///   too, so CROWN never had finiteness to destroy.
-    /// * `crown_lost` dominates `ibp_finite` -- a FINITENESS test, so no
-    ///   floating-point epsilon and no summation order enters the decision.
-    /// * `tightened_material` is ~zero -- a PARTIAL explosion (`lower -> -inf`
-    ///   with a finite, strictly better upper endpoint) is NOT vacuous: the
-    ///   intersection keeps that upper improvement, so the work was not wasted.
-    fn is_vacuous(&self) -> bool {
-        self.ibp_finite > 0
-            && self.crown_lost * 100 >= self.ibp_finite * VACUOUS_LOST_MIN_PERCENT
-            && self.tightened_material * 100 <= self.improvable * VACUOUS_TIGHTENED_MAX_PERCENT
-    }
-
-    /// The completed CROWN result was FINITE but strictly WORSE than the IBP box
-    /// it started from (#crown-honest-provenance).
-    ///
-    /// Distinct from `is_vacuous`, and NOT a subset of it: nothing went
-    /// non-finite, so `crown_lost` is 0 and the vacuity test is false. The
-    /// intersection clamps the stored bound back to IBP, so this node is SOUND
-    /// and looks healthy to every existing signal -- it simply spent a full
-    /// backward walk to produce something the forward pass already beat.
-    ///
-    /// This is the second half of "did this actually buy anything". A detector
-    /// that only asks "did CROWN fail to help" misses it entirely; you have to
-    /// ask "did CROWN make it worse".
-    fn is_regressed(&self) -> bool {
-        self.improvable > 0
-            && self.widened_material * 100 >= self.improvable * REGRESSED_WIDENED_MIN_PERCENT
-            && self.tightened_material * 100 <= self.improvable * VACUOUS_TIGHTENED_MAX_PERCENT
-    }
-}
-
-/// Measure a completed CROWN target against its forward IBP box.
-///
-/// One read-only pass, no allocation. The very next statement,
-/// `intersection_per_element`, already makes several full scans over these same
-/// four arrays and then clones two `ArrayD<f32>`s, so this is a small addition to
-/// a helper that is itself negligible beside the backward that produced
-/// `crown_bound`.
-///
-/// FAILS OPEN: on any shape disagreement it returns the default (all zeros),
-/// whose `is_vacuous()` is false -- i.e. exactly today's behavior.
-fn crown_gain_stat(ibp: &BoundedTensor, crown: &BoundedTensor) -> CrownGainStat {
-    let mut stat = CrownGainStat::default();
-    if ibp.shape() != crown.shape() {
-        return stat;
-    }
-    for ((&il, &iu), (&cl, &cu)) in ibp
-        .lower()
-        .iter()
-        .zip(ibp.upper().iter())
-        .zip(crown.lower().iter().zip(crown.upper().iter()))
-    {
-        if !il.is_finite() || !iu.is_finite() {
-            continue;
-        }
-        stat.ibp_finite += 1;
-        if !cl.is_finite() || !cu.is_finite() {
-            stat.crown_lost += 1;
-        }
-        let ibp_width = iu - il;
-        if ibp_width <= 0.0 {
-            continue;
-        }
-        stat.improvable += 1;
-        // Mirror `intersection_per_element` exactly: intersect when the intervals
-        // meet, union when they do not. A UNION NEVER COUNTS AS A TIGHTENING --
-        // it is the case where CROWN made the stored bound WIDER than IBP.
-        let tl = il.max(cl);
-        let tu = iu.min(cu);
-        if tl <= tu && ibp_width - (tu - tl) > MATERIAL_TIGHTEN_REL_EPS * ibp_width {
-            stat.tightened_material += 1;
-        }
-        // Judge REGRESSION on the RAW crown box, not the intersection. The
-        // intersection clamps to IBP and can therefore never look worse, which is
-        // precisely how a node that wasted a whole backward walk stays invisible.
-        if cl.is_finite()
-            && cu.is_finite()
-            && (cu - cl) - ibp_width > MATERIAL_TIGHTEN_REL_EPS * ibp_width
-        {
-            stat.widened_material += 1;
-        }
-    }
-    stat
-}
-
 use crate::output_margin_seed::scatter_margin_rows_over_bounds;
 
 #[cfg(test)]
@@ -4097,10 +4271,42 @@ mod sparse_relu_row_helpers_tests {
     use super::{
         collector_budget_route, collector_budget_rows, compose_target_subset_indices,
         intersect_sorted_rows, is_structural_crown_skip, sequential_fast_path_allowed,
-        subset_seed_fits_dense_budget, CollectorBudgetRoute,
+        subset_forfeits_patches_route, subset_seed_fits_dense_budget, CollectorBudgetRoute,
     };
     use crate::types::CrownIbpFallbackReason;
     use std::sync::Arc;
+
+    /// #subset-forfeits-patches. The three yolo_2023 / TinyYOLO targets whose
+    /// strict cone subsets densified the whole backward walk in the 2026-08-07
+    /// baseline must now be refused, and the one whose subset was already
+    /// refused on memory grounds must stay refused. A NON-patches target and a
+    /// full in-order grid (which seeds virtual sparse-identity Patches) must be
+    /// untouched, and so must a genuinely cheap strict subset.
+    #[test]
+    fn strict_subset_of_a_patches_target_is_refused_when_its_dense_seed_is_not_cheap() {
+        // Measured cone sizes; dense pair = rows * dim * 8 bytes.
+        // Conv_5: 33_856/43_264 -> 11.72 GB.  Conv_12: 6_400/10_816 -> 553 MB.
+        // Conv_20: 1_568/5_408 -> 67.8 MB (under the 128 MiB crossover).
+        assert!(subset_forfeits_patches_route(true, 33_856, 43_264));
+        assert!(subset_forfeits_patches_route(true, 6_400, 10_816));
+        assert!(subset_forfeits_patches_route(true, 40_000, 43_264));
+        assert!(
+            !subset_forfeits_patches_route(true, 1_568, 5_408),
+            "a cheap strict subset keeps the cone: 67.8 MB is under the 128 MiB crossover"
+        );
+        assert!(
+            !subset_forfeits_patches_route(false, 33_856, 43_264),
+            "a target that could not start in patches has no patches route to forfeit"
+        );
+        assert!(
+            !subset_forfeits_patches_route(true, 43_264, 43_264),
+            "the full in-order grid seeds a virtual sparse identity, not a dense pair"
+        );
+        assert!(
+            !subset_forfeits_patches_route(true, usize::MAX, usize::MAX),
+            "selected >= target_dim is never a strict subset, overflow or not"
+        );
+    }
 
     #[test]
     fn sparse_relu_rows_intersect_objective_cone_in_sorted_order() {
@@ -4326,10 +4532,15 @@ mod sparse_relu_row_collector_tests {
                 false,
                 None,
                 None,
+                0,
+                crate::output_margin_seed::published_margin_indices(),
                 false,
                 PartialCrownDeadlineSalvagePolicy::Disabled,
                 CrownIbpCollectionMode::Standard,
+                // #cgan-narrow-target-budget: no ceiling on this soft-deadline path.
+                None,
                 false,
+                graph.crown_ibp_runtime_policy(),
             )
             .expect("soft-deadline CROWN-IBP collection")
     }
@@ -4854,8 +5065,8 @@ mod sparse_relu_row_collector_tests {
             env.set(CROWN_CHUNK_AWARE_BUDGET_ENV, "1");
             env.set("NY_DENSE_BUDGET_MB", "1");
             env.set("NY_CROWN_OBJ_CHUNK", "0");
-            env.remove("NY_NO_CHUNK_WAVE_PAR");
-            let (graph, input) = direct_strided_conv_transpose_383();
+            let (mut graph, input) = direct_strided_conv_transpose_383();
+            graph.set_chunk_wave_parallel_enabled(true);
             let ibp = graph.collect_node_bounds(&input).expect("IBP");
             let (success, success_trace) =
                 run_with_m1_collector_test_controls(M1CollectorTestControls::default(), || {
@@ -4924,7 +5135,6 @@ mod sparse_relu_row_collector_tests {
         ny_test_utils::env::with_env_edits(|env| {
             env.set("NY_DENSE_BUDGET_MB", "1");
             env.set("NY_CROWN_OBJ_CHUNK", "0");
-            env.remove("NY_NO_CHUNK_WAVE_PAR");
             env.remove(CROWN_CHUNK_AWARE_BUDGET_ENV);
             let (graph, input) = direct_strided_conv_transpose_383();
             let ibp = graph.collect_node_bounds(&input).expect("IBP");
@@ -5703,5 +5913,474 @@ mod walk_admission_collector_tests {
                 "{node} must still get a genuine CROWN bound after the grant"
             );
         }
+    }
+}
+
+/// #target-cost-weight: the corrected cost model and the per-target share cap,
+/// exercised through a real CROWN-IBP collection.
+///
+/// The defect these tests pin: the collector weights each candidate's slice of
+/// the collection window by its objective-ROW COUNT. On cgan row 7 that hands
+/// the 28,800-row BatchNorm_11 217 s of a 405 s window (54%) while Conv_19 and
+/// Conv_22 share 2.9% — and measured secs/row across those same targets spans
+/// 27x, so the row count is not what the walks cost. `rows x prefix` tracks
+/// true cost to 1.5x; `rows` alone is off by 9.5x.
+#[cfg(test)]
+mod target_cost_weight_tests {
+    use super::{
+        run_with_m1_collector_test_controls, M1CollectorTestControls, M1CollectorTraceEvent,
+    };
+    use crate::layers::{Layer, LinearLayer, ReLULayer};
+    use crate::network::core::{GraphNetwork, GraphNode};
+    use crate::types::{BoundsProvenance, CrownIbpPerNodeTimeBudget, GraphCrownIbpBoundsResult};
+    use ndarray::{arr1, Array2};
+    use ny_tensor::BoundedTensor;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const DARK: CrownIbpPerNodeTimeBudget = CrownIbpPerNodeTimeBudget {
+        floor_secs: None,
+        cap_secs: None,
+        prefix_cost_weighted: false,
+        max_target_share_frac: None,
+    };
+
+    /// The two axes that could reprice these targets behind the test's back,
+    /// pinned unset through their EXISTING name constants.
+    ///
+    /// `CROWN_CHUNK_AWARE_BUDGET_ENV` in particular is the one mechanism this
+    /// lever deliberately stands down for, so leaking it in from another test
+    /// would turn every assertion below into a silent no-op.
+    ///
+    /// Spelled with the constants and not with `"NY_..."` string literals ON
+    /// PURPOSE: `ny-levers/tests/source_frontier.rs` is an EXACT occurrence
+    /// manifest over lever-name literals in which additions fail just as
+    /// removals do, so six new literals here would have moved a
+    /// parameter-governance ratchet that this change has no business touching.
+    /// A `const` USE is not a literal site.
+    struct EnvPins {
+        _lock: std::sync::RwLockWriteGuard<'static, ()>,
+        _pins: [ny_test_utils::env::ScopedEnvVar; 2],
+    }
+
+    fn pin_env() -> EnvPins {
+        let lock = ny_test_utils::env::lock_env();
+        EnvPins {
+            _lock: lock,
+            _pins: [
+                ny_test_utils::env::ScopedEnvVar::unset(
+                    super::super::budget_policy::CROWN_CHUNK_AWARE_BUDGET_ENV,
+                ),
+                ny_test_utils::env::ScopedEnvVar::unset(super::super::demand::SPARSE_RELU_ROWS_ENV),
+            ],
+        }
+    }
+
+    /// Deterministic dense weights; small magnitudes keep ReLUs genuinely
+    /// unstable so every hidden node is a real tightening candidate.
+    fn dense(out_features: usize, in_features: usize, seed: u64) -> LinearLayer {
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((((state >> 32) as u32) as f64 / f64::from(u32::MAX)) as f32 - 0.5) * 0.6
+        };
+        let data: Vec<f32> = (0..out_features * in_features).map(|_| next()).collect();
+        LinearLayer::new(
+            Array2::from_shape_vec((out_features, in_features), data).expect("shape"),
+            Some(arr1(&vec![0.05_f32; out_features])),
+        )
+        .expect("linear layer")
+    }
+
+    /// EQUAL demanded rows, WILDLY unequal walk cost — the exact shape the row
+    /// weight cannot see.
+    ///
+    /// `in=2 -> l1(32) -> r1 -> l2(32) -> r2 -> l3(32) -> r3 -> out(2)`.
+    /// Per-row prefix MACs: `l1` = 32·2 = 64, `l2` = 64 + 32·32 = 1088,
+    /// `l3` = 1088 + 32·32 = 2112. So the three targets carry IDENTICAL row
+    /// counts and their backward walks differ in cost by 33x.
+    fn equal_rows_unequal_prefix_net() -> (GraphNetwork, BoundedTensor) {
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("l1", Layer::Linear(dense(32, 2, 11))));
+        graph.add_node(GraphNode::new(
+            "r1",
+            Layer::ReLU(ReLULayer),
+            vec!["l1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "l2",
+            Layer::Linear(dense(32, 32, 22)),
+            vec!["r1".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "r2",
+            Layer::ReLU(ReLULayer),
+            vec!["l2".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "l3",
+            Layer::Linear(dense(32, 32, 33)),
+            vec!["r2".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "r3",
+            Layer::ReLU(ReLULayer),
+            vec!["l3".to_string()],
+        ));
+        graph.add_node(GraphNode::new(
+            "out",
+            Layer::Linear(dense(2, 32, 44)),
+            vec!["r3".to_string()],
+        ));
+        graph.set_output("out");
+        let input = BoundedTensor::new(
+            arr1(&[-1.0_f32, -1.0]).into_dyn(),
+            arr1(&[1.0_f32, 1.0]).into_dyn(),
+        )
+        .expect("input box");
+        (graph, input)
+    }
+
+    /// WRONG-LANE GUARD, and it is not optional.
+    ///
+    /// A pure CPU Linear/ReLU chain with no GEMM engine satisfies
+    /// `cpu_dense_chain`, so `sequential_fast_path_allowed` sends this exact
+    /// net to the SEQUENTIAL collector, which returns before the graph-native
+    /// loop this lever lives in ever runs. The first version of these tests did
+    /// that and reported a silent no-op: empty plan trace, zero refusals,
+    /// nothing repriced. A no-op width threshold (`Some(0.0)` — every node's
+    /// `max_width() >= 0.0`, so no candidate is filtered) sets
+    /// `width_threshold_present` and forces the graph-native route, the same
+    /// trick `test_crown_ibp_precomputed_short_deadline_falls_back_to_exact_ibp_3499`
+    /// uses. `assert_graph_native` below then makes the lane a checked fact
+    /// rather than an assumption.
+    fn collect(
+        graph: &GraphNetwork,
+        input: &BoundedTensor,
+        deadline: Option<Instant>,
+    ) -> (GraphCrownIbpBoundsResult, Vec<M1CollectorTraceEvent>) {
+        let ibp = graph.collect_node_bounds(input).expect("IBP bounds");
+        let (result, trace) =
+            run_with_m1_collector_test_controls(M1CollectorTestControls::default(), || {
+                graph
+                    .collect_crown_ibp_bounds_core_inner_with_cut_segment(
+                        input,
+                        ibp,
+                        deadline,
+                        None,
+                        Some(0.0),
+                        0,
+                    )
+                    .expect("CROWN-IBP collection")
+            });
+        assert_graph_native(&trace);
+        (result, trace)
+    }
+
+    /// The graph-native loop emits one `Plan` event per execution-order node.
+    /// An EMPTY trace means the collection returned through the sequential fast
+    /// path and none of the code under test executed — a VOID result, not a
+    /// passing one.
+    fn assert_graph_native(trace: &[M1CollectorTraceEvent]) {
+        assert!(
+            trace
+                .iter()
+                .any(|event| matches!(event, M1CollectorTraceEvent::Plan { .. })),
+            "collection did NOT enter the graph-native collector (no Plan events): \
+             the sequential fast path returned first and nothing under test ran"
+        );
+    }
+
+    fn planned_weights(trace: &[M1CollectorTraceEvent]) -> HashMap<String, f64> {
+        trace
+            .iter()
+            .filter_map(|event| match event {
+                M1CollectorTraceEvent::Plan {
+                    node,
+                    candidate,
+                    weight,
+                    ..
+                } if *candidate => Some((node.clone(), *weight)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE DEFECT, and the fix, on one graph.
+    ///
+    /// Dark, the three equal-row targets receive IDENTICAL weights — the
+    /// allocator cannot tell a 64-MAC/row walk from a 2112-MAC/row walk. Armed,
+    /// their weights become exactly `rows x prefix`, i.e. 1 : 17 : 33, so the
+    /// deepest target's share of the collection window rises from 33% to 65%.
+    #[test]
+    fn prefix_cost_weighting_reprices_equal_row_targets_by_their_real_walk_cost() {
+        let _env = pin_env();
+        let (mut graph, input) = equal_rows_unequal_prefix_net();
+
+        graph.set_crown_ibp_per_node_time_budget(DARK);
+        let (_, dark_trace) = collect(&graph, &input, None);
+        let dark = planned_weights(&dark_trace);
+
+        graph.set_crown_ibp_per_node_time_budget(CrownIbpPerNodeTimeBudget {
+            prefix_cost_weighted: true,
+            ..DARK
+        });
+        let (_, armed_trace) = collect(&graph, &input, None);
+        let armed = planned_weights(&armed_trace);
+
+        for node in ["l1", "l2", "l3"] {
+            assert!(
+                dark.contains_key(node) && armed.contains_key(node),
+                "{node} must be a budget candidate in both arms; \
+                 dark={dark:?} armed={armed:?}"
+            );
+        }
+
+        // Dark: row count only. Three 32-row targets, three identical weights.
+        assert!(
+            (dark["l1"] - dark["l2"]).abs() < 1e-9 && (dark["l2"] - dark["l3"]).abs() < 1e-9,
+            "the shipped model prices these three targets IDENTICALLY even though \
+             their walks differ 33x in cost: {dark:?}"
+        );
+
+        // Armed: rows x prefix. 64 : 1088 : 2112 per row, normalised to the
+        // cheapest = 1 : 17 : 33.
+        let base = armed["l1"];
+        assert!(base > 0.0, "armed base weight must be positive: {armed:?}");
+        assert!(
+            (armed["l2"] / base - 17.0).abs() < 1e-6,
+            "l2 walks 1088/64 = 17x the per-row prefix of l1: {armed:?}"
+        );
+        assert!(
+            (armed["l3"] / base - 33.0).abs() < 1e-6,
+            "l3 walks 2112/64 = 33x the per-row prefix of l1: {armed:?}"
+        );
+
+        // The number that actually matters: the deepest, most expensive target's
+        // SHARE of the window.
+        let dark_sum: f64 = ["l1", "l2", "l3"].iter().map(|n| dark[*n]).sum();
+        let armed_sum: f64 = ["l1", "l2", "l3"].iter().map(|n| armed[*n]).sum();
+        let dark_share = dark["l3"] / dark_sum;
+        let armed_share = armed["l3"] / armed_sum;
+        assert!(
+            armed_share > dark_share * 1.5,
+            "the expensive target's share must rise materially: \
+             dark={dark_share:.3} armed={armed_share:.3}"
+        );
+    }
+
+    /// Every sampled reachable activation must sit inside every published box,
+    /// in BOTH arms and under a starved schedule.
+    ///
+    /// CONTAINMENT, not finiteness. A scheduling change that produced a tighter
+    /// box by excluding reachable points would be a FALSE PROOF, not a win, so
+    /// the envelope is computed independently of the CROWN backward path — a
+    /// point forward through the graph's own IBP evaluator, which is exact on
+    /// this affine+ReLU net.
+    #[test]
+    fn every_arm_still_contains_the_sampled_reachable_envelope() {
+        let _env = pin_env();
+        let (mut graph, input) = equal_rows_unequal_prefix_net();
+
+        let mut samples: Vec<HashMap<String, Vec<f32>>> = Vec::new();
+        for i in 0..17_u32 {
+            for j in 0..17_u32 {
+                let x = -1.0 + f32::from(i as u16) / 8.0;
+                let y = -1.0 + f32::from(j as u16) / 8.0;
+                let point = BoundedTensor::new(
+                    arr1(&[x, y]).into_dyn(),
+                    arr1(&[x, y]).into_dyn(),
+                )
+                .expect("degenerate point box");
+                let values = graph.collect_node_bounds(&point).expect("point forward");
+                samples.push(
+                    values
+                        .into_iter()
+                        .map(|(node, bound)| {
+                            (node, bound.lower().iter().copied().collect::<Vec<f32>>())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        assert_eq!(samples.len(), 289, "the sampler itself must not be empty");
+
+        let arms: [(&str, CrownIbpPerNodeTimeBudget, Option<Duration>); 3] = [
+            ("dark", DARK, None),
+            (
+                "prefix-cost-weighted",
+                CrownIbpPerNodeTimeBudget {
+                    prefix_cost_weighted: true,
+                    ..DARK
+                },
+                None,
+            ),
+            (
+                // Starved by ARITHMETIC, not by wall clock: a 600 s window that
+                // is never reached, against a 100 s floor, so most targets are
+                // refused before any backward step runs.
+                "starved+capped",
+                CrownIbpPerNodeTimeBudget {
+                    prefix_cost_weighted: true,
+                    max_target_share_frac: Some(0.02),
+                    floor_secs: Some(100.0),
+                    ..DARK
+                },
+                Some(Duration::from_mins(10)),
+            ),
+        ];
+
+        for (label, budget, window) in arms {
+            graph.set_crown_ibp_per_node_time_budget(budget);
+            let deadline = window.map(|d| Instant::now() + d);
+            let (result, _) = collect(&graph, &input, deadline);
+            for (node, bound) in &result.bounds {
+                let lower = bound.lower();
+                let upper = bound.upper();
+                for sample in &samples {
+                    let Some(values) = sample.get(node) else {
+                        continue;
+                    };
+                    assert_eq!(values.len(), lower.len(), "{label}/{node} shape");
+                    for (index, value) in values.iter().enumerate() {
+                        let lo = lower.iter().nth(index).copied().expect("lower element");
+                        let hi = upper.iter().nth(index).copied().expect("upper element");
+                        assert!(
+                            *value >= lo - 1e-4 && *value <= hi + 1e-4,
+                            "{label}: node '{node}' row {index} EXCLUDES a reachable \
+                             activation {value} from [{lo}, {hi}] — a tighter box that \
+                             drops a reachable point is a false proof, not a win"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// SCHEDULING ONLY: this is what makes the lever safe to default-ON.
+    ///
+    /// Starving the schedule may only ever (a) leave a completed box
+    /// BIT-IDENTICAL, or (b) decline a target, which republishes the exact IBP
+    /// bound the collector was handed. It may never produce a box narrower than
+    /// the fully-funded arm on any element — the only direction in which a
+    /// scheduling change could become a soundness change.
+    ///
+    /// Deterministic by construction: the refusals come from the FLOOR, not
+    /// from wall-clock expiry. The window is 600 s (never reached; this
+    /// collection takes milliseconds) and the floor is 100 s, so which targets
+    /// decline is decided purely by arithmetic on the weights.
+    #[test]
+    fn a_declined_target_publishes_exactly_what_it_publishes_today() {
+        let _env = pin_env();
+        use crate::types::CrownIbpFallbackReason;
+
+        let (mut graph, input) = equal_rows_unequal_prefix_net();
+        let ibp = graph.collect_node_bounds(&input).expect("IBP bounds");
+
+        graph.set_crown_ibp_per_node_time_budget(DARK);
+        let (full, _) = collect(&graph, &input, None);
+
+        // Arithmetic, worked out in full so the expected split is auditable.
+        // Weights: l1=32, l2=32x17=544, l3=32x33=1056, out=2x34=68 (sum 1700).
+        // Window 600 s, share cap 0.35 (=210 s), adaptive per-node cap 150 s,
+        // floor 100 s. Shares in exec order against the REMAINING weight sum:
+        //   l1  600·32/1700   =  11.3  -> below the 100 s floor -> REFUSED
+        //   l2  600·544/1668  = 195.7  -> capped to 150 -> granted
+        //   l3  600·1056/1124 = 563.6  -> capped to 150 -> granted
+        //   out sole claimant, share cap SKIPPED -> 150 -> granted
+        // So the arm is guaranteed to produce both a refusal and completions,
+        // which is what keeps the two assertions at the bottom non-vacuous.
+        graph.set_crown_ibp_per_node_time_budget(CrownIbpPerNodeTimeBudget {
+            prefix_cost_weighted: true,
+            max_target_share_frac: Some(0.35),
+            floor_secs: Some(100.0),
+            ..DARK
+        });
+        let (starved, _) = collect(
+            &graph,
+            &input,
+            Some(Instant::now() + Duration::from_mins(10)),
+        );
+
+        let mut refused = 0usize;
+        let mut identical = 0usize;
+        for (node, starved_bound) in &starved.bounds {
+            let full_bound = full.bounds.get(node).expect("same node set");
+            let starved_lo: Vec<f32> = starved_bound.lower().iter().copied().collect();
+            let starved_hi: Vec<f32> = starved_bound.upper().iter().copied().collect();
+            let full_lo: Vec<f32> = full_bound.lower().iter().copied().collect();
+            let full_hi: Vec<f32> = full_bound.upper().iter().copied().collect();
+
+            // CONTAINMENT: starving can only ever WIDEN. This is the assertion
+            // that would fire if a scheduling change were secretly a bound
+            // change, and it is checked on EVERY node, in every arm.
+            for index in 0..starved_lo.len() {
+                assert!(
+                    starved_lo[index] <= full_lo[index] + 1e-5
+                        && starved_hi[index] >= full_hi[index] - 1e-5,
+                    "node '{node}' row {index}: the STARVED arm published [{}, {}], \
+                     NARROWER than the fully-funded arm's [{}, {}] — a schedule must \
+                     never tighten a box",
+                    starved_lo[index],
+                    starved_hi[index],
+                    full_lo[index],
+                    full_hi[index],
+                );
+            }
+
+            match starved.provenance.get(node) {
+                // A target REFUSED before any backward step must republish the
+                // collector's own input, byte for byte. This is the precise
+                // claim that makes the lever scheduling-only.
+                Some(BoundsProvenance::ForwardFallback(
+                    CrownIbpFallbackReason::PerNodeBudgetBelowFloor,
+                )) => {
+                    refused += 1;
+                    let handed = ibp.get(node).expect("refused node had an IBP bound");
+                    assert_eq!(
+                        starved_bound.lower(),
+                        handed.lower(),
+                        "refused node '{node}' must publish EXACTLY the IBP lower bound \
+                         it was handed"
+                    );
+                    assert_eq!(
+                        starved_bound.upper(),
+                        handed.upper(),
+                        "refused node '{node}' must publish EXACTLY the IBP upper bound \
+                         it was handed"
+                    );
+                }
+                Some(BoundsProvenance::Crown) => {
+                    if matches!(full.provenance.get(node), Some(BoundsProvenance::Crown)) {
+                        identical += 1;
+                        assert_eq!(
+                            starved_lo, full_lo,
+                            "node '{node}' completed in BOTH arms, so its box cannot \
+                             depend on how much time it was granted"
+                        );
+                        assert_eq!(
+                            starved_hi, full_hi,
+                            "node '{node}' completed in BOTH arms, so its box cannot \
+                             depend on how much time it was granted"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            refused > 0,
+            "the starved arm must actually REFUSE a target below the floor, otherwise \
+             the exact-IBP assertion above is vacuous: {:?}",
+            starved.provenance
+        );
+        assert!(
+            identical > 0,
+            "at least one target must complete in BOTH arms, otherwise the \
+             bit-identity assertion above is vacuous: {:?}",
+            starved.provenance
+        );
     }
 }

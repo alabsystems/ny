@@ -62,7 +62,7 @@ pub use gelu::{
 pub use log::log_linear_relaxation;
 pub use pow::pow2_linear_relaxation;
 pub use relu::relu_crown_relaxation;
-pub use rounding::{next_down_f32, next_up_f32};
+pub use rounding::{cast_f64_to_f32_down, cast_f64_to_f32_up, next_down_f32, next_up_f32};
 #[cfg(any(test, feature = "kani-proofs"))]
 pub use safe_math::safe_add_for_bounds;
 pub use safe_math::{

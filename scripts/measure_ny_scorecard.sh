@@ -643,9 +643,60 @@ fi
 # Benchmark root: newest local mirror first; override with NY_BROOT.
 BROOT="${NY_BROOT:-benchmarks/vnncomp2026/benchmarks}"
 [ -d "$BROOT" ] || BROOT=benchmarks/vnncomp2025/benchmarks
+# The score ledger is corpus-specific. Resolve the selected benchmark tree
+# physically, then prefer exact canonical repository roots and finally the two
+# reviewed external-checkout layouts (.../vnncomp20YY/benchmarks). An unknown
+# layout may still be useful for a research measurement, but it must never be
+# compared with either competition year's checked-in bank by guesswork.
+NORMALIZED_BROOT="$(
+  CDPATH='' builtin cd -- "$BROOT" && builtin pwd -P
+)" || {
+  echo "ERROR: cannot resolve benchmark root: $BROOT" >&2
+  exit 1
+}
+known_vnncomp2025_broot=""
+known_vnncomp2026_broot=""
+if [ -d "$PWD/benchmarks/vnncomp2025/benchmarks" ]; then
+  known_vnncomp2025_broot="$(
+    CDPATH='' builtin cd -- "$PWD/benchmarks/vnncomp2025/benchmarks" \
+      && builtin pwd -P
+  )" || exit 1
+fi
+if [ -d "$PWD/benchmarks/vnncomp2026/benchmarks" ]; then
+  known_vnncomp2026_broot="$(
+    CDPATH='' builtin cd -- "$PWD/benchmarks/vnncomp2026/benchmarks" \
+      && builtin pwd -P
+  )" || exit 1
+fi
+CHECKED_IN_BANK_DIR=""
+BENCHMARK_CONFIG_YEAR_DIR=""
+if [ -n "$known_vnncomp2026_broot" ] \
+  && [ "$NORMALIZED_BROOT" = "$known_vnncomp2026_broot" ]; then
+  CHECKED_IN_BANK_DIR="reports/measured-2026"
+  BENCHMARK_CONFIG_YEAR_DIR="vnncomp26"
+elif [ -n "$known_vnncomp2025_broot" ] \
+  && [ "$NORMALIZED_BROOT" = "$known_vnncomp2025_broot" ]; then
+  CHECKED_IN_BANK_DIR="reports/measured"
+  BENCHMARK_CONFIG_YEAR_DIR="vnncomp25"
+elif [ "${NORMALIZED_BROOT##*/}" = benchmarks ]; then
+  benchmark_corpus_parent=${NORMALIZED_BROOT%/*}
+  case "${benchmark_corpus_parent##*/}" in
+    vnncomp2026)
+      CHECKED_IN_BANK_DIR="reports/measured-2026"
+      BENCHMARK_CONFIG_YEAR_DIR="vnncomp26"
+      ;;
+    vnncomp2025)
+      CHECKED_IN_BANK_DIR="reports/measured"
+      BENCHMARK_CONFIG_YEAR_DIR="vnncomp25"
+      ;;
+  esac
+fi
 CONFIGS_DIR="${NY_MEASURE_CONFIGS_DIR:-}"
 # NY normally auto-discovers the repository configs tree from its executable.
-# Make that implicit input explicit so it can be sealed before execution.
+# Make that implicit input explicit and select the exact competition year so a
+# 2025 corpus cannot silently load a same-named preset from vnncomp26 merely
+# because the newer directory exists. Unknown research corpora must name an
+# already-scoped vnncompYY directory; a multi-year parent is ambiguous.
 if [ -z "$CONFIGS_DIR" ] && [ -d "$PWD/configs" ]; then
   CONFIGS_DIR="$PWD/configs"
 fi
@@ -659,6 +710,50 @@ if [ -n "$CONFIGS_DIR" ]; then
     echo "ERROR: NY_MEASURE_CONFIGS_DIR is not an existing directory: $CONFIGS_DIR" >&2
     exit 2
   }
+  CONFIGS_DIR="$(
+    CDPATH='' builtin cd -- "$CONFIGS_DIR" && builtin pwd -P
+  )" || {
+    echo "ERROR: cannot resolve NY_MEASURE_CONFIGS_DIR: $CONFIGS_DIR" >&2
+    exit 2
+  }
+  configs_basename=${CONFIGS_DIR##*/}
+  if [ -n "$BENCHMARK_CONFIG_YEAR_DIR" ]; then
+    case "$configs_basename" in
+      vnncomp[0-9][0-9])
+        if [ "$configs_basename" != "$BENCHMARK_CONFIG_YEAR_DIR" ]; then
+          echo "ERROR: benchmark corpus requires $BENCHMARK_CONFIG_YEAR_DIR, not $configs_basename" >&2
+          exit 2
+        fi
+        ;;
+      *)
+        expected_configs_dir="$CONFIGS_DIR/$BENCHMARK_CONFIG_YEAR_DIR"
+        [ -d "$expected_configs_dir" ] || {
+          echo "ERROR: config parent has no exact $BENCHMARK_CONFIG_YEAR_DIR directory: $CONFIGS_DIR" >&2
+          exit 2
+        }
+        CONFIGS_DIR="$(
+          CDPATH='' builtin cd -- "$expected_configs_dir" && builtin pwd -P
+        )" || {
+          echo "ERROR: cannot resolve exact $BENCHMARK_CONFIG_YEAR_DIR config directory" >&2
+          exit 2
+        }
+        if [ "${CONFIGS_DIR##*/}" != "$BENCHMARK_CONFIG_YEAR_DIR" ]; then
+          echo "ERROR: exact $BENCHMARK_CONFIG_YEAR_DIR config directory resolves to ${CONFIGS_DIR##*/}" >&2
+          exit 2
+        fi
+        ;;
+    esac
+  else
+    case "$configs_basename" in
+      vnncomp[0-9][0-9]) ;;
+      *)
+        echo "ERROR: an unknown benchmark corpus requires an explicitly scoped vnncompYY config directory" >&2
+        exit 2
+        ;;
+    esac
+  fi
+  NY_MEASURE_CONFIGS_DIR="$CONFIGS_DIR"
+  export NY_MEASURE_CONFIGS_DIR
   PROVENANCE_CONFIG_ARGS=(--configs-dir "$CONFIGS_DIR")
 fi
 RUN_ID="${NY_MEASURE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
@@ -790,6 +885,103 @@ case "$VNNLIB_VERSION" in
   *) echo "ERROR: NY_MEASURE_VNNLIB_VERSION must be 1.0 or 2.0" >&2; exit 2 ;;
 esac
 
+# Resolve the categories that can actually produce rows before sealing the
+# start manifest. VNN-COMP 2026 has a smaller category set than the historical
+# 2025 default above; carrying absent 2025 names into a 2026 start would either
+# demand nonexistent presets or, worse, let an unrelated baseline participate
+# in one cross-category predicate assignment. Use this same resolver again in
+# the execution loop so any benchmark-tree change after start fails closed.
+_scorecard_instances_for_category() {
+  local selected_cat="$1"
+  local search_root
+  local search_depth
+  if [ -n "$VNNLIB_VERSION" ]; then
+    search_root="$BROOT/$selected_cat/$VNNLIB_VERSION"
+    search_depth=1
+    find "$search_root" -maxdepth "$search_depth" -type f \
+      -name instances.csv 2>/dev/null | LC_ALL=C sort
+  elif [ -f "$BROOT/$selected_cat/instances.csv" ]; then
+    printf '%s\n' "$BROOT/$selected_cat/instances.csv"
+  else
+    search_root="$BROOT/$selected_cat"
+    search_depth=2
+    find "$search_root" -maxdepth "$search_depth" -type f \
+      -name instances.csv 2>/dev/null | LC_ALL=C sort
+  fi
+}
+
+ACTIVE_CATS=""
+SEALED_CATEGORY_INSTANCE_PATHS="$SCRATCH/category-instance-paths.nul"
+: > "$SEALED_CATEGORY_INSTANCE_PATHS" || {
+  echo "ERROR: cannot seal category instance paths: $SEALED_CATEGORY_INSTANCE_PATHS" >&2
+  exit 1
+}
+for selected_cat in $CATS; do
+  selected_instances=$(_scorecard_instances_for_category "$selected_cat")
+  selected_count=$(printf '%s\n' "$selected_instances" | \
+    awk 'NF { count++ } END { print count + 0 }')
+  if [ "$selected_count" -eq 0 ]; then
+    if [ "$INSTANCE_INDEX" -gt 0 ] || [ -n "$VNNLIB_VERSION" ]; then
+      echo "ERROR: selected category $selected_cat has no instances.csv" >&2
+      exit 1
+    fi
+    echo "SKIP $selected_cat (no instances.csv)"
+    continue
+  fi
+  if [ "$selected_count" -gt 1 ]; then
+    echo "ERROR: $selected_cat has multiple instances.csv files; set NY_MEASURE_VNNLIB_VERSION to 1.0 or 2.0" >&2
+    printf '%s\n' "$selected_instances" >&2
+    exit 1
+  fi
+  printf '%s\0' "$selected_instances" >> "$SEALED_CATEGORY_INSTANCE_PATHS" || {
+    echo "ERROR: cannot seal instances.csv path for $selected_cat" >&2
+    exit 1
+  }
+  ACTIVE_CATS="${ACTIVE_CATS:+$ACTIVE_CATS }$selected_cat"
+done
+if [ -z "$ACTIVE_CATS" ]; then
+  echo "ERROR: selected measurement has no runnable benchmark categories" >&2
+  exit 1
+fi
+CATS="$ACTIVE_CATS"
+
+# Mandatory current-evidence treatment-engagement contract. Every newly
+# produced run names one scalar-v1 predicate or one same-family joint-v2
+# predicate. Joint coordinates are comma-separated and must already be sorted:
+#   NY_MEASURE_REQUIRE_FLIGHT_EVENT=ny-exec-v1.pgd-fast-gradient-parameter-engaged.NY_PGD_FAST_GRAD.0=ran
+#   NY_MEASURE_REQUIRE_FLIGHT_EVENT=ny-exec-v2.exact-vjp-parameter-engaged.NY_PGD_VJP_K.52,NY_PGD_VJP_STEPS.250=ran
+# The row archiver validates the predicate against exact lever delivery and a
+# strict terminal runtime schema before writing immutable evidence or appending
+# the CSV, so a dark/wrong-lane treatment cannot masquerade as a valid A/B arm.
+REQUIRED_FLIGHT_EVENT="${NY_MEASURE_REQUIRE_FLIGHT_EVENT:-}"
+case "$REQUIRED_FLIGHT_EVENT" in
+  '')
+    echo "ERROR: current measurement evidence requires NY_MEASURE_REQUIRE_FLIGHT_EVENT=VERSIONED_PREDICATE=ran" >&2
+    exit 2
+    ;;
+  *=*)
+    predicate_transport=${REQUIRED_FLIGHT_EVENT%%=*}
+    predicate_status=${REQUIRED_FLIGHT_EVENT#*=}
+    case "$predicate_transport" in
+      ''|*[!A-Za-z0-9_.,-]*|*=*)
+        echo "ERROR: NY_MEASURE_REQUIRE_FLIGHT_EVENT must be VERSIONED_PREDICATE=ran" >&2
+        exit 2
+        ;;
+    esac
+    case "$predicate_status" in
+      ran) ;;
+      *)
+        echo "ERROR: NY_MEASURE_REQUIRE_FLIGHT_EVENT must be VERSIONED_PREDICATE=ran" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *)
+    echo "ERROR: NY_MEASURE_REQUIRE_FLIGHT_EVENT must be VERSIONED_PREDICATE=ran" >&2
+    exit 2
+    ;;
+esac
+
 # Capture the immutable run evidence before any result row can be appended.
 # This is deliberately fail-closed: a missing binary, unstable dirty worktree,
 # unpinned dependency, unknown NY_* environment knob, or incomplete benchmark
@@ -846,6 +1038,172 @@ PROVENANCE_ENV=(/usr/bin/env -i \
 if [ -n "$CUDA_RUNTIME_DIR" ]; then
   PROVENANCE_ENV+=(LD_LIBRARY_PATH="$CUDA_RUNTIME_DIR")
 fi
+
+# Read source-ledger state through the same empty environment as provenance.
+# Literal pathspecs and an explicit repository root keep ambient Git variables,
+# aliases, global config, and pathspec magic from suppressing a mismatch.
+_scorecard_source_git() {
+  "${PROVENANCE_ENV[@]}" GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
+    "$NY_MEASURE_GIT_BIN" --literal-pathspecs -C "$PWD" \
+      -c core.fileMode=true \
+      -c core.symlinks=true \
+      -c core.fsmonitor=false \
+      -c core.untrackedCache=false \
+      -c core.ignoreStat=false \
+      -c core.trustctime=true \
+      -c core.checkStat=default \
+      "$@"
+}
+
+# Compare bytes, not Git's index stat cache: assume-unchanged and skip-worktree
+# can make `git diff` report a modified bank as clean. ls-tree selects the HEAD
+# blob with a literal pathspec; hash-object reads the regular worktree file
+# directly and does not consult either index flag.
+_scorecard_bank_matches_head() {
+  local bank="$1" entry mode kind head_oid entry_path worktree_oid
+  entry=$(_scorecard_source_git ls-tree HEAD -- "$bank") || return 1
+  case "$entry" in
+    ''|*$'\n'*) return 1 ;;
+  esac
+  IFS=$' \t' read -r mode kind head_oid entry_path <<< "$entry"
+  case "$mode:$kind:$head_oid" in
+    100644:blob:*|100755:blob:*) ;;
+    *) return 1 ;;
+  esac
+  case "$head_oid" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  worktree_oid=$(_scorecard_source_git hash-object --no-filters \
+    -- "$bank") || return 1
+  [ "$worktree_oid" = "$head_oid" ]
+}
+
+# Decode one checked-in bank occurrence with the standard library CSV parser.
+# Historical banks have five-, six-, and seven-column rows, so the verdict is
+# the unique protocol token after the three identity fields, not a fixed
+# column. Structural errors, zero tokens, and multiple tokens are explicit
+# advisory mismatches rather than opportunities to suppress the warning.
+_scorecard_bank_lookup() {
+  "${PROVENANCE_ENV[@]}" "${SCORECARD_PYTHON[@]}" -c '
+import csv
+import sys
+
+path, category, onnx, vnnlib, occurrence_text = sys.argv[1:]
+protocol = {"sat", "unsat", "timeout", "unknown", "error"}
+try:
+    occurrence = int(occurrence_text)
+    if occurrence <= 0:
+        raise ValueError("non-positive occurrence")
+    seen = 0
+    with open(path, "r", encoding="utf-8", newline="") as source:
+        for row in csv.reader(source, strict=True):
+            if len(row) < 3:
+                print("malformed:")
+                raise SystemExit(0)
+            if row[0] != category or row[1] != onnx or row[2] != vnnlib:
+                continue
+            seen += 1
+            if seen != occurrence:
+                continue
+            tokens = []
+            for field in row[3:]:
+                normalized = field.strip().lower()
+                if normalized in protocol:
+                    tokens.append(normalized)
+            if len(tokens) == 1:
+                print("found:" + tokens[0])
+            elif len(tokens) > 1:
+                print("ambiguous:")
+            else:
+                print("malformed:")
+            raise SystemExit(0)
+    print("missing:")
+except (OSError, UnicodeError, csv.Error, ValueError):
+    print("malformed:")
+' "$@"
+}
+
+# Parse the official list and existing run CSV once into a NUL-delimited stream.
+# This preserves quoted commas (used by 2026 relational ONNX identities) while
+# keeping Bash 3.2 compatibility and occurrence-aware resume. Newlines/NULs
+# cannot be represented safely downstream, so reject them before any row runs.
+_scorecard_prepare_instance_rows() {
+  "${PROVENANCE_ENV[@]}" "${SCORECARD_PYTHON[@]}" -c '
+import csv
+import sys
+
+path, measurement_path, category = sys.argv[1:]
+try:
+    protocol = {"sat", "unsat", "timeout", "unknown", "error"}
+    recorded = {}
+    with open(measurement_path, "r", encoding="utf-8", newline="") as source:
+        for row in csv.reader(source, strict=True):
+            if len(row) not in (6, 7):
+                raise ValueError("measurement row must have six or seven fields")
+            if row[4].strip().lower() not in protocol:
+                raise ValueError("measurement row has a non-protocol verdict")
+            if row[0] == category:
+                key = (row[1], row[2])
+                recorded[key] = recorded.get(key, 0) + 1
+    with open(path, "r", encoding="utf-8", newline="") as source:
+        rows = list(csv.reader(source, strict=True))
+    for index, row in enumerate(rows, 1):
+        if len(row) != 3:
+            raise ValueError(f"record {index} has {len(row)} fields, expected 3")
+        if any(any(control in field for control in ("\0", "\r", "\n")) for field in row):
+            raise ValueError(f"record {index} contains an unsupported control byte")
+    official_counts = {}
+    for onnx, vnnlib, _timeout in rows:
+        key = (onnx, vnnlib)
+        official_counts[key] = official_counts.get(key, 0) + 1
+    unsafe_resume = [
+        key
+        for key, count in official_counts.items()
+        if count > 1 and recorded.get(key, 0) > 0
+    ]
+    if unsafe_resume:
+        onnx, vnnlib = unsafe_resume[0]
+        raise ValueError(
+            "cannot safely resume duplicated official instance "
+            f"({onnx!r}, {vnnlib!r}): existing measurement rows lack "
+            "occurrence provenance; use a fresh output/evidence directory"
+        )
+    output = sys.stdout.buffer
+    emit = lambda value: output.write(str(value).encode("utf-8") + b"\0")
+    emit(len(rows))
+    occurrences = {}
+    for index, (onnx, vnnlib, timeout) in enumerate(rows, 1):
+        key = (onnx, vnnlib)
+        occurrences[key] = occurrences.get(key, 0) + 1
+        for value in (
+            index,
+            onnx,
+            vnnlib,
+            timeout,
+            occurrences[key],
+            recorded.get(key, 0),
+        ):
+            emit(value)
+except (OSError, UnicodeError, csv.Error, ValueError) as error:
+    print(f"ERROR: malformed instance/measurement CSV: {error}", file=sys.stderr)
+    raise SystemExit(1)
+' "$@"
+}
+
+_scorecard_append_measurement_row() {
+  "${PROVENANCE_ENV[@]}" "${SCORECARD_PYTHON[@]}" -c '
+import csv
+import sys
+
+path, *row = sys.argv[1:]
+try:
+    with open(path, "a", encoding="utf-8", newline="") as output:
+        csv.writer(output, lineterminator="\n").writerow(row)
+except (OSError, UnicodeError, csv.Error) as error:
+    print(f"ERROR: cannot append measurement CSV {path}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+' "$@"
+}
 
 # Reconstruct the solver's complete environment from the reviewed values bound
 # into start.json, then execute it through `env -i`. This is the closure that a
@@ -979,6 +1337,69 @@ if [ "${NY_ALLOW_NONCUDA_MEASURE:-0}" != 1 ]; then
     exit 2
   fi
 fi
+
+# #binary-identity. --build-info answers "which FEATURES", which is necessary
+# and not sufficient: 330 rows were poisoned on 2026-08-21 by a binary that was
+# swapped at a stable path mid-run, and both sides answered `ny 0.3.0`. Capture
+# the full canonical identity ONCE, state it in the run log, and re-check the
+# solver's exact bytes before EVERY row.
+#
+# $BIN here is already the run-local sealed copy the start manifest bound, so a
+# rebuild of target/release/ny cannot reach it. The per-row check is what
+# catches everything else: a shared artifact root, a concurrent harness, a
+# helpful cleanup script.
+_verify_cuda_runtime || exit 1
+SCORECARD_BUILD_ID=$("${SOLVER_ENV[@]}" "$BIN" --build-id 2>/dev/null | head -1) \
+  || SCORECARD_BUILD_ID=""
+case "$SCORECARD_BUILD_ID" in
+  "NY_BUILD_ID_V1 "*) ;;
+  *)
+    echo "ERROR: sealed solver cannot state its own build identity" >&2
+    echo "  $BIN does not support --build-id, so no row it measures could name" >&2
+    echo "  the verifier that produced it — the 2026-08-21 failure mode." >&2
+    echo "  Rebuild, then re-run:" >&2
+    echo "    cargo build --release -p ny-cli --features mip,cuda --bin ny" >&2
+    echo "    scripts/ny_binary_identity.sh --expect-scored" >&2
+    exit 2
+    ;;
+esac
+echo "$SCORECARD_BUILD_ID"
+# macOS ships shasum, not sha256sum; the scorecard already carries per-platform
+# branches for `timeout`, so do the same here rather than assume coreutils.
+_sha256_of() {
+  local path="$1" output
+  if command -v sha256sum >/dev/null 2>&1; then
+    output=$(sha256sum -- "$path") || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    output=$(shasum -a 256 -- "$path") || return 1
+  else
+    return 1
+  fi
+  printf '%s\n' "${output%% *}"
+}
+SCORECARD_BIN_SHA256=$(_sha256_of "$BIN") || SCORECARD_BIN_SHA256=""
+[ -n "$SCORECARD_BIN_SHA256" ] || {
+  echo "ERROR: could not hash the sealed solver binary: $BIN" >&2
+  exit 1
+}
+
+# Fail closed, per row, with both ids side by side. A warning would be read as
+# noise; a bank of mixed provenance is worse than no bank.
+_verify_binary_identity() {
+  local observed
+  observed=$(_sha256_of "$BIN") || observed=""
+  if [ "$observed" != "$SCORECARD_BIN_SHA256" ]; then
+    echo "ERROR: the solver binary changed underneath this measurement" >&2
+    echo "  path:   $BIN" >&2
+    echo "  sealed: $SCORECARD_BIN_SHA256" >&2
+    echo "  found:  ${observed:-<unhashable>}" >&2
+    echo "  sealed identity: $SCORECARD_BUILD_ID" >&2
+    echo "  Rows before and after this point were measured by different" >&2
+    echo "  verifiers and are not comparable. Refusing to continue." >&2
+    return 1
+  fi
+}
+
 SEALED_AY=$("${PROVENANCE_ENV[@]}" "${SCORECARD_PYTHON[@]}" -c \
   'import json, sys; value=json.load(open(sys.argv[1], encoding="utf-8"))["dependencies"]["ay"]["sealed_executable"]; print("" if value is None else value["path"])' \
   "$START_MANIFEST") || {
@@ -1023,64 +1444,62 @@ _run_to() {
   return $rc
 }
 
+exec 8< "$SEALED_CATEGORY_INSTANCE_PATHS" || {
+  echo "ERROR: cannot reopen sealed category instance paths" >&2
+  exit 1
+}
 for cat in $CATS; do
-  if [ -n "$VNNLIB_VERSION" ]; then
-    search_root="$BROOT/$cat/$VNNLIB_VERSION"
-    search_depth=1
-    instances=$(find "$search_root" -maxdepth "$search_depth" -type f -name instances.csv 2>/dev/null | LC_ALL=C sort)
-  elif [ -f "$BROOT/$cat/instances.csv" ]; then
-    # The 2025 layout has one authoritative top-level list. Setup may also
-    # decompress payloads named instances.csv below data directories (Cora's
-    # vnnlib/instances.csv is one real example); those are not alternative
-    # benchmark versions and must not make the official list ambiguous.
-    instances="$BROOT/$cat/instances.csv"
-  else
-    search_root="$BROOT/$cat"
-    search_depth=2
-    instances=$(find "$search_root" -maxdepth "$search_depth" -type f -name instances.csv 2>/dev/null | LC_ALL=C sort)
-  fi
+  IFS= read -r -d '' sealed_instances <&8 || {
+    echo "ERROR: sealed instances.csv path is missing for $cat" >&2
+    exit 1
+  }
+  instances=$(_scorecard_instances_for_category "$cat")
   instance_list_count=$(printf '%s\n' "$instances" | awk 'NF { count++ } END { print count + 0 }')
-  if [ "$instance_list_count" -eq 0 ]; then
-    if [ "$INSTANCE_INDEX" -gt 0 ] || [ -n "$VNNLIB_VERSION" ]; then
-      echo "ERROR: selected category $cat has no instances.csv" >&2
-      exit 1
-    fi
-    echo "SKIP $cat (no instances.csv)"
-    continue
-  fi
-  if [ "$instance_list_count" -gt 1 ]; then
-    echo "ERROR: $cat has multiple instances.csv files; set NY_MEASURE_VNNLIB_VERSION to 1.0 or 2.0" >&2
-    printf '%s\n' "$instances" >&2
+  if [ "$instance_list_count" -ne 1 ] || [ "$instances" != "$sealed_instances" ]; then
+    echo "ERROR: $cat instances.csv selection changed after the measurement start was sealed" >&2
+    echo "  sealed:   $sealed_instances" >&2
+    echo "  observed: ${instances:-<missing>}" >&2
     exit 1
   fi
-  inst="$instances"
+  inst="$sealed_instances"
   bdir=$(dirname "$inst")
   csv="$OUT/$cat.csv"
   touch "$csv" || { echo "ERROR: cannot create measurement CSV: $csv" >&2; exit 1; }
   # Do not inject the shared test_nano/test_tiny overhead probes. The official
   # result processor explicitly filters those harness checks before scoring.
-  total=$(wc -l < "$inst")
+  instance_rows_file="$SCRATCH/instances.csv.nul"
+  if ! _scorecard_prepare_instance_rows \
+    "$inst" "$csv" "$cat" > "$instance_rows_file"; then
+    echo "ERROR: refusing malformed instance or measurement CSV for $cat" >&2
+    exit 1
+  fi
+  exec 9< "$instance_rows_file" || {
+    echo "ERROR: cannot open parsed instance rows: $instance_rows_file" >&2
+    exit 1
+  }
+  IFS= read -r -d '' total <&9 || {
+    echo "ERROR: parsed instance row stream has no count: $inst" >&2
+    exit 1
+  }
   if [ "$INSTANCE_INDEX" -gt "$total" ]; then
     echo "ERROR: selected instance index $INSTANCE_INDEX exceeds $cat row count $total" >&2
     exit 1
   fi
   echo "=== $cat ($total instances) $(date +%H:%M:%S) ==="
-  n=0
   run_rows=0
-  while IFS=, read -r onnx vnnlib timeout; do
-    n=$((n+1))
-    [ -z "$onnx" ] && continue
+  while IFS= read -r -d '' n <&9 \
+    && IFS= read -r -d '' onnx <&9 \
+    && IFS= read -r -d '' vnnlib <&9 \
+    && IFS= read -r -d '' timeout <&9 \
+    && IFS= read -r -d '' wanted_occurrence <&9 \
+    && IFS= read -r -d '' recorded_occurrence <&9; do
     if [ "$INSTANCE_INDEX" -gt 0 ] && [ "$n" -ne "$INSTANCE_INDEX" ]; then
       continue
     fi
     # Resume occurrence-by-occurrence. Some official instance lists contain an
-    # identical (onnx,vnnlib) pair more than once; a simple grep collapses those
-    # scored rows. Compare the pair's occurrence count through this input row to
-    # the number already recorded instead.
-    wanted_occurrence=$(awk -F, -v o="$onnx" -v v="$vnnlib" -v upto="$n" \
-      'NR <= upto && $1 == o && $2 == v { count++ } END { print count + 0 }' "$inst")
-    recorded_occurrence=$(awk -F, -v o="$onnx" -v v="$vnnlib" \
-      '$2 == o && $3 == v { count++ } END { print count + 0 }' "$csv")
+    # identical decoded (onnx,vnnlib) pair more than once. The CSV-safe parser
+    # supplied both occurrence counts so quoted commas cannot collapse or
+    # invent scored rows.
     if [ "$recorded_occurrence" -ge "$wanted_occurrence" ]; then continue; fi
     if [ "$MAX_ROWS_PER_CATEGORY" -gt 0 ] && [ "$run_rows" -ge "$MAX_ROWS_PER_CATEGORY" ]; then
       break
@@ -1131,6 +1550,11 @@ for cat in $CATS; do
       echo "ERROR: cannot clear flight-record scratch file: $FLIGHTF" >&2
       exit 1
     }
+    # #binary-identity: per ROW, never per manifest. This is the check the
+    # 2026-08-21 re-sweep did not have. BEFORE `t0`, deliberately: the sealed
+    # binary's hash is harness work, and charging ~0.07 s of it to the recorded
+    # elapsed time would corrupt the very measurement it protects.
+    _verify_binary_identity || exit 1
     t0=$SECONDS
     _verify_cuda_runtime || exit 1
     if [ -n "$CONFIGS_DIR" ]; then
@@ -1177,11 +1601,123 @@ for cat in $CATS; do
         fi
         exit 1
       }
-    echo "$cat,$onnx,$vnnlib,0,$res,$el,$RUN_ID" >> "$csv" || exit 1
+    _scorecard_append_measurement_row \
+      "$csv" "$cat" "$onnx" "$vnnlib" 0 "$res" "$el" "$RUN_ID" || exit 1
     run_rows=$((run_rows+1))
-  done < "$inst"
+    # A decided sealed run is not a score improvement until the checked-in
+    # regular bank reflects it.  This is deliberately an ACTION REQUIRED
+    # notice, not an automatic promotion: each corpus's reviewed evidence
+    # workflow still owns the replay, official-truth, and validation needed to
+    # mutate the score ledger. Match repeated rows occurrence-by-occurrence so
+    # a decision for one duplicate cannot hide a stale timeout for another.
+    checked_in_bank="${CHECKED_IN_BANK_DIR:+$CHECKED_IN_BANK_DIR/$cat.csv}"
+    checked_in_verdict=""
+    materialization_state="match"
+    if [ "$res" = sat ] || [ "$res" = unsat ]; then
+      if [ -z "$checked_in_bank" ]; then
+        materialization_state="unknown_bank_route"
+      elif [[ ! -e "$checked_in_bank" && ! -L "$checked_in_bank" ]]; then
+        materialization_state="missing_bank"
+      elif [[ -L "$checked_in_bank" || ! -f "$checked_in_bank" ]]; then
+        materialization_state="nonregular_bank"
+      elif ! _scorecard_source_git ls-files --error-unmatch \
+        -- "$checked_in_bank" >/dev/null 2>&1; then
+        materialization_state="untracked_bank"
+      elif ! _scorecard_bank_matches_head "$checked_in_bank"; then
+        materialization_state="dirty_bank"
+      else
+        checked_in_match=$(_scorecard_bank_lookup \
+          "$checked_in_bank" "$cat" "$onnx" "$vnnlib" \
+          "$wanted_occurrence") || checked_in_match="malformed:"
+        case "$checked_in_match" in
+          found:*) checked_in_verdict=${checked_in_match#found:} ;;
+          missing:) materialization_state="missing_occurrence" ;;
+          ambiguous:) materialization_state="ambiguous_verdict" ;;
+          *) materialization_state="invalid_verdict" ;;
+        esac
+        if [ "$materialization_state" = match ]; then
+          case "$checked_in_verdict" in
+            "$res") ;;
+            sat|unsat) materialization_state="verdict_conflict" ;;
+            timeout|unknown|error) materialization_state="stale_verdict" ;;
+            *) materialization_state="invalid_verdict" ;;
+          esac
+        fi
+      fi
+    fi
+    if [ "$materialization_state" != match ]; then
+      echo "================================================================" >&2
+      if [ "$materialization_state" = verdict_conflict ]; then
+        echo "ACTION REQUIRED: measured VNN-COMP verdict conflicts with checked-in bank" >&2
+      else
+        echo "ACTION REQUIRED: decided VNN-COMP result is not materialized" >&2
+      fi
+      echo "  instance: $cat row $n (pair occurrence $wanted_occurrence)" >&2
+      echo "  measured: $res in $csv (run $RUN_ID)" >&2
+      echo "  sealed artifacts: $ARTIFACT_ROOT" >&2
+      case "$materialization_state" in
+        unknown_bank_route)
+          echo "  checked-in: no bank is mapped for benchmark root $NORMALIZED_BROOT" >&2
+          ;;
+        missing_bank)
+          echo "  checked-in: $checked_in_bank is missing" >&2
+          ;;
+        nonregular_bank)
+          echo "  checked-in: $checked_in_bank is not a regular non-symlink file" >&2
+          ;;
+        untracked_bank)
+          echo "  checked-in: $checked_in_bank exists but is not tracked by Git" >&2
+          ;;
+        dirty_bank)
+          echo "  checked-in: $checked_in_bank differs from HEAD" >&2
+          ;;
+        missing_occurrence)
+          echo "  checked-in: $checked_in_bank has no row for pair occurrence $wanted_occurrence" >&2
+          ;;
+        invalid_verdict)
+          echo "  checked-in: $checked_in_bank has a malformed row or no verdict token" >&2
+          ;;
+        ambiguous_verdict)
+          echo "  checked-in: $checked_in_bank has multiple protocol verdict tokens" >&2
+          ;;
+        stale_verdict)
+          echo "  checked-in: $checked_in_bank still says $checked_in_verdict" >&2
+          ;;
+        verdict_conflict)
+          echo "  checked-in: $checked_in_bank says $checked_in_verdict, contradicting $res" >&2
+          ;;
+      esac
+      if [ "$materialization_state" = verdict_conflict ]; then
+        echo "  Investigate with the official checker and an independent sealed replay." >&2
+        echo "  Do not promote either verdict until the conflict is resolved." >&2
+      else
+        if [ "$materialization_state" = invalid_verdict ] \
+          || [ "$materialization_state" = ambiguous_verdict ]; then
+          echo "  Audit or repair the malformed bank row before promotion." >&2
+        fi
+        case "$CHECKED_IN_BANK_DIR" in
+          reports/measured)
+            echo "  Validate and promote the sealed run with scripts/promote_regular_bank.py." >&2
+            ;;
+          reports/measured-2026)
+            echo "  Validate the sealed run and use the reviewed 2026 bank evidence workflow." >&2
+            ;;
+          *)
+            echo "  Validate the sealed run before selecting a corpus-specific bank workflow." >&2
+            ;;
+        esac
+      fi
+      echo "================================================================" >&2
+    fi
+  done
+  exec 9<&-
   echo "  done $cat: $(wc -l < "$csv")/$total recorded"
 done
+if IFS= read -r -d '' unexpected_instances <&8; then
+  echo "ERROR: sealed category instance paths contain an unexpected extra entry" >&2
+  exit 1
+fi
+exec 8<&-
 echo "=== ALL BENCHMARKS SWEPT $(date +%H:%M:%S) ==="
 else
   /usr/bin/printf '%s\n' \

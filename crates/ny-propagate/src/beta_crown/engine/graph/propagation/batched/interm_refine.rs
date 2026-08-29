@@ -1505,10 +1505,14 @@ fn clip_interm_resnet_batched_enabled() -> bool {
 /// The lever ships dark (default OFF) until the armed 220-row moat sweep lands
 /// its receipts in-tree; the legacy `NY_CLIP_INTERM`/`NY_CLIP_INTERM_RESNET`
 /// spellings remain permanently inert.
+///
+/// DELIVERY SEAM (#lever-reachability): `NY_CLIP_INTERM_CERTIFIED` still wins in
+/// BOTH directions where present; absent, the typed `bab.clip_interm_certified`
+/// key decides. These refined caches feed verdict-authoritative CROWN bounds,
+/// so this is exactly the class of lever that must be preset-deliverable rather
+/// than reachable only from a shell the scored harness never writes.
 fn clip_interm_umbrella_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::collection::CLIP_INTERM_CERTIFIED)
-        .value
-        .as_bool()
+    crate::preset_gates::clip_interm_certified_enabled()
 }
 
 #[cfg(test)]
@@ -2376,10 +2380,14 @@ const COMPLETE_CLIP_HOST_MEAN_LA_MAX_RECONSTRUCT_DOMAINS: usize = 8;
 /// plus all five live per-device rungs can admit a device; ordinary or refused
 /// WGPU devices remain ineligible. Anyone investigating the inert consumer on
 /// such a run needs this switch.
+///
+/// DELIVERY SEAM (#lever-reachability): `NY_CLIP_HOST_MEAN_LA` still wins in
+/// BOTH directions where present; absent, the typed `bab.clip_host_mean_la` key
+/// decides. The diagnosis recorded above was taken through the env half, which
+/// cannot fire on a scored run — so the lane could not have been qualified even
+/// if the retained A/B had come back positive.
 fn complete_clip_host_mean_la_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::collection::CLIP_HOST_MEAN_LA)
-        .value
-        .as_bool()
+    crate::preset_gates::clip_host_mean_la_enabled()
 }
 
 /// HOST sibling of [`complete_clip_mean_las_from_gpu`]: reconstruct the
@@ -14208,47 +14216,63 @@ mod clip_interm_soundness {
 
 // (free fns at module scope — all private helpers are file-visible here).
 
-/// Root JOINT per-target intermediate-bound α pass (#root-joint-interm-alpha).
+/// Closed work receipt for one root JOINT intermediate-bound α driver call.
 ///
-/// auto_LiRPA's `fix_intermediate_layer_bounds=False` root pass, scoped: for each
-/// target pre-activation node L in `targets` (deepest-first), build the truncated
-/// L→input resnet stack, seed identity over L's CROSSING rows (`num_specs = n_sel`),
-/// and Adam-ascend the below-L α against the SUMMED lower-bound objective
-/// `Σ_r lb(L_r)` whose joint gradient flows THROUGH L's own bound computation via
-/// the on-device adjoint (`crown_joint_alpha_gradient_resident`). Every iterate is
-/// scored with the certified sound fold (`crown_backward_gpu_resnet_sound_beta`);
-/// the element-wise best `[l',u']` across iterates is intersected SHRINK-ONLY into
-/// `bounds[L]` (`intersection_per_element`, union fallback per element — the
-/// alpha_explicit contract), so the frozen root tree can only tighten, never widen.
-///
-/// SOUNDNESS: any α∈[0,1] is a valid ReLU lower slope ⇒ every scored fold is a
-/// valid enclosure of L's pre-activation over the root box; the element-wise best
-/// across valid enclosures is a valid enclosure (intersection); the final
-/// intersect-with-reference is shrink-only with per-element union fallback. On any
-/// refusal (no sound GPU, prep failure, shape mismatch, deadline) the target keeps
-/// its sound reference bound. Dark: only reachable under
-/// `NY_ROOT_JOINT_INTERM_ALPHA=1` (root.rs gate); finite-slice ascent additionally
-/// requires the typed `NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT=1` policy.
-/// Otherwise a bounded invocation remains base-fold-only. Default byte-identical.
-///
-/// Returns the number of targets whose bound strictly tightened.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::beta_crown::engine::graph) fn root_joint_tighten_relu_preactivations(
-    graph: &GraphNetwork,
-    input: &BoundedTensor,
-    targets: &[String],
-    engine: Option<&dyn GemmEngine>,
-    deadline: Option<Instant>,
-    iters: usize,
-    lr: f32,
-    bounds: &mut HashMap<String, BoundedTensor>,
-) -> usize {
-    root_joint_tighten_relu_preactivations_weighted(
-        graph, input, targets, engine, deadline, iters, lr, None, bounds,
-    )
+/// `tightened_count` is the historical result. The remaining counters separate
+/// dispatch from real backend work so scored tuning cannot attribute a no-op,
+/// base-fold-only route, or deadline-shortened ascent to knobs that never acted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::beta_crown::engine::graph) struct RootJointTightenReport {
+    pub tightened_count: usize,
+    pub target_attempts: usize,
+    pub base_folds_completed: usize,
+    pub effective_iters: usize,
+    pub ascent_iterations_attempted: usize,
+    pub max_ascent_iterations_attempted: usize,
+    pub optimizer_steps: usize,
+    pub ascent_folds_completed: usize,
+    pub max_selected_rows: usize,
+    pub selection_cap_bound_targets: usize,
+    pub frozen_stop_targets: usize,
+    pub pure_chain_targets: usize,
+    pub bn_extract_targets: usize,
 }
 
-/// #joint-interm-grad: the OBJECTIVE-WEIGHTED joint tightening entry.
+fn root_joint_note_selected_rows(
+    report: &mut RootJointTightenReport,
+    crossing_rows: usize,
+    max_sel: usize,
+) -> usize {
+    let selected_rows = crossing_rows.min(max_sel);
+    report.max_selected_rows = report.max_selected_rows.max(selected_rows);
+    report.selection_cap_bound_targets += usize::from(crossing_rows > max_sel);
+    selected_rows
+}
+
+fn root_joint_note_prep_usage(
+    report: &mut RootJointTightenReport,
+    configured_frozen_stop: bool,
+    configured_pure_chain: bool,
+    configured_bn_extract: bool,
+    stopped_at_frozen_box: bool,
+    is_pure_chain: bool,
+    bn_layers_extracted: usize,
+) {
+    report.frozen_stop_targets += usize::from(configured_frozen_stop && stopped_at_frozen_box);
+    // Frozen-stop independently turns on pure-chain extraction. Conservatively
+    // withhold dedicated pure-chain credit when both arms were configured.
+    report.pure_chain_targets +=
+        usize::from(configured_pure_chain && !configured_frozen_stop && is_pure_chain);
+    report.bn_extract_targets += usize::from(configured_bn_extract && bn_layers_extracted > 0);
+}
+
+/// #joint-interm-grad: the weight contract for `objective_sensitivity`, carried
+/// here from the removed `root_joint_tighten_relu_preactivations_weighted`
+/// wrapper. That wrapper and its unweighted twin were parallel entry points that
+/// nothing called — this function is the production path and takes the same
+/// weights — but the reasoning below is the only written record of why the
+/// weighting is sound, so it moves rather than dies with them.
+///
 ///
 /// # What the weights change
 ///
@@ -14292,34 +14316,6 @@ pub(in crate::beta_crown::engine::graph) fn root_joint_tighten_relu_preactivatio
 /// (`alpha_sound_regardless`), and the bounds this lane publishes still go
 /// through the same shrink-only intersect. Wrong weights cost tightness, never
 /// validity.
-#[allow(clippy::too_many_arguments)]
-pub(in crate::beta_crown::engine::graph) fn root_joint_tighten_relu_preactivations_weighted(
-    graph: &GraphNetwork,
-    input: &BoundedTensor,
-    targets: &[String],
-    engine: Option<&dyn GemmEngine>,
-    deadline: Option<Instant>,
-    iters: usize,
-    lr: f32,
-    objective_sensitivity: Option<&HashMap<String, Vec<f32>>>,
-    bounds: &mut HashMap<String, BoundedTensor>,
-) -> usize {
-    let gpu = engine
-        .and_then(|engine| engine.as_gpu_crown_backward())
-        .filter(|gpu| gpu.provides_sound_gpu_crown());
-    let mut options = root_joint_tighten_options(iters, lr);
-    options.objective_sensitivity = objective_sensitivity;
-    root_tighten_relu_preactivations_with_options(
-        graph,
-        input,
-        targets.iter().cloned().map(|target| (target, None)),
-        gpu,
-        deadline,
-        options,
-        bounds,
-    )
-}
-
 /// Call-local finite-deadline root-joint entry for the sanctioned CUDA engine.
 ///
 /// Unlike the legacy research entry above, this accepts only the typed
@@ -14337,10 +14333,11 @@ pub(in crate::beta_crown::engine::graph) fn root_joint_tighten_relu_preactivatio
     iters: usize,
     lr: f32,
     // #joint-interm-grad: per-target `df/dl` weights. `None` = the historical
-    // unit seed, byte for byte. See `root_joint_tighten_relu_preactivations_weighted`.
+    // unit seed, byte for byte. Contract and soundness argument: this function's
+    // doc comment above.
     objective_sensitivity: Option<&HashMap<String, Vec<f32>>>,
     bounds: &mut HashMap<String, BoundedTensor>,
-) -> usize {
+) -> RootJointTightenReport {
     debug_assert!(
         (1..=ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS).contains(&gpu.sound_fold_max_rows())
     );
@@ -14364,24 +14361,12 @@ fn root_joint_tighten_options(iters: usize, lr: f32) -> RootIntermTightenOptions
         objective_sensitivity: None,
         iters,
         lr,
-        max_sel: std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_MAX_SEL")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(512),
-        probe: std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_PROBE")
-            .ok()
-            .as_deref()
-            == Some("1"),
-        frozen_stop: std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP")
-            .ok()
-            .as_deref()
-            == Some("1"),
-        allow_bn: std::env::var("NY_BN_GPU_EXTRACT").ok().as_deref() == Some("1"),
-        allow_pure_chain: std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN")
-            .ok()
-            .as_deref()
-            == Some("1"),
-        deadline_ascent: RootJointDeadlineAscentPolicy::from_env(),
+        max_sel: crate::preset_gates::root_joint_interm_alpha_max_sel(),
+        probe: crate::preset_gates::root_joint_interm_alpha_probe_enabled(),
+        frozen_stop: crate::preset_gates::root_joint_interm_alpha_frozen_stop_enabled(),
+        allow_bn: crate::preset_gates::bn_gpu_extract_enabled(),
+        allow_pure_chain: crate::preset_gates::root_joint_interm_alpha_pure_chain_enabled(),
+        deadline_ascent: RootJointDeadlineAscentPolicy::from_governed(),
         log_tag: "root-joint-interm-alpha",
     }
 }
@@ -14498,6 +14483,7 @@ fn root_base_tighten_relu_preactivations(
     root_tighten_relu_preactivations_with_options(
         graph, input, targets, gpu, deadline, options, bounds,
     )
+    .tightened_count
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14574,12 +14560,8 @@ enum RootJointDeadlineAscentPolicy {
 }
 
 impl RootJointDeadlineAscentPolicy {
-    fn from_env() -> Self {
-        if std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
+    fn from_governed() -> Self {
+        if crate::preset_gates::root_joint_interm_alpha_deadline_ascent_enabled() {
             Self::ExactBounded
         } else {
             Self::BaseFoldOnly
@@ -15307,13 +15289,43 @@ mod root_joint_deadline_route_tests {
     use std::time::Duration;
 
     #[test]
+    fn execution_report_credits_only_engaged_selection_and_prep_knobs() {
+        let mut report = RootJointTightenReport::default();
+        assert_eq!(root_joint_note_selected_rows(&mut report, 17, 8), 8);
+        assert_eq!(root_joint_note_selected_rows(&mut report, 3, 8), 3);
+        assert_eq!(report.max_selected_rows, 8);
+        assert_eq!(report.selection_cap_bound_targets, 1);
+
+        root_joint_note_prep_usage(&mut report, true, true, true, true, true, 2);
+        assert_eq!(report.frozen_stop_targets, 1);
+        assert_eq!(
+            report.pure_chain_targets, 0,
+            "frozen-stop independently admitted this pure chain"
+        );
+        assert_eq!(report.bn_extract_targets, 1);
+
+        root_joint_note_prep_usage(&mut report, false, true, false, false, true, 0);
+        assert_eq!(report.pure_chain_targets, 1);
+    }
+
+    #[test]
+    fn execution_report_does_not_credit_configured_but_unused_prep_knobs() {
+        let mut report = RootJointTightenReport::default();
+        root_joint_note_prep_usage(&mut report, true, true, true, false, false, 0);
+        root_joint_note_prep_usage(&mut report, false, false, false, true, false, 0);
+        assert_eq!(report.frozen_stop_targets, 0);
+        assert_eq!(report.pure_chain_targets, 0);
+        assert_eq!(report.bn_extract_targets, 0);
+    }
+
+    #[test]
     fn deadline_ascent_gate_accepts_exactly_one() {
         for value in ["0", "true", "yes"] {
             ny_test_utils::env::with_serialized_env_vars(
                 &[("NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT", value)],
                 || {
                     assert_eq!(
-                        RootJointDeadlineAscentPolicy::from_env(),
+                        RootJointDeadlineAscentPolicy::from_governed(),
                         RootJointDeadlineAscentPolicy::BaseFoldOnly
                     );
                 },
@@ -15323,7 +15335,7 @@ mod root_joint_deadline_route_tests {
             &[("NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT", "1")],
             || {
                 assert_eq!(
-                    RootJointDeadlineAscentPolicy::from_env(),
+                    RootJointDeadlineAscentPolicy::from_governed(),
                     RootJointDeadlineAscentPolicy::ExactBounded
                 );
             },
@@ -15662,7 +15674,7 @@ fn root_tighten_relu_preactivations_with_options(
     deadline: Option<Instant>,
     options: RootIntermTightenOptions<'_>,
     bounds: &mut HashMap<String, BoundedTensor>,
-) -> usize {
+) -> RootJointTightenReport {
     let RootIntermTightenOptions {
         objective_sensitivity,
         iters: requested_iters,
@@ -15675,15 +15687,16 @@ fn root_tighten_relu_preactivations_with_options(
         deadline_ascent,
         log_tag,
     } = options;
+    let mut report = RootJointTightenReport::default();
     if max_sel == 0 {
-        return 0;
+        return report;
     }
     // Sanctioned sound-GPU access (same filter as refine_interm_bounds_with_opts):
     // the joint gradient only STEERS Adam (heuristic — cannot affect soundness);
     // every kept bound comes from the certified sound fold.
     let Some(gpu) = gpu.filter(|gpu| gpu.provides_sound_gpu_crown()) else {
         eprintln!("[{log_tag}] no sound GPU crown backward; skipping (sound no-op)");
-        return 0;
+        return report;
     };
     // Since #critical-alpha-deadline, both CUDA and wgpu expose a method-specific,
     // cooperatively cancellable joint adjoint. Keep finite-slice ascent enabled
@@ -15695,9 +15708,9 @@ fn root_tighten_relu_preactivations_with_options(
         gpu.provides_deadline_bounded_joint_alpha_gradient_resident(),
         deadline_ascent,
     );
+    report.effective_iters = iters;
     let past_deadline = || deadline.is_some_and(|d| Instant::now() >= d);
 
-    let mut n_tightened = 0usize;
     for (target, prepared) in targets {
         if past_deadline() {
             break;
@@ -15716,6 +15729,7 @@ fn root_tighten_relu_preactivations_with_options(
         let mut sel: Vec<usize> = (0..pre_dim)
             .filter(|&j| ref_l[j] < 0.0 && ref_u[j] > 0.0)
             .collect();
+        let crossing_rows = sel.len();
         sel.sort_by(|&a, &b| {
             let wa = ref_u[a] - ref_l[a];
             let wb = ref_u[b] - ref_l[b];
@@ -15753,7 +15767,7 @@ fn root_tighten_relu_preactivations_with_options(
         // the env set).
         // frozen-stop IMPLIES pure-chain: a truncated discriminator stack has no
         // residual Add, so without [Chain(..)] the stop lane could never fire.
-        let allow_pure_chain = frozen_stop || allow_pure_chain;
+        let effective_allow_pure_chain = frozen_stop || allow_pure_chain;
         let prep = prepared_or_extract(prepared, || {
             let Some(prep) = prep_resnet_domain_ext(
                 graph,
@@ -15762,7 +15776,7 @@ fn root_tighten_relu_preactivations_with_options(
                 input,
                 None,
                 None,
-                allow_pure_chain,
+                effective_allow_pure_chain,
                 allow_bn,
                 frozen_stop,
             ) else {
@@ -15968,6 +15982,24 @@ fn root_tighten_relu_preactivations_with_options(
 
         // Base sound fold = the ascent's starting enclosure (and best-so-far).
         let mut work_segs = prep.segments.clone();
+        let consumed_rows = root_joint_note_selected_rows(&mut report, crossing_rows, max_sel);
+        debug_assert_eq!(consumed_rows, n_rows);
+        let is_pure_chain = prep
+            .segments
+            .iter()
+            .all(|segment| matches!(segment, ny_core::GpuResnetSegment::Chain(_)));
+        root_joint_note_prep_usage(
+            &mut report,
+            frozen_stop,
+            allow_pure_chain,
+            allow_bn,
+            prep.stop_node.is_some(),
+            is_pure_chain,
+            prep.bn_layers_extracted,
+        );
+        // Count the target immediately before dispatch: preparation/refusal is
+        // not backend work, while an errored fold is still an honest attempt.
+        report.target_attempts += 1;
         let base_fold_result = match sound_fold(&work_segs) {
             Ok(result) => Ok(result),
             Err(error) => {
@@ -15993,6 +16025,7 @@ fn root_tighten_relu_preactivations_with_options(
                 continue;
             }
         };
+        report.base_folds_completed += 1;
         let mut best_l = base.lower_bounds.clone();
         let mut best_u = base.upper_bounds.clone();
         let obj0: f32 = best_l.iter().filter(|v| v.is_finite()).sum();
@@ -16001,11 +16034,19 @@ fn root_tighten_relu_preactivations_with_options(
         // Joint Adam ascent on the below-L α (summed lower objective).
         let mut slopes = base_slopes.clone();
         let mut adam = AlphaAdam::new(&base_slopes);
+        let mut target_ascent_iterations_attempted = 0usize;
         for t in 1..=iters {
             if past_deadline() {
                 break;
             }
             write_alpha_prime(&mut work_segs, &slopes, &stepped);
+            // This is the exact boundary at which a live ascent iteration
+            // becomes backend work. Rejected gradients still count as attempts.
+            report.ascent_iterations_attempted += 1;
+            target_ascent_iterations_attempted += 1;
+            report.max_ascent_iterations_attempted = report
+                .max_ascent_iterations_attempted
+                .max(target_ascent_iterations_attempted);
             let gradient_result = match deadline {
                 Some(deadline) => gpu.crown_joint_alpha_gradient_resident_with_deadline(
                     &work_segs,
@@ -16031,6 +16072,9 @@ fn root_tighten_relu_preactivations_with_options(
             };
             let lr_t = lr * 0.98f32.powi((t - 1) as i32);
             let max_g = adam.step(&mut slopes, &grads, &stepped, lr_t, t);
+            // Adam has consumed the configured learning rate even when its
+            // accepted gradient is zero and causes the early-stop below.
+            report.optimizer_steps += 1;
             if max_g == 0.0 || !max_g.is_finite() {
                 break;
             }
@@ -16039,6 +16083,7 @@ fn root_tighten_relu_preactivations_with_options(
                 Some(result) => result,
                 None => break,
             };
+            report.ascent_folds_completed += 1;
             // Element-wise best across iterates: each fold is a valid enclosure,
             // so per-element max-l / min-u is a valid enclosure (intersection).
             let mut obj_t = 0.0f32;
@@ -16134,10 +16179,10 @@ fn root_tighten_relu_preactivations_with_options(
             break;
         }
         if strictly_tightened {
-            n_tightened += 1;
+            report.tightened_count += 1;
         }
     }
-    n_tightened
+    report
 }
 
 /// Scoped target pre-activation (seed) node names for the root JOINT interm-α
@@ -16209,10 +16254,14 @@ pub(in crate::beta_crown::engine::graph) fn scoped_joint_alpha_targets_demand_ra
 
 /// Resolve the shared explicit max-dimension override, retaining each
 /// selector's own contextual fallback when the override is absent or rejected.
+///
+/// DELIVERY SEAM (#lever-reachability): `NY_ROOT_JOINT_INTERM_ALPHA_MAX_DIM`
+/// still wins in BOTH directions where present; absent, the typed
+/// `bab.root_joint_interm_alpha_max_dim` key decides; absent from both, each
+/// selector keeps its own contextual default, which is why this declaration is
+/// `DefaultSpec::Unset` rather than carrying one of the two numbers.
 fn root_joint_interm_alpha_max_dim(contextual_default: usize) -> usize {
-    ny_levers::read(&ny_levers::decls::collection::ROOT_JOINT_INTERM_ALPHA_MAX_DIM)
-        .value
-        .as_u64()
+    crate::preset_gates::root_joint_interm_alpha_max_dim_override()
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or(contextual_default)
 }
@@ -16246,9 +16295,8 @@ fn joint_alpha_candidates_in_exec_order(
         return Vec::new();
     };
     let order: Vec<String> = order.to_vec();
-    let layers_env = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_LAYERS")
-        .ok()
-        .map(|s| s.trim().to_string())
+    let layers_env = crate::preset_gates::root_joint_interm_alpha_layers()
+        .map(|value| value.trim().to_owned())
         .unwrap_or_default();
     let select_all = layers_env.is_empty() || layers_env.eq_ignore_ascii_case("all");
     let explicit: std::collections::HashSet<String> = if select_all {

@@ -439,11 +439,26 @@ impl LinearLayer {
 
     /// Deadline-aware CROWN backward propagation (#4321).
     ///
-    /// When a deadline is present, the dense `A @ W` work uses a pollable CPU
-    /// implementation and never enters a generic or process-global GEMM engine,
-    /// whose API has no cancellation contract. A wide classifier-head GEMM is
-    /// otherwise the single longest uninterrupted op on the spec-matrix root
-    /// output-bound path and can overrun the verifier timeout.
+    /// ROUTING (#pollable-faer status, 2026-08-19). When a deadline is
+    /// present, the dense `A @ W` + `|A|·|W|` pair runs on the pollable
+    /// row-block-chunked faer host path
+    /// (`crown_single::aw_f64_with_abssum_cpu_deadline`, restored by
+    /// a79a42d1 after the 6f49a660 scalar-per-MAC regression), polled between
+    /// blocks; sufficiently large products may enter the process-global sound
+    /// f64 engine ONLY through its explicit bounded
+    /// [`ny_core::GemmEngine::gemm_f64_with_deadline`] contract. The ordinary
+    /// (cancellation-free) engine methods are never entered under finite
+    /// authority, and the historical scalar per-MAC loop survives only as the
+    /// over-quantum / scratch-ceiling / `NY_NAIVE_F64_AW` fallback. A wide
+    /// classifier-head GEMM is otherwise the single longest uninterrupted op
+    /// on the spec-matrix root output-bound path and can overrun the verifier
+    /// timeout.
+    ///
+    /// The batched (N-D) sibling's bounded-host lane is `crown_batched.rs`'s
+    /// #pollable-faer arm (`NY_POLLABLE_FAER=1`, default OFF), which converts
+    /// the historical "no pollable host implementation" refusal into the same
+    /// chunked-faer discipline — bit-identical bounds, polls between blocks.
+    ///
     /// Returns [`ny_core::NyError::DeadlineExceeded`] once the deadline passes,
     /// which the graph-CROWN dispatch degrades to a sound per-node IBP fallback.
     #[inline]
@@ -456,6 +471,23 @@ impl LinearLayer {
         crown_single::propagate_linear_with_engine_and_deadline(self, bounds, engine, deadline)
     }
 
+    /// Deadline-PRESENCE-independent CROWN backward (`#deadline-parity`).
+    ///
+    /// Publishes the SAME certified f64 bound whether or not a deadline is
+    /// supplied, polling only when one is present. Use this wherever a bound
+    /// must not depend on the mere existence of a deadline — see
+    /// [`crown_single::propagate_linear_pollable_cpu`] for why
+    /// [`Self::propagate_linear_with_engine_and_deadline`] is not that.
+    #[inline]
+    pub(crate) fn propagate_linear_pollable_cpu<'a>(
+        &self,
+        bounds: &'a LinearBounds,
+        engine: Option<&dyn GemmEngine>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Cow<'a, LinearBounds>> {
+        crown_single::propagate_linear_pollable_cpu(self, bounds, engine, deadline)
+    }
+
     /// Batched CROWN backward propagation through linear layer (N-D batch dims).
     #[inline]
     pub fn propagate_linear_batched(
@@ -465,6 +497,15 @@ impl LinearLayer {
         crown_batched::propagate_linear_batched(self, bounds)
     }
 
+    /// Batched CROWN backward with an optional GEMM engine.
+    ///
+    /// A bounded host facade (an engine with
+    /// [`ny_core::GemmEngine::forbids_unbounded_cpu_fallback`], i.e. finite
+    /// deadline authority) historically got an unconditional refusal here.
+    /// With `NY_POLLABLE_FAER=1` it instead runs the #pollable-faer host
+    /// implementation: the identical certified f64 computation, row-block
+    /// chunked with the facade's deadline polled between blocks
+    /// (see `crown_batched.rs`).
     pub(crate) fn propagate_linear_batched_maybe_engine(
         &self,
         bounds: &BatchedLinearBounds,

@@ -776,7 +776,14 @@ fn deadline_aw_faer_rows_per_chunk(k: usize, p: usize, chunk_macs: usize) -> Opt
     Some(accepted)
 }
 
-/// Pollable CPU-only `A·W` + `|A|·|W|` for deadline-scoped replay work.
+/// Deadline-presence-independent, pollable CPU-only `A·W` + `|A|·|W|`.
+///
+/// The shape, scratch ceiling and `NY_NAIVE_F64_AW` kill-switch alone choose
+/// between row-chunked faer and the scalar fallback. `deadline` controls only
+/// the polls surrounding that same arithmetic. In particular this helper never
+/// consults the process-global sound-f64 engine, whose ordinary and bounded
+/// methods are both certified but are not required to use the same reduction
+/// order.
 ///
 /// # Rounding discipline + certificate (#cgan-row7-h4, b90a9fbf mirror)
 ///
@@ -801,13 +808,11 @@ fn deadline_aw_faer_rows_per_chunk(k: usize, p: usize, chunk_macs: usize) -> Opt
 ///   `mat_mul_f64` call (chunking splits only the output row axis), so no
 ///   extra cross-call partial-sum roundings are introduced.
 ///
-/// When the whole product fits one chunk (every sub-threshold Linear CROWN
-/// shape in practice), the operands and the single `mat_mul_f64` pair are
-/// IDENTICAL to the no-deadline faer twin's, so the deadline arm is
-/// BIT-IDENTICAL to it — the same convergence property b90a9fbf pinned for
-/// the ConvTranspose lanes. Multi-chunk results may differ bitwise from the
-/// single-call twin (faer may block differently per shape); the enclosure is
-/// certified either way by order-independence.
+/// Both deadline arms dispatch the IDENTICAL row chunks, so the reducer is
+/// bit-identical by construction. The chunked result is also empirically
+/// bit-identical to the historical one-call faer twin; that stronger row-count
+/// independence property is pinned separately by
+/// `pollable_chunked_aw_matches_unchunked_faer_bitwise`.
 ///
 /// The audit contract stays closed: `mat_mul_f64` is the plain faer CPU
 /// kernel (never the process-global engine; `current_par()` forces `Par::Seq`
@@ -816,14 +821,14 @@ fn deadline_aw_faer_rows_per_chunk(k: usize, p: usize, chunk_macs: usize) -> Opt
 /// and between the two GEMMs of a chunk. Shapes whose single-row dispatch
 /// `k·p` exceeds the quantum — where chunking cannot bound the stretch —
 /// fall back to the historical per-MAC scalar loop
-/// ([`aw_f64_with_abssum_cpu_deadline_scalar`]), as does the
+/// ([`aw_f64_with_abssum_cpu_pollable_scalar`]), as does the
 /// `NY_NAIVE_F64_AW` parity kill-switch.
-fn aw_f64_with_abssum_cpu_deadline(
+fn aw_f64_with_abssum_pollable_cpu(
     a_block: &Mat<f32>,
     w: &Mat<f32>,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
-    aw_f64_with_abssum_cpu_deadline_with_chunk_macs(
+    aw_f64_with_abssum_pollable_cpu_with_chunk_macs(
         a_block,
         w,
         deadline,
@@ -831,17 +836,85 @@ fn aw_f64_with_abssum_cpu_deadline(
     )
 }
 
+fn aw_f64_with_abssum_cpu_deadline(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Instant,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    aw_f64_with_abssum_pollable_cpu(a_block, w, Some(deadline))
+}
+
 /// Testable core of [`aw_f64_with_abssum_cpu_deadline`]. Production always
 /// passes [`DEADLINE_AW_FAER_CHUNK_MACS`]; tests pass a tiny quantum to force
 /// one row per chunk and pin the BETWEEN-chunk typed-deadline abort (the
 /// `ops_gemm.rs` between-blocks pattern).
+#[cfg(test)]
 fn aw_f64_with_abssum_cpu_deadline_with_chunk_macs(
     a_block: &Mat<f32>,
     w: &Mat<f32>,
     deadline: Instant,
     chunk_macs: usize,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
-    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    aw_f64_with_abssum_pollable_cpu_with_chunk_macs(a_block, w, Some(deadline), chunk_macs)
+}
+
+fn aw_f64_with_abssum_pollable_cpu_with_chunk_macs(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Option<Instant>,
+    chunk_macs: usize,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    let mut poll = || check_optional_aw_deadline(deadline, "during certified f64 A·W");
+    match aw_f64_with_abssum_chunked_poll(a_block, w, chunk_macs, &mut poll)? {
+        Some((a64, s, _blocks)) => Ok((a64, s)),
+        // Over-quantum / degenerate / kill-switch shapes: chunking cannot bound
+        // the non-pollable stretch, so the historical per-MAC scalar loop
+        // remains the only pollable form (byte-identical fallback order).
+        None => aw_f64_with_abssum_cpu_pollable_scalar(a_block, w, deadline),
+    }
+}
+
+/// Poll-closure core of the row-block-chunked certified f64 `A·W` + `|A|·|W|`
+/// pair (#pollable-faer). This is [`aw_f64_with_abssum_cpu_deadline`]'s body
+/// with the wall-clock observation abstracted into `poll`, so callers whose
+/// deadline authority is a cooperative seam rather than an `Instant` — the
+/// bounded host facade's [`ny_core::GemmEngine::poll_crown_backward_deadline`]
+/// on the batched Linear lane (`crown_batched.rs`) — can run the SAME audited
+/// chunked-faer discipline instead of a scalar per-MAC loop or a refusal.
+///
+/// Returns `Ok(None)` when the shape cannot be chunk-bounded: a single row's
+/// `k·p` exceeds `chunk_macs` (a full contraction cannot be split across
+/// calls), degenerate shapes, the faer scratch ceiling
+/// ([`DEADLINE_AW_FAER_MAX_SCRATCH_BYTES`]), or the `NY_NAIVE_F64_AW` parity
+/// kill-switch. The caller owns that fallback (Instant callers: the historical
+/// scalar loop; the bounded batched lane: the historical refusal).
+///
+/// On success returns `(a64, s, blocks)` where `blocks` is the number of row
+/// blocks dispatched (telemetry only).
+///
+/// BIT-IDENTITY: chunking splits ONLY the output row axis; every row's full
+/// `k` contraction stays inside one `mat_mul_f64` call, and faer's blocked f64
+/// GEMM computes each output element `(i,j)` by the same `k`-reduction
+/// sequence regardless of the call's row count — the row-count independence
+/// already empirically pinned for `aw_batched_f64_with_abssum`
+/// (`aw_batched_matches_per_domain_bit_for_bit`, 0/1.87M element mismatches
+/// under both `Par::Seq` and `Par::rayon`). So the chunked result is
+/// bit-identical to the single-call faer arm of [`aw_f64_with_abssum`],
+/// pinned again for this entry by
+/// `pollable_chunked_aw_matches_unchunked_faer_bitwise`. The certificate
+/// `γ_k·S` (Higham) is summation-order independent either way, so soundness
+/// never depends on this identity.
+///
+/// On a poll error mid-GEMM the typed error propagates unchanged and no
+/// partial result is published — the same contract as the scalar per-MAC
+/// paths.
+pub(crate) fn aw_f64_with_abssum_chunked_poll(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    chunk_macs: usize,
+    poll: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<(Array2<f64>, Array2<f64>, usize)>> {
+    poll()?;
     let m = a_block.nrows();
     let k = a_block.ncols();
     let p = w.ncols();
@@ -854,33 +927,33 @@ fn aw_f64_with_abssum_cpu_deadline_with_chunk_macs(
 
     // A single row's dispatch is `k·p` MACs and must stay whole (full-`k`
     // contraction per call); if even that exceeds the quantum, chunking cannot
-    // bound the non-pollable stretch and the scalar per-MAC loop remains the
-    // only pollable form. Degenerate shapes and the parity kill-switch take
-    // the same historical path.
+    // bound the non-pollable stretch. Degenerate shapes and the parity
+    // kill-switch decline the same way.
     let Some(rows_per_chunk) = deadline_aw_faer_rows_per_chunk(k, p, chunk_macs) else {
-        return aw_f64_with_abssum_cpu_deadline_scalar(a_block, w, deadline);
+        return Ok(None);
     };
     if use_naive_f64_aw() {
-        return aw_f64_with_abssum_cpu_deadline_scalar(a_block, w, deadline);
+        return Ok(None);
     }
 
     // Widen W (and |W|) once — exact conversions, O(k·p) ≤ one quantum of
     // work per matrix, with a poll after each.
     let w_f = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]));
-    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    poll()?;
     let w_abs = Mat::<f64>::from_fn(k, p, |i, j| f32_to_f64_exact(w[(i, j)]).abs());
-    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    poll()?;
 
     let mut a64 = Array2::<f64>::zeros((m, p));
     let mut s = Array2::<f64>::zeros((m, p));
     // Large zero-fills may themselves consume the remaining budget.
-    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    poll()?;
 
+    let mut blocks = 0usize;
     let mut row_start = 0usize;
     while row_start < m {
         let row_end = row_start.saturating_add(rows_per_chunk).min(m);
         let rows = row_end - row_start;
-        check_aw_deadline(deadline, "during certified f64 A·W")?;
+        poll()?;
         let a_f = Mat::<f64>::from_fn(rows, k, |i, j| {
             f32_to_f64_exact(a_block[(row_start + i, j)])
         });
@@ -888,19 +961,20 @@ fn aw_f64_with_abssum_cpu_deadline_with_chunk_macs(
             f32_to_f64_exact(a_block[(row_start + i, j)]).abs()
         });
         let c = mat_mul_f64(&a_f, &w_f);
-        check_aw_deadline(deadline, "during certified f64 A·W")?;
+        poll()?;
         let s_mat = mat_mul_f64(&a_abs, &w_abs);
-        check_aw_deadline(deadline, "during certified f64 A·W")?;
+        poll()?;
         for i in 0..rows {
             for j in 0..p {
                 a64[[row_start + i, j]] = c[(i, j)];
                 s[[row_start + i, j]] = s_mat[(i, j)];
             }
         }
+        blocks += 1;
         row_start = row_end;
     }
-    check_aw_deadline(deadline, "during certified f64 A·W")?;
-    Ok((a64, s))
+    poll()?;
+    Ok(Some((a64, s, blocks)))
 }
 
 /// Historical scalar per-MAC pollable loop, byte-identical to the 6f49a660
@@ -912,15 +986,31 @@ fn aw_f64_with_abssum_cpu_deadline_with_chunk_macs(
 /// `j` traversal only inserts deadline checks and therefore leaves every
 /// per-entry f64 reduction sequence unchanged. Each product is exact after
 /// f32→f64 widening, and the caller's existing `γ_k·S` enclosure remains valid.
+#[cfg(test)]
 fn aw_f64_with_abssum_cpu_deadline_scalar(
     a_block: &Mat<f32>,
     w: &Mat<f32>,
     deadline: Instant,
 ) -> Result<(Array2<f64>, Array2<f64>)> {
+    aw_f64_with_abssum_cpu_pollable_scalar(a_block, w, Some(deadline))
+}
+
+fn check_optional_aw_deadline(deadline: Option<Instant>, phase: &'static str) -> Result<()> {
+    match deadline {
+        Some(deadline) => check_aw_deadline(deadline, phase),
+        None => Ok(()),
+    }
+}
+
+fn aw_f64_with_abssum_cpu_pollable_scalar(
+    a_block: &Mat<f32>,
+    w: &Mat<f32>,
+    deadline: Option<Instant>,
+) -> Result<(Array2<f64>, Array2<f64>)> {
     const DEADLINE_POLL_MACS: usize = 1 << 12;
     const DEADLINE_POLL_SKIPPED_K: usize = 1 << 12;
 
-    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
     let m = a_block.nrows();
     let k = a_block.ncols();
     let p = w.ncols();
@@ -934,7 +1024,7 @@ fn aw_f64_with_abssum_cpu_deadline_scalar(
     let mut a64 = Array2::<f64>::zeros((m, p));
     let mut s = Array2::<f64>::zeros((m, p));
     // Large zero-fills may themselves consume the remaining budget.
-    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
 
     let a64_buf = a64
         .as_slice_mut()
@@ -944,7 +1034,7 @@ fn aw_f64_with_abssum_cpu_deadline_scalar(
         .expect("s is freshly allocated row-major contiguous");
     let mut skipped_k_since_poll = 0usize;
     for i in 0..m {
-        check_aw_deadline(deadline, "during certified f64 A·W")?;
+        check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
         let a64_row = &mut a64_buf[i * p..i * p + p];
         let s_row = &mut s_buf[i * p..i * p + p];
         for kk in 0..k {
@@ -952,7 +1042,7 @@ fn aw_f64_with_abssum_cpu_deadline_scalar(
             if av == 0.0 || p == 0 {
                 skipped_k_since_poll += 1;
                 if skipped_k_since_poll >= DEADLINE_POLL_SKIPPED_K {
-                    check_aw_deadline(deadline, "during certified f64 A·W")?;
+                    check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
                     skipped_k_since_poll = 0;
                 }
                 continue;
@@ -967,12 +1057,12 @@ fn aw_f64_with_abssum_cpu_deadline_scalar(
                     a64_row[j] += av * wv;
                     s_row[j] += av_abs * wv.abs();
                 }
-                check_aw_deadline(deadline, "during certified f64 A·W")?;
+                check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
                 j_start = j_end;
             }
         }
     }
-    check_aw_deadline(deadline, "during certified f64 A·W")?;
+    check_optional_aw_deadline(deadline, "during certified f64 A·W")?;
     Ok((a64, s))
 }
 
@@ -2035,12 +2125,7 @@ fn propagate_linear_cpu_with_deadline<'a>(
             if allow_global_f64_engine {
                 aw_f64_with_abssum_and_deadline(&stacked, layer.weight_faer(), deadline)?
             } else {
-                let deadline = deadline.ok_or_else(|| {
-                    NyError::UnsupportedOp(
-                        "bounded Linear CROWN requires a finite host deadline".into(),
-                    )
-                })?;
-                aw_f64_with_abssum_cpu_deadline(&stacked, layer.weight_faer(), deadline)?
+                aw_f64_with_abssum_pollable_cpu(&stacked, layer.weight_faer(), deadline)?
             }
         };
 
@@ -2311,6 +2396,68 @@ pub(crate) fn propagate_linear_with_engine_and_deadline<'a>(
     }
     let result = propagate_linear_cpu_with_deadline(layer, bounds, Some(d), !bounded_host_engine)?;
     if Instant::now() >= d {
+        return Err(NyError::DeadlineExceeded(
+            "Linear CROWN backward: deadline exceeded before returning pollable CPU result"
+                .to_string(),
+        ));
+    }
+    Ok(result)
+}
+
+/// Deadline-PRESENCE-independent CROWN backward through a Linear layer
+/// (`#deadline-parity`).
+///
+/// Identical to [`propagate_linear_with_engine_and_deadline`] in every capability
+/// check, but the choice of ARITHMETIC does not depend on whether a deadline
+/// exists: this always runs the certified f64 CPU contraction, polling only when
+/// a deadline is present.
+///
+/// # Why this entry point exists
+///
+/// [`propagate_linear_with_engine_and_deadline`] routes `deadline == None` to the
+/// engine f32 GEMM ([`propagate_linear_via_gemm`]) and `deadline == Some(..)` to
+/// the certified f64 CPU path. Those two arms publish DIFFERENT numbers: the f32
+/// arm's stored coefficient is the engine's round-to-nearest f32 product and its
+/// certified error is `γ_n^{f32}·S`, while the f64 arm's is the f64 contraction
+/// with `γ_n^{f64}·S` — roughly `2^29` tighter.
+///
+/// That is the `deadline`-PRESENCE degradation class: every scored run carries a
+/// deadline and no test does, so the two arms are split exactly along the
+/// competition/test boundary and no test can see the difference. Callers that
+/// must publish the same bound either way use THIS entry point, and the
+/// `#deadline-parity` guard
+/// (`beta_crown/engine/graph/propagation/batched/tests_deadline_parity.rs`)
+/// asserts bit-identity across the two arms.
+pub(crate) fn propagate_linear_pollable_cpu<'a>(
+    layer: &LinearLayer,
+    bounds: &'a LinearBounds,
+    engine: Option<&dyn GemmEngine>,
+    deadline: Option<Instant>,
+) -> Result<Cow<'a, LinearBounds>> {
+    let bounded_marker = engine.is_some_and(|engine| engine.forbids_unbounded_cpu_fallback());
+    let bounded_host_engine = bounded_marker
+        && engine.is_some_and(|engine| engine.provides_deadline_pollable_host_gemm());
+    if bounded_marker && !bounded_host_engine {
+        return Err(NyError::UnsupportedOp(
+            "bounded Linear CROWN requires a pollable capped host engine".into(),
+        ));
+    }
+    if bounded_host_engine && deadline.is_none() {
+        return Err(NyError::UnsupportedOp(
+            "bounded Linear CROWN requires an explicit finite deadline".into(),
+        ));
+    }
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(NyError::DeadlineExceeded(
+            "Linear CROWN backward: deadline exceeded before pollable CPU propagation".to_string(),
+        ));
+    }
+    // Exact `#deadline-parity` requires more than choosing certified f64 on
+    // both sides: the process-global engine's ordinary and bounded methods may
+    // use different valid reduction orders. Force the dedicated CPU reducer in
+    // BOTH arms; `deadline` then changes polling/refusal only.
+    let result = propagate_linear_cpu_with_deadline(layer, bounds, deadline, false)?;
+    if deadline.is_some_and(|d| Instant::now() >= d) {
         return Err(NyError::DeadlineExceeded(
             "Linear CROWN backward: deadline exceeded before returning pollable CPU result"
                 .to_string(),
@@ -3011,15 +3158,16 @@ mod faer_f64_aw_tests {
     use super::{
         aw_f64_with_abssum, aw_f64_with_abssum_and_deadline,
         aw_f64_with_abssum_cpu_deadline_scalar, aw_f64_with_abssum_deadline_via_engine_or_cpu,
-        aw_via_engine_deadline, deadline_f64_accelerator_eligible, f32_to_f64_exact, gamma_n_f64,
-        incoming_error_product, incoming_error_product_deadline, incoming_error_product_gemm,
-        incoming_error_product_with_poll_quantum, next_up_nonnegative_f64,
-        DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS, INCOMING_ERROR_POLL_MACS,
-        SOUND_F64_GEMM_MIN_MACS,
+        aw_via_engine_deadline, deadline_aw_faer_rows_per_chunk, deadline_f64_accelerator_eligible,
+        f32_to_f64_exact, gamma_n_f64, incoming_error_product, incoming_error_product_deadline,
+        incoming_error_product_gemm, incoming_error_product_with_poll_quantum,
+        next_up_nonnegative_f64, propagate_linear_pollable_cpu, LinearBounds, LinearLayer,
+        DEADLINE_AW_FAER_CHUNK_MACS, DEADLINE_F64_ACCELERATOR_MAX_DISPATCH_MACS,
+        INCOMING_ERROR_POLL_MACS, SOUND_F64_GEMM_MIN_MACS,
     };
     use faer::Mat;
-    use ndarray::{arr2, Array2};
-    use ny_core::{GemmEngine, NyError, Result};
+    use ndarray::{arr2, Array1, Array2};
+    use ny_core::{GemmEngine, NaiveCpuGemmEngine, NyError, Result};
     use ny_tensor::next_up_f32;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -3283,6 +3431,98 @@ mod faer_f64_aw_tests {
             1,
             SOUND_F64_GEMM_MIN_MACS
         ));
+    }
+
+    fn bounds_fingerprint(bounds: &LinearBounds) -> Vec<u32> {
+        let mut bits = Vec::new();
+        bits.extend(bounds.lower_a().iter().map(|value| value.to_bits()));
+        bits.extend(bounds.lower_b().iter().map(|value| value.to_bits()));
+        bits.extend(bounds.upper_a().iter().map(|value| value.to_bits()));
+        bits.extend(bounds.upper_b().iter().map(|value| value.to_bits()));
+        for error in [bounds.lower_a_err(), bounds.upper_a_err()] {
+            match error {
+                Some(error) => {
+                    bits.push(1);
+                    bits.extend(error.iter().map(|value| value.to_bits()));
+                }
+                None => bits.push(0),
+            }
+        }
+        bits
+    }
+
+    /// Production boundary for `#deadline-parity`: with a 512x512 weight, the
+    /// stacked lower+upper product is below both the historical global-engine
+    /// threshold and the row-chunk quantum at 31 objectives, but above both at
+    /// 33 objectives (66 rows => two 64-row chunks). The parity entry must
+    /// publish identical bits on both sides and must not consult the global
+    /// engine even when its old admission predicate becomes true.
+    #[ntest::timeout(120_000)]
+    #[test]
+    fn pollable_cpu_parity_brackets_engine_and_chunk_boundary() {
+        const WIDTH: usize = 512;
+        let _accessor_lock = crate::sound_f64_gemm::accessor_counter_test_lock();
+        crate::sound_f64_gemm::reset_cpu_only_global_accessor_attempts();
+        let _cpu_only = crate::sound_f64_gemm::CpuOnlyF64Guard::new();
+
+        let mut rng = SplitMix64(0xD3AD_11E0_2026_0824);
+        let weight = Array2::from_shape_fn((WIDTH, WIDTH), |_| rng.signed(1.5));
+        let bias = Array1::from_shape_fn(WIDTH, |_| rng.signed(0.5));
+        let layer = LinearLayer::new(weight, Some(bias)).expect("square threshold fixture");
+
+        assert_eq!(
+            deadline_aw_faer_rows_per_chunk(WIDTH, WIDTH, DEADLINE_AW_FAER_CHUNK_MACS),
+            Some(64),
+            "512x512 must use the production 64-row chunk boundary"
+        );
+
+        for objectives in [31usize, 33usize] {
+            let stacked_rows = 2 * objectives;
+            let above_engine_floor = objectives == 33;
+            assert_eq!(
+                deadline_f64_accelerator_eligible(stacked_rows, WIDTH, WIDTH),
+                above_engine_floor,
+                "fixture must bracket the historical global-engine boundary"
+            );
+            assert_eq!(
+                stacked_rows.div_ceil(64),
+                if above_engine_floor { 2 } else { 1 },
+                "fixture must bracket the production row-chunk boundary"
+            );
+
+            let bounds = LinearBounds::new(
+                Array2::from_shape_fn((objectives, WIDTH), |_| rng.signed(2.0)),
+                Array1::from_shape_fn(objectives, |_| rng.signed(0.25)),
+                Array2::from_shape_fn((objectives, WIDTH), |_| rng.signed(2.0)),
+                Array1::from_shape_fn(objectives, |_| rng.signed(0.25)),
+            )
+            .expect("threshold LinearBounds fixture");
+
+            let without =
+                propagate_linear_pollable_cpu(&layer, &bounds, Some(&NaiveCpuGemmEngine), None)
+                    .expect("no-deadline parity arm")
+                    .into_owned();
+            let with = propagate_linear_pollable_cpu(
+                &layer,
+                &bounds,
+                Some(&NaiveCpuGemmEngine),
+                Some(Instant::now() + Duration::from_mins(2)),
+            )
+            .expect("live-deadline parity arm")
+            .into_owned();
+
+            assert_eq!(
+                bounds_fingerprint(&without),
+                bounds_fingerprint(&with),
+                "deadline presence changed published bits at {objectives} objectives"
+            );
+        }
+
+        assert_eq!(
+            crate::sound_f64_gemm::cpu_only_global_accessor_attempts(),
+            0,
+            "the parity entry consulted the process-global engine"
+        );
     }
 
     #[test]

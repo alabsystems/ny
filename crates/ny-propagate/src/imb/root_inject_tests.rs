@@ -9,6 +9,7 @@ use super::super::{
 use super::{
     anchor_cache_key, authoritative_candidate_lower, ay_region_selector_envelope_from_frontiers,
     batched_replay_gate, bounded_tail_pq_samples, build_replay_phase_census,
+    build_subgraph_to_node, build_tail,
     certified_regional_relu_bounds, certify_ay_region_affine_reachability_partition_with,
     certify_ay_region_global_composition, certify_ay_region_partition_with,
     certify_ay_region_reachability_partition_with, certify_ay_region_selector_root_with,
@@ -139,6 +140,24 @@ fn relu_valley_graph() -> GraphNetwork {
     ));
     graph.set_output("out");
     graph
+}
+
+#[test]
+fn imb_derived_graphs_retain_frozen_authority() {
+    let frozen = Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |_| None));
+    let mut graph = relu_valley_graph();
+    graph.set_frozen_levers(Some(Arc::clone(&frozen)));
+
+    let prefix = build_subgraph_to_node(&graph, "relu").expect("valid IMB prefix");
+    let tail = build_tail(&graph, "relu").expect("valid IMB tail");
+    for derived in [&prefix, &tail] {
+        assert!(Arc::ptr_eq(
+            derived
+                .frozen_levers()
+                .expect("derived graph retains authority"),
+            &frozen,
+        ));
+    }
 }
 
 fn constant_convtranspose_graph() -> GraphNetwork {

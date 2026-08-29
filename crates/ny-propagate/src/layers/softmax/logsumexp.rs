@@ -57,7 +57,32 @@ impl LogSumExpLayer {
         let max_expanded = max_vals.clone().insert_axis(Axis(axis));
         // f64 accumulation for exp and sum_axis to prevent precision loss
         // for large reduction axes (seq_len=512+). Part of #2423.
-        let exp_shifted_f64 = (&values - &max_expanded).mapv(|x| (x as f64).exp());
+        //
+        // Limit-correct shift at ±inf (dc9da0fde class): a plain `x - m`
+        // yields inf - inf = NaN exactly on the element that ATTAINS an
+        // infinite max (and on every element of an all-(-inf) slice, where
+        // m = -inf). Pinning `x == m` to a shift of 0 is exact for finite
+        // values (x - x = 0) and gives each max-attaining element its true
+        // limit contribution exp(0) = 1, so sum >= 1 and:
+        //   m = +inf  →  +inf + ln(sum)  =  +inf   (LSE(.., +inf, ..) = +inf)
+        //   m = -inf  →  -inf + ln(n)    =  -inf   (LSE(-inf, .., -inf) = -inf)
+        //   m finite, x = -inf → shift -inf, exp 0 (exact, unchanged).
+        // NaN still propagates: NaN == m is false, NaN - m = NaN.
+        let max_broadcast = max_expanded.broadcast(values.raw_dim()).ok_or_else(|| {
+            NyError::InternalError(
+                "LogSumExp: max_expanded must broadcast to the input shape".to_string(),
+            )
+        })?;
+        let exp_shifted_f64 =
+            ndarray::Zip::from(&values)
+                .and(&max_broadcast)
+                .map_collect(|&x, &m| {
+                    if x == m {
+                        1.0_f64 // exp(0): the element attaining the max, exact at ±inf too
+                    } else {
+                        f64::from(x - m).exp()
+                    }
+                });
         let sum_exp_f64 = exp_shifted_f64.sum_axis(Axis(axis));
         let logsumexp = max_vals.mapv(|x| x as f64) + sum_exp_f64.mapv(|x| x.ln());
         // Directed rounding on f64→f32 cast: next_down for lower bounds,
@@ -75,11 +100,17 @@ impl BoundPropagation for LogSumExpLayer {
     /// IBP for LogSumExp: y = log(sum(exp(x))) over specified axes.
     ///
     /// LogSumExp is monotonically increasing in each argument, so IBP
-    /// applies logsumexp independently to lower and upper bounds.
+    /// applies logsumexp independently to lower and upper bounds — including
+    /// at the extended-real limits, which `logsumexp_reduce` maps exactly:
+    /// a +inf element makes the reduction +inf, an all-(-inf) slice reduces
+    /// to -inf, and a -inf element among finite ones contributes exp(-inf) =
+    /// 0. Only NaN input bounds fail closed.
     ///
     /// Category B per domain validation policy (designs/2026-02-07-domain-validation-policy.md):
-    /// logsumexp is defined for all finite inputs, but non-finite inputs indicate
-    /// upstream numerical issues that must be surfaced, not masked.
+    /// NaN carries no bound information and must be surfaced, not masked; a
+    /// ±inf endpoint is the conservative-bounds convention for "unbounded in
+    /// that direction" (deep-stack IBP overflow saturation, dc9da0fde class)
+    /// and propagates as the corresponding exact limit.
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         let ndim = input.shape().len();
@@ -89,14 +120,11 @@ impl BoundPropagation for LogSumExpLayer {
 
         let axes = self.resolve_axes(ndim)?;
 
-        // Guard: reject non-finite inputs (Category B strict mode).
-        // Non-finite bounds indicate upstream numerical issues — surfacing
-        // the error is more useful than returning maximally-loose [-inf, +inf].
-        if input.lower().iter().any(|&v| !v.is_finite())
-            || input.upper().iter().any(|&v| !v.is_finite())
-        {
+        // Guard: NaN input bounds fail closed (Category B strict mode). ±Inf
+        // is admitted and handled limit-exactly inside `logsumexp_reduce`.
+        if input.lower().iter().any(|&v| v.is_nan()) || input.upper().iter().any(|&v| v.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "LogSumExp IBP: non-finite input bounds".to_string(),
+                "LogSumExp IBP: NaN input bounds".to_string(),
             ));
         }
 
@@ -111,9 +139,12 @@ impl BoundPropagation for LogSumExpLayer {
             upper = Self::logsumexp_reduce(upper, axis, self.keepdims, next_up_f32)?;
         }
 
-        // Repair non-finite outputs: logsumexp_reduce can produce Inf from large
-        // finite inputs via exp() overflow. Clamp to FALLBACK_BOUND for consistency
-        // with the IBP overflow strategy (#3030, #3060).
+        // Conservative construction: ±Inf endpoints are preserved — both the
+        // exact ±inf limits from saturated inputs and Inf produced from large
+        // FINITE inputs via exp() overflow are sound conservative bounds
+        // (#3030, #3060). NaN cannot arise from the NaN-guarded input, and
+        // would still be repaired to the conservative direction here rather
+        // than silently kept.
         BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
     }
 
@@ -330,18 +361,42 @@ mod tests {
     }
 
     #[test]
-    fn test_ibp_non_finite_error() {
+    fn test_ibp_nan_error() {
+        let layer = LogSumExpLayer::new(vec![-1], false);
+        let input = BoundedTensor::new_unchecked(
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NAN, 1.0]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 2.0]).unwrap(),
+        )
+        .unwrap();
+        let err = layer.propagate_ibp(&input).expect_err("NaN fails closed");
+        assert!(matches!(err, NyError::NumericalInstability(_)));
+    }
+
+    /// A -inf endpoint among finite ones contributes exp(-inf) = 0 exactly
+    /// (dc9da0fde saturation class — supersedes the old non-finite refusal).
+    #[test]
+    fn test_ibp_neg_inf_among_finite_is_exact() {
         let layer = LogSumExpLayer::new(vec![-1], false);
         let input = BoundedTensor::new_unchecked(
             ArrayD::from_shape_vec(IxDyn(&[2]), vec![f32::NEG_INFINITY, 1.0]).unwrap(),
             ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 2.0]).unwrap(),
         )
         .unwrap();
-        let err = layer.propagate_ibp(&input).expect_err("non-finite");
-        assert!(matches!(err, NyError::NumericalInstability(_)));
+        let result = layer
+            .propagate_ibp(&input)
+            .expect("-inf among finite values must propagate");
+        // Lower: LSE(-inf, 1) = ln(e^1) = 1 exactly (up to directed rounding).
+        assert!(
+            (result.lower().iter().next().unwrap() - 1.0).abs() < 1e-5,
+            "LSE(-inf, 1) = 1, got {}",
+            result.lower().iter().next().unwrap()
+        );
     }
 
-    /// Regression for #2713: all-NEG_INFINITY must not produce NaN (guard catches it).
+    /// Regression for #2713, updated for the dc9da0fde saturation class:
+    /// all-NEG_INFINITY reduces to the exact -inf limit — sum(exp) = 0, so
+    /// LSE = -inf — and must NOT produce NaN (the failure #2713 guarded
+    /// against was -inf - -inf = NaN inside the max-shift).
     #[test]
     fn test_ibp_all_neg_infinity_no_nan_2713() {
         let layer = LogSumExpLayer::new(vec![-1], false);
@@ -350,9 +405,41 @@ mod tests {
             ArrayD::from_shape_vec(IxDyn(&[3]), vec![f32::NEG_INFINITY; 3]).unwrap(),
         )
         .unwrap();
-        // Input guard rejects non-finite before ln(sum_exp) can produce NaN.
-        let err = layer.propagate_ibp(&input).expect_err("non-finite guard");
-        assert!(matches!(err, NyError::NumericalInstability(_)));
+        let result = layer
+            .propagate_ibp(&input)
+            .expect("all -inf must propagate as the exact -inf limit");
+        for v in result.lower().iter().chain(result.upper().iter()) {
+            assert!(!v.is_nan(), "all -inf reduction must not produce NaN");
+            assert!(
+                v.is_infinite() && v.is_sign_negative(),
+                "LSE(-inf, ..., -inf) = -inf, got {v}"
+            );
+        }
+    }
+
+    /// A +inf endpoint dominates the reduction: LSE(.., +inf, ..) = +inf,
+    /// with no NaN from the inf - inf shift on the max-attaining element.
+    #[test]
+    fn test_ibp_pos_inf_dominates_reduction() {
+        let layer = LogSumExpLayer::new(vec![-1], false);
+        let input = BoundedTensor::new_unchecked(
+            ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.0, f32::NEG_INFINITY, 0.0]).unwrap(),
+            ArrayD::from_shape_vec(IxDyn(&[3]), vec![1.0, f32::INFINITY, 1.0]).unwrap(),
+        )
+        .unwrap();
+        let result = layer.propagate_ibp(&input).expect("+inf must propagate");
+        let upper = *result.upper().iter().next().unwrap();
+        assert!(
+            upper.is_infinite() && upper.is_sign_positive(),
+            "LSE with a +inf element is +inf, got {upper}"
+        );
+        let lower = *result.lower().iter().next().unwrap();
+        // Lower: LSE(0, -inf, 0) = ln(2) exactly (the -inf term drops out).
+        assert!(
+            (lower - (2.0f32).ln()).abs() < 1e-5,
+            "LSE(0, -inf, 0) = ln 2, got {lower}"
+        );
+        assert!(!lower.is_nan() && !upper.is_nan());
     }
 
     #[test]

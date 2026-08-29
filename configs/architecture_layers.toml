@@ -15,7 +15,20 @@
 
 [layers]
 # L0: Foundational contracts, types, traits, and errors
-L0 = ["ny-contracts", "ny-core", "ny-levers"]
+#
+# `ny-claims` is here because it depends on NOTHING internal — anyhow, clap,
+# serde, serde_json, sha2 and a dev-only tempfile — so at L0 it can never be a
+# downward violation and every layer may use it. It records executable
+# empirical claims (extractor + engagement witness + sensitivity set,
+# re-checkable against the artifacts they came from), which is a contract type.
+#
+# NOT sidecar, though it reads like one: `ny-cli` depends on it with a NORMAL
+# dependency (it ships as the `ny claims` subcommand), and the validator makes
+# a normal edge into a sidecar an error unless explicitly excepted — and this
+# file reserves exceptions for intentional UPWARD edges. Its own `[[bin]]`
+# exists as a fast path for hooks, not as evidence that it is out of the
+# runtime chain.
+L0 = ["ny-claims", "ny-contracts", "ny-core", "ny-levers"]
 
 # L1: Tensor representation
 L1 = ["ny-tensor"]

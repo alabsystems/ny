@@ -64,6 +64,22 @@ const SWEEP_MIN_ROWS_PER_TARGET: usize = 8;
 /// choose the useful starting row tier. The exact sweep planner remains the
 /// final capacity authority and may cleanly decline any whole request before
 /// allocation or dispatch.
+/// `NY_WIDE_PROBE` — the declared chokepoint for the `[wide]` diagnostic
+/// markers in these kernels.
+///
+/// Seven sites across this file and `crown_backward_sound_resident.rs` used to
+/// open-code `wide_probe_armed()`,
+/// which accepts the single spelling "1" and nothing else. Routing them through
+/// the declaration makes the switch answer consistently and takes seven raw
+/// reads off the lever ratchet -- the same migration NY_BETA_GPU_PROBE got.
+///
+/// Dark by default: disarmed, this is one env read returning false.
+pub(super) fn wide_probe_armed() -> bool {
+    ny_levers::read(&ny_levers::decls::telemetry::WIDE_PROBE)
+        .value
+        .as_bool()
+}
+
 fn automatic_intermediate_sweep_resource_policy(
     device_type: wgpu::DeviceType,
     max_buffer_size: u64,
@@ -102,14 +118,13 @@ fn automatic_intermediate_sweep_resource_policy(
     // SCALING LAW, which decides between one wide sweep and row-chunked
     // accumulation. Absent/malformed values leave the shipped class policy.
     let (class_bytes, class_rows) = match (
-        ny_levers::read(&ny_levers::decls::comprehensive_rows::SWEEP_CLASS_MIB)
-            .value
-            .as_u64()
+        // DELIVERY SEAM (#lever-reachability): env first in BOTH directions,
+        // then the typed `bab.sweep_class_mib` / `bab.sweep_class_rows` keys,
+        // then the shipped class policy. Absent everywhere is byte-identical.
+        ny_propagate::preset_gates::sweep_class_mib_override()
             .and_then(|mib| usize::try_from(mib).ok())
             .filter(|mib| *mib > 0),
-        ny_levers::read(&ny_levers::decls::comprehensive_rows::SWEEP_CLASS_ROWS)
-            .value
-            .as_u64()
+        ny_propagate::preset_gates::sweep_class_rows_override()
             .and_then(|rows| usize::try_from(rows).ok())
             .filter(|rows| *rows > 0),
     ) {
@@ -459,10 +474,14 @@ fn wide_max_safe_stacked_rows(max_wg: usize, width: usize) -> usize {
 /// It is deliberately not `env_gate_default_on`-style: this lane changes WHICH
 /// kernel produces a verdict-bearing bound, so arming it is a measured-session
 /// decision, not a default.
+///
+/// DELIVERY SEAM (#lever-reachability): `NY_BAB_RESNET_WIDE_SUBGROUP` still wins
+/// in BOTH directions where present; absent, the typed
+/// `bab.bab_resnet_wide_subgroup` key decides. It changes WHICH kernel produces
+/// a verdict-bearing bound, so arming it stays a measured-session decision —
+/// but the decision is now expressible in the scored configuration at all.
 fn wide_subgroup_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::wide_lane::BAB_RESNET_WIDE_SUBGROUP)
-        .value
-        .as_bool()
+    ny_propagate::preset_gates::bab_resnet_wide_subgroup_enabled()
 }
 
 /// Legacy-armed global selector for every wide ResNet CROWN dispatch.
@@ -470,10 +489,13 @@ fn wide_subgroup_enabled() -> bool {
 /// Exact `0` disables the lane; absence and every other spelling retain the
 /// shipped ON behavior. The declaration preserves that compatibility contract
 /// while keeping its unqualified-default debt explicit in the central registry.
+///
+/// DELIVERY SEAM (#lever-reachability): the declaration ships ARMED, so the
+/// typed `bab.bab_resnet_wide` key is the per-category KILL SWITCH — the `0`
+/// arm, previously expressible only through an environment variable the scored
+/// harness never exports. Env still wins in both directions.
 fn wide_resnet_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::wide_lane::BAB_RESNET_WIDE)
-        .value
-        .as_bool()
+    ny_propagate::preset_gates::bab_resnet_wide_enabled()
 }
 
 /// Number of whole domains that fit in a device-safe wide group.  A domain is
@@ -1536,7 +1558,7 @@ impl GpuCrownBackward for WgpuDevice {
         // 2's wide kernel — which ASSUMES one shared skeleton — its soundness
         // precondition. A mismatch aborts the whole batch to the serial fallback;
         // it never packs ragged rows.
-        let wprobe = std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1");
+        let wprobe = wide_probe_armed();
         let homogeneous = domains[1..]
             .iter()
             .all(|d| resnet_skeleton_matches(domains[0].segments, d.segments));
@@ -2534,7 +2556,7 @@ impl WgpuDevice {
                 vec![spec.len()],
             ));
         }
-        let probe = std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1");
+        let probe = wide_probe_armed();
         if probe {
             eprintln!(
                 "[chunk] num_specs={num_specs} output_dim={output_dim} chunk={chunk} n_chunks={}",
@@ -2659,7 +2681,7 @@ impl WgpuDevice {
             return note_wide_lane_decline_none(WideLaneDecline::GpuCoeffOverDispatchLimit);
         }
 
-        if std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1") {
+        if wide_probe_armed() {
             eprintln!(
                 "[wide] SUBCHUNK n_domains={n_domains} nsp={nsp} width={width} max_wg={max_wg} \
                  safe_domains={safe_domains} n_groups={}",
@@ -2742,7 +2764,7 @@ impl WgpuDevice {
             return note_wide_lane_decline_none(WideLaneDecline::GpuSeedShapeRefused);
         };
         let od = seed.current_dim;
-        let probe = std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1");
+        let probe = wide_probe_armed();
         // Wide skeleton: shared weights + per-domain-STACKED Activation slopes.
         let Some(wide_segments) = stack_wide_segments(domains) else {
             if probe {
@@ -2870,7 +2892,7 @@ impl WgpuDevice {
         let (lo, hi, alpha_grads, gathers) = match wide_res {
             Ok(v) => v,
             Err(e) => {
-                if std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1") {
+                if wide_probe_armed() {
                     eprintln!(
                         "[wide] ERR n_domains={n_domains} nsp={nsp} N={n} od={od} segs={} beta={} fa={} na={} in_dim={input_dim}: {e}",
                         wide_segments.len(),
@@ -2894,7 +2916,7 @@ impl WgpuDevice {
         if lo.len() != n || hi.len() != n {
             return note_wide_lane_decline_none(WideLaneDecline::GpuWideOutputLenMismatch);
         }
-        if std::env::var("NY_WIDE_PROBE").ok().as_deref() == Some("1") {
+        if wide_probe_armed() {
             eprintln!(
                 "[wide] FIRED n_domains={n_domains} nsp={nsp} N={n} segs={} beta={} fa={} na={}",
                 wide_segments.len(),

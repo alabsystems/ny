@@ -39,6 +39,11 @@ mod conv_mode_tests;
 mod cut_authority_tests;
 #[cfg(test)]
 mod gpu_bab_sidecar_tests;
+/// #lever-reachability: PROMOTION IS NOT ARMING. Pins that no shipped yaml sets
+/// any key from the 2026-08-23 delivery batch, so every promoted lever still
+/// resolves through an empty cell and the batch is byte-identical.
+#[cfg(test)]
+mod lever_delivery_pin_tests;
 #[cfg(test)]
 mod linearizenn_2024_tests;
 #[cfg(test)]
@@ -97,6 +102,21 @@ pub(crate) struct PresetConfig {
     /// (#dd-zonotope / #metaroom-ddzono).
     #[serde(default)]
     pub(crate) dd_zonotope: DdZonotopePreset,
+
+    /// Exact-instance admission for the independently certified MetaRoom
+    /// constrained-zonotope verdict lane (#cz-hybrid).
+    #[serde(default)]
+    pub(crate) cz_hybrid: CzHybridPreset,
+}
+
+/// Fail-closed exact-basename allowlist for the wired MetaRoom CZ lane. Both
+/// fields must be present and match the harness arguments; a partial or absent
+/// section never engages the lane.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CzHybridPreset {
+    pub(crate) only_onnx: Option<String>,
+    pub(crate) only_vnnlib: Option<String>,
 }
 
 /// Per-category ADMISSION-override plumbing for the certified double-double
@@ -135,24 +155,24 @@ pub(crate) struct DdZonotopePreset {
 
 /// Margin-row lane budget policy, per benchmark category (#epoch-bab).
 ///
-/// The lane runs AFTER the internal verifier returns unknown/timeout, so by
-/// default it lives on leftover budget only and is strictly additive. A
-/// category may opt into a RESERVE — seconds held back from the internal
-/// verifier — but only where the measured production solve-time
-/// distribution shows that tail is genuinely unused, because on a category
-/// whose solves crowd the budget wall a reserve trades away real points
-/// (measured: a 45 s reserve would forfeit 28 `sat_relu` and 10
-/// `cifar100_2024` solves). Default 0 = no reserve.
+/// The lane normally runs after the internal verifier returns unknown/timeout.
+/// Its historical runtime reserve default is 45 seconds, but that reserve is
+/// held only after exact structural admission; an explicit typed zero releases
+/// it. Category presets may instead run the lane concurrently, or enable the
+/// adaptive budget-share route that releases the reserve and grants sparse
+/// root CROWN authority. Those controls are one coupled schedule: configuration
+/// alone is not evidence that time was held, released, or overlapped.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MarginRowPreset {
     /// Seconds reserved from the internal verifier for the lane.
     pub(crate) reserve_secs: Option<u64>,
 
-    /// Release the reserve only for the sealed exact open-row allowlist and
-    /// route those rows to the internal alpha/beta verifier. Unknown rows keep
-    /// the configured reserve. Default `None`/`false` preserves the historical
-    /// fixed-reserve policy.
+    /// Release a structurally admitted reserve when it reaches the configured
+    /// share of the internal verifier budget, and route that case through the
+    /// sparse-root alpha/beta policy. Default `None`/`false` preserves the
+    /// historical fixed-reserve policy. This is budget arithmetic, not an
+    /// instance-name allowlist.
     pub(crate) adaptive_reserve: Option<bool>,
 
     /// Ceiling on the reserve, as a fraction of the INTERNAL verifier budget
@@ -207,8 +227,10 @@ pub(crate) struct MarginRowPreset {
     /// loss is arithmetic, not a regression. This key is the only shipped way
     /// to give the lane what its bank measured it with.
     ///
-    /// Pairs with `reserve_secs: 0`: concurrent + a reserve taxes the verifier
-    /// twice (it loses the reserve AND contends), which is the combination
+    /// Requires an EFFECTIVE held reserve of zero: TinyImageNet requests that
+    /// directly with `reserve_secs: 0`, while CIFAR100 reaches it through the
+    /// adaptive release calculation. Concurrent + a held reserve taxes the
+    /// verifier twice (it loses the reserve AND contends), the combination
     /// 31949bcc refused for want of evidence.
     pub(crate) concurrent: Option<bool>,
 
@@ -226,6 +248,48 @@ pub(crate) struct MarginRowPreset {
     /// loosening (see `margin_row::root::root_f32_requested`). It can lose a
     /// proof, never invent one, and the lane stays fail-closed.
     pub(crate) root_f32: Option<bool>,
+
+    /// `#tableau-f32`: f32 STORAGE for the root tableau walk (typed form of
+    /// `NY_MARGIN_ROW_TABLEAU_F32`; the env var wins where present, exact
+    /// `1`/`0`).
+    ///
+    /// `root_f32` made the conv COMPUTE f32 but left every tensor STORED f64,
+    /// so the bandwidth-bound walk still streamed 8-byte lanes plus a full
+    /// f64->f32 cast pass per conv layer. This key stores the M and D lanes as
+    /// `Array2<f32>` end-to-end, halving the streamed bytes of the walk that
+    /// is 97% of the tinyimagenet root build (39.93 s of 41.35 s, measured
+    /// 2026-08-24 under `NY_MARGIN_ROW_ROOT_TIMING`).
+    ///
+    /// SOUND BY CONSTRUCTION: conv-lane stores are bit-exact, radius-role
+    /// stores are directed UP, and every remaining store perturbation is
+    /// charged into the same certified `g_err` concretize slack `root_f32`
+    /// uses — pure loosening, oracle-tested per site
+    /// (`tableau_f32_store_per_site_containment_oracle`). Requires `root_f32`;
+    /// requested without it the build refuses LOUDLY (`[tableau-f32] INERT`)
+    /// and runs f64 storage.
+    pub(crate) tableau_f32: Option<bool>,
+
+    /// Deterministic y-pack LRU capacity (typed form of `NY_MARGIN_ROW_LRU`,
+    /// historical default 64). A cache hit returns exactly the pack a miss
+    /// rebuilds, so this changes memory/recomputation only. The legacy
+    /// untrimmed environment value retains precedence, and a present malformed
+    /// value suppresses this key and restores 64.
+    ///
+    /// No shipped yaml sets this key; it exists for canonical scored search.
+    pub(crate) lru: Option<usize>,
+
+    /// Parallel best-first frontier width (typed form of
+    /// `NY_MARGIN_ROW_PARALLEL`). Canonical typed tokens are exactly
+    /// `0|2|4|8|16`: `0` selects the serial frontier and positive values pin
+    /// that width without clamping to available Rayon workers. Omission keeps
+    /// the measured all-worker default.
+    ///
+    /// Typed `1` is deliberately invalid: the legacy environment grammar uses
+    /// `1` to mean ALL available workers, not width one. The legacy grammar
+    /// (`true|on|yes`, `false|off|no`, arbitrary usize, trimming and malformed
+    /// fallback) remains authoritative wherever the environment is present.
+    /// No shipped yaml sets this key.
+    pub(crate) parallel: Option<String>,
 
     /// #margin-row-branch-width: candidate budget per expansion (head rows).
     ///
@@ -253,6 +317,178 @@ pub(crate) struct MarginRowPreset {
     /// non-overfit alternative to pinning `k_head`/`k_trunk` per category.
     pub(crate) k_adaptive: Option<bool>,
 
+    // #parameter-governance: complete typed delivery for the margin-row
+    // search surface.  These keys are deliberately absent from every shipped
+    // preset; they make existing, default-preserving A/B controls reachable
+    // through the scored entry point without qualifying any treatment.
+    /// Authoritative margin-row GPU seam (`NY_MARGIN_ROW_GPU`).
+    pub(crate) gpu: Option<bool>,
+
+    /// Domain batching for the GPU seam (`NY_MARGIN_ROW_GPU_BATCH`).
+    pub(crate) gpu_batch: Option<bool>,
+
+    /// Certified GPU backward transaction (`NY_MARGIN_ROW_GPU_BACKWARD`).
+    pub(crate) gpu_backward: Option<bool>,
+
+    /// Lane-local alpha ascent (`NY_MARGIN_ROW_ALPHA_OPT`).
+    pub(crate) alpha_opt: Option<bool>,
+
+    /// Alpha-ascent iteration cap (`NY_MARGIN_ROW_ALPHA_ITERS`).
+    pub(crate) alpha_iters: Option<usize>,
+
+    /// Alpha-ascent wall-clock request (`NY_MARGIN_ROW_ALPHA_SECS`).
+    pub(crate) alpha_secs: Option<f64>,
+
+    /// Adam step for the root alpha ascent (`NY_MARGIN_ROW_ALPHA_LR`). A value
+    /// of zero selects the historical normalized-supergradient update.
+    pub(crate) alpha_lr: Option<f64>,
+
+    /// Number of worst objective columns used to steer the root alpha ascent
+    /// (`NY_MARGIN_ROW_ALPHA_COLS`).
+    pub(crate) alpha_cols: Option<usize>,
+
+    /// Published-frame monotonicity guard for the root alpha ascent
+    /// (`NY_MARGIN_ROW_ALPHA_GUARD`).
+    pub(crate) alpha_guard: Option<bool>,
+
+    /// Clip-and-Verify y-box tightening (`NY_MARGIN_ROW_CLIP`).
+    pub(crate) clip: Option<bool>,
+
+    /// Intermediate Clip-and-Verify tightening (`NY_MARGIN_ROW_CLIP_INTERM`).
+    pub(crate) clip_interm: Option<bool>,
+
+    /// Retain the certified clip halfspace rows required by both clip paths
+    /// (`NY_MARGIN_ROW_CLIP_ROWS`).
+    pub(crate) clip_rows: Option<bool>,
+
+    /// Per-layer Clip-and-Verify width (`NY_MARGIN_ROW_CLIP_TOPK`).
+    pub(crate) clip_topk: Option<usize>,
+
+    /// Closure fraction that triggers the adaptive ladder
+    /// (`NY_MARGIN_ROW_CLOSURE_THRESH`).
+    pub(crate) closure_thresh: Option<f64>,
+
+    /// Expansion warm-up before the first closure decision
+    /// (`NY_MARGIN_ROW_CLOSURE_WARMUP`).
+    pub(crate) closure_warmup: Option<usize>,
+
+    /// Expansion window between closure decisions
+    /// (`NY_MARGIN_ROW_CLOSURE_WINDOW`).
+    pub(crate) closure_window: Option<usize>,
+
+    /// Highest closure-adaptive tier (`NY_MARGIN_ROW_CLOSURE_MAX_TIER`).
+    pub(crate) closure_max_tier: Option<usize>,
+
+    /// Backward-intermediate chunk width (`NY_MARGIN_ROW_BI_CHUNK`).
+    pub(crate) bi_chunk: Option<usize>,
+
+    /// Target wall seconds for one backward-intermediate prefix pass
+    /// (`NY_MARGIN_ROW_BI_CHUNK_SECS`). Zero preserves fixed-width chunking.
+    pub(crate) bi_chunk_secs: Option<f64>,
+
+    /// Backward-intermediate per-layer selection width
+    /// (`NY_MARGIN_ROW_BI_TOPK`).
+    pub(crate) bi_topk: Option<usize>,
+
+    /// Split-dual beta ascent (`NY_MARGIN_ROW_BETA`).
+    pub(crate) beta: Option<bool>,
+
+    /// Legacy sign-step size used when Polyak is disabled
+    /// (`NY_MARGIN_ROW_BETA_ETA`).
+    pub(crate) beta_eta: Option<f64>,
+
+    /// Beta-ascent trial cap (`NY_MARGIN_ROW_BETA_ITERS`).
+    pub(crate) beta_iters: Option<usize>,
+
+    /// Give each selected failing output column independent split-dual state
+    /// (`NY_MARGIN_ROW_BETA_PERCOL`). Default off; inert unless beta is live.
+    pub(crate) beta_per_column: Option<bool>,
+
+    /// Maximum failing columns carrying independent beta state
+    /// (`NY_MARGIN_ROW_BETA_COLS`, default 8, clamped by the runtime to 1..=32).
+    pub(crate) beta_columns: Option<usize>,
+
+    /// Inherit certificate-closed output columns and omit them from descendant
+    /// passes (`NY_MARGIN_ROW_COL_RETIRE`). Default off.
+    pub(crate) column_retire: Option<bool>,
+
+    /// Prebuild deterministic y-packs for executable multi-domain frontier
+    /// batches (`NY_MARGIN_ROW_PARALLEL_PREBUILD`). Default off.
+    pub(crate) parallel_prebuild: Option<bool>,
+
+    /// Polyak gap fraction (`NY_MARGIN_ROW_BETA_LAMBDA`).
+    pub(crate) beta_lambda: Option<f64>,
+
+    /// Opt-out selector for Polyak sizing (`NY_MARGIN_ROW_BETA_POLYAK`).
+    pub(crate) beta_polyak: Option<bool>,
+
+    /// Opt-out selector for head-split beta terms
+    /// (`NY_MARGIN_ROW_BETA_HEADS`).
+    pub(crate) beta_heads: Option<bool>,
+
+    /// Joint forward re-bake (`NY_MARGIN_ROW_REBAKE`).
+    pub(crate) rebake: Option<bool>,
+
+    /// Re-bake round cap (`NY_MARGIN_ROW_REBAKE_ROUNDS`).
+    pub(crate) rebake_rounds: Option<usize>,
+
+    /// Re-bake wall-clock request (`NY_MARGIN_ROW_REBAKE_SECS`).
+    pub(crate) rebake_secs: Option<f64>,
+
+    /// #closure-adaptive: let the lane pick its OWN closure mechanisms at
+    /// runtime from an observable it computes about itself.
+    ///
+    /// WHY ONE POLICY KEY IN ADDITION TO THE INDIVIDUAL KEYS. Every closure
+    /// mechanism now has typed delivery for attributable A/B search. The
+    /// composite key serves a different purpose: it lets one row-local policy
+    /// choose among β, clip, retained rows, re-bake and per-domain α from an
+    /// observable, instead of requiring a human to pin six category-wide
+    /// treatments. No shipped preset arms either route merely because it is
+    /// deliverable.
+    ///
+    /// THE OBSERVABLE. Measured 2026-08-22 on the 16 `cifar100_2024` rows this
+    /// lane fails and alpha-beta-CROWN proves: the ONLY variable separating
+    /// abc's wins from its losses, with ZERO overlap, is the per-batch
+    /// child-closure fraction — wins 0.50-1.00, losses 0.18-0.34. Node count
+    /// does not predict it (abc loses at 33 618 nodes, wins at 16) and neither
+    /// does the root bound (wins at post-alpha -0.765, loses at -0.423). ny
+    /// closes ZERO domains on 12 of the 16. That fraction is free to compute in
+    /// a best-first loop, so the lane can detect that its children are not
+    /// closing and escalate, re-measuring after each step.
+    ///
+    /// WHICH MECHANISMS, and this is measured rather than guessed. A 24-run
+    /// matrix on one pinned binary, engagement telemetry on every arm: β moves
+    /// closure 3-8x and is the ONLY thing that does; β with 8 ascent trials is
+    /// the largest single movement in the matrix; Clip-and-Verify is
+    /// BIT-IDENTICAL to baseline with the mechanism provably armed
+    /// (`mean_rel_shrink` 8.4e-16 to 1.6e-4 — one split is one halfspace in 3072
+    /// dimensions, and it cuts the split neuron 63% and everything
+    /// near-orthogonal to it by nothing). So the ladder is β, then deeper β,
+    /// then the Tier-2 epoch rebuild — dual/objective coupling, not box
+    /// tightening — and the clip rungs were cut after measurement rather than
+    /// shipped as decoration.
+    ///
+    /// SOUND BY CONSTRUCTION at every tier: both β rungs are valid for any
+    /// `β >= 0` by weak duality and keep only ACCEPTED improvements scored by
+    /// the certified pass; the epoch's gates are valid exactly on the
+    /// split-halfspace intersection and the parent intervals it inherits are
+    /// shrink-only. The policy writes one integer and never a bound. A row whose
+    /// closure is healthy escalates nothing and runs bit-identically — measured
+    /// on idx_5308 (closure 0.957) and idx_7554 (0.557-0.775), both held at
+    /// base by the 0.40 threshold.
+    ///
+    /// Default `None`/`false`: ships dark pending the measurement.
+    pub(crate) closure_adaptive: Option<bool>,
+
+    /// #branch-reduceop: reduce a candidate's two child bounds by `max`
+    /// (BaBSR s_SR, De Palma eq. 22) instead of `min` (FSB balanced, eq. 23).
+    /// alpha-beta-CROWN's TUNED cifar100 and tinyimagenet configs both set
+    /// `reduceop: max`, overriding its own global `min` default on exactly the
+    /// two benchmarks ny fails. Ranker-only: it picks WHICH candidate to split,
+    /// every child bound still comes from the same certified pass. Absent =
+    /// `min` = byte-identical to today.
+    pub(crate) branch_reduce_max: Option<bool>,
+
     /// #backward-interm: recompute each trunk ReLU's input bounds via the
     /// lane's OWN backward engine through the already-frozen prefix gates,
     /// shrink-only intersected with the forward tableau BEFORE gate
@@ -260,9 +496,191 @@ pub(crate) struct MarginRowPreset {
     /// move ~0.18-0.20 (idx_5242 -0.613 -> -0.438, INTO the proven band);
     /// tiny idx_4330 timeout -> UNSAT 3/3; and proving rows get 5-10x
     /// CHEAPER (idx_6659 211 exp/72s -> 19 exp/3.8s; idx_8600 186/45s ->
-    /// 35/12s). Shrink-only by construction — a wrong bound costs tightness,
-    /// never soundness; parity mode refuses.
+    /// 35/12s). Intersecting two valid enclosures and skipping/crossing
+    /// fail-open are tightness-only; the clip-calibration ordering invariant is
+    /// still soundness-critical, and parity mode refuses the phase.
     pub(crate) backward_interm: Option<bool>,
+
+    /// #margin-row-domain-alpha: re-optimize the lane's lower-line slope PER
+    /// BaB DOMAIN — against that domain's own gates, Clip-and-Verify tightening
+    /// included — instead of freezing the root value for the whole tree, with
+    /// each child warm-starting from its parent's accepted alpha.
+    ///
+    /// WHY IT IS THE REMAINING CANDIDATE. The frontier-worst bound at a given
+    /// DEPTH is bit-identical across every arm tried (base, β, β×8, stateless
+    /// clip, stateful clip, both branching reductions), improving ~0.0096-0.0120
+    /// per level against a gap of 0.155-0.203 — 13-21 more levels, i.e.
+    /// 2^13..2^21 domains where the budget affords ~90. Per-domain alpha is the
+    /// only mechanism whose deficit GROWS WITH DEPTH by construction (at depth
+    /// 30 every unsplit unstable neuron still carries a root-box slope), and it
+    /// is the missing CONSUMER for clip: abc ships the two as a compounding
+    /// pair, which is why a measured 1.5-2.7e-2 stateful-clip shrink moved the
+    /// gating curve by exactly zero. Measure as a 2x2, never one at a time.
+    ///
+    /// Tightness-only: any `alpha in [0, 1]` is a valid lower line pointwise on
+    /// all of R, `ms = max(alpha, s)` is re-derived at the single write site,
+    /// and the certified pass is the only scorer. Default `None`/`false`: ships
+    /// dark pending the measurement.
+    pub(crate) domain_alpha: Option<bool>,
+
+    /// Per-domain alpha ascent trials per expanded domain (typed form of
+    /// `NY_MARGIN_ROW_DOMAIN_ALPHA_ITERS`, default 2, clamped `1..=8`; env wins
+    /// in both directions). EACH TRIAL IS ONE MORE CERTIFIED PASS on every
+    /// expanded domain with a movable neuron — the whole cost model. Inert
+    /// unless `domain_alpha` is armed.
+    pub(crate) domain_alpha_iters: Option<u64>,
+
+    /// Initial normalized step for the per-domain alpha ascent (typed form of
+    /// `NY_MARGIN_ROW_DOMAIN_ALPHA_ETA`, default 0.25, clamped to
+    /// `[0.01, 1.0]`; env wins in both directions). Literally how far the
+    /// largest-gradient neuron moves through the legal `[0, 1]` slope range in
+    /// one trial. Inert unless `domain_alpha` is armed.
+    pub(crate) domain_alpha_eta: Option<f64>,
+
+    /// SCHEDULE: skip the per-domain alpha ascent at domains shallower than
+    /// this split depth (typed form of `NY_MARGIN_ROW_DOMAIN_ALPHA_MIN_DEPTH`,
+    /// default 0 = every depth pays, capped at 64; env wins in both
+    /// directions). The ascent costs `domain_alpha_iters` certified passes
+    /// uniformly in depth while the measured gain GROWS with depth, so a floor
+    /// buys the deep half of the curve without paying the shallow half — at the
+    /// risk of declining exactly the shallow alphas every descendant inherits.
+    /// Inert unless `domain_alpha` is armed.
+    pub(crate) domain_alpha_min_depth: Option<u64>,
+
+    /// SCHEDULE: pay the per-domain alpha ascent only where
+    /// `depth % stride == 0` (typed form of
+    /// `NY_MARGIN_ROW_DOMAIN_ALPHA_STRIDE`, default 1 = every depth pays,
+    /// clamped `1..=16`; env wins in both directions). The WARM START is free,
+    /// so an unpaid level still carries its ancestors' accepted alpha; this is
+    /// the arm that says whether the gain is carried by inheritance (cost/k,
+    /// gain kept) or by each node's own trials (both divided). Inert unless
+    /// `domain_alpha` is armed.
+    pub(crate) domain_alpha_stride: Option<u64>,
+
+    /// SCHEDULE: pay the per-domain alpha ascent only at domains within this
+    /// much of closure, i.e. where the pre-ascent bound has `b >= -gap` (typed
+    /// form of `NY_MARGIN_ROW_DOMAIN_ALPHA_GAP`, default 0 = UNLIMITED; env
+    /// wins in both directions). cifar100 fails by a counting problem, so the
+    /// passes are worth most where they can retire a domain outright rather
+    /// than where they buy +0.002 against a -0.30 gap. Inert unless
+    /// `domain_alpha` is armed.
+    pub(crate) domain_alpha_gap: Option<f64>,
+
+    /// Seconds cap for the backward-intermediate phase (typed form of
+    /// `NY_MARGIN_ROW_BI_SECS`; env wins in both directions).
+    ///
+    /// MEASURED 2026-08-22 over 64 banked-timeout resnet_large rows: at the
+    /// shipped 20 s default the phase is TRUNCATED (`exhausted=true`) on 10/10
+    /// resnet_LARGE rows, which need 24-35 s, and on 0/9 resnet_MEDIUM rows,
+    /// which finish in 6.6-8.4 s. Raising it is therefore free on medium (a
+    /// byte-identical no-op) and strictly better on large: the tighter root
+    /// yields a SMALLER tree (idx_5410 39 -> 28 expansions, idx_496 2 -> 1) at
+    /// no wall cost. Converts idx_9883 (unknown 3/3 -> unsat 3/3); moat 7/7
+    /// preserved; no row converts at 20 and fails at 40. The effective value
+    /// is `min(secs, 0.4 * remaining)`, so 40 resolves to ~37.2 s at a scored
+    /// 100 s budget — and 63/64 rows then finish inside it, so there is no
+    /// headroom left in this lever.
+    pub(crate) bi_secs: Option<u64>,
+
+    /// #epoch-bab Tier-0 ranker shortlist width. Typed form of
+    /// `NY_EPOCH_TIER0`; `0` keeps the established shortlist path, while a
+    /// positive value sends that many rank-1-ranked candidates to the exact
+    /// certified pass. A present legacy environment value still wins, and a
+    /// malformed present value suppresses this key and restores the historical
+    /// default `0`.
+    ///
+    /// No shipped preset sets this key: promotion makes the measured ranker
+    /// reachable from a clean scorecard without arming it.
+    pub(crate) epoch_tier0: Option<usize>,
+
+    /// Number of trunk candidates scored by the Tier-0 ranker before its exact
+    /// shortlist is selected. Typed form of `NY_EPOCH_UNIVERSE`, with the
+    /// historical default `64` and the same untrimmed environment precedence.
+    /// Inert unless `epoch_tier0` is positive.
+    pub(crate) epoch_universe: Option<usize>,
+
+    /// Retained f32 pre-activation rows per trunk ReLU layer for the Tier-0
+    /// ranker. Typed form of `NY_EPOCH_RETAIN`, with historical default `128`;
+    /// the separate 256 MiB global retention cap is unchanged. The runtime
+    /// only consults this value when root-build retention is requested.
+    pub(crate) epoch_retain: Option<usize>,
+
+    /// #epoch-parent: number of NEW trunk splits between Tier-2 epoch
+    /// refreshes. `None` and `0` keep epochs disabled. Typed form of the
+    /// legacy `NY_EPOCH_DEPTH`; a present environment value still wins.
+    ///
+    /// This key only makes the mechanism reachable by canonical scored
+    /// measurement. No shipped preset sets it pending a sealed A/B.
+    pub(crate) epoch_depth: Option<usize>,
+
+    /// Maximum Unknown-ending Tier-2 epoch attempts per BaB driver. Typed form
+    /// of `NY_EPOCH_ATTEMPTS` (built-in default 2); a present environment value
+    /// still wins. `0` is an explicit kill switch.
+    ///
+    /// No shipped preset sets this key.
+    pub(crate) epoch_attempts: Option<usize>,
+
+    /// #epoch-parent: maximum number of widest downstream preactivation
+    /// columns refreshed per ReLU layer. `None`/`0` preserves the established
+    /// full-tableau epoch path. Typed form of
+    /// `NY_MARGIN_ROW_EPOCH_PARENT_TOPK`; a present governed environment value
+    /// wins, including `0` as a kill switch.
+    ///
+    /// This changes an authoritative bound path when paired with a positive
+    /// `epoch_depth`, so it ships dark until sealed soundness and wall-time
+    /// measurements justify a preset value.
+    pub(crate) epoch_parent_topk: Option<usize>,
+
+    /// #twinwall-early-exit: publish RESULTS_FILE and end the instance the
+    /// moment the CONCURRENT lane certifies `unsat`, instead of letting the
+    /// internal verifier run its remaining budget out on an already-proved row.
+    ///
+    /// DEFAULT ON (`None` == `true`); this key exists as the typed kill switch,
+    /// alongside `NY_MARGIN_ROW_EARLY_EXIT`, which wins where present.
+    ///
+    /// Verdict-neutral by construction: the lane is fail-closed (`Unsat` or
+    /// `Unknown`, never `Sat`), both existing consumers already `return` its
+    /// verdict verbatim with no refinement, and the attack lanes it skips can
+    /// only ADD `sat` on rows the lane did NOT prove. MEASURED waste it
+    /// removes on cifar100_2024: `resnet_medium prop_idx_7704_sidx_3701`
+    /// proved at 10.4 s of a 100 s budget and published at 89.7 s.
+    pub(crate) early_exit: Option<bool>,
+
+    /// #verifier-thread-cap: request this width for Rayon's process-global pool
+    /// before the INTERNAL alpha/beta verifier or any optional Rayon work starts.
+    ///
+    /// `NY_MARGIN_ROW_CONCURRENT_THREADS` already bounds the lane; nothing
+    /// bounded the verifier, so on a 20-core box the lane that produces every
+    /// UNSAT on this category competes with the lane that produces none.
+    ///
+    /// Absent or `0` preserves today's behavior: this policy does not initialize
+    /// or inspect the global pool, and the verifier remains on the main thread.
+    /// A positive value makes one main-thread `build_global` attempt. An already
+    /// initialized pool is recorded with its observed actual width and voids the
+    /// cap A/B; any other build failure stops scored work with a sound `unknown`.
+    /// The verifier is never moved into a private pool because competition-result
+    /// capture is main-thread-local. `NY_VERIFIER_THREADS` wins where present,
+    /// including explicit zero.
+    ///
+    /// Scheduling only — a thread count cannot change a bound or a verdict, it
+    /// can only change what finishes inside the budget.
+    pub(crate) verifier_threads: Option<usize>,
+
+    /// #scheduler-resource-governance: optional Rayon width for the CONCURRENT
+    /// margin-row lane (typed form of `NY_MARGIN_ROW_CONCURRENT_THREADS`).
+    ///
+    /// `None` and `0` are intentionally different. Without a positive verifier
+    /// request, `None` uses the shared global pool. With one, `None` derives a
+    /// private lane width only as `host_parallelism - actual_global_threads`;
+    /// missing observations or no positive remainder refuse the lane. It never
+    /// derives from the requested verifier cap. Explicit `0` suppresses the
+    /// derivation and requests the shared global pool. A positive value requests
+    /// a private pool of exactly that width; a build failure refuses the lane,
+    /// with no global-pool fallback. The environment override remains untrimmed
+    /// and wins only when it parses as a platform `usize`, including zero.
+    ///
+    /// Scheduling only. No shipped preset sets this unmeasured resource seam.
+    pub(crate) concurrent_threads: Option<usize>,
 }
 
 /// Model-loading configuration (alpha-beta-CROWN compatibility).
@@ -375,6 +793,28 @@ pub(crate) struct AttackPreset {
     pub(crate) pgd_restarts: Option<usize>,
     /// Number of PGD steps per restart.
     pub(crate) pgd_steps: Option<usize>,
+    /// Prefer the exact-gradient conjunctive route over generic batched SPSA.
+    pub(crate) pgd_exact_batched: Option<bool>,
+    /// Attempt the point-Jacobian fast gradient in sequential graph PGD.
+    pub(crate) pgd_fast_grad: Option<bool>,
+    /// Admit the batched exact point-VJP graph attack drivers.
+    pub(crate) pgd_vjp_batch: Option<bool>,
+    /// Shared exact-VJP restart width (route-specific default when absent).
+    pub(crate) pgd_vjp_k: Option<usize>,
+    /// Uniform seed-replay lanes in the first conjunctive exact-VJP wave.
+    pub(crate) pgd_legacy_lanes: Option<usize>,
+    /// Output-diversified initialization steps per conjunctive wave.
+    pub(crate) pgd_odi_steps: Option<usize>,
+    /// Positive finite f32 ODI step scale in input half-range units.
+    pub(crate) pgd_odi_eta: Option<f32>,
+    /// Optional positive joint-margin steps per conjunctive exact-VJP wave.
+    pub(crate) pgd_vjp_steps: Option<usize>,
+    /// Rate-projection lane-recycling window; zero disables.
+    pub(crate) pgd_lane_window: Option<usize>,
+    /// Enable conjunctive endgame exploit recycling.
+    pub(crate) pgd_exploit: Option<bool>,
+    /// Non-negative finite f32 odd-lane tau-hinge threshold.
+    pub(crate) pgd_hinge_tau: Option<f32>,
     /// PGD alpha/step size. Accepts numeric YAML values or the string `auto`.
     #[serde(default, deserialize_with = "value_parse::option_string_or_number")]
     pub(crate) pgd_alpha: Option<String>,
@@ -392,8 +832,9 @@ pub(crate) struct AttackPreset {
     ///
     /// The lane auto-enables only for MULTI-CLAUSE DISJUNCTIONS. safenlp's specs
     /// are single-constraint (`(assert (<= Y_0 Y_1))`), so the auto rule skips
-    /// them and the lane has to be forced — which until now happened ONLY via
-    /// `NY_UPFRONT_ATTACK=1` exported from `vnncomp_scripts/run_instance.sh`.
+    /// them and the lane has to be forced. Historically that happened ONLY via
+    /// a wrapper-only `NY_UPFRONT_ATTACK=1` export; the scored wrapper no longer
+    /// injects any `NY_*` values.
     /// That made the submission path behave differently from every other
     /// invocation: `ny benchmarks run`, `measure_ny_scorecard.sh` and a direct
     /// `ny vnncomp` all missed it. MEASURED on safenlp
@@ -409,6 +850,37 @@ pub(crate) struct AttackPreset {
     /// measurement/submission divergence described above for every non-wrapper
     /// entry point.
     pub(crate) upfront_attack: Option<bool>,
+    /// Whole-second wall cap for a forced or typed-relational upfront attack.
+    ///
+    /// Typed delivery for `NY_UPFRONT_ATTACK_CAP`. The environment override is
+    /// resolved once at scored-run entry and wins when admissible; absence
+    /// retains this value or the measured eight-second declaration default.
+    pub(crate) upfront_attack_cap_secs: Option<u64>,
+    /// Whole-second wall cap for contextual automatic multi-clause-disjunction
+    /// admission.
+    ///
+    /// Typed delivery for `NY_UPFRONT_ATTACK_AUTO_CAP`. This clamp is applied
+    /// only on the automatic route; a force or typed relational admission uses
+    /// [`Self::upfront_attack_cap_secs`].
+    pub(crate) upfront_attack_auto_cap_secs: Option<u64>,
+    /// Fraction of live scored wall offered to the upfront lane before its cap.
+    ///
+    /// Typed delivery for `NY_UPFRONT_ATTACK_FRAC`. Validation is driven by the
+    /// declaration and requires a finite value in `0 < fraction <= 1`.
+    pub(crate) upfront_attack_fraction: Option<f64>,
+    /// Fraction of live scored wall offered to the upfront lane on Sign nets.
+    ///
+    /// Typed delivery for `NY_BNN_ATTACK_FRAC`. The environment override wins
+    /// when admissible; absence retains this value or the measured 0.5 default.
+    /// Declaration-driven validation requires a finite value in
+    /// `0 < fraction <= 1`.
+    pub(crate) bnn_attack_fraction: Option<f64>,
+    /// Whole-second wall cap for the upfront lane on Sign nets.
+    ///
+    /// Typed delivery for `NY_BNN_ATTACK_CAP`. The environment override wins
+    /// when admissible; absence retains this value or the measured 240-second
+    /// default.
+    pub(crate) bnn_attack_cap_secs: Option<u64>,
     /// Attack mode: "PGD" or "diversed_PGD" (OSI init, #1449).
     pub(crate) attack_mode: Option<String>,
     /// OSI initialization steps; only with `attack_mode: diversed_PGD` (#1449).
@@ -462,9 +934,19 @@ pub(crate) struct AttackPreset {
     /// the ordinary lanes run. That is why it is scoped to the category where
     /// that spend is measured rather than shipped on globally.
     ///
-    /// CONSUMER: `commands::vnncomp::run_and_translate`, which passes it to
-    /// `try_sign_space_falsify` as the lever's config layer.
+    /// CONSUMER: `commands::vnncomp::run_and_translate` projects the typed key
+    /// into the entry-time `LeverSet`; `BnnFalsificationPolicy::from_levers`
+    /// then freezes the resolved value before any private, allocated, or
+    /// scheduled lane can run.
     pub(crate) bnn_sign_space: Option<bool>,
+
+    /// Adopt the minimum feasible segment move instead of the LP vertex in
+    /// sign-space falsification (`NY_BNN_SIGN_SPACE_MINIMAL_MOVE`).
+    pub(crate) bnn_sign_space_minimal_move: Option<bool>,
+
+    /// Pixel trust-region arm for sign-space falsification: `box`, `tight`, or
+    /// `linf` (`NY_BNN_SIGN_SPACE_TRUST_REGION`).
+    pub(crate) bnn_sign_space_trust_region: Option<String>,
 
     /// Arm the STE-PGD falsification lane (`#bnn-ste-pgd`) for this category.
     ///
@@ -484,9 +966,115 @@ pub(crate) struct AttackPreset {
     /// cannot, whose witnesses sit 483-1483 first-layer flips from the box
     /// centre.
     ///
-    /// CONSUMER: `commands::vnncomp::run_and_translate`, which passes it to
-    /// `try_ste_pgd_falsify` as the lever's config layer.
+    /// CONSUMER: `commands::vnncomp::run_and_translate` projects the typed key
+    /// into the entry-time `LeverSet`; `BnnFalsificationPolicy::from_levers`
+    /// then freezes the resolved value before any private, allocated, or
+    /// scheduled lane can run.
     pub(crate) bnn_ste_pgd: Option<bool>,
+
+    /// `attack.upfront_attack_probe_first` — consult the EXISTING upfront
+    /// DLR-APGD falsification lane once at the TOP of the attack slice, under
+    /// the small fixed `UPFRONT_ATTACK_PROBE_CAP` (5 s), ahead of the two BNN
+    /// lanes, instead of only behind them (#upfront-probe-first).
+    ///
+    /// WHAT IT DECIDES IS ORDER, NOT CAPABILITY. Nothing is added and nothing
+    /// is removed: on a miss the LP sign-space and STE-PGD lanes run
+    /// afterwards in today's order under today's windows, and the ordinary
+    /// (uncapped) upfront consultation still happens behind them. The probe's
+    /// seconds are charged against the same `attack_start` subtraction every
+    /// attack-slice lane pays, so arming it cannot push branch-and-bound past
+    /// the scored deadline.
+    ///
+    /// MEASURED, 45/45 rows of `traffic_signs_recognition_2023` at the official
+    /// 480 s budget, arms interleaved per row (2026-08-21, see
+    /// `reports/measured-2026/traffic_signs_recognition_2023_NOTES.md`):
+    /// **0 rows lost, 15 rows won by the probe**, 12 of them the `model_30`
+    /// eps>=3 instances that otherwise land at t=242-336 s and now land at
+    /// t=1.4-5.6 s. Summed family solve time 7558 s -> 5335 s. On the 30 rows
+    /// the probe CANNOT win it costs the cap and nothing more — measured
+    /// 5.00-5.03 s on all 30, including the three `model_30` eps=1 rows the LP
+    /// walk owns, which keep their winner and their bit-identical trajectory.
+    /// Worst-case wall is unmoved (dark 468.65 s, armed 468.70 s of 480 s),
+    /// because on rows that exhaust their budget the probe DISPLACES seconds
+    /// rather than adding them.
+    ///
+    /// SOUNDNESS. Identical to the lane's ordinary consultation, because it IS
+    /// that lane: it returns a claimed counterexample INPUT and never a
+    /// verdict, so it cannot produce an `unsat`, and a candidate becomes a
+    /// `sat` only by passing the EXISTING, UNCHANGED
+    /// `gate_sat_with_trusted_oracle`. A candidate the gate drops falls
+    /// through to the ordinary slice (#upfront-gate-fallthrough).
+    ///
+    /// `NY_UPFRONT_ATTACK_PROBE_FIRST` still WINS wherever it is present, in
+    /// both directions (exact `"1"` arms, exact `"0"` disarms, anything else is
+    /// a recorded rejection falling back to the declaration default).
+    ///
+    /// CONSUMER: `commands::vnncomp::preset_delivered_config_value`, which
+    /// projects it into the shared entry-time LeverSet consumed by
+    /// `UpfrontAttackPolicy::from_levers`.
+    pub(crate) upfront_attack_probe_first: Option<bool>,
+
+    // ---------------------------------------------------------------------
+    // #lever-reachability (2026-08-23). The six keys below were promoted in
+    // one batch from environment-only gates. Each is DEFAULT OFF and set by no
+    // shipped yaml — pinned by
+    // `no_shipped_preset_arms_a_promoted_lever_delivery_key` — so this batch is
+    // byte-identical on every scored run. Promotion makes a lever
+    // DELIVERABLE; arming one stays a separate, measured decision.
+    //
+    // WHY THEY ALL BELONG TO THE ATTACK SLICE. That slice is where ny earns
+    // `sat`, the half of the score branch-and-bound cannot reach, and every
+    // lane in it was reachable only through an environment variable that
+    // `vnncomp_scripts/run_instance.sh` does not export. So the entire
+    // falsification portfolio was, in competition, dead code.
+    //
+    // SOUNDNESS, once for the group: no lane in the attack slice has a
+    // verdict-bearing return type. Each returns a CLAIMED counterexample
+    // INPUT, and a claim becomes `sat` only by passing the unchanged
+    // `gate_sat_with_trusted_oracle`; none can produce `unsat`. Arming any of
+    // these can therefore lose time (hence proofs) but cannot manufacture a
+    // verdict.
+    // ---------------------------------------------------------------------
+    /// Run the falsification portfolio (`NY_FALSIFY_PORTFOLIO`).
+    ///
+    /// The lane's own reader used to document the defect verbatim: "Environment
+    /// only, and deliberately: there is no typed `attack.*` preset key, so a
+    /// competition harness (which exports no `NY_*`) cannot reach this lane at
+    /// all." This key is that missing route. Env wins in both directions.
+    pub(crate) falsify_portfolio: Option<bool>,
+
+    /// Wall cap in seconds for the portfolio above
+    /// (`NY_FALSIFY_PORTFOLIO_SECONDS`). `0` or absent selects the derived
+    /// rule. Taken from the same instance window the sound lanes spend, so it
+    /// is a real budget trade rather than free time.
+    pub(crate) falsify_portfolio_secs: Option<u64>,
+
+    /// Score the attack against the PRE-Softmax objective
+    /// (`NY_ATTACK_PRE_SOFTMAX_OBJECTIVE`) instead of the post-Softmax one.
+    ///
+    /// Disarmed — the shipped default — the objective, direction row and DLR
+    /// denominator are the historical post-Softmax ones and the path is
+    /// byte-identical. It changes which counterexamples are findable.
+    pub(crate) pre_softmax_objective: Option<bool>,
+
+    /// Size every attack-slice lane once, up front, from its own unchanged rule
+    /// (`NY_LANE_BUDGET_FRAME`), so a lane that declines cannot have its unspent
+    /// seconds absorbed by a downstream lane that re-derives its window from the
+    /// live remaining budget.
+    pub(crate) lane_budget_frame: Option<bool>,
+
+    /// Commit every attack-slice lane's cap jointly and up front by solving a
+    /// multiple-choice knapsack (`NY_LANE_BUDGET_ALLOCATOR`, Layer A).
+    ///
+    /// Can take a structurally blind lane to zero seconds, so it changes which
+    /// lane runs under what cap and therefore which counterexamples are
+    /// reachable within the budget.
+    pub(crate) lane_budget_allocator: Option<bool>,
+
+    /// Reallocate a stalled lane's remaining seconds to a later lane
+    /// (`NY_LANE_VALUE_SCHEDULER`). Scheduling only; see the module Soundness
+    /// note in `commands::lane_schedule`.
+    pub(crate) lane_value_scheduler: Option<bool>,
 }
 
 /// Explicit NY compatibility choices for unimplemented reference PGD orders.
@@ -544,6 +1132,61 @@ pub(crate) struct SolverPreset {
     /// MIP complete-verifier configuration (alpha-beta-CROWN `solver.mip`).
     #[serde(default)]
     pub(crate) mip: MipPreset,
+
+    /// Retired typed spelling for the quarantined
+    /// `NY_CONST_MATMUL_INTERVAL` research carrier.
+    ///
+    /// Kept only so an older research YAML receives the explicit quarantine
+    /// error from semantic validation. Any `Some` value, including `false`, is
+    /// rejected: the Unsafe axis is deliberately EnvOnly because the carrier
+    /// exposed a false-proof propagation path and may not be armed by a scored
+    /// preset.
+    pub(crate) const_matmul_interval: Option<bool>,
+
+    /// `solver.joint_bilinear_quad` — typed delivery for the
+    /// `NY_JOINT_BILINEAR_QUAD` dark correlation-preserving relaxation.
+    /// `None` preserves the historical default-OFF behavior; no shipped preset
+    /// sets this key. A present environment value still wins in both directions
+    /// through the central lever resolver.
+    pub(crate) joint_bilinear_quad: Option<bool>,
+
+    /// `solver.scored_wall_clamp` — stop branch-and-bound at an ABSOLUTE
+    /// instant derived from the scored budget, independent of the effort
+    /// horizon its timeout shapes (#scored-wall-clamp).
+    ///
+    /// WHAT IT SEPARATES. The disjunctive input-split lane sizes every
+    /// per-node CROWN-IBP grant as a fraction of the budget it believes still
+    /// REMAINS, so a nearer deadline buys looser bounds, more splits, and a
+    /// non-converging tree — the search is measurably NON-MONOTONIC in its own
+    /// timeout. The relational lane exploits that by inflating its BaB
+    /// deadline 1.4x (`DEFAULT_REL_BAB_DEADLINE_MULT`). Before this key, the
+    /// inflated number was ALSO the stop, so the trajectory was bought with
+    /// wall-clock the process did not own.
+    ///
+    /// MEASURED, `isomorphic_acasxu_2026` at the official 100 s budget: on the
+    /// banked 50-row sweep EIGHTEEN rows ran past the 95 s internal tier and
+    /// were SIGKILLed by the in-process watchdog at 105.0-105.1 s — 105 % of
+    /// the official budget, and on the competition harness an external kill at
+    /// 100 s leaves them with no verdict token at all.
+    ///
+    /// WHAT IT CHANGES. Only the loop's termination checks. `crown_deadline`,
+    /// the initial-bounds fraction and every per-node collector deadline still
+    /// derive from the UNCHANGED horizon, so the trajectory up to the wall is
+    /// the trajectory the multiplier bought. Clamping the horizon instead
+    /// (equivalently `NY_REL_BAB_DEADLINE_MULT=1.0`) also stops the overrun but
+    /// degrades the bounds and loses rows.
+    ///
+    /// SOUNDNESS. It can only ever SHORTEN a search, and a shortened sound
+    /// search returns `timeout`, never a verdict. A wall beyond the horizon is
+    /// ignored, so it cannot extend a configured timeout either.
+    ///
+    /// `NY_SCORED_WALL_CLAMP` still WINS wherever it is present, in both
+    /// directions (exact `"1"` arms, exact `"0"` disarms, anything else is a
+    /// recorded rejection falling back to the declaration default).
+    ///
+    /// CONSUMER: `commands::vnncomp::handle_vnncomp_command`, which passes it
+    /// to `scored_wall_clamp_armed` as the lever's config layer.
+    pub(crate) scored_wall_clamp: Option<bool>,
 }
 
 /// Branch-and-bound (BaB) configuration.
@@ -598,6 +1241,361 @@ pub(crate) struct BabPreset {
     /// the remaining collection budget (25%, clamped to 12–600 seconds).
     /// Explicit caps are dimension-scaled above 28,800 rows.
     pub(crate) crown_ibp_per_node_cap_secs: Option<f64>,
+
+    /// #target-cost-weight: weight each CROWN-IBP collection target by the
+    /// MACs of the backward walk it will run (`rows x prefix`) instead of by
+    /// its objective-row count. Unset/false keeps the historical row weights.
+    /// Scheduling only — a declined target publishes exactly what it publishes
+    /// today.
+    pub(crate) crown_ibp_prefix_cost_weighted: Option<bool>,
+
+    /// #target-cost-weight: cap on the fraction of the remaining CROWN-IBP
+    /// collection window any single non-final target may be granted. Unset
+    /// applies no cap. A present value outside `(0, 1)` is REJECTED at preset
+    /// load (`apply.rs` bails) rather than silently ignored — a yaml that asks
+    /// for a cap and gets none is worse than one that fails to load. The
+    /// resolver additionally ignores such a value if one ever reaches it by
+    /// another route.
+    pub(crate) crown_ibp_max_target_share_frac: Option<f64>,
+
+    /// #cgan-reclaim (docs/CGAN_BUDGET_RECLAIM_2026-08-20.md): the typed,
+    /// competition-reachable route for the cgan budget-reclaim set. The set
+    /// is one gate over five retention sites — cross-mode CROWN-IBP
+    /// collection-cache serve, crown-partial expiry retention, sequential
+    /// CROWN-IBP expiry salvage, ConvTranspose2d mid-step expiry salvage, and
+    /// forward-fallback publication past expiry — deliberately not separable,
+    /// because the standing audit finding is that set-mates switch together
+    /// and partial fixes measure exactly zero.
+    ///
+    /// WHY THE KEY EXISTS AT ALL. `vnncomp_scripts/run_instance.sh` exports no
+    /// `NY_*`, so `NY_CGAN_RECLAIM` can never arm on a scored run:
+    /// the mechanism was built, correct and unreachable, the sixth in that
+    /// family after `NY_EPOCH_DEPTH` and `NY_MARGIN_ROW_CLIP_ROWS`. Env still
+    /// wins in both directions where present.
+    ///
+    /// Absent (the shipped state on every config) = dark = byte-identical.
+    pub(crate) cgan_reclaim: Option<bool>,
+
+    // ---------------------------------------------------------------------
+    // #lever-reachability (2026-08-23). Fifteen keys promoted in one batch
+    // from environment-only gates. Every one is DEFAULT OFF (or, where the
+    // declaration ships armed, a typed KILL SWITCH that changes nothing while
+    // absent) and set by no shipped yaml — pinned by
+    // `no_shipped_preset_arms_a_promoted_lever_delivery_key`. The batch is
+    // byte-identical on every scored run: promotion makes a lever
+    // DELIVERABLE, it does not arm it.
+    //
+    // The environment name keeps precedence in BOTH directions wherever it is
+    // present, so every banked A/B recipe still works unchanged; a present but
+    // malformed value is a kill switch that resolves to the declaration
+    // default rather than silently revealing the preset.
+    // ---------------------------------------------------------------------
+    /// Root PHASE-RESIDENT sweep (`NY_ROOT_PHASE_RESIDENT_CROWN`).
+    ///
+    /// OWNS the root slot when armed, suppressing the comprehensive and
+    /// wide-demanded phases entirely, so it decides which intermediate
+    /// tightening the whole instance gets. Shrink-only and fail-closed: a
+    /// wrong choice costs tightness and can lose a proof, never invent one.
+    pub(crate) root_phase_resident_crown: Option<bool>,
+
+    /// One-target wide DEMANDED intermediate CROWN
+    /// (`NY_ROOT_WIDE_DEMANDED_INTERM_CROWN`). Reachable only when both
+    /// earlier root phases are unarmed; same shrink-only contract.
+    pub(crate) root_wide_demanded_interm_crown: Option<bool>,
+
+    /// Comprehensive CPU-parallel root sweep
+    /// (`NY_ROOT_CPU_PARALLEL_INTERM_CROWN`). REPLACES the dense-head
+    /// tightener rather than adding to it, so it changes which intermediate
+    /// bounds are published.
+    pub(crate) root_cpu_parallel_interm_crown: Option<bool>,
+
+    /// Per-target row ceiling for the comprehensive sound-GPU root sweep
+    /// (`NY_ROOT_COMP_GPU_INTERM_ROWS`). Absent keeps the shipped cap. The
+    /// device-class policy may still cap the request below the requested
+    /// value, and the backend refuses an over-large one — which is exactly the
+    /// signal the #comprehensive-rows-probe program measures.
+    pub(crate) root_comprehensive_gpu_interm_rows: Option<u64>,
+
+    /// Local authority slice, in seconds, for that sweep
+    /// (`NY_ROOT_COMP_GPU_INTERM_SECS`). Capped in turn by half the remaining
+    /// global budget, so large values saturate. Every chunk stays atomic,
+    /// deadline-bounded and shrink-only.
+    pub(crate) root_comprehensive_gpu_interm_secs: Option<u64>,
+
+    /// Rank the root objective pass at the rows that gate the verdict
+    /// (`NY_ROOT_OBJECTIVE_DIRECTED_ROWS`). SHIPS ARMED, so this key is the
+    /// typed per-category KILL SWITCH — the A/B control arm that previously
+    /// existed only as an environment variable a scored run cannot set.
+    pub(crate) root_objective_directed_rows: Option<bool>,
+
+    /// Retain the optional CPU compute-engine presence handle
+    /// (`NY_CPU_COMPUTE_ENGINE`). The historical policy is enabled by absence;
+    /// `false` is its typed kill switch. A qualified WGPU proof device always
+    /// survives independently of this value. No shipped preset sets this key.
+    pub(crate) cpu_compute_engine: Option<bool>,
+
+    /// Master arm for the root joint intermediate-alpha transaction
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA`). The same resolved value owns both root
+    /// entry routes, finite-deadline GPU admission and the CLI's optional CPU
+    /// engine suppression, so this key cannot produce a half-enabled run.
+    /// Absent keeps the measured research mechanism dark.
+    pub(crate) root_joint_interm_alpha: Option<bool>,
+
+    /// Permit root-joint alpha ascent under a finite deadline
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT`). This is a second,
+    /// default-dark arm: the selected GPU must also expose the audited bounded
+    /// joint-adjoint and sound-fold capability or execution keeps the certified
+    /// zero-iteration base fold.
+    pub(crate) root_joint_interm_alpha_deadline_ascent: Option<bool>,
+
+    /// Local root-joint wall request in seconds
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA_SECS`), default 30 when absent. This is a
+    /// request, not extra authority: the graph route caps it by remaining
+    /// budget and the scored input-split route caps it by the overall instance
+    /// deadline. Standalone research calls without that authority retain the
+    /// historical grace behavior.
+    pub(crate) root_joint_interm_alpha_secs: Option<u64>,
+
+    /// Joint-alpha ascent iteration ceiling
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA_ITERS`), default 100 when absent.
+    pub(crate) root_joint_interm_alpha_iters: Option<usize>,
+
+    /// Joint-alpha Adam step (`NY_ROOT_JOINT_INTERM_ALPHA_LR`), default 0.1
+    /// when absent. The runtime narrows the governed finite f32-range value at
+    /// the unchanged optimizer boundary.
+    pub(crate) root_joint_interm_alpha_lr: Option<f64>,
+
+    /// Per-target crossing-row ceiling
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA_MAX_SEL`), default 512 when absent.
+    /// Zero makes the bounded tightener a sound no-op; the execution receipt
+    /// distinguishes a configured ceiling from one that actually truncated a
+    /// target's crossing-row selection.
+    pub(crate) root_joint_interm_alpha_max_sel: Option<usize>,
+
+    /// Permit root-joint extraction to stop at a finite frozen interior box
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP`). Default OFF. The receipt
+    /// credits the arm only when an accepted target actually used a stop box.
+    pub(crate) root_joint_interm_alpha_frozen_stop: Option<bool>,
+
+    /// Admit a certified pure-chain suffix with no residual block
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN`). Default OFF. Frozen-stop can
+    /// independently imply this admission, so attributed execution requires a
+    /// target for which this specific arm was necessary.
+    pub(crate) root_joint_interm_alpha_pure_chain: Option<bool>,
+
+    /// Admit the certified BatchNorm-to-diagonal-Conv extraction used by the
+    /// root-joint lane (`NY_BN_GPU_EXTRACT`). Default OFF. The July cGAN
+    /// research recipe required this together with frozen-stop, but no shipped
+    /// preset arms either treatment.
+    pub(crate) bn_gpu_extract: Option<bool>,
+
+    /// Instance-specific comma-separated ReLU selector
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA_LAYERS`). Empty or `all` keeps automatic
+    /// selection. This key is deliverable for reproducible targeted research
+    /// but deliberately has no global search axis because node names are not
+    /// portable across VNN-COMP graphs.
+    pub(crate) root_joint_interm_alpha_layers: Option<String>,
+
+    /// Minimum real remaining seconds for graph-route admission
+    /// (`NY_ROOT_JOINT_MIN_REMAINING_SECS`), default 240 when absent. Explicit
+    /// zero preserves the research recipe that disables the floor.
+    pub(crate) root_joint_min_remaining_secs: Option<u64>,
+
+    /// Dimension ceiling for the root joint intermediate-alpha selector
+    /// (`NY_ROOT_JOINT_INTERM_ALPHA_MAX_DIM`). Absent keeps each selector's own
+    /// contextual default (2,048 legacy / 32,768 demand-ranked), which is why
+    /// the declaration carries no number of its own. Selection-only: a target
+    /// that is selected but not tightened keeps its reference bound bit-for-bit.
+    pub(crate) root_joint_interm_alpha_max_dim: Option<u64>,
+
+    /// Host mean-lA reconstruct for the per-domain clip lane
+    /// (`NY_CLIP_HOST_MEAN_LA`). The 2026-08-12 pilot behind this lane was run
+    /// entirely through its env half, i.e. through a route no scored run can
+    /// take, so it could not have been qualified even had it come back positive.
+    pub(crate) clip_host_mean_la: Option<bool>,
+
+    /// Certified batched intermediate clip (`NY_CLIP_INTERM_CERTIFIED`).
+    /// Certified end-to-end (docs/CLIP_APPLY_ENCLOSURE_PROOF_DESIGN_2026-08-12.md)
+    /// and shrink-only, but it feeds verdict-authoritative CROWN bounds, so it
+    /// is exactly the class of lever that must be preset-deliverable.
+    pub(crate) clip_interm_certified: Option<bool>,
+
+    /// Give each multi-objective GPU chunk its own deadline rather than one
+    /// deadline for the batch (`NY_MO_GPU_CHUNK_DEADLINE`), letting the wide
+    /// batch width rise under an authoritative deadline. Default OFF.
+    pub(crate) mo_gpu_chunk_deadline: Option<bool>,
+
+    /// Replace stored ancestor graph-domain alpha with the sound current-box
+    /// 0/1 heuristic in multi-objective propagation
+    /// (`NY_MO_ALPHA_HEURISTIC`). The retained trace moved a binding deep-child
+    /// lower bound, but did not establish a row conversion or category-wide
+    /// non-regression. This key is therefore deliverable for sealed searches
+    /// and remains absent from every shipped preset.
+    pub(crate) mo_alpha_heuristic: Option<bool>,
+
+    /// Use the measured two-sided SPSA gradient in the multi-objective graph
+    /// beta optimizer (`NY_MO_BETA_SPSA`). The declaration ships armed because
+    /// the analytical rollback differentiates the wrong quantity; this typed
+    /// key is therefore both a per-category arm and a kill switch. No shipped
+    /// preset sets it, so omission preserves the measured default-on policy.
+    pub(crate) mo_beta_spsa: Option<bool>,
+
+    /// Jointly step stored graph alpha with beta through the same SPSA samples
+    /// (`NY_MO_ALPHA_STEP`). The first isolated measurement regressed the probe
+    /// bound, so this is a sealed-search route only and remains absent from
+    /// every shipped preset. It is inert when beta SPSA is off, and the
+    /// current-box alpha heuristic supersedes its stored alpha when armed.
+    pub(crate) mo_alpha_step: Option<bool>,
+
+    /// Share of the kFSB branching budget spent on candidate simulation
+    /// (`NY_KFSB_SIM_SHARE`, closed `[0, 1]`, declaration default 0.35; `0`
+    /// removes the cap). Sound by construction — stopping early ranks over
+    /// fewer candidates, so the wave may commit a WORSE split, but every
+    /// committed child is still evaluated by the ordinary sound backward.
+    pub(crate) kfsb_sim_share: Option<f64>,
+
+    /// Publish the Graph-MIP leaf oracle's SAT witness as the run's verdict
+    /// candidate (`NY_GRAPH_MIP_LEAF_SAT`). SHIPS ARMED, so this key is the
+    /// typed kill switch back to the pre-change ADVISORY behaviour. The witness
+    /// is graph-forward-confirmed against every objective row before it is
+    /// published either way.
+    pub(crate) graph_mip_leaf_sat: Option<bool>,
+
+    /// GPU-evaluated replay for the true-gradient lane
+    /// (`NY_TRUE_GRAD_GPU_REPLAY`). SHIPS ARMED where a caller supplies
+    /// operands, so this key is the typed kill switch to the CPU path.
+    /// Gradients only steer alpha in [0, 1] — any value there is a valid lower
+    /// relaxation slope — and no bound from this lane is ever published.
+    pub(crate) true_grad_gpu_replay: Option<bool>,
+
+    /// SafeNLP full-cycle master arm (`NY_SAFENLP_MIP_CYCLE`,
+    /// docs/SAFENLP_CYCLE_2026-08-20.md): conditional MIP handoff with the
+    /// historical BaB floor kept, serial one-model solve, and AY's
+    /// verdict-preserving margin reframe, as one gate so the composed cycle
+    /// cannot be measured split.
+    ///
+    /// This one changes WHICH prover answers, so it deserves its own soundness
+    /// sentence: both provers are verdict authorities in their own right, and
+    /// the reframe banks UNSAT only on a strict bound crossing with
+    /// original-model proof replay. Arming it can lose a row to the schedule;
+    /// it cannot certify a false one.
+    pub(crate) safenlp_mip_cycle: Option<bool>,
+
+    /// Context-grouped disjunctive refinement covers on nn4sys
+    /// (`NY_NN4SYS_CTX_GROUP`): one shared tree over the hull of bit-identical
+    /// clause boxes instead of one tree per box. The cover and disjointness
+    /// proofs are FAIL-CLOSED — any doubt keeps the obligation — so it changes
+    /// which boxes get bounded, and therefore coverage, without weakening what
+    /// a discharged obligation means.
+    pub(crate) nn4sys_ctx_group: Option<bool>,
+
+    // ---------------------------------------------------------------------
+    // #lever-reachability batch 2 (2026-08-23). Nine more, same contract as
+    // the block above: DEFAULT OFF (or a typed kill switch where the
+    // declaration ships armed), set by no shipped yaml, pinned by
+    // `no_shipped_preset_arms_a_promoted_lever_delivery_key`.
+    //
+    // Six of them are read in `ny-gpu`, whose cells live in
+    // `ny_propagate::preset_gates` because `ny-gpu` depends on `ny-propagate`
+    // — one place the bridge writes, one place a reviewer looks.
+    // ---------------------------------------------------------------------
+    /// The wide ResNet CROWN dispatch (`NY_BAB_RESNET_WIDE`). SHIPS ARMED, so
+    /// this key is the typed per-category KILL SWITCH — the `0` arm, which was
+    /// expressible only through an environment variable the scored harness does
+    /// not export.
+    pub(crate) bab_resnet_wide: Option<bool>,
+
+    /// Split a HETEROGENEOUS wide batch into maximal homogeneous runs and fold
+    /// it run-by-run instead of abandoning the wave to the serial path
+    /// (`NY_BAB_RESNET_WIDE_SUBGROUP`). It changes WHICH kernel produces a
+    /// verdict-bearing bound, so arming it stays a measured-session decision;
+    /// this key makes that decision expressible at all.
+    pub(crate) bab_resnet_wide_subgroup: Option<bool>,
+
+    /// Row count above which a sound-GPU sweep is classified LARGE
+    /// (`NY_SWEEP_CLASS_ROWS`). Absent keeps the shipped class policy. The
+    /// backend preflight still computes exact simultaneous liveness and refuses
+    /// anything it cannot honour.
+    pub(crate) sweep_class_rows: Option<u64>,
+
+    /// The memory half of the same classification, in whole MiB
+    /// (`NY_SWEEP_CLASS_MIB`). Rows and MiB can disagree, and which one binds
+    /// is the thing being measured. NOTE the GB10 hazard recorded at the read
+    /// site: the 121 GiB is shared with the host and an earlier
+    /// over-allocation caused a global OOM, so this is an explicit opt-in.
+    pub(crate) sweep_class_mib: Option<u64>,
+
+    /// Discharge the sound GPU-resident ResNet walk's accumulated coefficient
+    /// error PER SEGMENT against the frontier magnitudes instead of carrying it
+    /// forward as coefficient radii (`NY_RESNET_ERR_CONCRETIZE`). It is on the
+    /// CERTIFIED lane and feeds the main-bound auto-fallback, so it changes
+    /// which bound is published — not a plumbing switch despite looking like
+    /// one.
+    pub(crate) resnet_err_concretize: Option<bool>,
+
+    /// Per-RELU rather than per-segment error concretization on the same
+    /// certified walk (`NY_RESNET_ERR_CONCRETIZE_FINE`); a refinement of the
+    /// key above and inert unless that one is armed.
+    pub(crate) resnet_err_concretize_fine: Option<bool>,
+
+    /// Cost-weighted vs count-based per-candidate grants for the sequential
+    /// CROWN-IBP collection budget (`NY_SEQ_WEIGHTED_BUDGET`).
+    ///
+    /// SHIPS ARMED, and armed by ABSENCE on a legacy `!= "0"` opt-out parser,
+    /// so this key is the typed count-based CONTROL ARM. A candidate that loses
+    /// its grant degrades to IBP and that degraded intermediate is published
+    /// into every downstream bound, so the choice moves bounds in both
+    /// directions — which is exactly why the control arm needed a route a
+    /// scored run can take.
+    pub(crate) seq_weighted_budget: Option<bool>,
+
+    /// One stacked backward walk in place of per-target walks in the cgan
+    /// collector (`NY_CGAN_STACKED_BACKWARD`). Default dark; the fallback
+    /// computes the same bounds.
+    pub(crate) cgan_stacked_backward: Option<bool>,
+
+    /// Host-memory admission budget in MiB for the stacked cGAN walk
+    /// (`NY_CGAN_STACKED_BUDGET_MB`). Absence preserves the host-adaptive
+    /// budget; explicit zero remains a real control arm.
+    pub(crate) cgan_stacked_budget_mb: Option<u64>,
+
+    /// Kernel selector for finite-deadline certified Conv2d IBP: `1`
+    /// (parallel blocked), `seq`, or `0` (scalar oracle)
+    /// (`NY_CONV_IBP_BLOCKED`).
+    pub(crate) conv_ibp_blocked: Option<String>,
+
+    /// Decide native Patches finite authority by deadline expiry rather than
+    /// deadline presence (`NY_PATCHES_FINITE_EXPIRY`). Ships armed; this is
+    /// also the typed kill-switch route.
+    pub(crate) patches_finite_expiry: Option<bool>,
+
+    /// Disable consultation of passive graph-walk timing records
+    /// (`NY_NO_WALK_RECORD_ADMISSION`).
+    pub(crate) no_walk_record_admission: Option<bool>,
+
+    /// Pollable chunked-faer bounded Linear CROWN (`NY_POLLABLE_FAER`). The
+    /// environment retains its historical truthy parser; this typed route is
+    /// canonical Boolean delivery for scored search.
+    pub(crate) pollable_faer: Option<bool>,
+
+    /// Near-miss survivor alpha polish on the grouped-disjunctive eager lane
+    /// (`NY_CGAN_POLISH`): children inside the knife-edge band get one
+    /// certified warm-alpha re-bound with real SPSA steps, FLOOR-MERGED so
+    /// bounds only tighten.
+    pub(crate) cgan_polish: Option<bool>,
+
+    /// Switch the two per-node partial CROWN sites from deadline PRESENCE to
+    /// deadline EXPIRY (`NY_CROWN_PARTIAL_FINITE_EXPIRY`): commit what the walk
+    /// already holds instead of declining the moment a deadline merely EXISTS.
+    ///
+    /// Worth delivering precisely because the standing audit predicts a NULL
+    /// unless the whole root-cause-D set switches together — a zero measured
+    /// through this key is evidence about the split, not about the fix, and
+    /// until now there was no way to measure it on a scored run at all. Both
+    /// arms publish sound enclosures; the walk's existing entry/exit expiry
+    /// checks still refuse any late publication.
+    pub(crate) crown_partial_finite_expiry: Option<bool>,
+
     /// Hard wall-clock cap (seconds) on the root alpha-CROWN warmup.
     /// See `BetaCrownConfig::root_alpha_cap_secs` for the measurement.
     #[serde(default)]
@@ -652,7 +1650,7 @@ pub(crate) struct BabPreset {
 
     /// Run the comprehensive all-target sound-GPU root intermediate sweep.
     ///
-    /// DELIVERY: the scored entry point exports exactly one `NY_*` variable, so
+    /// DELIVERY: the scored entry point exports no `NY_*` variables, so
     /// the env lever this was measured through is dead in competition. This typed
     /// key is how the result reaches a scored run
     /// (`crates/ny-cli/tests/measured_gate_delivery.rs`).
@@ -661,7 +1659,7 @@ pub(crate) struct BabPreset {
     /// `#bab-floor`: BaB's share of the root window, subtracted before any root
     /// phase sizes itself.
     ///
-    /// DELIVERY: the scored entry point exports exactly one `NY_*` variable, so
+    /// DELIVERY: the scored entry point exports no `NY_*` variables, so
     /// the env levers these were measured through are dead in competition.
     /// These three typed keys are how a search result reaches a scored run.
     pub(crate) root_bab_reserve_frac: Option<f64>,
@@ -797,6 +1795,37 @@ pub(crate) struct PhaseBudgetPreset {
     /// rest). Default: 0.10.
     pub(crate) post_bab_pgd_fraction: Option<f32>,
 
+    /// #reserve-demand — size the post-BaB reservation from the lane that
+    /// actually follows BaB instead of always subtracting
+    /// `post_bab_pgd_fraction`.
+    ///
+    /// Default `true`. A reserve taken BEFORE BaB can only be justified by a
+    /// capability known BEFORE BaB, and the post-BaB falsifier's only such
+    /// capability is the network gradient. On a net outside the exact-gradient
+    /// fragment the pre-payment buys nothing: `#deadlane` hands the lane the
+    /// window and it declines in ~0.03 s, so the seconds are discarded with the
+    /// row still undecided (measured on vit_2023 at the official 100 s budget:
+    /// BaB stopped at 81.0 s of a 95 s internal tier and the row published
+    /// `timeout` while its own ledger read `remaining_s=14.198`).
+    ///
+    /// `false` restores the historical unconditional subtraction exactly. This
+    /// is the kill switch for the sizing rule, not for the lane.
+    pub(crate) demand_sized_post_bab_reserve: Option<bool>,
+
+    /// #disj-demand — zero the disjunctive global PGD slice when the net is
+    /// statically outside the exact-gradient fragment (the same static probe
+    /// as `demand_sized_post_bab_reserve`), so the phase could only spend the
+    /// slice on SPSA over point-IBP forwards.
+    ///
+    /// Default `false` (historical schedule everywhere): the SPSA fallback is
+    /// a real searcher and gradient-ineligible categories may score through it
+    /// (ml4acopf_2024 has a banked 256 s `sat`), so each category arms this
+    /// only behind its own A/B. Measured for vit_2023 at the official 100 s
+    /// budget: the phase spends its full 4.75 s slice and has never produced a
+    /// counterexample on the family. On a net INSIDE the fragment the armed
+    /// key is inert — the static probe decides, not the yaml.
+    pub(crate) demand_sized_disjunctive_pgd: Option<bool>,
+
     /// Whether the VNN-COMP wrapper may run its independent exact-gradient
     /// falsifier after the in-process verifier returns undecided.
     ///
@@ -808,6 +1837,15 @@ pub(crate) struct PhaseBudgetPreset {
     /// also give the scalable historical tail back to proof while retaining
     /// its fixed results-publication margin.
     pub(crate) vnncomp_post_bab_attack: Option<bool>,
+
+    /// Fixed whole-second reserve for that outer wrapper falsifier
+    /// (`NY_POSTBAB_RESERVE_SECS`). Zero or absence preserves the historical
+    /// schedule. A positive value never reduces a verifier window from ten or
+    /// more seconds to below ten, and never extends an already-shorter window;
+    /// the outer lane still has to pass its ordinary route, memory,
+    /// executable-stage, and live-budget admissions before it can receive
+    /// optimizer engagement credit.
+    pub(crate) post_bab_reserve_secs: Option<u64>,
 
     /// Fraction of the REMAINING budget for the single adaptive attack
     /// extension (#attack-extend). Default: 0.15. Set 0.0 to disable for
@@ -891,11 +1929,22 @@ pub(crate) struct BranchingPreset {
     /// branching, mirrors alpha-beta-CROWN's `method: nonlinear`).
     pub(crate) method: Option<String>,
 
-    /// Number of candidates for FSB/kFSB.
+    /// Number of candidates for ordinary FSB/kFSB branching.
     pub(crate) candidates: Option<usize>,
 
-    /// Reduce operation for kFSB: "min", "max", "mean".
+    /// Reduce operation for ordinary kFSB: "min", "max", "mean".
     pub(crate) reduceop: Option<String>,
+
+    /// Candidate count for the wave-batched multi-objective kFSB selector
+    /// only. This is the typed layer beneath governed `NY_MO_KFSB_K`; keeping
+    /// it separate from `candidates` makes a scored treatment equivalent to
+    /// the legacy environment arm instead of also retuning ordinary FSB/kFSB.
+    pub(crate) kfsb_multi_candidates: Option<usize>,
+
+    /// Two-child reduction for the wave-batched multi-objective selector only.
+    /// The governed `NY_MO_KFSB_REDUCE` environment override retains its
+    /// narrower exact `min|max` parser; the typed layer also accepts `mean`.
+    pub(crate) kfsb_multi_reduceop: Option<String>,
 
     /// Arm the multi-objective wave-batched kFSB selector (#kfsb-multi). When
     /// `Some(true)`, sets `BetaCrownConfig::use_kfsb_multi_branching = true`.
@@ -924,6 +1973,46 @@ pub(crate) struct BranchingPreset {
     /// Nonlinear split configuration (for networks with nonlinear operations).
     #[serde(default)]
     pub(crate) nonlinear_split: NonlinearSplitPreset,
+}
+
+/// Self-calibrating per-child bound allowance (#cost-observer):
+/// `bab.branching.input_split.child_bound_calibration`.
+///
+/// Every field optional AND every field DIMENSIONLESS; the block itself is
+/// optional — absent keeps `child_bound_max_secs` in charge (byte-identical).
+/// The absence of any `*_secs` field is the point of the key: the seconds are
+/// measured at runtime, not declared here.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputSplitChildBoundCalibrationPreset {
+    /// Multiple of this row's MEASURED median completed-call cost that a call
+    /// may run before being cut off. Omitted = 160.
+    pub(crate) headroom: Option<f64>,
+    /// Largest share of the REMAINING wall one call may take. Omitted = 0.25.
+    pub(crate) max_share_of_remaining: Option<f64>,
+    /// Share of the remaining wall spent on the regime-finding probe before any
+    /// call has completed. Omitted = 0.05.
+    pub(crate) probe_share: Option<f64>,
+    /// Completed observations before the measured term governs. Omitted = 8.
+    pub(crate) min_samples: Option<usize>,
+    /// Sliding window of retained completed observations. Omitted = 128.
+    pub(crate) window: Option<usize>,
+    /// Growth per CONSECUTIVE truncated call. Omitted = 2.0.
+    pub(crate) growth: Option<f64>,
+}
+
+/// Certified f64 tail escalation sub-key (#cgan-f64-tail, design B step B5):
+/// `bab.branching.input_split.f64_tail`. Every field optional; the block
+/// itself is optional — absent keeps the mechanism dark (byte-identical).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InputSplitF64TailPreset {
+    /// Arm both escalation seams (batch seam + survivor-polish hook).
+    pub(crate) enabled: Option<bool>,
+    /// Escalation guard band (gap >= -band escalates). Omitted = legacy 5e-3.
+    pub(crate) band: Option<f32>,
+    /// Hard per-run escalation cap shared by both seams (0 = unlimited).
+    pub(crate) max_escalations: Option<usize>,
 }
 
 /// Input-splitting SB configuration.
@@ -977,6 +2066,74 @@ pub(crate) struct InputSplitPreset {
     /// `ibp_enhancement` is also set. ny-specific (no alpha-beta-CROWN
     /// counterpart; the reference batches all layers on GPU natively).
     pub(crate) stacked_rebound: Option<bool>,
+
+    /// Certified f64 tail re-bounding of knife-edge survivors on the
+    /// grouped-disjunctive input-split lane (#cgan-f64-tail, design B).
+    /// Sub-key `bab.branching.input_split.f64_tail.{enabled, band,
+    /// max_escalations}` maps onto `BetaCrownConfig::input_split_f64_tail_*`.
+    /// Omitted = dark everywhere (byte-identical); the env levers
+    /// `NY_F64_TAIL` / `NY_F64_TAIL_BAND` override at the ny-propagate
+    /// resolution chokepoint (`resolve_f64_tail_settings`). ny-specific.
+    pub(crate) f64_tail: Option<InputSplitF64TailPreset>,
+
+    /// Nested-rebound deadline authority for the input-split dense-spec
+    /// rebound (#dist-shift-5291; the `6f49a660` deadline-presence cliff).
+    /// `false` = the nested rebound verifier runs its bound computations
+    /// WITHOUT the inner finite deadline (the pre-`6f49a660` shape): wall-
+    /// clock safety comes from the OUTER BaB loop's own deadline poll between
+    /// rebound batches plus the harness per-instance budget; what is ceded is
+    /// intra-rebound interruptibility, bounded by one rebound batch — so only
+    /// categories whose per-batch rebound cost is known-small should set it.
+    /// Soundness is unaffected either way (the nested deadline selects routes
+    /// and fallbacks, never bound math). Omitted/`true` keeps the shipped
+    /// deadline-carrying arm. Env `NY_INPUT_SPLIT_NESTED_DEADLINE` overrides
+    /// in both directions (`0` drop / `1` keep). ny-specific.
+    pub(crate) nested_deadline: Option<bool>,
+
+    /// Per-CHILD wall cap in SECONDS for the grouped-disjunctive input-split
+    /// per-child bound calls (#cgan-dark-tail FIX-1). Maps onto
+    /// `BetaCrownConfig::input_split_child_bound_max_secs`.
+    ///
+    /// OMITTED — the shipped state for every preset — is NO CAP: each per-child
+    /// bound keeps the absolute BaB `crown_deadline` it has today and the route
+    /// is byte-for-byte identical. Naming the key makes each call run against
+    /// `min(crown_deadline, now + secs)`; the absolute ceiling is never
+    /// extended.
+    ///
+    /// The defect it addresses: one child bound is entitled to the whole
+    /// remaining budget, and the trajectory only prints between batches, so it
+    /// spends it invisibly (cgan row 2: ~290 s / 32% of the 900 s budget on
+    /// 0-10 domains, 13/13 logs; tail calls ~70 s to >=285 s against a 0.13 s
+    /// median). Soundness is unaffected: a per-call deadline can only make a
+    /// bound LOOSER, and the frozen-root-α retry that catches the `Err` arm
+    /// already exists and is already exercised. Config-only, no env override.
+    /// ny-specific.
+    pub(crate) child_bound_max_secs: Option<f64>,
+
+    /// #cost-observer: SELF-CALIBRATING replacement for
+    /// `child_bound_max_secs`. Maps onto
+    /// `BetaCrownConfig::input_split_child_bound_calibration`.
+    ///
+    /// OMITTED — the shipped state for every preset — leaves the constant above
+    /// in charge and the route byte-for-byte identical. Naming the key derives
+    /// each call's allowance at runtime from the median cost of the calls that
+    /// have already completed ON THIS ROW and the wall actually remaining.
+    ///
+    /// The defect it addresses is not that the constant is mis-tuned; it is
+    /// that no single value exists. A/B'd 2026-08-26 at the official 1200 s on
+    /// the two 1200 s cgan rows at `child_bound_max_secs: 20.0`:
+    /// `nonlinear_activations` explored `2 -> 957` with zero collection
+    /// truncations (20 s CORRECT), `upsample` took 37 truncations cutting a
+    /// 27-layer collection to 5-6 with the gap unmoved (20 s an order of
+    /// magnitude TOO SHORT). Their per-call costs differ by ~3 orders of
+    /// magnitude — `0.13 s` median versus `>= 300 s` — and nothing in the
+    /// instance declares that.
+    ///
+    /// Soundness is unaffected and for the same reason as the constant: the
+    /// derived allowance is composed by the same `min(ceiling, now + allowance)`
+    /// law, so a bound can only ever get LOOSER, never wrong. Config-only, no
+    /// env override. ny-specific.
+    pub(crate) child_bound_calibration: Option<InputSplitChildBoundCalibrationPreset>,
 
     /// Parallelize independent per-domain warm-alpha refinements in the
     /// deferred reordered rebound. ny-specific and default false; a preset must
@@ -1170,7 +2327,7 @@ pub(crate) struct AlphaCrownPreset {
     /// `improved_output`-gated refresh, which is measured dead on cifar100.
     ///
     /// This is a preset key rather than an env lever on purpose: the scored entry
-    /// point exports exactly one `NY_*` variable, so an env-only setting cannot
+    /// point exports no `NY_*` variables, so an env-only setting cannot
     /// fire in competition however well it measures
     /// (`crates/ny-cli/tests/measured_gate_delivery.rs`).
     pub(crate) joint_interm_alpha_every: Option<usize>,
@@ -1231,6 +2388,11 @@ pub(crate) struct AlphaCrownPreset {
     /// forward-linear map and tightens every demanded CROWN-IBP target. Child
     /// warm starts clear the policy and retain the cheap forward-linear map.
     pub(crate) cgan_complete_crown_ibp_root: Option<bool>,
+    /// Row ceiling for demanded CROWN targets inside the complete cGAN root
+    /// cascade (`#cgan-narrow-target-budget`). Absent/None keeps the historical
+    /// all-demanded candidate set. Scheduling-only: a declined target retains
+    /// the certified forward-linear baseline the cascade was seeded with.
+    pub(crate) cgan_narrow_target_max_rows: Option<usize>,
 
     /// Consecutive non-improving α iterations tolerated before optimization
     /// stops early. Maps 1:1 to `AlphaCrownConfig::early_stop_patience` and to
@@ -1383,6 +2545,29 @@ pub(crate) fn load_preset(path: &Path) -> Result<PresetConfig> {
     }
 
     Ok(preset)
+}
+
+/// Resolve the typed `bab.cgan_reclaim` key (#cgan-reclaim).
+///
+/// WITHOUT THIS READER AND ITS CALL SITE THE WHOLE SET IS DEAD CODE IN
+/// COMPETITION, exactly like `NY_EPOCH_DEPTH` and the closure-adaptive ladder
+/// before it: `run_instance.sh` exports no `NY_*`, so the env half
+/// (`NY_CGAN_RECLAIM`) cannot arm on a scored run. Returning `None` for an
+/// unreadable or key-less preset keeps the shipped configs byte-identical.
+pub(crate) fn cgan_reclaim_from_preset(preset: Option<&Path>) -> Option<bool> {
+    preset
+        .and_then(|path| load_preset(path).ok())
+        .and_then(|config| config.bab.cgan_reclaim)
+}
+
+/// Resolve the typed `bab.mo_alpha_heuristic` key (#stale-alpha).
+///
+/// Same reason the reader above exists: without a call site the lever is dead
+/// code on a scored run, because `run_instance.sh` exports no `NY_*` values.
+pub(crate) fn mo_alpha_heuristic_from_preset(preset: Option<&Path>) -> Option<bool> {
+    preset
+        .and_then(|path| load_preset(path).ok())
+        .and_then(|config| config.bab.mo_alpha_heuristic)
 }
 
 pub(crate) fn build_onnx_load_config(preset: &PresetConfig) -> Result<ny_onnx::OnnxLoadConfig> {

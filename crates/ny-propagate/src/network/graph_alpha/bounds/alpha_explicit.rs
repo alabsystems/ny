@@ -352,6 +352,10 @@ impl GraphNetwork {
         let chunk_aware_target_routes: Option<HashMap<String, Option<ChunkAwareAlphaRoute>>> =
             chunk_aware_budget.then(|| {
                 let dense_budget = cpu_crown_dense_budget_bytes();
+                // Resolve the frozen policy ONCE. It is constant for this graph, and
+                // the closure below runs per TARGET; reading it there cost six linear
+                // scans of the ~197-entry registry per field, twice per target.
+                let runtime_policy = self.crown_ibp_runtime_policy();
                 targets
                     .iter()
                     .filter_map(|target| {
@@ -372,6 +376,8 @@ impl GraphNetwork {
                                     execution,
                                     deadline.is_some(),
                                     false,
+                                    runtime_policy.chunk_wave_parallel_enabled,
+                                    runtime_policy.chunk_adaptive_growth_enabled,
                                 ),
                             });
                             (target.clone(), route)
@@ -747,23 +753,20 @@ impl GraphNetwork {
     ///    driver — it does not run it. `propagate_crown_to_node_core` hard-wires
     ///    `deadline_is_hard = per_node_deadline.is_some()`
     ///    (target_backward.rs), and `propagate_crown_to_node_chunked` opens with
-    ///    an unconditional `if deadline_is_hard { return Err(
-    ///    UnsupportedConfiguration("finite objective-chunk target backward is
-    ///    not cooperatively bounded ..")) }`. Every scored run carries a
-    ///    deadline, so on this benchmark the reroute is refused at driver entry
-    ///    and `UnsupportedConfiguration` lands on the SAME reference-bound arm
-    ///    the memory error did. The target degrades either way; only the log
-    ///    line changes.
+    ///    a driver-entry refusal.
     ///
-    /// That second guard is the same PRESENCE-not-EXPIRY shape the
-    /// `NY_PATCHES_FINITE_EXPIRY` family repairs, and the crate already owns the
-    /// helper it should use —
-    /// `network::core::sequential::crown::patches_step::hard_finite_authority_refuses_patches(deadline_is_hard, deadline)`,
-    /// which returns `true` only once the deadline has actually EXPIRED when the
-    /// authority is armed. The chunk driver already re-checks expiry at entry
-    /// and polls between chunks, so deciding this refusal by expiry costs no
-    /// interruptibility. Until that one call site changes, widening the budget
-    /// predicate here buys nothing, so it is intentionally left alone.
+    /// CORRECTED 2026-08-24 (stale-doc item, `DEADLINE_PRESENCE_AUDIT_2026-08-24.md`
+    /// §D1): that driver-entry refusal is NO LONGER unconditional on presence.
+    /// `target_backward.rs` (the `finite objective-chunk target backward is not
+    /// cooperatively bounded` guard, ~:3312) now refuses only when
+    /// `expiry_authority_armed()` is false OR the deadline has actually
+    /// EXPIRED — and the `PATCHES_FINITE_EXPIRY` authority SHIPS ARMED
+    /// (`DefaultSpec::Bool(true)`), so in a scored run with budget left the
+    /// chunk driver IS entered. The historical conclusion "widening the budget
+    /// predicate here buys nothing, so it is intentionally left alone" rested
+    /// on the old presence refusal and is obsolete; whether widening the budget
+    /// predicate here now buys anything is an OPEN, unmeasured question, not a
+    /// settled negative.
     fn alpha_target_chunk_override(
         &self,
         node_name: &str,

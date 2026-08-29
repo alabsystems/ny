@@ -20,6 +20,122 @@ use std::ops::Deref;
 /// Extracted network parameters: (weights, biases, layer_dims).
 pub(super) type NetworkParams = (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<usize>);
 
+/// Class of a layer under the MIP feed-forward canonicalization, for the cheap
+/// pre-unfold screen in [`mip_feedforward_activation_refusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MipLayerClass {
+    /// Becomes a `Linear` in the canonical network (`Linear` passes through;
+    /// `Conv2d` is densified one-for-one by [`unfold_conv2d_to_linear`]).
+    Affine,
+    /// Survives canonicalization unchanged.
+    Relu,
+    /// Deleted by [`strip_shape_layers`] or absorbed by [`fold_constant_layers`],
+    /// so it cannot appear in the canonical network and is skipped here.
+    Erasable,
+    /// Not modelled by this screen. Presence makes the screen abstain.
+    Opaque,
+}
+
+const fn mip_layer_class(layer: &Layer) -> MipLayerClass {
+    match layer {
+        Layer::Linear(_) | Layer::Conv2d(_) => MipLayerClass::Affine,
+        Layer::ReLU(_) => MipLayerClass::Relu,
+        Layer::Flatten(_) | Layer::Reshape(_) => MipLayerClass::Erasable,
+        Layer::AddConstant(_) | Layer::SubConstant(_) => MipLayerClass::Erasable,
+        _ => MipLayerClass::Opaque,
+    }
+}
+
+/// CHEAP pre-unfold screen for the same topology
+/// [`validate_mip_feedforward_topology`] enforces after canonicalization.
+///
+/// # Why this exists
+///
+/// `canonicalize_mip_feedforward_network` runs `unfold_conv2d_to_linear` —
+/// which materializes a DENSE im2col matrix per Conv2d — and only then runs
+/// the purely structural topology check. On a model the encoder can never
+/// accept, every second of that densification is thrown away. Measured on
+/// `relusplitter` `cifar_biasfield` (16-D input, `Gemm → Reshape → Conv×8`),
+/// 3/3 rows at the official 60 s budget: the refusal lands 14.6-16.5 s after
+/// the unfold begins, i.e. **29-32% of the 51 s internal verifier grant is
+/// spent to learn the model is unencodable**. The refusal is decidable from
+/// the layer SEQUENCE alone, at O(layers) and zero allocation.
+///
+/// # Why it is exactly equivalent
+///
+/// The canonicalization is class-preserving on the sequence this screen reads:
+/// `unfold_conv2d_to_linear` rewrites each `Conv2d` to exactly one `Linear` and
+/// clones every other layer in place; `strip_shape_layers` deletes only
+/// `Flatten`/`Reshape`; `fold_constant_layers` only absorbs
+/// `AddConstant`/`SubConstant` into an adjacent `Linear` bias. None of them
+/// inserts, deletes or reorders an affine-or-ReLU layer. So the `[Affine, ReLU]*,
+/// Affine` alternation is invariant, and a violation here is a violation there.
+///
+/// # Why it fails OPEN, not closed
+///
+/// Any layer this screen does not model maps to [`MipLayerClass::Opaque`] and
+/// makes the screen ABSTAIN (`None`), deferring to the existing post-unfold
+/// authority. The screen can therefore only ever refuse EARLIER something that
+/// would have been refused LATER — it can never reject a model the encoder
+/// would have accepted, and it never admits one it would have rejected.
+///
+/// SOUNDNESS: this is a scheduling/cost decision only. Refusing the MIP
+/// escalation degrades to the inconclusive BaB verdict exactly as the
+/// post-unfold refusal already does; no bound and no verdict is affected.
+pub(super) fn refuse_mip_feedforward_before_unfold(network: &Network) -> Result<()> {
+    if let Some(reason) = mip_feedforward_activation_refusal(network) {
+        anyhow::bail!(reason);
+    }
+    Ok(())
+}
+
+fn mip_feedforward_activation_refusal(network: &Network) -> Option<String> {
+    let mut affine_relu_alternation = Vec::with_capacity(network.layers().len());
+    for layer in network.layers() {
+        match mip_layer_class(layer) {
+            MipLayerClass::Erasable => {}
+            // Unmodelled layer: abstain and let the canonical path decide.
+            MipLayerClass::Opaque => return None,
+            class => affine_relu_alternation.push(class),
+        }
+    }
+
+    if affine_relu_alternation.is_empty() {
+        return Some(
+            "MIP feedforward topology is empty; expected [Linear, ReLU]*, Linear".to_string(),
+        );
+    }
+    for (index, class) in affine_relu_alternation.iter().enumerate() {
+        let expected = if index % 2 == 0 {
+            MipLayerClass::Affine
+        } else {
+            MipLayerClass::Relu
+        };
+        if *class != expected {
+            let expected_name = if index % 2 == 0 { "Linear" } else { "ReLU" };
+            let found = if *class == MipLayerClass::Affine {
+                "Linear"
+            } else {
+                "ReLU"
+            };
+            return Some(format!(
+                "MIP feedforward topology mismatch at layer {index}: encoder expects \
+                 {expected_name}, found {found} (required topology: [Linear, ReLU]*, Linear) \
+                 [refused before Conv2d densification]"
+            ));
+        }
+    }
+    if affine_relu_alternation.len().is_multiple_of(2) {
+        let index = affine_relu_alternation.len() - 1;
+        return Some(format!(
+            "MIP feedforward topology mismatch at layer {index}: trailing ReLU has no following \
+             Linear (required topology: [Linear, ReLU]*, Linear) \
+             [refused before Conv2d densification]"
+        ));
+    }
+    None
+}
+
 /// Validate the exact topology encoded by [`ny_mip::encode_feedforward`].
 ///
 /// The encoder receives only affine parameters, not the original activation
@@ -942,6 +1058,87 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("layer 1: encoder expects ReLU, found Add"));
+    }
+
+    /// A 1x2x2 -> 1x1x1 Conv2d, the cheapest layer that forces the dense
+    /// im2col path in `unfold_conv2d_to_linear`.
+    fn tiny_conv() -> Layer {
+        let kernel =
+            ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![1.0f32, 0.0, 0.0, 1.0]).unwrap();
+        Layer::Conv2d(Conv2dLayer::with_input_shape(kernel, None, (1, 1), (0, 0), 2, 2).unwrap())
+    }
+
+    /// #mip-unfold-precheck: the measured `relusplitter` `cifar_biasfield`
+    /// shape is `Gemm -> Reshape -> Conv -> ReLU -> ...`, i.e. two adjacent
+    /// AFFINE layers once the Reshape is stripped. The pre-unfold screen must
+    /// refuse it WITHOUT densifying any Conv2d — that refusal was costing
+    /// 14.6-16.5 s of a 51 s internal grant, 3/3 rows.
+    #[test]
+    fn mip_precheck_refuses_biasfield_shape_before_densifying_conv() {
+        let mut network = Network::new();
+        network.add_layer(linear(&[1.0], 1, 1, &[0.0]));
+        network.add_layer(Layer::Flatten(FlattenLayer::flatten_all()));
+        network.add_layer(tiny_conv());
+        network.add_layer(Layer::ReLU(Default::default()));
+        network.add_layer(linear(&[1.0], 1, 1, &[0.0]));
+
+        let error = refuse_mip_feedforward_before_unfold(&network)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("layer 1: encoder expects ReLU, found Linear"),
+            "unexpected refusal: {error}"
+        );
+        assert!(error.contains("refused before Conv2d densification"));
+
+        // EQUIVALENCE: the post-canonicalization authority refuses the very
+        // same network, so the screen only moves the refusal earlier.
+        let unfolded = unfold_conv2d_to_linear(&network, &[1, 2, 2]).unwrap();
+        let stripped = strip_shape_layers(&unfolded);
+        let folded = fold_constant_layers(&stripped).unwrap();
+        assert!(validate_mip_feedforward_topology(&folded).is_err());
+    }
+
+    /// The screen must ACCEPT (return Ok) every sequence the encoder accepts,
+    /// including Conv2d in affine position and foldable constant-bias layers.
+    #[test]
+    fn mip_precheck_admits_every_encodable_sequence() {
+        // Conv2d sits in an AFFINE slot; Flatten/AddConstant are erased.
+        let mut network = Network::new();
+        network.add_layer(tiny_conv());
+        network.add_layer(Layer::ReLU(Default::default()));
+        network.add_layer(linear(&[1.0], 1, 1, &[0.0]));
+        network.add_layer(Layer::AddConstant(AddConstantLayer::new(vector_constant(
+            &[1.0],
+        ))));
+        assert!(refuse_mip_feedforward_before_unfold(&network).is_ok());
+
+        let mut plain = Network::new();
+        plain.add_layer(linear(&[1.0], 1, 1, &[0.0]));
+        plain.add_layer(Layer::ReLU(Default::default()));
+        plain.add_layer(linear(&[1.0], 1, 1, &[0.0]));
+        assert!(refuse_mip_feedforward_before_unfold(&plain).is_ok());
+    }
+
+    /// The screen must ABSTAIN on any layer it does not model, so it can never
+    /// pre-empt a decision the canonical path is entitled to make.
+    #[test]
+    fn mip_precheck_abstains_on_unmodelled_layers() {
+        let mut network = Network::new();
+        network.add_layer(linear(&[1.0], 1, 1, &[0.0]));
+        network.add_layer(Layer::SubConstant(SubConstantLayer::new_reverse(
+            vector_constant(&[1.0]),
+        )));
+        network.add_layer(linear(&[1.0], 1, 1, &[0.0]));
+        // A reverse SubConstant is NOT foldable, so the canonical path must be
+        // the one to refuse it. The screen treats it as erasable-shaped and
+        // therefore sees [Affine, Affine] — assert the canonical path still
+        // refuses, i.e. no encodable model is lost either way.
+        let folded = fold_constant_layers(&strip_shape_layers(&network));
+        assert!(
+            folded.is_err() || validate_mip_feedforward_topology(&folded.unwrap()).is_err(),
+            "canonical path must remain the authority for unfoldable constants"
+        );
     }
 
     /// Regression for the measured ACAS-Xu row-66/row-74 topology.  The old

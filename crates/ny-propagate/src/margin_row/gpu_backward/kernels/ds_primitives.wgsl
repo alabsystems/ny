@@ -51,6 +51,18 @@
 // A ds32 value is vec2<f32>(hi, lo): the unevaluated sum hi + lo with
 // |lo| <= ulp(hi)/2 after renormalization.
 
+// Certified per-op RELATIVE bound of the ds algebra: 2^-44 (exactly
+// representable in f32; host twin ds.rs U_DS, design section 4.1). Kernels
+// use it ONLY to WIDEN error terms — an overestimate loosens, never unsounds.
+const DS_UNIT: f32 = 5.6843418860808015e-14;
+
+// Upper bound on |value| of a ds pair: |hi| + |lo| >= |hi + lo|. One f32 add
+// of nonnegative terms; its own rounding is covered by the host's E-lane
+// egress widening (design section 4.2, "E-lane propagation" row).
+fn ds_abs_bound(x: vec2<f32>) -> f32 {
+    return abs(x.x) + abs(x.y);
+}
+
 // TwoProduct: p = fl(a*b), e exact with a*b = p + e (away from the
 // underflow band |p| < 2^-101, where the HOST charges the 2^-126 floor).
 fn eft_two_prod(a: f32, b: f32) -> vec2<f32> {
@@ -110,4 +122,19 @@ fn ds_add(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> {
 fn ds_mul_f32(x: vec2<f32>, w: f32) -> vec2<f32> {
     let pe = eft_two_prod(x.x, w);
     return ds_renorm(pe.x, fma(x.y, w, pe.y));
+}
+
+// ds * ds (one-fma DWTimesDW2: the xl*yl-DROPPING variant — published bound
+// <= 6u^2 for THIS shape; the 5u^2 sometimes quoted belongs to the
+// xl*yl-CARRYING Algorithm 12, a different sequence — see the ds.rs ds_mul
+// trap note; U_DS = 16u^2 dominates). Used for the GATE
+// parameters, which ride as ds pairs so the device certifies the SAME f64
+// relaxation the CPU lane uses (design M2 precondition).
+// Host twin: ds.rs ds_mul, op-for-op.
+fn ds_mul(x: vec2<f32>, y: vec2<f32>) -> vec2<f32> {
+    let pe = eft_two_prod(x.x, y.x);
+    let tl = x.x * y.y;
+    let cl2 = fma(x.y, y.x, tl);
+    let cl3 = pe.y + cl2;
+    return eft_fast_two_sum(pe.x, cl3);
 }

@@ -11,8 +11,8 @@ use crate::network::backward_dispatch::{
     dispatch_backward_layer, dispatch_backward_layer_finite_boundary, DispatchContext,
 };
 use crate::network::core::{
-    crown_backward_step_patches_with_deadline_authority, CrownStepResult, GraphNetwork,
-    GraphTargetShapeContract, NETWORK_INPUT,
+    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy, CrownStepResult,
+    GraphNetwork, GraphTargetShapeContract, NETWORK_INPUT,
 };
 use crate::network::crown_memory::{cpu_crown_dense_budget_bytes, DenseMaterializationEstimate};
 use crate::MulBinaryRelaxationMode;
@@ -122,6 +122,10 @@ mod channel_only_alpha_tests;
 #[cfg(test)]
 #[path = "kokoro_tests.rs"]
 mod kokoro_tests;
+
+#[cfg(test)]
+#[path = "mulbinary_alpha_tests.rs"]
+mod mulbinary_alpha_tests;
 
 #[cfg(test)]
 #[path = "residual_patches_tests.rs"]

@@ -130,7 +130,7 @@ impl PgdAttacker<'_> {
         for restart in 0..self.config.num_restarts {
             // Deadline check (#3109): bail early if verification timeout budget
             // is exhausted. Return best counterexample found so far.
-            if self.config.past_deadline() {
+            if self.past_deadline() {
                 info!(
                     "PGD attack: deadline exceeded at restart {}/{}, returning best result",
                     restart, self.config.num_restarts
@@ -246,7 +246,7 @@ impl PgdAttacker<'_> {
                 }
 
                 // Deadline check (#3109): skip remaining restarts if deadline exceeded.
-                if self.config.past_deadline() {
+                if self.past_deadline() {
                     return None;
                 }
 

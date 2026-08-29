@@ -116,6 +116,7 @@ pub(super) fn build_parent_contexts(
                 crown_backward_layers: verifier.config.crown_backward_layers,
                 ibp_enhancement: verifier.config.input_split_ibp_enhancement,
                 stacked_rebound: verifier.config.input_split_stacked_rebound,
+                nested_deadline: verifier.config.input_split_nested_deadline,
             })?;
         batched_timing = Some(batched_bounds.rebound_timing.clone());
 

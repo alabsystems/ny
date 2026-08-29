@@ -106,8 +106,9 @@ bab:
   # them in-budget. Sweep: 4000/12000/20000 lose the unsats; >=35000 wins the
   # unsats but starves the post-BaB attack window that wins the 8 razor-thin
   # SAT rows (1997/2068/2893/2895/6241/869/2710/2714). The zero-sum is broken
-  # by NY_UPFRONT_ATTACK=1 (scoped to this category in run_instance.sh): the
-  # upfront gradient lane wins the razor-thin SATs in its ~1.6s slice BEFORE
+  # by the category's typed `attack.upfront_attack: true` policy (historically
+  # a wrapper-scoped NY_UPFRONT_ATTACK=1): the upfront gradient lane wins the
+  # razor-thin SATs in its ~1.6s slice BEFORE
   # BaB, so the full budget stays with the UNSAT proof. Combined config
   # measured 6/6 on the discriminating rows (3 unsat + 3 sat).
   # RAISED 50000 -> 400000 (MEASURED 2026-08-03). The 50000 pin cut off

@@ -98,8 +98,9 @@ pub use branching::{
 };
 pub use config::KfsbReduceOp;
 pub use config::{
-    AdaptiveOptConfig, BetaCrownConfig, ConvMode, CutEvictionPolicy, CutScoreWeights,
-    DepthTwoBranchLookaheadConfig, DepthTwoBranchLookaheadMode, InputClipType, LRScheduler,
+    AdaptiveOptConfig, BetaCrownConfig, ChildBoundCalibrationConfig, ConvMode,
+    CutEvictionPolicy, CutScoreWeights, DepthTwoBranchLookaheadConfig,
+    DepthTwoBranchLookaheadMode, InputClipType, LRScheduler,
     LookaheadConfig, PerLayerLR, PhaseBudgetConfig, VerificationArtifactAuthority,
     ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS,
 };
@@ -136,7 +137,10 @@ pub use objective_owner::{
     OwnedSignNormalizedObjectiveSet, ResidentObjectiveInvalidV1, ResidentObjectiveObservationV1,
     ResidentObjectiveReceiptV1, ResidentObjectiveUnsupportedV1,
 };
-pub use result::{BabVerificationStatus, BetaCrownResult, ViolationWitness};
+pub use result::{
+    reset_global_timeout_deadline_source, take_global_timeout_deadline_source,
+    BabVerificationStatus, BetaCrownResult, ViolationWitness,
+};
 pub use state::{
     AlphaNeuronState, BetaEntry, BetaState, DomainAlphaState, GraphAlphaStateByteCensus,
     GraphAlphaStateRepresentation, GraphBetaEntry, GraphBetaState, GraphDomainAlphaState,

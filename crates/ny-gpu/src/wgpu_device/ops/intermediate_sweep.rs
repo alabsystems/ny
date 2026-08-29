@@ -124,20 +124,78 @@ fn record_post_submit_abort(state: PostSubmitAbort) {
     });
 }
 
-/// Called by the shared readback helpers when the call-local deadline gives up
-/// on an in-flight submission. First-cause-wins: the later, generic
-/// [`SweepScope`] drop on the same unwind cannot downgrade this to
-/// [`PostSubmitAbort::UnknownInFlight`].
+/// How an armed sweep stood at the moment a deadline gave up on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeadlineAbortStanding {
+    /// Nothing was ever submitted by this sweep: a PRE-SUBMIT decline. Nothing
+    /// is in flight, so there is nothing to drain and nothing to record.
+    PreSubmit,
+    /// At least one submit happened and a later bounded `poll(Wait)` completed.
+    Drained,
+    /// At least one submit happened with no proving synchronization after it.
+    InFlight,
+}
+
+fn deadline_abort_standing() -> Option<DeadlineAbortStanding> {
+    ACTIVE_SWEEP.with(|slot| {
+        slot.borrow().as_ref().map(|active| {
+            if active.work.submits == 0 {
+                DeadlineAbortStanding::PreSubmit
+            } else if active.submits_since_last_sync > 0 {
+                DeadlineAbortStanding::InFlight
+            } else {
+                DeadlineAbortStanding::Drained
+            }
+        })
+    })
+}
+
+/// Called wherever a call-local deadline gives up on an armed sweep: the shared
+/// readback helpers, this module's own [`deadline_check`], and — via
+/// [`note_deadline_shaped_abort`] — every device phase whose checked-GPU
+/// wrapper can abandon an already-submitted transaction.
+///
+/// First-cause-wins: the later, generic [`SweepScope`] drop on the same unwind
+/// cannot downgrade this to [`PostSubmitAbort::UnknownInFlight`].
 pub(in crate::wgpu_device) fn note_post_submit_abort() {
-    let in_flight = ACTIVE_SWEEP.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|active| active.submits_since_last_sync > 0)
-    });
-    match in_flight {
-        None => {}
-        Some(true) => record_post_submit_abort(PostSubmitAbort::DeadlineInFlight),
-        Some(false) => record_post_submit_abort(PostSubmitAbort::ProvenDrained),
+    match deadline_abort_standing() {
+        // No armed sweep, or nothing submitted yet: a pre-submit decline
+        // leaves the ledger's accounting truthful with no drain at all.
+        None | Some(DeadlineAbortStanding::PreSubmit) => {}
+        Some(DeadlineAbortStanding::InFlight) => {
+            record_post_submit_abort(PostSubmitAbort::DeadlineInFlight)
+        }
+        Some(DeadlineAbortStanding::Drained) => {
+            record_post_submit_abort(PostSubmitAbort::ProvenDrained)
+        }
+    }
+}
+
+/// Classify a device-phase failure while the sweep scope is STILL ARMED.
+///
+/// R2 (availability). [`SweepScope::drop`] is the only observer left on an
+/// unwind and it cannot see the error kind, so it must assume the worst
+/// ([`PostSubmitAbort::UnknownInFlight`]) and poison the ledger for the rest of
+/// the process. That default is correct for a device-suspect fault and WRONG
+/// for a deadline: [`NyError::DeadlineExceeded`] is a purely HOST-side decision
+/// to stop waiting on a healthy device, so the right answer is the bounded
+/// drain of [`PostSubmitAbort::DeadlineInFlight`], which releases the ledger
+/// only after `poll(Wait)` PROVES the queue idle.
+///
+/// This is availability-only. Every non-deadline error — a validation fault, an
+/// internal error, an unwind — is left untouched and still fails closed, and a
+/// deadline abort still poisons if its bounded drain cannot reach queue idle.
+///
+/// The measured recurrence this closes (design §6 review item 1): the DAG
+/// route's device-keep carrier phase
+/// (`crown_backward_sound_resident_sweep_carrier`) submits and deliberately
+/// SKIPS the readback, so `submits_since_last_sync > 0` when the checked-GPU
+/// wrapper's post-op fence raises "deadline expired while finalizing reentrant
+/// WGPU work" — the one exit from an accepted sweep that reached the poison
+/// path with a perfectly healthy device.
+pub(in crate::wgpu_device) fn note_deadline_shaped_abort(error: &NyError) {
+    if matches!(error, NyError::DeadlineExceeded(_)) {
+        note_post_submit_abort();
     }
 }
 
@@ -458,6 +516,12 @@ impl Drop for SweepMemoryReservation<'_> {
 
 pub(super) fn deadline_check(deadline: Instant, context: &str) -> Result<()> {
     if Instant::now() >= deadline {
+        // R2 (availability): both sweep routes call this between execution
+        // units, i.e. with an armed scope and possibly-unsynchronized submits.
+        // Classify here so the reservation drains and releases rather than
+        // letting `SweepScope::drop` default the abort to `UnknownInFlight`.
+        // A no-op when no sweep is armed or nothing has been submitted yet.
+        note_post_submit_abort();
         Err(NyError::DeadlineExceeded(format!(
             "WGPU intermediate sweep deadline exceeded {context}"
         )))
@@ -1581,6 +1645,142 @@ mod tests {
         drop(reservation);
         assert_eq!(drain.calls.get(), 0);
         assert_eq!(*ledger.lock().unwrap(), usize::MAX);
+    }
+
+    /// Reproduce the M2-measured abort shape (design §6 review item 1): an
+    /// accepted sweep whose device phase SUBMITTED and returned without a
+    /// proving synchronization — the device-keep DAG carrier phase skips the
+    /// readback entirely — after which the checked-GPU wrapper's post-op fence
+    /// discarded the otherwise successful result. The phase error is the only
+    /// evidence of what happened; `SweepScope::drop` cannot see it.
+    fn finalize_abort_after_unsynchronized_submit(error: &NyError) {
+        let scope = SweepScope::arm(vec![SweepBoundary::default()]).unwrap();
+        note_submits(1);
+        note_deadline_shaped_abort(error);
+        drop(scope);
+    }
+
+    #[test]
+    fn deadline_during_finalize_drains_instead_of_poisoning_the_ledger() {
+        // The exact line the M2 shadow run hit:
+        // "crown_backward_sound_resident: deadline expired while finalizing
+        // reentrant WGPU work", raised AFTER an unsynchronized submit. The
+        // device is healthy — only the host stopped waiting — so the bounded
+        // drain must run and the ledger must stay available for every later
+        // sweep in the instance.
+        let ledger = std::sync::Mutex::new(0usize);
+        let drain = ScriptedDrain::new(false);
+        let reservation = reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        finalize_abort_after_unsynchronized_submit(&NyError::DeadlineExceeded(
+            "crown_backward_sound_resident: deadline expired while finalizing reentrant WGPU work"
+                .into(),
+        ));
+        drop(reservation);
+        assert_eq!(
+            drain.calls.get(),
+            1,
+            "the finalize deadline must reach the bounded drain, not the \
+             type-blind scope-drop default"
+        );
+        assert_eq!(
+            *ledger.lock().unwrap(),
+            0,
+            "a drained deadline abort must NOT leave the ledger poisoned"
+        );
+        assert!(
+            reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+                .unwrap()
+                .is_some(),
+            "later sweeps in the same instance must still be admissible"
+        );
+    }
+
+    #[test]
+    fn unaccounted_abort_during_finalize_still_fails_closed() {
+        // Soundness bar: the availability fix is deadline-shaped ONLY. A
+        // genuinely unaccounted abort with the identical in-flight standing
+        // (validation fault, internal error, unwind) must still poison.
+        let ledger = std::sync::Mutex::new(0usize);
+        let drain = ScriptedDrain::new(false);
+        let reservation = reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        finalize_abort_after_unsynchronized_submit(&NyError::InternalError(
+            "wgpu validation error during crown_backward_sound_resident".into(),
+        ));
+        drop(reservation);
+        assert_eq!(
+            drain.calls.get(),
+            0,
+            "a device-suspect abort must not be drained into availability"
+        );
+        assert_eq!(
+            *ledger.lock().unwrap(),
+            usize::MAX,
+            "an unaccounted in-flight abort must stay fail-closed"
+        );
+        assert!(reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 1)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn host_deadline_check_classifies_an_in_flight_sweep_abort() {
+        // Both routes call `deadline_check` between execution units, i.e. with
+        // an armed scope over possibly-unsynchronized submits.
+        let ledger = std::sync::Mutex::new(0usize);
+        let drain = ScriptedDrain::new(false);
+        let reservation = reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        let scope = SweepScope::arm(vec![SweepBoundary::default()]).unwrap();
+        note_submits(1);
+        // `checked_sub`, not `-`: `clippy::unchecked_duration_subtraction` is
+        // denied by the workspace lints, and `Instant - Duration` panics rather
+        // than saturating on a monotonic clock whose epoch is under a
+        // millisecond old.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("the monotonic clock is at least a millisecond past its epoch");
+        assert!(matches!(
+            deadline_check(expired, "after a DAG execution unit"),
+            Err(NyError::DeadlineExceeded(_))
+        ));
+        drop(scope);
+        drop(reservation);
+        assert_eq!(drain.calls.get(), 1);
+        assert_eq!(*ledger.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn deadline_check_before_any_submission_is_a_pre_submit_decline() {
+        // Nothing was submitted, so nothing can be in flight: the reservation
+        // releases with no drain at all (the pre-submit arm of the invariant).
+        let ledger = std::sync::Mutex::new(0usize);
+        let drain = ScriptedDrain::new(true);
+        let reservation = reserve_sweep_ledger(&ledger, Some(&drain), 200, 200, 100)
+            .unwrap()
+            .unwrap();
+        let scope = SweepScope::arm(vec![SweepBoundary::default()]).unwrap();
+        // `checked_sub`, not `-`: `clippy::unchecked_duration_subtraction` is
+        // denied by the workspace lints, and `Instant - Duration` panics rather
+        // than saturating on a monotonic clock whose epoch is under a
+        // millisecond old.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("the monotonic clock is at least a millisecond past its epoch");
+        assert!(deadline_check(expired, "before a DAG execution unit").is_err());
+        assert_eq!(
+            SWEEP_POST_SUBMIT_ABORTED.with(Cell::get),
+            PostSubmitAbort::None,
+            "a pre-submit decline must record no post-submit abort at all"
+        );
+        drop(scope);
+        drop(reservation);
+        assert_eq!(drain.calls.get(), 0);
+        assert_eq!(*ledger.lock().unwrap(), 0);
     }
 
     #[test]

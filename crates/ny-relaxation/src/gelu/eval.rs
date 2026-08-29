@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use crate::rounding::{next_down_f32, next_up_f32};
+use crate::rounding::{cast_f64_to_f32_down, cast_f64_to_f32_up, next_down_f32, next_up_f32};
 use crate::types::GeluApproximation;
 use ny_core::{nan_propagating_max, nan_propagating_min};
 
@@ -359,13 +359,49 @@ pub(crate) fn gelu_infinite_bounds_relaxation(
         return Some((0.0, f32::NEG_INFINITY, 0.0, f32::INFINITY));
     }
 
-    let fu = gelu_eval(u, approximation);
-    let f_crit = gelu_eval(gelu_critical_point(approximation), approximation);
+    // DIRECTED ROUNDING, both directions, from f64 witnesses. This is the
+    // ny-propagate hunk of commit 31741b290 applied to the mirror, which that
+    // commit left behind.
+    //
+    // `fu` was published as a certified constant in BOTH directions at once —
+    // it fed `min_val` (the lower intercept) and `max_val` (the upper) — and it
+    // came from `gelu_eval`, the round-to-NEAREST f32 evaluator. The lower needs
+    // it rounded DOWN and the upper needs it rounded UP, so no single f32 is
+    // sound for both; whichever side it lands on, that bound is false.
+    // `f_crit` was a second instance: an f32 round-to-nearest published straight
+    // into a certified LOWER intercept.
+    //
+    // MODEL-INDEPENDENT WITNESS, needing no assumption about `libm::erff`:
+    // u = f32::from_bits(1) = 1.401298464324817e-45, a member of
+    // `tests/drift.rs`'s own grid. `gelu_erf` computes
+    // `0.5 * x * (1.0 + erff(x * inv_sqrt2))`; the erff argument is subnormal so
+    // `1.0f32 + subnormal == 1.0f32` EXACTLY for any implementation, and
+    // `0.5f32 * 1.401298464324817e-45` is exactly half an ULP, so
+    // round-half-to-even gives +0.0. The old `max_val` was therefore
+    // `max(0.0, 0.0) = 0.0`, certifying `GELU(x) <= 0` on
+    // (-inf, 1.401298464324817e-45] while
+    // GELU(1.401298464324817e-45) = 7.0064923216240854e-46 > 0 — a false proof
+    // at the interval's own endpoint. With the fix,
+    // `cast_f64_to_f32_up(7.0064923216240854e-46)` steps to
+    // 1.401298464324817e-45, which is above the true value.
+    //
+    // Replaying the whole of `drift.rs`'s grid, 130 of 206 (u, approximation)
+    // pairs differed bitwise from production before this change and 48 of the
+    // mirror's upper bounds were below the true GELU. Bit-parity with production
+    // is what `drift_gelu_sound` asserts, so this MUST be production's
+    // expression verbatim — not an improved one.
+    //
+    // Widening only ever loosens, by at most one f32 ULP.
+    let fu64 = gelu_eval_f64(f64::from(u), approximation);
+    let f_crit64 = gelu_eval_f64(f64::from(gelu_critical_point(approximation)), approximation);
 
     // Lower bound: min of function value at critical point, endpoint, and 0 (GELU(-∞))
-    let min_val = nan_propagating_min(nan_propagating_min(f_crit, fu), 0.0);
+    let min_val = nan_propagating_min(
+        nan_propagating_min(cast_f64_to_f32_down(f_crit64), cast_f64_to_f32_down(fu64)),
+        0.0,
+    );
     // Upper bound: max of function value at endpoint and 0 (GELU(-∞))
-    let max_val = nan_propagating_max(fu, 0.0);
+    let max_val = nan_propagating_max(cast_f64_to_f32_up(fu64), 0.0);
 
     Some((0.0, min_val, 0.0, max_val))
 }

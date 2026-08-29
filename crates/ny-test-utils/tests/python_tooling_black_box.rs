@@ -83,9 +83,8 @@ fn run_repository_script(relative_script: &str, arguments: &[String], cwd: &Path
         .unwrap_or_else(|error| panic!("the selected Python interpreter is unavailable: {error}"))
 }
 
-// Sole caller is the `#[cfg(unix)]` byte-path contract below; gate to match so
-// this is not dead on Windows.
-#[cfg(unix)]
+// Run a repository module as an isolated external Python program while still
+// allowing the Cargo-owned contract to pass explicit fixture paths.
 fn run_repository_code(program: &str, test_root: &Path) -> Output {
     let root = workspace_root();
     Command::new(python_executable())
@@ -477,7 +476,13 @@ fn biccos_planner_manifest_can_never_authorize_execution() {
         &arguments,
         temporary.path(),
     );
-    assert_eq!(rejected.status.code(), Some(2));
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "unsafe planner manifest returned an unexpected status\nstdout:\n{}\nstderr:\n{}",
+        stdout(&rejected),
+        stderr(&rejected),
+    );
     assert!(stderr(&rejected).contains("planner manifest must forbid execution"));
     assert!(
         !output.exists(),
@@ -739,4 +744,556 @@ fn vnncomp_benchmark_routes_relusplitter_to_mip_without_forcing_a_solver() {
         .and_then(|index| values.get(index))
         .copied();
     assert_eq!(status, Some("verified"));
+}
+
+#[test]
+fn regular_bank_promotion_enforces_the_sealed_flight_event_contract() {
+    let temporary = TestDirectory::new("regular-bank-flight-contract");
+    let output = run_repository_code(
+        r#"
+import copy
+import hashlib
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+repository = Path(os.environ["NY_REPOSITORY_ROOT"])
+script = repository / "scripts" / "regular_bank_evidence.py"
+spec = importlib.util.spec_from_file_location("regular_bank_evidence_cargo", script)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+solver_environment = {"NY_NO_CUDA": "1", "PATH": "/usr/bin:/bin"}
+predicate = (
+    "ny-exec-v1.pgd-fast-gradient-parameter-engaged."
+    "NY_PGD_FAST_GRAD.0=ran"
+)
+search_space_payload = {
+    "schema": "ny-levers/search-space/v6",
+    "axes": [
+        {
+            "name": "NY_PGD_FAST_GRAD",
+            "domain": "bool",
+            "values": ["0", "1"],
+            "class": "VerdictAffecting",
+            "deliver": "preset:attack.pgd_fast_grad",
+            "why": "Cargo promotion fixture",
+            "absence_baseline": {"kind": "declaration_default"},
+            "category_prefixes": [],
+            "preset_baseline_keys": ["attack.pgd_fast_grad"],
+        }
+    ],
+    "edges": [],
+    "unsafe": [],
+    "instrument_only": [],
+    "test_only": [],
+    "declarations": {
+        "NY_PGD_FAST_GRAD": {
+            "kind": "Bool",
+            "default": "1",
+            "min": None,
+            "max": None,
+            "members": None,
+        }
+    },
+}
+search_space_contract = module.provenance._search_space_contract_from_payload(
+    search_space_payload, source="Cargo promotion fixture"
+)
+measurement = dict.fromkeys(module.CURRENT_EXECUTION_MEASUREMENT_KEYS)
+measurement.update({
+    "result_file": "/tmp/result.txt",
+    "flight_record_file": "/tmp/result.txt.flight.json",
+    "flight_record_capture": module.FLIGHT_RECORD_CAPTURE_POLICY,
+    "execution_evidence_profile": module.provenance.EXECUTION_EVIDENCE_PROFILE,
+    "solver_environment": {
+        "mode": "env-i-reviewed-record-v1",
+        "values": solver_environment,
+    },
+})
+solver_sha256 = "2" * 64
+build_fields = {
+    "version": "0.3.1",
+    "features": "none",
+    "backend": "wgpu",
+    "markers": "cargo-promotion-fixture-v1",
+    "commit": "a" * 40,
+    "dirty": "false",
+    "revision": "1",
+    "source": "clean",
+    "profile": "release",
+    "target": "fixture-target",
+    "rustc": "1.90.0",
+    "stamp": "1" * 64,
+    "exe": solver_sha256,
+}
+build_fields["id"] = hashlib.sha256(
+    (
+        f"{module.provenance.BUILD_ID_SCHEMA}\n"
+        f"{build_fields['stamp']}\n{build_fields['exe']}\n"
+    ).encode("ascii")
+).hexdigest()
+build_id = {
+    "schema": module.provenance.BUILD_ID_SCHEMA,
+    "line": " ".join(
+        [module.provenance.BUILD_ID_SCHEMA]
+        + [
+            f"{field}={build_fields[field]}"
+            for field in module.provenance.BUILD_ID_CANONICAL_FIELDS
+        ]
+    ),
+    "fields": build_fields,
+}
+solver = dict.fromkeys(module.CURRENT_EXECUTION_SOLVER_BINARY_KEYS)
+solver.update({
+    "declared_build_features": [],
+    "sha256": solver_sha256,
+    "build_id": build_id,
+    "fingerprint": {"mtime_ns": 3_000_000_000},
+    "build_coherence": {
+        "binary_mtime_epoch": 3,
+        "build_inputs_last_commit_epoch": 1,
+        "behaviour_inputs_last_commit_epoch": 2,
+        "build_input_paths": list(module.provenance._BUILD_INPUT_PATHS),
+        "behaviour_input_paths": list(module.provenance._BEHAVIOUR_INPUT_PATHS),
+    },
+})
+start = dict.fromkeys(module.START_KEYS)
+start.update({
+    "measurement": measurement,
+    "solver_binary": solver,
+    "environment": {
+        "allowlist_schema": "ny_measurement_environment_v1",
+        "values": {
+            "NY_MEASURE_REQUIRE_FLIGHT_EVENT": predicate,
+        },
+        "typed_values": {
+            "NY_MEASURE_REQUIRE_FLIGHT_EVENT":
+                module.provenance.parse_execution_predicate_requirement(predicate),
+        },
+    },
+})
+measurement["search_space_contract"] = search_space_contract
+measurement["execution_predicate_assignment"] = (
+    module.provenance.build_execution_predicate_assignment(
+        start["environment"], search_space_contract
+    )
+)
+flight_build_stamp = module.provenance.flight_build_stamp_for_binary_build_id(
+    build_id
+)
+record = {
+    "schema_version": 3,
+    "ambient_env_schema": "ny-cli/ambient-env/v3",
+    "build_id": flight_build_stamp,
+    "backend_kind": "cpu-only",
+    "backend_summary": "Cargo promotion fixture",
+    "host": {
+        "hostname": "fixture-host",
+        "cpu_model": "fixture-cpu",
+        "logical_cores": 1,
+        "ram_bytes": 1024,
+    },
+    "category": "cgan2026",
+    "budget_secs": 10,
+    "ambient_env": {"NY_NO_CUDA": "1"},
+    "levers": {
+        "status": "resolved",
+        "receipt": {
+            "schema": "ny-levers/receipt/v3",
+            "lever_count": 2,
+            "env_present": 1,
+            "env_accepted": 1,
+            "env_rejected": 0,
+            "env_ignored": 0,
+            "levers": [
+                {
+                    "name": "NY_NO_CUDA",
+                    "value": True,
+                    "source": "legacy_env",
+                    "bucket": "debug",
+                    "moat": "high",
+                    "provenance": "unmeasured",
+                    "env_utf8": True,
+                },
+                {
+                    "name": "NY_PGD_FAST_GRAD",
+                    "value": False,
+                    "source": "config",
+                    "bucket": "debug",
+                    "moat": "high",
+                    "provenance": "unmeasured",
+                },
+            ],
+        },
+    },
+    "events": [
+        {
+            "method": "pgd_fast_gradient_execution",
+            "status": "ran",
+            "reason": (
+                "schema=ny-cli/pgd-fast-gradient-execution/v1 "
+                "phase=terminal route=conjunctive configured=false decisions=1 "
+                "fast_attempts=0 fast_selected=0 certified_selected=1 "
+                "spsa_selected=0"
+            ),
+            "at_secs": 0.5,
+        },
+        {
+            "method": "run_complete",
+            "status": "complete",
+            "reason": "sat",
+            "at_secs": 1.0,
+        },
+    ],
+}
+source = module._flight_record_source_bytes(record)
+capture = {
+    "status": "captured",
+    "source_sha256": module.sha256(source),
+    "size_bytes": len(source),
+    "record": record,
+}
+metadata = dict.fromkeys(module.METADATA_KEYS)
+metadata.update({
+    "category": "cgan2026",
+    "timeout_seconds": 10,
+    "solver_verdict": "sat",
+    "flight_record": capture,
+})
+
+assert module.validate_flight_record_binding(start=start, metadata=metadata) == (
+    module.CURRENT_EXECUTION_START_PROFILE
+)
+print("ACCEPT=matching")
+
+def expect_rejected(
+    label, candidate_start, candidate_metadata, message, *, exact=False
+):
+    try:
+        module.validate_flight_record_binding(
+            start=candidate_start,
+            metadata=candidate_metadata,
+        )
+    except module.EvidenceError as error:
+        observed = str(error)
+        assert (observed == message if exact else message in observed), (
+            label,
+            observed,
+        )
+        print("REJECT=" + label)
+    else:
+        raise AssertionError(label + " unexpectedly passed promotion validation")
+
+dark = copy.deepcopy(metadata)
+dark_record = dark["flight_record"]["record"]
+dark_record["levers"]["receipt"]["levers"][1]["value"] = True
+dark_record["events"][0]["reason"] = (
+    "schema=ny-cli/pgd-fast-gradient-execution/v1 "
+    "phase=terminal route=conjunctive configured=true decisions=1 "
+    "fast_attempts=1 fast_selected=1 certified_selected=0 spsa_selected=0"
+)
+dark_source = module._flight_record_source_bytes(dark_record)
+dark["flight_record"]["source_sha256"] = module.sha256(dark_source)
+dark["flight_record"]["size_bytes"] = len(dark_source)
+expect_rejected(
+    "dark",
+    start,
+    dark,
+    "sealed required flight event did not earn current execution credit: "
+    "governed NY_PGD_FAST_GRAD=0 was not accepted exactly from config or "
+    "the child environment",
+    exact=True,
+)
+
+malformed = copy.deepcopy(start)
+malformed["environment"]["values"]["NY_MEASURE_REQUIRE_FLIGHT_EVENT"] = (
+    predicate + "=extra"
+)
+expect_rejected("malformed", malformed, metadata, "current execution predicate")
+
+legacy_credit = copy.deepcopy(start)
+legacy_credit["environment"]["values"]["NY_MEASURE_REQUIRE_FLIGHT_EVENT"] = (
+    "cgan_input_leaf_summary=ran"
+)
+legacy_credit["environment"]["typed_values"]["NY_MEASURE_REQUIRE_FLIGHT_EVENT"] = {
+    "type": "flight_event_requirement",
+    "method": "cgan_input_leaf_summary",
+    "status": "ran",
+}
+expect_rejected(
+    "legacy-credit",
+    legacy_credit,
+    metadata,
+    "execution predicate assignment differs from its typed requirement",
+)
+
+config_only = copy.deepcopy(metadata)
+config_event = config_only["flight_record"]["record"]["events"][0]
+config_event["status"] = "skipped"
+config_event["reason"] = (
+    "schema=ny-cli/pgd-fast-gradient-execution/v1 "
+    "phase=terminal route=conjunctive configured=false decisions=0 "
+    "fast_attempts=0 fast_selected=0 certified_selected=0 spsa_selected=0"
+)
+config_source = module._flight_record_source_bytes(
+    config_only["flight_record"]["record"]
+)
+config_only["flight_record"]["source_sha256"] = module.sha256(config_source)
+config_only["flight_record"]["size_bytes"] = len(config_source)
+expect_rejected(
+    "config-only", start, config_only, "did not prove live engagement"
+)
+
+bad_values = copy.deepcopy(start)
+bad_values["environment"]["values"] = []
+expect_rejected(
+    "bad-values", bad_values, metadata, "sealed assignment environment is incomplete"
+)
+
+missing = copy.deepcopy(metadata)
+missing["flight_record"] = {"status": "missing"}
+expect_rejected("missing", start, missing, "flight record is missing")
+
+legacy = copy.deepcopy(start)
+legacy["measurement"].pop("execution_evidence_profile")
+legacy["measurement"].pop("execution_predicate_assignment")
+legacy["measurement"].pop("search_space_contract")
+legacy["environment"]["values"] = {}
+legacy["environment"]["typed_values"] = {}
+assert module.validate_flight_record_binding(start=legacy, metadata=metadata) == (
+    module.FLIGHT_BUILD_ID_START_PROFILE
+)
+print("ACCEPT=no-contract")
+"#,
+        temporary.path(),
+    );
+    assert_success(&output, "regular-bank flight-event promotion contract");
+    let captured = stdout(&output);
+    for marker in [
+        "ACCEPT=matching",
+        "REJECT=dark",
+        "REJECT=malformed",
+        "REJECT=legacy-credit",
+        "REJECT=config-only",
+        "REJECT=bad-values",
+        "REJECT=missing",
+        "ACCEPT=no-contract",
+    ] {
+        assert!(
+            captured.lines().any(|line| line == marker),
+            "missing {marker:?} in promotion-contract output: {captured}"
+        );
+    }
+}
+
+#[test]
+fn measured_2026_coverage_census_matches_the_committed_complete_banks() {
+    let root = workspace_root();
+    let output = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &["--check".to_owned()],
+        &root,
+    );
+    assert_success(&output, "measured-2026 coverage census check");
+    let captured = stdout(&output);
+    assert!(
+        captured.contains("reports/measured-2026/README.md matches ")
+            && captured.contains(" complete result banks"),
+        "coverage check did not report its complete-bank count: {captured}"
+    );
+}
+
+fn measured_2026_index_fixture(
+    label: &str,
+    complete_bank: &str,
+) -> (TestDirectory, PathBuf, Vec<String>) {
+    let temporary = TestDirectory::new(label);
+    let report_dir = temporary.path().join("measured-2026");
+    let readme = report_dir.join("README.md");
+    let manifest = report_dir.join("bank_manifest.json");
+    write(
+        &readme,
+        "# fixture\n\n<!-- BEGIN GENERATED: measured-2026 coverage census -->\n\
+         stale\n<!-- END GENERATED: measured-2026 coverage census -->\n",
+    );
+    write(&report_dir.join("fixture_complete.csv"), complete_bank);
+    write(
+        &manifest,
+        r#"{
+  "schema": "ny_measured_2026_bank_manifest_v1",
+  "source_repository": "fixture",
+  "source_commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "scored_categories": ["fixture_complete", "fixture_later"],
+  "banks": {
+    "fixture_complete": {
+      "instances_csv": "benchmarks/fixture_complete/instances.csv",
+      "instances_csv_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bank_csv_sha256": "d856616765b5fadeec63a52fbdb03c11cde37cc94edda75a6c80945c1cee4835",
+      "instances": [
+        ["onnx/repeated.onnx", "vnnlib/repeated.vnnlib", "10"],
+        ["onnx/repeated.onnx", "vnnlib/repeated.vnnlib", "10"]
+      ]
+    },
+    "fixture_later": {
+      "instances_csv": "benchmarks/fixture_later/instances.csv",
+      "instances_csv_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "bank_csv_sha256": "49c148631b9041dce213ae24e118a4e325cafce5b51b75560ee59b8bbd21dcb6",
+      "instances": [["onnx/later.onnx", "vnnlib/later.vnnlib", "5"]]
+    }
+  }
+}
+"#,
+    );
+    let arguments = vec![
+        "--report-dir".to_owned(),
+        report_dir.display().to_string(),
+        "--readme".to_owned(),
+        readme.display().to_string(),
+        "--manifest".to_owned(),
+        manifest.display().to_string(),
+    ];
+    (temporary, report_dir, arguments)
+}
+
+#[test]
+fn measured_2026_coverage_census_detects_a_new_pinned_complete_bank() {
+    let (temporary, report_dir, arguments) = measured_2026_index_fixture(
+        "measured-2026-index",
+        "fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,sat,1.0\n\
+         fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,timeout,10.0\n",
+    );
+    let readme = report_dir.join("README.md");
+
+    let updated = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &arguments,
+        temporary.path(),
+    );
+    assert_success(&updated, "initial measured-2026 coverage census update");
+    let census = fs::read_to_string(&readme).expect("generated README must be readable");
+    assert!(census.contains("Complete banks cover **1 of 2**"));
+    assert!(census.contains("1 sat, 1 timeout | 1 / 2 (50.0%)"));
+
+    // Move, don't clone: this is the last use of `arguments` in the test, and
+    // stock clippy's `redundant_clone` is denied by the publish gate.
+    let mut check_arguments = arguments;
+    check_arguments.push("--check".to_owned());
+    let current = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &check_arguments,
+        temporary.path(),
+    );
+    assert_success(&current, "unchanged measured-2026 coverage census check");
+
+    write(
+        &report_dir.join("fixture_later.csv"),
+        "fixture_later,onnx/later.onnx,vnnlib/later.vnnlib,unsat,1.0\n",
+    );
+    let stale = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &check_arguments,
+        temporary.path(),
+    );
+    assert_eq!(stale.status.code(), Some(1));
+    assert!(stderr(&stale).contains("STALE:"));
+    assert!(stderr(&stale).contains("does not match the complete result banks"));
+}
+
+#[test]
+fn measured_2026_coverage_census_rejects_a_truncated_occurrence_bank() {
+    let (temporary, _report_dir, mut arguments) = measured_2026_index_fixture(
+        "measured-2026-truncated",
+        "fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,sat,1.0\n",
+    );
+    arguments.push("--check".to_owned());
+
+    let rejected = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &arguments,
+        temporary.path(),
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(stderr(&rejected).contains("pinned instances.csv has 2 occurrences"));
+}
+
+#[test]
+fn measured_2026_coverage_census_rejects_an_over_budget_row() {
+    let (temporary, _report_dir, mut arguments) = measured_2026_index_fixture(
+        "measured-2026-over-budget",
+        "fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,sat,1.0\n\
+         fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,timeout,10.001\n",
+    );
+    arguments.push("--check".to_owned());
+
+    let rejected = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &arguments,
+        temporary.path(),
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(stderr(&rejected).contains("exceeds official budget 10 s"));
+}
+
+#[test]
+fn measured_2026_coverage_census_rejects_a_wrong_pinned_occurrence() {
+    let (temporary, _report_dir, mut arguments) = measured_2026_index_fixture(
+        "measured-2026-wrong-occurrence",
+        "fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,sat,1.0\n\
+         fixture_complete,onnx/different.onnx,vnnlib/repeated.vnnlib,timeout,2.0\n",
+    );
+    arguments.push("--check".to_owned());
+
+    let rejected = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &arguments,
+        temporary.path(),
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(stderr(&rejected).contains("instance occurrence 2"));
+    assert!(stderr(&rejected).contains("does not match the pinned instances.csv row"));
+}
+
+#[test]
+fn measured_2026_coverage_census_rejects_an_unpinned_new_bank() {
+    let (temporary, report_dir, mut arguments) = measured_2026_index_fixture(
+        "measured-2026-unpinned",
+        "fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,sat,1.0\n\
+         fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,timeout,2.0\n",
+    );
+    write(
+        &report_dir.join("unreviewed.csv"),
+        "unreviewed,onnx/new.onnx,vnnlib/new.vnnlib,unsat,1.0\n",
+    );
+    arguments.push("--check".to_owned());
+
+    let rejected = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &arguments,
+        temporary.path(),
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(stderr(&rejected).contains("lack a pinned official instances.csv contract"));
+    assert!(stderr(&rejected).contains("unreviewed"));
+}
+
+#[test]
+fn measured_2026_coverage_census_rejects_an_unreviewed_bank_byte_change() {
+    let (temporary, _report_dir, mut arguments) = measured_2026_index_fixture(
+        "measured-2026-bank-digest",
+        "fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,unsat,1.0\n\
+         fixture_complete,onnx/repeated.onnx,vnnlib/repeated.vnnlib,timeout,10.0\n",
+    );
+    arguments.push("--check".to_owned());
+
+    let rejected = run_repository_script(
+        "scripts/update_measured_2026_index.py",
+        &arguments,
+        temporary.path(),
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(stderr(&rejected).contains("bank CSV sha256"));
+    assert!(stderr(&rejected).contains("review the result change"));
 }

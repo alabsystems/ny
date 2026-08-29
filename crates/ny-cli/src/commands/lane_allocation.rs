@@ -125,10 +125,16 @@ use std::time::{Duration, Instant};
 ///
 /// Exact `"1"` arms it, exact `"0"` disarms it, every other byte sequence is a
 /// recorded rejection falling back to the declaration's `false`. Fails CLOSED.
+///
+/// DELIVERY SEAM (#lever-reachability, 2026-08-23): `NY_LANE_BUDGET_ALLOCATOR`
+/// still wins in both directions; absent, the typed
+/// `attack.lane_budget_allocator` key decides. Layer A commits every
+/// attack-slice lane's cap jointly and can take a structurally blind lane to
+/// zero seconds, so it changes which counterexamples are reachable inside the
+/// budget — a verdict-affecting choice that no scored run could previously
+/// express.
 pub(crate) fn lane_budget_allocator_armed() -> bool {
-    ny_levers::read(&ny_levers::decls::dark_probes::LANE_BUDGET_ALLOCATOR)
-        .value
-        .as_bool()
+    crate::preset_gates::lane_budget_allocator_armed()
 }
 
 /// The arming rule as a pure predicate over one raw environment string.
@@ -186,12 +192,29 @@ pub(crate) enum AllocatedLane {
     UpfrontAttack,
 }
 
+/// The mechanism that committed an [`AttackSliceAllocation`].
+///
+/// This is deliberately typed rather than inferred from ledger prose or a
+/// zero-reason string.  The fixed frame and the measured knapsack can both
+/// produce identical [`LaneWindow`] values, but those values have different
+/// parameter lineage and therefore must not share machine evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocationAuthority {
+    Frame,
+    Knapsack,
+}
+
 /// What the caller does with one lane's window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LaneWindow {
     /// No allocation is in force: the lane derives exactly the window it
     /// derives today, from its own private helper. This is the ONLY value
-    /// reachable with the lever disarmed.
+    /// reachable with the lever disarmed — and, since `#upfront-probe-first`,
+    /// the only value reachable with BOTH this lever and
+    /// `NY_UPFRONT_ATTACK_PROBE_FIRST` disarmed. That second lever is the only
+    /// other producer of a [`LaneWindow::Cap`]: armed, it hands the upfront
+    /// lane a small fixed probe cap through this same seam at the top of the
+    /// attack slice. It never reaches the allocator's own decision function.
     Private,
     /// The allocator committed this lane to this cap. The lane is handed it
     /// through its own `*_granted` seam and plans its schedule against it.
@@ -240,15 +263,27 @@ impl TodaySlices {
 /// A committed attack-slice plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttackSliceAllocation {
+    authority: AllocationAuthority,
     sign_space: LaneWindow,
     ste_pgd: LaneWindow,
     upfront: LaneWindow,
     pool: Duration,
     granted: Duration,
     ledger: String,
+    /// Why a [`LaneWindow::Skip`] in this plan carries zero seconds. The two
+    /// authorities that can commit a plan zero a lane for DIFFERENT reasons —
+    /// the knapsack for a measured structural blindness, the fixed frame
+    /// because today's own rules already declined the lane — and a receipt that
+    /// names the wrong one is worse than no receipt.
+    zero_reason: &'static str,
 }
 
 impl AttackSliceAllocation {
+    /// The mechanism that committed this plan.
+    pub(crate) fn authority(&self) -> AllocationAuthority {
+        self.authority
+    }
+
     /// The window committed for `lane`.
     pub(crate) fn window(&self, lane: AllocatedLane) -> LaneWindow {
         match lane {
@@ -279,6 +314,94 @@ impl AttackSliceAllocation {
     /// One line, for the log and the flight receipt.
     pub(crate) fn ledger(&self) -> &str {
         &self.ledger
+    }
+
+    /// Why a skipped lane in THIS plan was granted zero seconds.
+    pub(crate) fn zero_reason(&self) -> &'static str {
+        self.zero_reason
+    }
+
+    /// #lane-budget-frame — THE IDENTITY PLAN: every lane committed to exactly
+    /// the cap today's own rules would hand it, computed ONCE against ONE
+    /// reference clock reading, before the first lane starts.
+    ///
+    /// Nothing is redistributed and nothing is optimised. The only thing that
+    /// changes is WHEN each cap is decided, and that is the whole fix: a cap
+    /// decided up front cannot grow because the lane ahead of it declined, so
+    /// the freed seconds fall past the attack slice to the branch-and-bound
+    /// residual claimant instead of being absorbed by whichever downstream lane
+    /// happens to have a non-zero coefficient in [`SizingRule`].
+    ///
+    /// A lane whose today-cap is `None` is [`LaneWindow::Skip`], never
+    /// [`LaneWindow::Private`]. `Private` would send that lane back to its own
+    /// live-clock helper at run time, which is exactly the absorption this
+    /// frame exists to stop: a lane that today's chain declines for lack of
+    /// budget would re-derive a 4-minute window the moment an upstream lane
+    /// freed the seconds.
+    ///
+    /// `None` when no lane is consulted at all — there is nothing to frame, and
+    /// the caller falls open to today's unframed run.
+    pub(crate) fn frame(today: TodaySlices) -> Option<Self> {
+        let window = |cap: Option<Duration>| match cap {
+            Some(cap) if !cap.is_zero() => LaneWindow::Cap(cap),
+            _ => LaneWindow::Skip,
+        };
+        let sign_space = window(today.sign_space);
+        let ste_pgd = window(today.ste_pgd);
+        let upfront = window(today.upfront);
+        if [sign_space, ste_pgd, upfront]
+            .iter()
+            .all(|w| matches!(w, LaneWindow::Skip))
+        {
+            return None;
+        }
+        // The frame grants exactly today's caps, so pool == granted by
+        // construction and I-POOL holds with nothing to check: the frame can
+        // never claim a second today's chain does not already claim.
+        let granted = [today.sign_space, today.ste_pgd, today.upfront]
+            .into_iter()
+            .flatten()
+            .fold(Duration::ZERO, |sum, cap| sum + cap);
+        let ledger = format!(
+            "lane budget frame: committed {:.2}s up front \
+             [sign_space {}, ste_pgd {}, upfront {}]; a lane that declines frees its \
+             committed seconds to the branch-and-bound residual claimant, not to the \
+             next lane that reads the clock",
+            granted.as_secs_f64(),
+            render_window(sign_space),
+            render_window(ste_pgd),
+            render_window(upfront),
+        );
+        Some(Self {
+            authority: AllocationAuthority::Frame,
+            sign_space,
+            ste_pgd,
+            upfront,
+            pool: granted,
+            granted,
+            ledger,
+            zero_reason: FRAME_ZERO_REASON,
+        })
+    }
+}
+
+/// The reason a [`AttackSliceAllocation::frame`] plan carries a zero grant.
+pub(crate) const FRAME_ZERO_REASON: &str =
+    "the fixed attack-slice frame committed 0s because today's own sizing rules already \
+     declined this lane against the reference clock; the seconds are held for the \
+     branch-and-bound residual claimant rather than released to a downstream lane";
+
+/// The reason a knapsack plan carries a zero grant.
+pub(crate) const KNAPSACK_ZERO_REASON: &str =
+    "lane budget allocator granted 0s on a structurally FLAT objective tier (one distinct \
+     f32 over the in-box probe); an exact-gradient search has no direction to find here";
+
+/// One lane's window, rendered for a ledger line.
+fn render_window(window: LaneWindow) -> String {
+    match window {
+        LaneWindow::Private => "not requested".to_string(),
+        LaneWindow::Skip => "SKIPPED (0s)".to_string(),
+        LaneWindow::Cap(cap) => format!("{:.2}s", cap.as_secs_f64()),
     }
 }
 
@@ -427,6 +550,89 @@ where
     })
 }
 
+// ---------------------------------------------------------------------------
+// WHEN a FLAT verdict is EVIDENCE ABOUT THE UPFRONT LANE — the narrowing
+// ---------------------------------------------------------------------------
+
+/// What the upfront lane will actually DO on this instance, restricted to the
+/// two facts that decide whether a FLAT probe verdict is evidence about it.
+///
+/// # Why this type exists: the FLAT zero was applied where its premise is FALSE
+///
+/// The zero is licensed by one sentence — "on a flat objective a GRADIENT
+/// search cannot climb". That sentence is true only if the lane's step
+/// direction is the gradient OF THE FUNCTION THE PROBE MEASURED. On the
+/// measured traffic rows it is neither, twice over, and the lane wins rows
+/// there:
+///
+/// * **It does not steer on that function.** On a net with a `Sign` node
+///   `GraphNetwork::attack_point_gradient` differentiates a SMOOTH SURROGATE —
+///   `tanh(β·z/rms)` per primary `Sign`, under a β 2→20 ramp, with the
+///   per-unit STE reachability windows of `#traffic-input-linear-window`
+///   installed over this very box
+///   (`crates/ny-propagate/src/network/graph_crown/point_vjp.rs:1136`,
+///   `smooth_sign_forward_enabled`). The probe measures the post-terminal-op
+///   property margin through a real ORT forward on the model as loaded. Those
+///   are different functions, and the surrogate is smooth exactly where the
+///   probed one is piecewise constant. This module already refuses this
+///   category error twice — the two BNN lanes are exempt because they steer on
+///   the pre-Softmax integer logit margin, and the whole allocator stands down
+///   under the traffic terminal-Softmax peel because that route rewrites the
+///   upfront lane's objective ([`allocator_admitted`]). A `Sign` net is the
+///   same error a third time, and it was the one being made.
+///
+/// * **And the FLAT verdict is refuted in the box it was taken in.** Measured,
+///   `traffic_signs_recognition_2023 model_30_idx_6371_eps_{3,5,10,15}` and
+///   `model_30_idx_178_eps_10`: the probe reports ONE distinct f32 value over
+///   33 in-box points, and the same lane then reaches an **ORT-confirmed
+///   violation in 1–2 gradient steps** from the box centre. A point where the
+///   margin differs therefore EXISTS inside the probed box. `n_distinct == 1`
+///   over 33 hashed points is evidence that the objective is constant AT 33
+///   POINTS; on a piecewise-constant net with a wide plateau that is not
+///   evidence that it is constant on the box.
+///
+/// The second fact also indicts the SAMPLING sub-lanes, which never needed a
+/// gradient at all: [`OBJECTIVE_PROBE_POINTS`] takes both all-lo/all-hi
+/// corners, the centre and 30 hashed interior points, while the upfront lane's
+/// `low_dim_ort_corner_falsify` ENUMERATES all `2^d` corners of a ≤5-dimension
+/// box and `low_dim_relational_face_grid_falsify` grids its faces. At d = 5 the
+/// probe has looked at 2 of the 32 points that sub-lane would visit. Zeroing an
+/// enumeration on a 33-point sample of the space it enumerates is not a
+/// structural certainty.
+///
+/// Neither field is a name, a path, or a preset key: one is a graph-op scan for
+/// `Sign` nodes, the other is the sub-lane's own admission rule evaluated on
+/// this instance's box. §3 of the design doc holds.
+///
+/// Deliberately NOT `Default`: `false, false` is the one combination that
+/// ZEROES a lane, so a default-constructed shape would sit on the unsafe side
+/// of the rule. Every caller must state both facts about the instance in front
+/// of it, or not build a shape at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UpfrontLaneShape {
+    /// The lane's ascent direction is the gradient of a SURROGATE, not of the
+    /// probed objective — a `Sign` net's smooth-Sign/STE direction, or a
+    /// rewritten attack objective. A probe of the real margin says nothing
+    /// about a function the lane is not using.
+    pub(crate) steers_on_a_surrogate_objective: bool,
+    /// The lane admits at least one sub-lane that ENUMERATES points rather than
+    /// climbing: the low-dimensional corner sweep or the relational face grid.
+    /// A gradient-blindness argument does not reach them.
+    pub(crate) enumerates_points: bool,
+}
+
+/// Whether a FLAT probe verdict may take the upfront lane to zero seconds.
+///
+/// The narrowing, as one pure predicate so the rule is testable rather than
+/// spread across the caller's `if`. Every uncertainty must resolve to `false`
+/// upstream: this returns the ZERO, and a zero costs the row the lane wins.
+pub(crate) const fn flat_verdict_zeroes_upfront(
+    probe_is_flat: bool,
+    shape: UpfrontLaneShape,
+) -> bool {
+    probe_is_flat && !shape.steers_on_a_surrogate_objective && !shape.enumerates_points
+}
+
 /// Clamp a COMMITTED cap to the LIVE remaining budget before handing it over.
 ///
 /// The allocator planned against a prediction of where each lane starts; the
@@ -459,6 +665,251 @@ pub(crate) fn clamp_to_live_remaining(
     let usable = remaining.checked_sub(margin)?;
     let clamped = cap.min(usable);
     (!clamped.is_zero()).then_some(clamped)
+}
+
+// ---------------------------------------------------------------------------
+// #lane-budget-frame — WHAT EACH LANE'S WINDOW IS A FUNCTION OF
+// ---------------------------------------------------------------------------
+
+/// How one attack-slice lane turns a clock reading into a window.
+///
+/// # The mixture, which is the bug
+///
+/// Every lane in the attack slice reads the SAME published deadline at the
+/// moment IT starts, so every one of them sizes from LIVE REMAINING. What
+/// differs — and what was never written down in one place — is each lane's
+/// RESPONSE to a second that a lane ahead of it did not spend:
+///
+/// | lane | helper | rule | absorbs of each freed second |
+/// |---|---|---|---|
+/// | LP sign-space | `sign_space_falsify.rs:459` (`lane_budget`, called at `:519`) | `(live - 45 s) * 0.5`, capped 4 min, floored 20 s | **0.5** |
+/// | STE-PGD | `sign_space_falsify.rs:477` (`trailing_lane_budget`) | `live - 45 s - 100 s`, capped 4 min, floored 20 s | **1.0**, until the 4 min wall binds |
+/// | upfront DLR-APGD, `Sign` net | `vnncomp.rs:12961` (and its mirror `upfront_today_cap`, `vnncomp.rs:11616`) | `(live - 3 s) * 0.5`, capped 240 s, admitted by the 8 % rule below | **0.5** |
+/// | upfront DLR-APGD, other nets | `vnncomp.rs:11930` (`upfront_attack_budget`) | `(live - 3 s) * 0.08`, capped 8 s (4 s auto-disjunction) | ~0, the 8 s wall binds immediately |
+///
+/// A lane that DECLINES therefore does not hand its seconds to the lane the
+/// slice was designed around. It hands them to the next lane that reads the
+/// clock, in proportion to that lane's own coefficient. Measured, on
+/// `traffic_signs_recognition_2023` at a 480 s budget: disabling the two BNN
+/// lanes freed 327.4 s, and the upfront lane grew ITSELF from 71.0 s to
+/// 234.7 s — `0.5 * 327.4 = 163.7 s` of the freed budget, exactly this table's
+/// prediction — so only ~150 s of 327 reached branch-and-bound. Removing a
+/// lane is not how the prover is given budget.
+///
+/// This type states each rule once, as data, so the coefficient is visible and
+/// so `todays_rules_are_transcribed_exactly` can prove the transcription
+/// against the production helpers instead of asking a reader to trust a
+/// comment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum SizingRule {
+    /// `(live - margin) * fraction`, capped at `wall`, and refused below
+    /// `floor`. Absorbs `fraction` of every second freed upstream.
+    FractionOfLive {
+        margin: Duration,
+        fraction: f64,
+        wall: Duration,
+        floor: Duration,
+    },
+    /// `live - margin - reserve`, capped at `wall`, and refused below `floor`.
+    /// Absorbs ALL of every second freed upstream until the wall binds —
+    /// subtraction has coefficient one.
+    LiveMinusReserves {
+        margin: Duration,
+        reserve: Duration,
+        wall: Duration,
+        floor: Duration,
+    },
+    /// The upfront attack on a `Sign` net: `max` of the BNN fraction and the
+    /// ordinary one, ADMITTED BY THE ORDINARY ONE.
+    ///
+    /// Stated as its own variant because the admission gate is not on the
+    /// window this lane takes. `try_upfront_falsify` computes the ordinary
+    /// `(live - 3 s) * 0.08` capped at 8 s FIRST and returns early if that
+    /// value is under `UPFRONT_ATTACK_MIN_BUDGET`; only then does the `Sign`
+    /// branch raise it to `(live - 3 s) * 0.5` capped at 240 s. So below about
+    /// 13 s of remaining budget the lane is refused even though the BNN rule
+    /// would have funded it. Absorbs half of every freed second above that
+    /// threshold.
+    UpfrontSignNet {
+        margin: Duration,
+        fraction: f64,
+        wall: Duration,
+        /// The ordinary non-BNN fraction and wall, which carry the admission.
+        gate_fraction: f64,
+        gate_wall: Duration,
+        floor: Duration,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl SizingRule {
+    /// The window this rule produces from a clock reading. `None` is the lane's
+    /// own "not worth starting", exactly as its private helper reports it.
+    ///
+    /// `remaining == None` means no deadline is published — information absent,
+    /// never budget spent — and every production helper answers its wall.
+    pub(crate) fn window(self, remaining: Option<Duration>) -> Option<Duration> {
+        match self {
+            Self::FractionOfLive {
+                margin,
+                fraction,
+                wall,
+                floor,
+            } => {
+                let Some(remaining) = remaining else {
+                    return Some(wall);
+                };
+                let budget = remaining.checked_sub(margin)?.mul_f64(fraction).min(wall);
+                (budget >= floor).then_some(budget)
+            }
+            Self::LiveMinusReserves {
+                margin,
+                reserve,
+                wall,
+                floor,
+            } => {
+                let Some(remaining) = remaining else {
+                    return Some(wall);
+                };
+                let budget = remaining
+                    .checked_sub(margin)?
+                    .checked_sub(reserve)?
+                    .min(wall);
+                (budget >= floor).then_some(budget)
+            }
+            Self::UpfrontSignNet {
+                margin,
+                fraction,
+                wall,
+                gate_fraction,
+                gate_wall,
+                floor,
+            } => {
+                let Some(remaining) = remaining else {
+                    if gate_wall < floor {
+                        return None;
+                    }
+                    return Some(wall.max(gate_wall));
+                };
+                let usable = remaining.checked_sub(margin)?;
+                let gate = usable.mul_f64(gate_fraction).min(gate_wall);
+                if gate < floor {
+                    return None;
+                }
+                Some(usable.mul_f64(fraction).min(wall).max(gate))
+            }
+        }
+    }
+
+    /// How much of `freed` extra seconds this rule ABSORBS into its own window,
+    /// given it would otherwise have started at `base`.
+    ///
+    /// This is the quantity issue 2 is about, and it is a measurement of the
+    /// rule rather than a claim about it: the window at `base + freed` minus
+    /// the window at `base`.
+    pub(crate) fn absorbed(self, base: Duration, freed: Duration) -> Duration {
+        let before = self.window(Some(base)).unwrap_or_default();
+        let after = self.window(Some(base + freed)).unwrap_or_default();
+        after.saturating_sub(before)
+    }
+}
+
+/// The LP sign-space lane's rule, transcribed from
+/// `beta_crown/sign_space_falsify.rs:459` (`lane_budget`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LP_LANE_RULE: SizingRule = SizingRule::FractionOfLive {
+    margin: Duration::from_secs(45),
+    fraction: 0.5,
+    wall: Duration::from_mins(4),
+    floor: Duration::from_secs(20),
+};
+
+/// The STE-PGD lane's rule, transcribed from
+/// `beta_crown/sign_space_falsify.rs:477` (`trailing_lane_budget`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const STE_LANE_RULE: SizingRule = SizingRule::LiveMinusReserves {
+    margin: Duration::from_secs(45),
+    reserve: Duration::from_secs(100),
+    wall: Duration::from_mins(4),
+    // `MIN_LANE_BUDGET`, shared with the LP lane: below this a consultation
+    // cannot realistically finish and the seconds are better left downstream.
+    floor: Duration::from_secs(20),
+};
+
+/// The upfront attack's rule ON A `Sign` NET, transcribed from the branch at
+/// `vnncomp.rs:12961`.
+///
+/// `fraction` and `wall` are the frozen `NY_BNN_ATTACK_FRAC` /
+/// `NY_BNN_ATTACK_CAP` policy values resolved from the scored command's
+/// entry-time `LeverSet`. They are passed in here, so the sizing mirror and the
+/// authoritative lane share one receipted treatment without a later process-
+/// environment read.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const fn upfront_sign_net_rule(
+    fraction: f64,
+    wall: Duration,
+    gate_fraction: f64,
+    gate_wall: Duration,
+) -> SizingRule {
+    SizingRule::UpfrontSignNet {
+        margin: Duration::from_secs(3),
+        fraction,
+        wall,
+        gate_fraction,
+        gate_wall,
+        floor: Duration::from_millis(800),
+    }
+}
+
+/// Whether the fixed frame may size this instance's attack slice.
+///
+/// Same shape and same reasoning as [`allocator_admitted`], plus one more
+/// condition: the frame is the WEAKEST of the three cap authorities, so it
+/// stands down under either of the others. Exactly one mechanism holds a lane's
+/// cap at any time.
+///
+/// * `armed` — the lever. Dark by default, so this is `false` on every scored
+///   run and nothing below is consulted.
+/// * `!allocator_armed` — Layer A already commits every lane's cap up front,
+///   which is a strict superset of what the frame does.
+/// * `!scheduler_armed` — `#lane-value-scheduler` owns the two BNN lanes in
+///   flight.
+/// * `!traffic_terminal_softmax_peel` — that route rewrites the upfront lane's
+///   objective; the frame does not read the objective, but it does hand that
+///   lane a committed cap, and the peel route is where the existing wiring
+///   declines to touch it.
+pub(crate) const fn frame_admitted(
+    armed: bool,
+    allocator_armed: bool,
+    scheduler_armed: bool,
+    traffic_terminal_softmax_peel: bool,
+) -> bool {
+    armed && !allocator_armed && !scheduler_armed && !traffic_terminal_softmax_peel
+}
+
+/// Whether the fixed attack-slice frame is admitted.
+///
+/// Exact `"1"` arms it, exact `"0"` disarms it, every other byte sequence is a
+/// recorded rejection falling back to the declaration's `false`. Fails CLOSED.
+///
+/// DELIVERY SEAM (#lever-reachability, 2026-08-23): `NY_LANE_BUDGET_FRAME`
+/// still wins in both directions; absent, the typed `attack.lane_budget_frame`
+/// key decides.
+pub(crate) fn lane_budget_frame_armed() -> bool {
+    crate::preset_gates::lane_budget_frame_armed()
+}
+
+/// The arming rule as a pure predicate over one raw environment string.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn lane_budget_frame_armed_from(raw: Option<&str>) -> bool {
+    let owned = raw.map(str::to_owned);
+    ny_levers::read_with(
+        &ny_levers::decls::dark_probes::LANE_BUDGET_FRAME,
+        move |_| owned,
+    )
+    .value
+    .as_bool()
 }
 
 // ---------------------------------------------------------------------------
@@ -512,8 +963,8 @@ pub(crate) use mip_plan::plan_attack_slice;
 #[cfg(feature = "mip")]
 mod mip_plan {
     use super::{
-        AllocatedLane, AttackSliceAllocation, LaneWindow, NoAllocation, TodaySlices,
-        LP_LANE_MEASURED_FLOOR,
+        render_window, AllocatedLane, AllocationAuthority, AttackSliceAllocation, LaneWindow,
+        NoAllocation, TodaySlices, KNAPSACK_ZERO_REASON, LP_LANE_MEASURED_FLOOR,
     };
     use std::time::Duration;
 
@@ -577,16 +1028,22 @@ mod mip_plan {
 
     /// Choose the attack slice's caps jointly, by solving the Layer-A knapsack.
     ///
-    /// `objective_is_flat` is the structural probe's verdict on the objective
-    /// the UPFRONT exact-gradient lane steers on (see the caller). The two BNN
-    /// lanes are NOT zeroed by it: their extraction strips a terminal Softmax
-    /// and they steer on the pre-Softmax integer logit margin, which is a
-    /// different function from the one the probe measured. Zeroing a lane on
-    /// evidence about someone else's objective is exactly the category error
-    /// this module must not make.
+    /// `flat_zero_applies` is the structural probe's FLAT verdict AFTER the
+    /// caller has established that the verdict is evidence about the upfront
+    /// lane at all — see [`super::flat_verdict_zeroes_upfront`] and
+    /// [`super::UpfrontLaneShape`]. It is deliberately not the raw probe
+    /// verdict: a FLAT probe on a net whose attack direction is a smooth-`Sign`
+    /// surrogate says nothing about that lane, and applying it there was
+    /// measured to remove the lane that WINS five traffic rows.
+    ///
+    /// The two BNN lanes are NOT zeroed by it either: their extraction strips a
+    /// terminal Softmax and they steer on the pre-Softmax integer logit margin,
+    /// which is a different function from the one the probe measured. Zeroing a
+    /// lane on evidence about someone else's objective is exactly the category
+    /// error this module must not make.
     pub(crate) fn plan_attack_slice(
         today: TodaySlices,
-        objective_is_flat: bool,
+        flat_zero_applies: bool,
         solve_cap: Duration,
     ) -> Result<AttackSliceAllocation, NoAllocation> {
         let pool = today.pool();
@@ -644,7 +1101,7 @@ mod mip_plan {
             // hard p = 0: an exact-gradient search on an objective that takes a
             // single f32 value over the whole probe is not slow, it is BLIND.
             match StructuralZero::flat_objective(
-                if objective_is_flat { 1 } else { 2 },
+                if flat_zero_applies { 1 } else { 2 },
                 ObjectiveRequirement::Exact,
             ) {
                 Some(zero) => {
@@ -701,23 +1158,25 @@ mod mip_plan {
             pool.as_secs_f64(),
             granted.as_secs_f64(),
             pool.saturating_sub(granted).as_secs_f64(),
-            render(windows[0]),
-            render(windows[1]),
-            render(windows[2]),
-            if objective_is_flat {
-                "FLAT"
+            render_window(windows[0]),
+            render_window(windows[1]),
+            render_window(windows[2]),
+            if flat_zero_applies {
+                "FLAT (applied)"
             } else {
-                "not flat"
+                "not flat, or FLAT but not evidence about this lane"
             },
         );
 
         Ok(AttackSliceAllocation {
+            authority: AllocationAuthority::Knapsack,
             sign_space: windows[0],
             ste_pgd: windows[1],
             upfront: windows[2],
             pool,
             granted,
             ledger,
+            zero_reason: KNAPSACK_ZERO_REASON,
         })
     }
 
@@ -726,14 +1185,6 @@ mod mip_plan {
             AllocatedLane::SignSpace => 0,
             AllocatedLane::StePgd => 1,
             AllocatedLane::UpfrontAttack => 2,
-        }
-    }
-
-    fn render(window: LaneWindow) -> String {
-        match window {
-            LaneWindow::Private => "not requested".to_string(),
-            LaneWindow::Skip => "SKIPPED (0s)".to_string(),
-            LaneWindow::Cap(cap) => format!("{:.2}s", cap.as_secs_f64()),
         }
     }
 }

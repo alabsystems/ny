@@ -54,6 +54,104 @@ pub(crate) fn clamp_inverted_best_bounds(
     widened
 }
 
+/// Intersect two sound enclosures of the SAME quantity.
+///
+/// Both arguments must enclose the same output box, so their elementwise
+/// intersection encloses it as well and is no looser than either — that is the
+/// only reason this is allowed to tighten anything. Used by the DAG alpha
+/// router (#mulbinary-alpha-router) to carry the bound the previous route
+/// returned into a graph that now takes the optimizer instead, so re-routing
+/// can only tighten what the caller sees.
+///
+/// Fail-closed in three ways, because a *wrong* tightening is worse than no
+/// tightening:
+///
+/// * a length mismatch abandons the intersection entirely (`None`) rather than
+///   guessing an elementwise correspondence between differently shaped boxes;
+/// * any element whose intersection would not satisfy `lower <= upper` — a
+///   contradiction between two supposedly sound enclosures — keeps `base`'s
+///   interval for that element untouched, and so does any element where the
+///   floor carries a NaN on either endpoint;
+/// * the result always carries `base`'s shape, never `floor`'s.
+///
+/// Returns `None` when nothing was intersected; the caller then keeps `base`.
+pub(crate) fn intersect_sound_enclosure(
+    base: &BoundedTensor,
+    floor: &BoundedTensor,
+    context: &str,
+) -> Option<BoundedTensor> {
+    if base.lower().len() != floor.lower().len() || base.upper().len() != floor.upper().len() {
+        warn!(
+            context = context,
+            base_len = base.lower().len(),
+            floor_len = floor.lower().len(),
+            "α-CROWN enclosure intersection declined: element counts differ",
+        );
+        return None;
+    }
+
+    let mut lower = base.lower().clone();
+    let mut upper = base.upper().clone();
+    let mut refused = 0usize;
+    let mut tightened = 0usize;
+    for (((out_l, out_u), &f_l), &f_u) in lower
+        .iter_mut()
+        .zip(upper.iter_mut())
+        .zip(floor.lower().iter())
+        .zip(floor.upper().iter())
+    {
+        // A NaN anywhere in the floor's interval discredits that interval
+        // whole, not just the endpoint carrying it — take nothing from it.
+        // (Comparison alone would silently accept the other endpoint, since
+        // every comparison against NaN is false.)
+        if f_l.is_nan() || f_u.is_nan() {
+            refused += 1;
+            continue;
+        }
+        let cand_l = if f_l > *out_l { f_l } else { *out_l };
+        let cand_u = if f_u < *out_u { f_u } else { *out_u };
+        // Deliberately the NEGATED comparison, not `cand_l > cand_u`: on a NaN
+        // carried by `base` every ordinary comparison is false, and only
+        // `!(a <= b)` refuses in that case. Fail-closed is the whole point.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let contradicted = !(cand_l <= cand_u);
+        if contradicted {
+            refused += 1;
+            continue;
+        }
+        if cand_l != *out_l || cand_u != *out_u {
+            tightened += 1;
+        }
+        *out_l = cand_l;
+        *out_u = cand_u;
+    }
+
+    if refused > 0 {
+        warn!(
+            context = context,
+            refused = refused,
+            total = base.lower().len(),
+            "α-CROWN enclosure intersection contradicted itself at some elements; \
+             kept the original interval there",
+        );
+    }
+    if tightened == 0 {
+        return None;
+    }
+
+    match BoundedTensor::new_allow_infinite(lower, upper) {
+        Ok(bounds) => Some(bounds),
+        Err(err) => {
+            warn!(
+                context = context,
+                error = %err,
+                "α-CROWN enclosure intersection rejected by BoundedTensor; keeping the original",
+            );
+            None
+        }
+    }
+}
+
 /// Merge per-iteration concrete bounds into running element-wise best bounds.
 ///
 /// Uses flat iteration (`iter`/`iter_mut`) so it works for non-standard-layout
@@ -383,6 +481,119 @@ mod tests {
         // Valid element [2]: unchanged
         assert_eq!(best_lower[[2]], 0.0);
         assert_eq!(best_upper[[2]], 1.0);
+    }
+
+    /// #mulbinary-alpha-router: the intersection tightens each side toward the
+    /// floor and keeps the base's shape.
+    #[test]
+    fn intersect_sound_enclosure_takes_the_tighter_side_elementwise() {
+        let base = BoundedTensor::new(
+            array![-2.0_f32, -1.0, 0.0].into_dyn(),
+            array![2.0_f32, 3.0, 1.0].into_dyn(),
+        )
+        .unwrap();
+        let floor = BoundedTensor::new(
+            array![-1.0_f32, -5.0, -1.0].into_dyn(),
+            array![5.0_f32, 1.0, 0.5].into_dyn(),
+        )
+        .unwrap();
+
+        let merged = intersect_sound_enclosure(&base, &floor, "test").expect("should tighten");
+
+        assert_eq!(merged.lower().shape(), base.lower().shape());
+        assert_eq!(merged.lower()[[0]], -1.0);
+        assert_eq!(merged.upper()[[0]], 2.0);
+        assert_eq!(merged.lower()[[1]], -1.0);
+        assert_eq!(merged.upper()[[1]], 1.0);
+        assert_eq!(merged.lower()[[2]], 0.0);
+        assert_eq!(merged.upper()[[2]], 0.5);
+    }
+
+    /// Nothing to gain must report "no change" so the caller keeps its own
+    /// value (and its own array identity) rather than a rebuilt copy.
+    #[test]
+    fn intersect_sound_enclosure_returns_none_when_nothing_tightens() {
+        let base = BoundedTensor::new(
+            array![0.0_f32, 0.0].into_dyn(),
+            array![1.0_f32, 1.0].into_dyn(),
+        )
+        .unwrap();
+        let floor = BoundedTensor::new(
+            array![-1.0_f32, -1.0].into_dyn(),
+            array![2.0_f32, 2.0].into_dyn(),
+        )
+        .unwrap();
+
+        assert!(intersect_sound_enclosure(&base, &floor, "test").is_none());
+    }
+
+    /// Two "sound" enclosures that contradict each other must NOT produce an
+    /// inverted interval — that is the infeasibility sentinel elsewhere in the
+    /// optimizer. The contradicting element keeps the base interval; the
+    /// non-contradicting one still tightens.
+    #[test]
+    fn intersect_sound_enclosure_refuses_contradictory_elements() {
+        let base = BoundedTensor::new(
+            array![0.0_f32, 0.0].into_dyn(),
+            array![1.0_f32, 1.0].into_dyn(),
+        )
+        .unwrap();
+        let floor = BoundedTensor::new(
+            array![5.0_f32, 0.25].into_dyn(),
+            array![6.0_f32, 0.75].into_dyn(),
+        )
+        .unwrap();
+
+        let merged = intersect_sound_enclosure(&base, &floor, "test").expect("element 1 tightens");
+
+        assert_eq!(merged.lower()[[0]], 0.0, "contradiction must keep base");
+        assert_eq!(merged.upper()[[0]], 1.0, "contradiction must keep base");
+        assert_eq!(merged.lower()[[1]], 0.25);
+        assert_eq!(merged.upper()[[1]], 0.75);
+        assert!(merged
+            .lower()
+            .iter()
+            .zip(merged.upper().iter())
+            .all(|(l, u)| l <= u));
+    }
+
+    /// A NaN on the floor side is a contradiction too: it must be skipped, not
+    /// merged in. Both `new` and `new_allow_infinite` already reject NaN, so
+    /// this reaches the guard through the unchecked constructor — the guard is
+    /// defense in depth for a floor that arrived by some other route.
+    #[test]
+    fn intersect_sound_enclosure_skips_nan_floor_elements() {
+        let base = BoundedTensor::new(
+            array![0.0_f32, 0.0].into_dyn(),
+            array![1.0_f32, 1.0].into_dyn(),
+        )
+        .unwrap();
+        let floor = BoundedTensor::new_unchecked(
+            array![f32::NAN, 0.5].into_dyn(),
+            array![0.5_f32, 0.75].into_dyn(),
+        )
+        .unwrap();
+
+        let merged = intersect_sound_enclosure(&base, &floor, "test").expect("element 1 tightens");
+
+        assert_eq!(merged.lower()[[0]], 0.0);
+        assert_eq!(merged.upper()[[0]], 1.0);
+        assert!(merged.lower().iter().all(|v| !v.is_nan()));
+        assert!(merged.upper().iter().all(|v| !v.is_nan()));
+    }
+
+    /// Differently sized boxes have no elementwise correspondence to guess at.
+    #[test]
+    fn intersect_sound_enclosure_declines_on_length_mismatch() {
+        let base = BoundedTensor::new(
+            array![0.0_f32, 0.0].into_dyn(),
+            array![1.0_f32, 1.0].into_dyn(),
+        )
+        .unwrap();
+        let floor =
+            BoundedTensor::new(array![0.5_f32].into_dyn(), array![0.75_f32].into_dyn()).unwrap();
+
+        assert!(intersect_sound_enclosure(&base, &floor, "test").is_none());
     }
 
     #[test]

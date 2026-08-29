@@ -415,22 +415,28 @@ pub(crate) fn apply_dense_backward_dispatch_result_with_deadline(
                 input_accumulated,
                 deadline,
             )?;
-            for (graph_idx, lb) in bounds.into_iter().flatten().enumerate() {
+            // #nary-zip: ONNX-ordered slots compacted onto the dynamic-only
+            // `node.inputs`. This lane already compacted correctly; routing it
+            // through the same owner turns the previously silent
+            // `node.inputs.get(idx) == None` drop into a fail-closed refusal.
+            let paired = bounds.pair_with_dynamic_inputs(
+                &node.inputs,
+                &format!("{context_prefix} n-ary split path"),
+            )?;
+            for (inp_name, lb) in paired {
                 GraphNetwork::verify_split_path_bias_zero(
                     &lb,
                     &format!("{context_prefix} n-ary split path"),
                 )?;
-                if let Some(inp_name) = node.inputs.get(graph_idx) {
-                    graph.accumulate_dense_bounds_to_input_with_deadline(
-                        inp_name,
-                        lb,
-                        node_crown_bounds,
-                        output_dim,
-                        input_dim,
-                        input_accumulated,
-                        deadline,
-                    )?;
-                }
+                graph.accumulate_dense_bounds_to_input_with_deadline(
+                    inp_name,
+                    lb,
+                    node_crown_bounds,
+                    output_dim,
+                    input_dim,
+                    input_accumulated,
+                    deadline,
+                )?;
             }
             Ok(())
         }

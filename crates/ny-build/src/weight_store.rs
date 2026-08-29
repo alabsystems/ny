@@ -26,6 +26,34 @@ pub struct WeightRevision {
 #[derive(Debug)]
 pub struct WeightStore {
     weights: HashMap<String, ArrayD<f32>>,
+    /// Frozen constants that are known only up to a RIGOROUS ENCLOSURE
+    /// `[lower, upper]`, keyed by tensor name and DISJOINT from `weights`.
+    ///
+    /// A name lands here when a both-constant fold could not be carried out
+    /// bit-exactly in binary32 (the `try_fold_matmul_exact` gate) but a sound
+    /// outward-rounded interval carrier could be computed instead. The
+    /// invariant is the only thing the store promises:
+    ///
+    /// > the exact real value of the folded tensor lies in `[lower, upper]`
+    /// > elementwise.
+    ///
+    /// WHY A SEPARATE MAP, AND WHY [`Self::get`] DOES NOT SEE IT. Every
+    /// existing consumer of a frozen constant in this workspace reads through
+    /// [`Self::get`] and would compute with the value as if it were exact.
+    /// Silently handing back a midpoint is precisely the unsound point-fold
+    /// this carrier exists to avoid, so an interval-valued name is INVISIBLE to
+    /// the point API: `get`, `contains_key`, `len`, `keys`, `iter` and
+    /// `find_by_key` are unchanged and never observe it. A consumer that wants
+    /// the enclosure must ask for it by name through [`Self::get_interval`],
+    /// which is an explicit, auditable opt-in; every consumer that does not ask
+    /// simply fails to find the constant and degrades to its existing
+    /// unsupported/fail-closed path.
+    ///
+    /// A ZERO-WIDTH interval is never stored: [`Self::insert_interval`]
+    /// canonicalizes `lower == upper` (bitwise) back into `weights` as an
+    /// ordinary point constant, so "the fold was exact after all" stays
+    /// indistinguishable from today.
+    interval_weights: HashMap<String, (ArrayD<f32>, ArrayD<f32>)>,
     integers: HashMap<String, ArrayD<i64>>,
     integer_ranges: HashMap<String, (i64, i64)>,
     revision_tracking: Option<RevisionTracking>,
@@ -43,6 +71,7 @@ impl WeightStore {
     pub fn new() -> Self {
         Self {
             weights: HashMap::new(),
+            interval_weights: HashMap::new(),
             integers: HashMap::new(),
             integer_ranges: HashMap::new(),
             revision_tracking: None,
@@ -60,9 +89,102 @@ impl WeightStore {
     }
 
     /// Inserts or replaces a weight tensor by name.
+    ///
+    /// A POINT value supersedes any interval carrier previously recorded for
+    /// the same name: the two maps stay disjoint, and the exact value is
+    /// strictly better information than an enclosure of it.
     pub fn insert(&mut self, name: String, weights: ArrayD<f32>) {
         self.bump_revision(&name);
+        self.interval_weights.remove(&name);
         self.weights.insert(name, weights);
+    }
+
+    /// Returns the rigorous `(lower, upper)` enclosure recorded for `name`, if
+    /// this name is an interval-valued frozen constant.
+    ///
+    /// Returns `None` for ordinary point constants — a caller that wants to
+    /// treat both uniformly must handle the point case through [`Self::get`]
+    /// explicitly. That asymmetry is deliberate: it makes "I forgot the
+    /// interval case" a missing constant (fail closed) rather than a silently
+    /// exact-looking midpoint.
+    #[must_use]
+    pub fn get_interval(&self, name: &str) -> Option<(&ArrayD<f32>, &ArrayD<f32>)> {
+        self.interval_weights.get(name).map(|(l, u)| (l, u))
+    }
+
+    /// Whether `name` is an interval-valued frozen constant.
+    #[must_use]
+    pub fn contains_interval(&self, name: &str) -> bool {
+        self.interval_weights.contains_key(name)
+    }
+
+    /// Number of interval-valued frozen constants held.
+    ///
+    /// This is zero for every model loaded with the interval carrier disarmed,
+    /// which is what the dark-behaviour tests assert.
+    #[must_use]
+    pub fn interval_len(&self) -> usize {
+        self.interval_weights.len()
+    }
+
+    /// Iterate over `(name, lower, upper)` triples of the interval constants.
+    pub fn iter_intervals(&self) -> impl Iterator<Item = (&str, &ArrayD<f32>, &ArrayD<f32>)> {
+        self.interval_weights
+            .iter()
+            .map(|(k, (l, u))| (k.as_str(), l, u))
+    }
+
+    /// Records a rigorous enclosure `[lower, upper]` for a frozen constant.
+    ///
+    /// The caller is asserting that the EXACT REAL value of the tensor lies in
+    /// `[lower, upper]` elementwise. Everything that can be checked here is
+    /// checked here, and a violation is REFUSED (returns `false`, stores
+    /// nothing) rather than repaired:
+    ///
+    /// * `lower` and `upper` must have the same shape;
+    /// * every endpoint must be finite (an infinite endpoint is not an
+    ///   enclosure worth carrying — the caller should leave the node unfolded
+    ///   and let it fail closed to an unbounded skip instead);
+    /// * `lower[i] <= upper[i]` elementwise, with NaN rejected;
+    /// * the name must not already be a point constant.
+    ///
+    /// A bitwise-identical `lower`/`upper` pair is CANONICALIZED into the point
+    /// map: zero width is exactly the case the existing bit-exact fold already
+    /// covers, and keeping it out of the interval map is what makes
+    /// [`Self::interval_len`] a faithful "did the carrier fire" signal.
+    ///
+    /// Returns whether the tensor was stored (in either map).
+    pub fn insert_interval(
+        &mut self,
+        name: String,
+        lower: ArrayD<f32>,
+        upper: ArrayD<f32>,
+    ) -> bool {
+        if lower.shape() != upper.shape() {
+            return false;
+        }
+        if self.weights.contains_key(&name) {
+            return false;
+        }
+        let mut zero_width = true;
+        for (&l, &u) in lower.iter().zip(upper.iter()) {
+            if !l.is_finite() || !u.is_finite() || l > u {
+                return false;
+            }
+            if l != u {
+                zero_width = false;
+            }
+        }
+        if zero_width {
+            // Exact after all: indistinguishable from the bit-exact path. The
+            // test is NUMERIC equality rather than bitwise, so a `(-0.0, +0.0)`
+            // pair — which denotes the single real value zero — collapses too;
+            // `upper` is stored because it carries the non-negative sign.
+            self.insert(name, upper);
+            return true;
+        }
+        self.interval_weights.insert(name, (lower, upper));
+        true
     }
 
     /// Enables opaque floating-point revision snapshots for future inserts.
@@ -120,6 +242,7 @@ impl WeightStore {
     /// Removes a floating-point weight tensor by name.
     pub fn remove(&mut self, name: &str) -> Option<ArrayD<f32>> {
         self.bump_revision(name);
+        self.interval_weights.remove(name);
         self.weights.remove(name)
     }
 
@@ -158,6 +281,15 @@ impl WeightStore {
             if tensor.iter().any(|v| v.is_nan()) {
                 return Err(NyError::ModelLoad(format!(
                     "Weight tensor '{}' contains NaN values — corrupted or adversarial model",
+                    name
+                )));
+            }
+        }
+        for (name, (lower, upper)) in &self.interval_weights {
+            if lower.iter().chain(upper.iter()).any(|v| v.is_nan()) {
+                return Err(NyError::ModelLoad(format!(
+                    "Interval weight tensor '{}' contains NaN endpoints — corrupted or \
+                     adversarial model",
                     name
                 )));
             }
@@ -216,6 +348,7 @@ impl Clone for WeightStore {
     fn clone(&self) -> Self {
         Self {
             weights: self.weights.clone(),
+            interval_weights: self.interval_weights.clone(),
             integers: self.integers.clone(),
             integer_ranges: self.integer_ranges.clone(),
             revision_tracking: self.revision_tracking.as_ref().map(|tracking| {

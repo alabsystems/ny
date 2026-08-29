@@ -284,6 +284,8 @@ fn test_alpha_crown_config_custom() {
         // #joint-interm-grad: 0 = legacy frozen-intermediate ascent, which is
         // what these fixtures were written against.
         joint_interm_alpha_every: 0,
+        // #cgan-narrow-target-budget: None = the shipped default (no ceiling).
+        cgan_narrow_target_max_rows: None,
         // #envelope-grad: false = the shipped local rule these fixtures assume.
         alpha_envelope_grad: false,
         iterations: 10,

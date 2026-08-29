@@ -67,6 +67,16 @@ pub(super) struct DagAlphaInitState {
     pub(super) has_sqrt: bool,
     pub(super) has_reciprocal: bool,
     pub(super) invprop_enabled: bool,
+    /// Elementwise FLOOR the optimizer may never fall below
+    /// (#mulbinary-alpha-router).
+    ///
+    /// `Some` only on the arm that this router used to hand to the batched
+    /// path before multiplicative nodes counted as optimizable: it holds the
+    /// exact bound that arm would have returned. The optimization loop
+    /// intersects it into the initial best box, so re-routing a graph into the
+    /// alpha loop can only tighten what the caller sees, never loosen it.
+    /// `None` for every graph whose route is unchanged.
+    pub(super) batched_floor: Option<BoundedTensor>,
 }
 
 impl GraphNetwork {
@@ -153,6 +163,49 @@ impl GraphNetwork {
             && super::invprop_output_seed_treatment_eligible(config, output_dim)
             && !super::uses_patches_output_seed(self, output_bounds);
 
+        // Multiplicative relaxations are alpha-bearing too (#mulbinary-alpha-router).
+        //
+        // This gate used to test ONLY ReLU/Sigmoid/Tanh/Sqrt, so a graph whose
+        // sole optimizable relaxations are multiplicative left through the
+        // batched door before any alpha state was built. `MulBinary` is the
+        // damaging case: the batched optimizer has no MulBinary alpha entry
+        // point, so `up * silu(gate)` SwiGLU FFNs — and every other elementwise
+        // product frontend emits — reached plain batched CROWN and were never
+        // alpha-optimized at all. Collect the MulBinary alpha map BEFORE the
+        // gate and let its presence hold the graph in the optimizer, using the
+        // SAME `node_bounds`-keyed predicate Step 2c below uses so the gate can
+        // never admit a graph the optimizer would find nothing to move on.
+        //
+        // Element-wise mul z = x*y: shape [2, n] (r_l, r_u per element).
+        // Reference: designs/2026-03-06-mulbinary-crown-backward-dispatch.md Phase 3.
+        let mut mul_binary_alphas: HashMap<String, Array2<f32>> = HashMap::new();
+        let mut mul_binary_adam_m: HashMap<String, Array2<f32>> = HashMap::new();
+        let mut mul_binary_adam_v: HashMap<String, Array2<f32>> = HashMap::new();
+        for (name, node) in &self.nodes {
+            if let Layer::MulBinary(_) = &node.layer {
+                if let Some(bounds) = node_bounds.get(name) {
+                    let n = bounds.lower().len();
+                    // Initialize to 0.5 (Middle mode default).
+                    mul_binary_alphas.insert(name.clone(), Array2::from_elem((2, n), 0.5));
+                    mul_binary_adam_m.insert(name.clone(), Array2::zeros((2, n)));
+                    mul_binary_adam_v.insert(name.clone(), Array2::zeros((2, n)));
+                }
+            }
+        }
+        let has_mul_binary = !mul_binary_alphas.is_empty();
+        if has_mul_binary {
+            debug!(
+                "DAG α-CROWN: {} MulBinary nodes registered for alpha optimization",
+                mul_binary_alphas.len()
+            );
+        }
+
+        // The bound this router returned BEFORE MulBinary counted as
+        // optimizable. Carried into the loop as an elementwise floor on the
+        // arm that changed route, so the new route is provably never looser
+        // than the old one (see `DagAlphaInitState::batched_floor`).
+        let mut batched_floor: Option<BoundedTensor> = None;
+
         if relu_nodes.is_empty()
             && s_shaped_nodes.is_empty()
             && sqrt_nodes.is_empty()
@@ -164,37 +217,75 @@ impl GraphNetwork {
             // optimization via the batched alpha-CROWN path.
             // #3588: thread the caller's engine into the batched alpha optimizer
             // instead of dropping it.
-            debug!(
-                "DAG α-CROWN: No optimizable activation nodes, trying BilinearCrown alpha optimization"
-            );
             let has_bilinear = self
                 .nodes
                 .values()
                 .any(|node| matches!(node.layer, Layer::BilinearCrown(_)));
-            if node_bounds_source.is_typed_cgan() && !has_bilinear {
-                // The typed transaction already published a certified output
-                // enclosure. With no alpha-bearing activation or bilinear
-                // state there is nothing for the fallback optimizer to change;
-                // carrying this handled artifact prevents the outer collector
-                // from entering the typed transaction a second time.
-                let bounds = output_bounds.clone();
-                let alpha_state = GraphAlphaState::new();
+            let typed_cgan_retention = node_bounds_source.is_typed_cgan() && !has_bilinear;
+            if !has_mul_binary {
+                debug!(
+                    "DAG α-CROWN: No optimizable activation nodes, trying BilinearCrown alpha optimization"
+                );
+                if typed_cgan_retention {
+                    // The typed transaction already published a certified output
+                    // enclosure. With no alpha-bearing activation or bilinear
+                    // state there is nothing for the fallback optimizer to change;
+                    // carrying this handled artifact prevents the outer collector
+                    // from entering the typed transaction a second time.
+                    let bounds = output_bounds.clone();
+                    let alpha_state = GraphAlphaState::new();
+                    #[cfg(test)]
+                    route_probe::record(route_probe::DagAlphaRoute::TypedCganEarlyReturn);
+                    return Ok(DagAlphaInitResult::EarlyReturn {
+                        bounds: bounds.clone(),
+                        collection_artifact: Some(super::DagAlphaCollectionArtifact {
+                            output_bounds: bounds,
+                            alpha_state,
+                            reference_bounds: node_bounds,
+                            reference_bounds_source: node_bounds_source,
+                            completed_iterations: 0,
+                            optimizer_updates_completed: 0,
+                        }),
+                    });
+                }
+                #[cfg(test)]
+                route_probe::record(route_probe::DagAlphaRoute::BatchedEarlyReturn);
                 return Ok(DagAlphaInitResult::EarlyReturn {
-                    bounds: bounds.clone(),
-                    collection_artifact: Some(super::DagAlphaCollectionArtifact {
-                        output_bounds: bounds,
-                        alpha_state,
-                        reference_bounds: node_bounds,
-                        reference_bounds_source: node_bounds_source,
-                        completed_iterations: 0,
-                        optimizer_updates_completed: 0,
-                    }),
+                    bounds: self.propagate_alpha_crown_batched(input, config, engine)?,
+                    collection_artifact: None,
                 });
             }
-            return Ok(DagAlphaInitResult::EarlyReturn {
-                bounds: self.propagate_alpha_crown_batched(input, config, engine)?,
-                collection_artifact: None,
-            });
+            // Re-routed: the graph's only optimizable relaxations are
+            // multiplicative. Pay for the old answer once and keep it as a
+            // floor rather than discarding a bound the caller used to get.
+            // A failure here is NOT fatal — the pre-fix route would have
+            // returned that same error, so continuing without a floor is
+            // strictly better than the old behavior.
+            debug!(
+                mul_binary_nodes = mul_binary_alphas.len(),
+                has_bilinear,
+                "DAG α-CROWN: multiplicative-only graph enters the alpha optimizer \
+                 (previously routed to the batched path with no MulBinary alphas)"
+            );
+            let previous_route_bounds = if typed_cgan_retention {
+                Ok(output_bounds.clone())
+            } else {
+                self.propagate_alpha_crown_batched(input, config, engine)
+            };
+            match previous_route_bounds {
+                Ok(bounds) => {
+                    batched_floor = Some(bounds);
+                    #[cfg(test)]
+                    route_probe::record_floor_captured();
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "DAG α-CROWN: previous batched route failed for a multiplicative-only \
+                         graph; continuing into the alpha optimizer without its floor"
+                    );
+                }
+            }
         }
 
         let mut graph_alpha_state = GraphAlphaState::new();
@@ -321,30 +412,9 @@ impl GraphNetwork {
             );
         }
 
-        // Step 2c: Collect MulBinary nodes and initialize alpha parameters (#3439 Phase 3).
-        // Element-wise mul z = x*y: shape [2, n] (r_l, r_u per element).
-        // Reference: designs/2026-03-06-mulbinary-crown-backward-dispatch.md Phase 3.
-        let mut mul_binary_alphas: HashMap<String, Array2<f32>> = HashMap::new();
-        let mut mul_binary_adam_m: HashMap<String, Array2<f32>> = HashMap::new();
-        let mut mul_binary_adam_v: HashMap<String, Array2<f32>> = HashMap::new();
-        for (name, node) in &self.nodes {
-            if let Layer::MulBinary(_) = &node.layer {
-                if let Some(bounds) = node_bounds.get(name) {
-                    let n = bounds.lower().len();
-                    // Initialize to 0.5 (Middle mode default).
-                    mul_binary_alphas.insert(name.clone(), Array2::from_elem((2, n), 0.5));
-                    mul_binary_adam_m.insert(name.clone(), Array2::zeros((2, n)));
-                    mul_binary_adam_v.insert(name.clone(), Array2::zeros((2, n)));
-                }
-            }
-        }
-        let has_mul_binary = !mul_binary_alphas.is_empty();
-        if has_mul_binary {
-            debug!(
-                "DAG α-CROWN: {} MulBinary nodes registered for alpha optimization",
-                mul_binary_alphas.len()
-            );
-        }
+        // Step 2c: MulBinary alpha parameters (#3439 Phase 3) are collected
+        // ABOVE, before the no-optimizable-node gate, because their presence is
+        // now part of that routing decision (#mulbinary-alpha-router).
 
         // Initialize INVPROP state if enabled and constraints are provided
         let invprop_enabled = config.invprop.enabled && config.output_constraints.is_some();
@@ -428,13 +498,31 @@ impl GraphNetwork {
             relu_nodes.iter().map(|(name, _)| name.clone()).collect(),
         );
 
+        // The second no-optimizable-state gate. `has_bilinear`/`has_mul_binary`
+        // belong here for the same reason they belong above
+        // (#mulbinary-alpha-router): both alpha families have just been
+        // initialized, and the loop's own `no_alpha_optimizer` predicate
+        // already counts them, so omitting them here dropped a graph whose
+        // ReLUs all resolved stable — but which still carries live
+        // multiplicative alphas — into fixed-slope CROWN with no optimizer.
+        //
+        // Re-routing here needs no floor: this arm's fallback is exactly the
+        // dense CROWN bound the loop seeds its elementwise best box from, so
+        // the optimizer's answer is no looser than this early return by
+        // construction.
         if runtime.graph().num_unstable() == 0
+            && !has_bilinear
+            && !has_mul_binary
             && !has_s_shaped
             && !has_sqrt
             && !has_reciprocal
             && !gamma_only_invprop
         {
             debug!("DAG α-CROWN: No optimizable activation state, using CROWN");
+            #[cfg(test)]
+            route_probe::record(route_probe::DagAlphaRoute::CrownEarlyReturn);
+            // `!has_bilinear && !has_mul_binary` is implied by the gate above;
+            // kept explicit so this typed-cGAN retention stays readable on its own.
             if node_bounds_source.is_typed_cgan() && !has_bilinear && !has_mul_binary {
                 let bounds = self
                     .propagate_crown_with_engine_and_deadline_and_node_bounds(
@@ -465,6 +553,8 @@ impl GraphNetwork {
             });
         }
 
+        #[cfg(test)]
+        route_probe::record(route_probe::DagAlphaRoute::OptimizerLoop);
         Ok(DagAlphaInitResult::Ready(Box::new(DagAlphaInitState {
             node_bounds,
             node_bounds_source,
@@ -485,6 +575,59 @@ impl GraphNetwork {
             has_sqrt,
             has_reciprocal,
             invprop_enabled,
+            batched_floor,
         })))
+    }
+}
+
+/// Test-only route evidence for the DAG α-CROWN router.
+///
+/// The router's arm is not observable from the returned bounds (an early
+/// return and a zero-gain optimizer run can produce the same numbers), and it
+/// must never be inferred from timing. Tests assert on this instead.
+#[cfg(test)]
+pub(in crate::network::graph_alpha) mod route_probe {
+    use std::cell::Cell;
+
+    /// Which arm [`super::GraphNetwork::init_dag_alpha_state`] selected.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::network::graph_alpha) enum DagAlphaRoute {
+        /// No optimizable node of any family — batched α-CROWN.
+        BatchedEarlyReturn,
+        /// No optimizable node of any family, typed cGAN reference retained.
+        TypedCganEarlyReturn,
+        /// Alpha state was built but nothing in it is optimizable — CROWN.
+        CrownEarlyReturn,
+        /// The DAG alpha optimization loop.
+        OptimizerLoop,
+    }
+
+    thread_local! {
+        static LAST: Cell<Option<DagAlphaRoute>> = const { Cell::new(None) };
+        static FLOOR_CAPTURED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(in crate::network::graph_alpha) fn record(route: DagAlphaRoute) {
+        LAST.with(|slot| slot.set(Some(route)));
+    }
+
+    /// Records that the router captured the previous route's bound as an
+    /// elementwise floor for the optimizer. Lets a test prove that safety net
+    /// is live even on fixtures where the optimizer dominates it anyway.
+    pub(in crate::network::graph_alpha) fn record_floor_captured() {
+        FLOOR_CAPTURED.with(|slot| slot.set(true));
+    }
+
+    pub(in crate::network::graph_alpha) fn reset() {
+        LAST.with(|slot| slot.set(None));
+        FLOOR_CAPTURED.with(|slot| slot.set(false));
+    }
+
+    pub(in crate::network::graph_alpha) fn last() -> Option<DagAlphaRoute> {
+        LAST.with(Cell::get)
+    }
+
+    pub(in crate::network::graph_alpha) fn floor_captured() -> bool {
+        FLOOR_CAPTURED.with(Cell::get)
     }
 }

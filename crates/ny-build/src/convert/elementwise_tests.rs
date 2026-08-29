@@ -402,6 +402,77 @@ fn convert_snake_reads_per_channel_alpha_tensor_4117() {
     }
 }
 
+/// The production Kokoro checkpoint mixes alpha signs within one tensor
+/// (`alpha[63] = -0.026045702`, bits 0xbcd55dcc). Conversion must accept the
+/// mixed-sign tensor and preserve the negative value bit-exactly; the
+/// negative-alpha envelope is certified via the point reflection in
+/// ny-propagate.
+#[test]
+fn convert_snake_accepts_mixed_sign_alpha_tensor() {
+    let kokoro_alpha = f32::from_bits(0xbcd5_5dcc);
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "snake_alpha".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1, 3, 1]), vec![0.5, kokoro_alpha, 2.0])
+            .expect("valid alpha"),
+    );
+    let ctx = make_context_with_weights(weights);
+    let spec = LayerSpec {
+        name: "snake".to_string(),
+        layer_type: LayerType::Snake,
+        inputs: vec!["x".to_string(), "snake_alpha".to_string()],
+        outputs: vec!["y".to_string()],
+        weights: None,
+        attributes: HashMap::new(),
+    };
+
+    let layer = ctx
+        .convert_elementwise(&spec)
+        .expect("mixed-sign snake conversion should succeed")
+        .expect("snake layer should be converted");
+
+    match layer {
+        Layer::Snake(snake) => {
+            assert_eq!(snake.alpha().len(), 3);
+            assert_eq!(
+                snake.alpha()[1].to_bits(),
+                0xbcd5_5dcc,
+                "the Kokoro negative alpha must survive conversion bit-exactly"
+            );
+        }
+        other => panic!("expected Snake layer, got {:?}", other),
+    }
+}
+
+/// Zero alpha stays refused at conversion, fail-closed, with the offending
+/// index in the message (the Snake form divides by alpha).
+#[test]
+fn convert_snake_rejects_zero_alpha_tensor() {
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "snake_alpha".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1, 2, 1]), vec![-0.5, 0.0]).expect("valid alpha"),
+    );
+    let ctx = make_context_with_weights(weights);
+    let spec = LayerSpec {
+        name: "snake".to_string(),
+        layer_type: LayerType::Snake,
+        inputs: vec!["x".to_string(), "snake_alpha".to_string()],
+        outputs: vec!["y".to_string()],
+        weights: None,
+        attributes: HashMap::new(),
+    };
+
+    let error = ctx
+        .convert_elementwise(&spec)
+        .expect_err("zero alpha must fail conversion closed");
+    let msg = error.to_string();
+    assert!(
+        msg.contains("alpha[1]"),
+        "error must name the offending index, got: {msg}"
+    );
+}
+
 #[test]
 fn convert_triu_3x3_default_diagonal_4270() {
     let ctx = make_context_with_shapes(HashMap::from([("x".to_string(), vec![3, 3])]));
@@ -681,4 +752,102 @@ fn convert_native_trunc_does_not_inherit_cast_destination_restriction() {
     layer
         .propagate_ibp(&full_finite)
         .expect("native Trunc remains defined over every finite f32 value");
+}
+
+// ── EpsilonExpand ───────────────────────────────────────────────────────
+
+fn epsilon_expand_spec(inputs: &[&str], attributes: HashMap<String, AttributeValue>) -> LayerSpec {
+    LayerSpec {
+        name: "widen".to_string(),
+        layer_type: LayerType::EpsilonExpand,
+        inputs: inputs.iter().map(|input| (*input).to_string()).collect(),
+        outputs: vec!["y".to_string()],
+        weights: None,
+        attributes,
+    }
+}
+
+#[test]
+fn convert_epsilon_expand_builds_layer_from_epsilon_weight() {
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "eps".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[3]), vec![0.5, 0.0, 2.0]).unwrap(),
+    );
+    let ctx = make_context_with_weights(weights);
+    let layer = ctx
+        .convert_layer(&epsilon_expand_spec(&["x", "eps"], HashMap::new()))
+        .expect("EpsilonExpand with constant epsilon weight should convert");
+    let Layer::EpsilonExpand(inner) = &layer else {
+        panic!("expected Layer::EpsilonExpand, got {}", layer.layer_type());
+    };
+    assert_eq!(
+        inner.epsilons().iter().copied().collect::<Vec<_>>(),
+        vec![0.5, 0.0, 2.0]
+    );
+
+    // The built layer widens IBP bounds by exactly the carried radii.
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[3]), 1.0_f32),
+        ArrayD::from_elem(IxDyn(&[3]), 1.0_f32),
+    )
+    .unwrap();
+    let output = layer
+        .propagate_ibp(&input)
+        .expect("IBP through built layer");
+    assert_eq!(
+        output.lower().iter().copied().collect::<Vec<_>>(),
+        vec![0.5, 1.0, -1.0]
+    );
+    assert_eq!(
+        output.upper().iter().copied().collect::<Vec<_>>(),
+        vec![1.5, 1.0, 3.0]
+    );
+}
+
+#[test]
+fn convert_epsilon_expand_requires_constant_epsilon_input() {
+    let ctx = make_context();
+    let error = ctx
+        .convert_layer(&epsilon_expand_spec(&["x", "dynamic_eps"], HashMap::new()))
+        .expect_err("dynamic epsilon input must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("must be a constant weight tensor"),
+        "{error}"
+    );
+}
+
+#[test]
+fn convert_epsilon_expand_rejects_invalid_radii_and_arity() {
+    let mut weights = WeightStore::new();
+    weights.insert(
+        "eps".to_string(),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![-0.5]).unwrap(),
+    );
+    let ctx = make_context_with_weights(weights);
+    let error = ctx
+        .convert_layer(&epsilon_expand_spec(&["x", "eps"], HashMap::new()))
+        .expect_err("negative epsilon must fail closed via EpsilonExpandLayer::try_new");
+    assert!(error.to_string().contains("finite non-negative"), "{error}");
+
+    let error = ctx
+        .convert_layer(&epsilon_expand_spec(&["x"], HashMap::new()))
+        .expect_err("missing epsilon input must fail closed");
+    assert!(
+        error.to_string().contains("exactly two non-empty inputs"),
+        "{error}"
+    );
+
+    let error = ctx
+        .convert_layer(&epsilon_expand_spec(
+            &["x", "eps"],
+            HashMap::from([("axis".to_string(), AttributeValue::Int(0))]),
+        ))
+        .expect_err("unknown attributes must fail closed");
+    assert!(
+        error.to_string().contains("unsupported attribute"),
+        "{error}"
+    );
 }

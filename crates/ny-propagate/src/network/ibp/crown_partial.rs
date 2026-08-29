@@ -17,8 +17,9 @@ use crate::bounds::LinearBounds;
 use crate::contiguous_flat_slice;
 use crate::layers::{BoundPropagation, Layer};
 use crate::network::core::{
-    crown_backward_step_patches, materialize_terminal_crown_bounds_with_deadline,
-    CrownStepFallback, CrownStepResult,
+    crown_backward_step_patches,
+    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy,
+    materialize_terminal_crown_bounds_with_deadline, CrownStepFallback, CrownStepResult,
 };
 use crate::network::crown_memory::{cpu_crown_dense_budget_bytes, DenseMaterializationEstimate};
 use ndarray::{Array1, Array2};
@@ -98,16 +99,34 @@ fn check_partial_deadline(deadline: Option<Instant>) -> Result<()> {
 fn crown_partial_expiry_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| {
-        let armed = ny_levers::read(&ny_levers::decls::diagnostics::CROWN_PARTIAL_FINITE_EXPIRY)
-            .value
-            .as_bool();
+        // DELIVERY SEAM (#lever-reachability): `NY_CROWN_PARTIAL_FINITE_EXPIRY`
+        // still wins in BOTH directions where present; absent, the typed
+        // `bab.crown_partial_finite_expiry` key decides. The audit predicts a
+        // null unless the WHOLE root-cause-D set switches together, so this
+        // needed a route that can carry the set on a scored run rather than
+        // only in a shell.
+        let lever = crate::preset_gates::crown_partial_finite_expiry_enabled();
+        // #cgan-reclaim item 3 (docs/CGAN_BUDGET_RECLAIM_2026-08-20.md): the
+        // cgan reclaim set arms the SAME expiry semantics for this pair — the
+        // measured live #18 signature on the scored cgan route is exactly this
+        // pair's presence-decline (`crown-partial-salvage: saved=0
+        // discarded=32` in every 900 s run). Route/seed selection only; both
+        // arms produce sound enclosures, and the sound-GPU gate (default ON)
+        // still refuses any unsound GPU backward from deciding a bound.
+        let reclaim = crate::cgan_reclaim::cgan_reclaim_armed();
+        let armed = lever || reclaim;
         if armed {
             // R9: the lever's own engagement announcement. A null measured
             // without this line is indistinguishable from an inert lever.
             eprintln!(
-                "[deadline-preserve] NY_CROWN_PARTIAL_FINITE_EXPIRY ARMED: CROWN-IBP \
+                "[deadline-preserve] crown-partial expiry ARMED (source: {}): CROWN-IBP \
                  partial GPU route and sparse seed discovery now decline on EXPIRY, \
-                 not on deadline presence"
+                 not on deadline presence",
+                if lever {
+                    "NY_CROWN_PARTIAL_FINITE_EXPIRY"
+                } else {
+                    "NY_CGAN_RECLAIM"
+                },
             );
         }
         armed
@@ -144,6 +163,17 @@ static CROWN_PARTIAL_PRESERVE:
 /// Dense mode (O(out_dim²) total).
 ///
 /// Part of #2613: Patches Mode Phase 1
+/// Walk-time attribution by layer kind for the sequential partial backward
+/// (#budget-log companion; read by the `[walk-share]` diagnostics line).
+pub(crate) static WALK_CONV_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static WALK_ACT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static WALK_OTHER_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static WALK_FINAL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(super) fn propagate_crown_partial_with_engine(
     _all_layers: &[Layer],
     input: &BoundedTensor,
@@ -151,6 +181,7 @@ pub(super) fn propagate_crown_partial_with_engine(
     prior_bounds: &[BoundedTensor],
     engine: Option<&dyn GemmEngine>,
     deadline: Option<Instant>,
+    patches_deadline_flat_bias_enabled: Option<bool>,
 ) -> Result<PartialCrownPropagationResult> {
     if deadline.is_some_and(|limit| Instant::now() >= limit) {
         return Err(NyError::DeadlineExceeded(
@@ -454,15 +485,48 @@ pub(super) fn propagate_crown_partial_with_engine(
             ));
         };
 
-        match crown_backward_step_patches(
-            layer,
-            &mut crown_bounds,
-            pre_activation,
-            engine,
-            i,
-            "CROWN-IBP",
-            deadline,
-        )? {
+        let step_t = Instant::now();
+        let step_result = match patches_deadline_flat_bias_enabled {
+            Some(flat_bias_enabled) => {
+                crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy(
+                    layer,
+                    &mut crown_bounds,
+                    pre_activation,
+                    engine,
+                    i,
+                    "CROWN-IBP",
+                    deadline,
+                    deadline.is_some(),
+                    flat_bias_enabled,
+                )
+            }
+            None => crown_backward_step_patches(
+                layer,
+                &mut crown_bounds,
+                pre_activation,
+                engine,
+                i,
+                "CROWN-IBP",
+                deadline,
+            ),
+        };
+        // #budget-log companion: attribute walk time by layer kind so a
+        // per-node overrun points at an arm, not at "the walk".
+        let bucket = {
+            let t = layer.layer_type();
+            if t.contains("Conv") {
+                &WALK_CONV_NANOS
+            } else if t.contains("Relu") || t.contains("ReLU") || t.contains("Sigmoid") {
+                &WALK_ACT_NANOS
+            } else {
+                &WALK_OTHER_NANOS
+            }
+        };
+        bucket.fetch_add(
+            u64::try_from(step_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        match step_result? {
             CrownStepResult::Continue => {}
             CrownStepResult::IbpFallback(fallback) => {
                 return Ok(PartialCrownPropagationResult::ForwardFallback(fallback));
@@ -493,6 +557,10 @@ pub(super) fn propagate_crown_partial_with_engine(
         ));
     };
     let dense_secs = dense_start.elapsed().as_secs_f64();
+    WALK_FINAL_NANOS.fetch_add(
+        u64::try_from(dense_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Concretize linear bounds with input bounds and reshape to the IBP output shape.
     //

@@ -229,8 +229,8 @@ soundness one.",
         moat: MoatRisk::High,
         doc: "\
 Rollback for objective-directed row ranking in the comprehensive root sweep. \
-The FEATURE is default-on: the scored entry point exports exactly one `NY_*` \
-variable, so an env-gated improvement cannot fire in competition however well it \
+The FEATURE is default-on: the scored entry point exports no `NY_*` variables, so an \
+env-gated improvement cannot fire in competition however well it \
 measures. This lever exists only to hold the disarmed A/B arm. Exact `0` \
 disarms and restores the historical width ordering byte for byte; absent, exact \
 `1`, malformed UTF-8 and non-UTF-8 values all leave it armed.

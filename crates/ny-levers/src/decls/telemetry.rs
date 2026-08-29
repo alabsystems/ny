@@ -41,6 +41,11 @@ const SEG_PROBE_SCOPE: Scope = Scope {
     subsystem: "segment-probe",
 };
 
+const WIDE_PROBE_SCOPE: Scope = Scope {
+    package: "ny-gpu",
+    subsystem: "wide-probe",
+};
+
 const BETA_GPU_PROBE_READERS: &[ReaderSite] = &[
     ReaderSite {
         scope: BETA_GPU_PROBE_SCOPE,
@@ -64,6 +69,15 @@ const BETA_GPU_PROBE_READERS: &[ReaderSite] = &[
 
 /// `NY_SEG_PROBE` gates the three complementary diagnostics emitted by the
 /// resident GPU segment-composition fold.
+const WIDE_PROBE_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: WIDE_PROBE_SCOPE,
+    role: "gate the `[wide]` diagnostic markers in the wgpu CROWN-backward \
+               kernels -- dispatch shape, tile selection and the resident \
+               sound-fold variant",
+    site: "crates/ny-gpu/src/wgpu_device/ops/crown_backward.rs and \
+               crown_backward_sound_resident.rs:wide_probe_armed",
+}];
+
 const SEG_PROBE_READERS: &[ReaderSite] = &[
     ReaderSite {
         scope: SEG_PROBE_SCOPE,
@@ -164,6 +178,29 @@ ratchet.",
     };
 
     /// `NY_SEG_PROBE` — dark segment-composition diagnostics.
+    /// `NY_WIDE_PROBE` — dark wide-kernel diagnostic output.
+    pub WIDE_PROBE = LeverDecl {
+        name: "NY_WIDE_PROBE",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::Low,
+        doc: "\
+Enables the `[wide]` diagnostic lines in the wgpu CROWN-backward kernels. \
+Seven call sites used to open-code `env::var(\"NY_WIDE_PROBE\") == Some(\"1\")`, \
+which is the exact-one spelling; routing them through this declaration widens \
+the accepted spellings to the standard Bool set and makes the switch answer \
+consistently everywhere, the same correction the NY_BETA_GPU_PROBE migration \
+made. The output does not feed a bound, but stderr traffic can perturb a \
+deadline-sensitive run, so it stays dark by default.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "dark by default and diagnostic only; armed-vs-unarmed \
+                     deadline and verdict parity has not been measured",
+        },
+        owner: WIDE_PROBE_SCOPE,
+        readers: WIDE_PROBE_READERS,
+    };
+
     pub SEG_PROBE = LeverDecl {
         name: "NY_SEG_PROBE",
         kind: LeverKind::Bool,

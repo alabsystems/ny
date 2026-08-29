@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::tests::assert_relaxation_sound_exact;
 use ndarray::arr1;
 use proptest::prelude::*;
 
@@ -483,6 +484,109 @@ fn mish_f64_reference(x: f64) -> f64 {
         (1.0_f64 + x.exp()).ln()
     };
     x * softplus.tanh()
+}
+
+/// ZERO-tolerance f64 pin on Mish's CONSTANT / SATURATING branches.
+///
+/// `assert_mish_relaxation_soundness` above walks a 102-point grid of a FINITE
+/// `[l, u]` in f32 against the f32 evaluator, so it can enter none of these
+/// branches; the strict proptests draw finite `l, u` and then `prop_assume!` the
+/// coefficients finite, which discards the whole family. Nothing was checking
+/// these lines against real arithmetic.
+///
+/// The load-bearing assertion is on `MISH_GLOBAL_MIN`. It is published directly
+/// as the certified lower intercept on all three infinite branches, so it must
+/// sit at or BELOW Mish's true global minimum. Re-derived rather than taken from
+/// the constant's own comment: the true minimum is -0.3088434130170535 near
+/// x = -1.1924312, and `MISH_GLOBAL_MIN` as f32 is -0.3089999854564667 — below
+/// it by 1.566e-04. That margin is five orders of magnitude larger than the
+/// f32 rounding that made SELU's analogous asymptote a false proof, so this is
+/// a genuine structural check and not a knife-edge one. The samples include the
+/// minimiser itself, which is where the constant binds.
+///
+/// COVERAGE GAP, deliberate and named. Every case here has `u <= 0`, where the
+/// upper intercept is `max(mish_eval(u), 0.0) = 0.0` and `Mish(x) <= 0` holds
+/// on `(-inf, 0]` for structural reasons independent of any rounding. The
+/// `u > 0` region is NOT covered, because there the upper intercept is
+/// `mish_eval(u)` — the **f32** evaluator's round-to-nearest output published
+/// directly as a certified bound, with no directed rounding, while
+/// `mish_eval_f64` sits in the same file. That is structurally the same defect
+/// class as SELU's `l = -inf` upper witness (see the directed-rounding note in
+/// `elu_family.rs`), but confirming it needs f32 `exp`/`ln`/`tanh` rounding,
+/// which cannot be settled by inspection. It is reported as SUSPECTED, not
+/// proven; when it is settled, extend these cases to `u > 0` and delete this
+/// paragraph.
+#[test]
+fn mish_saturating_branches_are_exact_in_f64() {
+    // Mish's minimiser, where MISH_GLOBAL_MIN is the binding lower bound.
+    const MINIMISER: f64 = -1.192_431_2;
+
+    assert!(
+        f64::from(MISH_GLOBAL_MIN) <= mish_f64_reference(MINIMISER),
+        "MISH_GLOBAL_MIN {} sits ABOVE Mish at its own minimiser {} — a \
+         certified lower bound the function drops below",
+        MISH_GLOBAL_MIN,
+        mish_f64_reference(MINIMISER)
+    );
+
+    // The `-1.192_431_2` entries below ARE `MINIMISER`; spelled as literals so
+    // the slices stay all-literal and promote to 'static without relying on
+    // const-path promotion.
+    let cases: [(f32, f32, &[f64], &str); 4] = [
+        (
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            &[
+                -1000.0,
+                -100.0,
+                -50.0,
+                -20.0,
+                -1.192_431_2,
+                -1.0,
+                0.0,
+                1.0,
+                100.0,
+            ],
+            "Mish [-inf, +inf]",
+        ),
+        (
+            f32::NEG_INFINITY,
+            0.0,
+            &[-1000.0, -100.0, -50.0, -20.0, -5.0, -1.192_431_2, -1.0, 0.0],
+            "Mish [-inf, 0]",
+        ),
+        (
+            f32::NEG_INFINITY,
+            -5.0,
+            &[-1000.0, -100.0, -50.0, -20.0, -5.0],
+            "Mish [-inf, -5]",
+        ),
+        (
+            -5.0,
+            f32::INFINITY,
+            &[-5.0, -1.192_431_2, -1.0, 0.0, 1.0, 10.0, 100.0],
+            "Mish [-5, +inf]",
+        ),
+    ];
+
+    for (l, u, samples, label) in cases {
+        let r = mish_linear_relaxation(l, u);
+        // Non-vacuity: `assert_relaxation_sound_exact` deliberately does not
+        // assert it, and the (0, -inf, 0, +inf) fallback passes every sample.
+        assert_eq!(
+            r.lower_slope, 0.0,
+            "{label}: expected a CONSTANT lower bound"
+        );
+        assert_eq!(
+            r.upper_slope, 0.0,
+            "{label}: expected a CONSTANT upper bound"
+        );
+        assert_eq!(
+            r.lower_intercept, MISH_GLOBAL_MIN,
+            "{label}: lower intercept is no longer the global minimum constant"
+        );
+        assert_relaxation_sound_exact(l, u, r, mish_f64_reference, samples, label);
+    }
 }
 
 /// ULP distance between two f32 values, handling sign correctly.

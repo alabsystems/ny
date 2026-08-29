@@ -103,6 +103,25 @@ fn interval_radius_f32(center: f32, interval: RealInterval) -> Option<f32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchNormChannelAxisHint {
     /// The propagated tensor always uses this channel axis.
+    ///
+    /// **No production producer today.** Every converted model takes
+    /// [`BatchNormLayer::with_onnx_nchw_rank`] instead
+    /// (`ny-build/src/convert/normalization.rs`), and the only safe constructor
+    /// for this variant, [`BatchNormLayer::with_channel_axis`], has no non-test
+    /// caller. It is retained, not deleted, for two reasons:
+    ///
+    /// 1. [`BatchNormLayer::channel_axis_hint`] is a **public field**, so this
+    ///    variant is constructible by struct literal with *any* `usize`. That
+    ///    is precisely why the `Fixed(axis) if axis > 1` arms in
+    ///    `validate_affine_parameters` (and its patches-path twin) are live
+    ///    fail-closed guards rather than dead defensive code — see
+    ///    `channel_axis_hint_fixed_above_one_is_refused_from_a_struct_literal`.
+    /// 2. It is the only way to state an axis that `OnnxNchw`'s
+    ///    rank-differencing cannot infer.
+    ///
+    /// To make it live, a graph-side BatchNorm producer that knows the
+    /// propagated (not authored) rank would call `with_channel_axis`; nothing
+    /// in ny-build or ny-propagate has that shape today.
     Fixed(usize),
     /// Standard ONNX `[N,C,...]` provenance.  NY has two propagation surfaces:
     /// sequential networks retain the authored rank/channel axis 1, while DAG
@@ -407,6 +426,21 @@ impl BatchNormLayer {
     /// BatchNorm propagation supports only the leading channel axis of an
     /// unbatched tensor (`0`) or axis `1` of a tensor that still carries a
     /// leading batch dimension.
+    ///
+    /// # Reachability (quarantined, deliberately kept)
+    ///
+    /// This has **no production caller**. Model conversion authenticates the
+    /// axis through [`Self::with_onnx_nchw_rank`] instead, which carries the
+    /// authored ONNX rank and so survives ny's batch-strip; this constructor
+    /// would have to be called by a producer that knows the *propagated* rank
+    /// directly. Nothing has that shape today, so it is exercised only by
+    /// `authenticated_unbatched_axis_zero_wins_ambiguous_c_equals_l_shape`.
+    ///
+    /// It is kept rather than deleted because it is the only *checked* way to
+    /// build [`BatchNormChannelAxisHint::Fixed`]: the underlying
+    /// [`Self::channel_axis_hint`] field is public, so removing this would leave
+    /// the unchecked struct-literal route as the only one. See that variant's
+    /// doc for why the `axis > 1` validator arms remain live.
     pub fn with_channel_axis(mut self, channel_axis: usize) -> Result<Self> {
         if channel_axis > 1 {
             return Err(NyError::InvalidSpec(format!(

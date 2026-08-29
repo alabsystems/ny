@@ -331,7 +331,12 @@ impl BetaCrownVerifier {
             }
             // === All other layers: exhaustive trait dispatch (#3424) ===
             // Every variant listed — no catch-all. Compiler catches new variants.
-            Layer::Slice(_)
+            //
+            // Conv3d belongs here rather than beside Conv1d/Conv2d above: it
+            // has no CROWN backward, so the trait dispatch below receives
+            // `UnsupportedOp` and takes the sound IBP degrade.
+            Layer::Conv3d(_)
+            | Layer::Slice(_)
             | Layer::Gather(_)
             | Layer::ScatterAdd(_)
             | Layer::IndexAdd(_)
@@ -344,6 +349,7 @@ impl BetaCrownVerifier {
             | Layer::SkipMerge(_)
             | Layer::OpaqueSkip(_)
             | Layer::QdqPerturbation(_)
+            | Layer::EpsilonExpand(_)
             | Layer::MulBinary(_)
             | Layer::Where(_)
             | Layer::Div(_)
@@ -413,6 +419,10 @@ impl BetaCrownVerifier {
             | Layer::NonZero(_)
             | Layer::SelfAttention(_)
             | Layer::Compare(_)
+            // Interval-valued frozen constant: this legacy backward composes
+            // `A*W` from `linear.weight()` with no error channel, so take the
+            // sound IBP fallback rather than dropping the enclosure.
+            | Layer::IntervalConst(_)
             | Layer::CompareTensor(_) => super::layer_dispatch::beta_crown_ibp_fallback(
                 layer,
                 output_bounds,

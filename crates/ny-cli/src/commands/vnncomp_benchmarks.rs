@@ -166,6 +166,18 @@ pub(crate) fn run_bounded_child(
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub(crate) enum BenchmarkAssetsAction {
+    /// Print the compiled lever-search space and interaction lattice.
+    ///
+    /// This is the authoritative input to `scripts/ny_search.py`. Reading it
+    /// from the binary prevents a search from measuring a source tree whose
+    /// axes, domains, or dependency edges differ from the executable that will
+    /// actually run the benchmark children.
+    Space {
+        /// Emit the complete machine-readable search contract.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
     /// Download VNN-COMP benchmark repositories.
     Download {
         /// VNN-COMP years to download. Defaults to 2021 and 2023-2026.
@@ -433,6 +445,234 @@ fn parse_cache_mode(
     super::vnncomp_sweep::cache::CacheMode::parse(raw).map_err(|error| error.to_string())
 }
 
+fn domain_json(domain: ny_levers::space::Domain) -> (&'static str, Vec<String>) {
+    match domain {
+        ny_levers::space::Domain::Bool => ("bool", vec!["0".into(), "1".into()]),
+        ny_levers::space::Domain::Enum(values) => (
+            "enum",
+            values.iter().map(|value| (*value).to_string()).collect(),
+        ),
+        ny_levers::space::Domain::Grid(values) => {
+            ("grid", values.iter().map(u64::to_string).collect())
+        }
+    }
+}
+
+fn class_name(class: ny_levers::space::Class) -> &'static str {
+    match class {
+        ny_levers::space::Class::Unsafe => "Unsafe",
+        ny_levers::space::Class::VerdictAffecting => "VerdictAffecting",
+        ny_levers::space::Class::SafeToSearch => "SafeToSearch",
+    }
+}
+
+fn delivery_name(delivery: ny_levers::space::Deliver) -> String {
+    match delivery {
+        ny_levers::space::Deliver::PresetKey(key) => format!("preset:{key}"),
+        ny_levers::space::Deliver::EnvOnly => "env-only".to_string(),
+    }
+}
+
+fn absence_baseline_json(baseline: ny_levers::space::AbsenceBaseline) -> serde_json::Value {
+    match baseline {
+        ny_levers::space::AbsenceBaseline::DeclarationDefault => {
+            json!({ "kind": "declaration_default" })
+        }
+        ny_levers::space::AbsenceBaseline::Distinct => json!({ "kind": "distinct" }),
+        ny_levers::space::AbsenceBaseline::Equivalent(token) => {
+            json!({ "kind": "equivalent", "token": token })
+        }
+        ny_levers::space::AbsenceBaseline::Contextual => json!({ "kind": "contextual" }),
+    }
+}
+
+fn default_token(default: ny_levers::DefaultSpec) -> Option<String> {
+    match default {
+        ny_levers::DefaultSpec::Bool(value) => Some(if value { "1" } else { "0" }.into()),
+        ny_levers::DefaultSpec::U64(value) => Some(value.to_string()),
+        ny_levers::DefaultSpec::F64(value) | ny_levers::DefaultSpec::Secs(value) => {
+            Some(value.to_string())
+        }
+        ny_levers::DefaultSpec::Text(value) => Some(value.to_string()),
+        ny_levers::DefaultSpec::Unset => None,
+    }
+}
+
+fn declaration_json(decl: &ny_levers::LeverDecl) -> serde_json::Value {
+    let (kind, min, max, members) = match decl.kind {
+        ny_levers::LeverKind::Bool => ("Bool", None, None, None),
+        ny_levers::LeverKind::BoolOverride => ("BoolOverride", None, None, None),
+        ny_levers::LeverKind::BoolKillOverride => ("BoolKillOverride", None, None, None),
+        ny_levers::LeverKind::TruthyTrimmed => ("TruthyTrimmed", None, None, None),
+        ny_levers::LeverKind::TrimmedExactOne => ("TrimmedExactOne", None, None, None),
+        ny_levers::LeverKind::Presence => ("Presence", None, None, None),
+        ny_levers::LeverKind::U64 => ("U64", None, None, None),
+        ny_levers::LeverKind::U64Override => ("U64Override", None, None, None),
+        ny_levers::LeverKind::U64Trimmed => ("U64Trimmed", None, None, None),
+        ny_levers::LeverKind::UsizeTrimmed => ("UsizeTrimmed", None, None, None),
+        ny_levers::LeverKind::UsizeTrimmedUnicodeOwned => {
+            ("UsizeTrimmedUnicodeOwned", None, None, None)
+        }
+        ny_levers::LeverKind::UsizeTrimmedOverride { min } => (
+            "UsizeTrimmedOverride",
+            Some(min as f64),
+            Some(usize::MAX as f64),
+            None,
+        ),
+        ny_levers::LeverKind::UsizeOverride { min } => (
+            "UsizeOverride",
+            Some(min as f64),
+            Some(usize::MAX as f64),
+            None,
+        ),
+        ny_levers::LeverKind::Usize { min } => {
+            ("Usize", Some(min as f64), Some(usize::MAX as f64), None)
+        }
+        ny_levers::LeverKind::F32Positive => (
+            "F32Positive",
+            Some(f64::from(f32::from_bits(1))),
+            Some(f64::from(f32::MAX)),
+            None,
+        ),
+        ny_levers::LeverKind::F32NonNegative => {
+            ("F32NonNegative", Some(0.0), Some(f64::from(f32::MAX)), None)
+        }
+        ny_levers::LeverKind::F64Open { min, max } => ("F64Open", Some(min), Some(max), None),
+        ny_levers::LeverKind::F64OpenUnicodeOwned { min, max } => {
+            ("F64OpenUnicodeOwned", Some(min), Some(max), None)
+        }
+        ny_levers::LeverKind::F64OpenOverride { min, max } => {
+            ("F64OpenOverride", Some(min), Some(max), None)
+        }
+        ny_levers::LeverKind::F64ClosedTrimmed { min, max } => {
+            ("F64ClosedTrimmed", Some(min), Some(max), None)
+        }
+        ny_levers::LeverKind::Secs => ("Secs", None, None, None),
+        ny_levers::LeverKind::Enum(members) => (
+            "Enum",
+            None,
+            None,
+            Some(members.to_vec()),
+        ),
+        ny_levers::LeverKind::LayeredEnum { env_members, .. } => (
+            "LayeredEnum",
+            None,
+            None,
+            Some(env_members.to_vec()),
+        ),
+        ny_levers::LeverKind::Text => ("Text", None, None, None),
+    };
+    json!({
+        "kind": kind,
+        "default": default_token(decl.default),
+        "min": min,
+        "max": max,
+        "members": members,
+    })
+}
+
+fn benchmark_space_payload() -> serde_json::Value {
+    use std::collections::BTreeMap;
+
+    let axes = ny_levers::space::axes()
+        .iter()
+        .map(|axis| {
+            let (domain, values) = domain_json(axis.domain);
+            json!({
+                "name": axis.name,
+                "domain": domain,
+                "values": values,
+                "class": class_name(axis.class),
+                "deliver": delivery_name(axis.deliver),
+                "absence_baseline": absence_baseline_json(
+                    ny_levers::space::absence_baseline(axis.name)
+                ),
+                "preset_baseline_keys": ny_levers::space::preset_baseline_keys(axis.name),
+                "category_prefixes": ny_levers::space::category_prefixes(axis.name),
+                "why": axis.why,
+            })
+        })
+        .collect::<Vec<_>>();
+    let edges = ny_levers::space::edges()
+        .iter()
+        .map(|edge| {
+            let (kind, parent, parents, bound, token) = match edge.requires {
+                ny_levers::space::Requirement::Armed(parent) => {
+                    ("armed", Some(parent), None, None, None)
+                }
+                ny_levers::space::Requirement::AnyArmed(parents) => {
+                    ("any_armed", None, Some(parents), None, None)
+                }
+                ny_levers::space::Requirement::NonZero(parent) => {
+                    ("non_zero", Some(parent), None, None, None)
+                }
+                ny_levers::space::Requirement::GreaterThan(parent, bound) => {
+                    ("greater_than", Some(parent), None, Some(bound), None)
+                }
+                ny_levers::space::Requirement::NotArmed(parent) => {
+                    ("not_armed", Some(parent), None, None, None)
+                }
+                ny_levers::space::Requirement::NotEquals(parent, token) => {
+                    ("not_equals", Some(parent), None, None, Some(token))
+                }
+                ny_levers::space::Requirement::Absent(parent) => {
+                    ("absent", Some(parent), None, None, None)
+                }
+                ny_levers::space::Requirement::Equals(parent, token) => {
+                    ("equals", Some(parent), None, None, Some(token))
+                }
+            };
+            json!({
+                "child": edge.child,
+                "kind": kind,
+                "parent": parent,
+                "parents": parents,
+                "bound": bound,
+                "token": token,
+                "site": edge.site,
+            })
+        })
+        .collect::<Vec<_>>();
+    let declarations = ny_levers::all()
+        .all()
+        .iter()
+        .map(|decl| (decl.name.to_string(), declaration_json(decl)))
+        .collect::<BTreeMap<_, _>>();
+
+    json!({
+        "schema": "ny-levers/search-space/v6",
+        "axes": axes,
+        "edges": edges,
+        "unsafe": ny_levers::space::unsafe_axes()
+            .iter()
+            .map(|axis| axis.name)
+            .collect::<Vec<_>>(),
+        "instrument_only": ny_levers::space::instrument_only(),
+        "test_only": ny_levers::space::test_only(),
+        "declarations": declarations,
+    })
+}
+
+fn print_benchmark_space(json_output: bool) -> Result<()> {
+    let payload = benchmark_space_payload();
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    let axes = ny_levers::space::axes();
+    let deliverable = axes
+        .iter()
+        .filter(|axis| matches!(axis.deliver, ny_levers::space::Deliver::PresetKey(_)))
+        .count();
+    println!("compiled searchable axes: {}", axes.len());
+    println!("preset-deliverable: {deliverable}");
+    println!("environment-only: {}", axes.len() - deliverable);
+    println!("dependency edges: {}", ny_levers::space::edges().len());
+    println!("use --json for the complete machine-readable contract");
+    Ok(())
+}
+
 /// Parse `--lever NAME=VALUE` pairs and refuse anything the search space says is
 /// unsafe or inert, BEFORE any instance runs.
 ///
@@ -494,7 +734,7 @@ fn parse_and_validate_arm(levers: &[String]) -> Result<Vec<(String, String)>> {
             if axis.deliver == ny_levers::space::Deliver::EnvOnly {
                 eprintln!(
                     "[sweep-arm] WARNING: {name} is EnvOnly. The scored entry point exports \
-                     exactly one NY_* variable, so whatever this measures CANNOT reach a \
+                     no NY_* variables, so whatever this measures CANNOT reach a \
                      scored run until a typed preset key exists for it."
                 );
             }
@@ -505,6 +745,7 @@ fn parse_and_validate_arm(levers: &[String]) -> Result<Vec<(String, String)>> {
 
 pub(crate) fn handle_benchmark_assets_command(action: BenchmarkAssetsAction) -> Result<()> {
     match action {
+        BenchmarkAssetsAction::Space { json } => print_benchmark_space(json),
         BenchmarkAssetsAction::Download { years, all } => {
             handle_vnncomp_benchmarks_command(years, all, false)
         }
@@ -756,6 +997,223 @@ mod tests {
     struct AssetsCli {
         #[command(subcommand)]
         action: BenchmarkAssetsAction,
+    }
+
+    #[test]
+    fn compiled_schema_serializes_scheduler_usize_ownership_exactly() {
+        let declaration = |name: &'static str, kind: ny_levers::LeverKind| ny_levers::LeverDecl {
+            name,
+            kind,
+            default: ny_levers::DefaultSpec::Unset,
+            bucket: ny_levers::Bucket::Debug,
+            moat: ny_levers::MoatRisk::None,
+            doc: "unit-test fixture",
+            provenance: ny_levers::Provenance::Unmeasured { why_ok: "test" },
+            owner: ny_levers::Scope {
+                package: "ny-cli",
+                subsystem: "compiled-schema-test",
+            },
+            readers: &[],
+        };
+
+        let unicode_owned = declaration(
+            "FIXTURE_VERIFIER_THREADS",
+            ny_levers::LeverKind::UsizeTrimmedUnicodeOwned,
+        );
+        assert_eq!(
+            declaration_json(&unicode_owned),
+            json!({
+                "kind": "UsizeTrimmedUnicodeOwned",
+                "default": null,
+                "min": null,
+                "max": null,
+                "members": null,
+            })
+        );
+
+        let override_kind = declaration(
+            "FIXTURE_CONCURRENT_THREADS",
+            ny_levers::LeverKind::UsizeOverride { min: 0 },
+        );
+        assert_eq!(
+            declaration_json(&override_kind),
+            json!({
+                "kind": "UsizeOverride",
+                "default": null,
+                "min": 0.0,
+                "max": usize::MAX as f64,
+                "members": null,
+            })
+        );
+    }
+
+    #[test]
+    fn compiled_space_subcommand_and_json_contract_are_complete() {
+        AssetsCli::command().debug_assert();
+        let parsed = AssetsCli::try_parse_from(["assets", "space", "--json"])
+            .expect("compiled space command parses");
+        assert!(matches!(
+            parsed.action,
+            BenchmarkAssetsAction::Space { json: true }
+        ));
+
+        let payload = benchmark_space_payload();
+        assert_eq!(payload["schema"], "ny-levers/search-space/v6");
+        assert_eq!(
+            payload["axes"].as_array().map(Vec::len),
+            Some(ny_levers::space::axes().len())
+        );
+        assert_eq!(
+            payload["edges"].as_array().map(Vec::len),
+            Some(ny_levers::space::edges().len())
+        );
+        let declarations = payload["declarations"]
+            .as_object()
+            .expect("declaration map");
+        assert_eq!(declarations.len(), ny_levers::all().len());
+        let upfront_master = declarations
+            .get("NY_UPFRONT_ATTACK")
+            .expect("upfront master declaration");
+        assert_eq!(upfront_master["kind"], "BoolOverride");
+        assert!(upfront_master["default"].is_null());
+        let upfront_fraction = declarations
+            .get("NY_UPFRONT_ATTACK_FRAC")
+            .expect("upfront fraction declaration");
+        assert_eq!(upfront_fraction["kind"], "F64ClosedTrimmed");
+        assert_eq!(
+            upfront_fraction["min"].as_f64().map(f64::to_bits),
+            Some(1),
+            "compiled schema must preserve the strict-positive lower endpoint"
+        );
+        assert_eq!(upfront_fraction["max"], 1.0);
+        for axis in ny_levers::space::axes() {
+            let declaration = declarations
+                .get(axis.name)
+                .unwrap_or_else(|| panic!("searchable axis {} has no declaration", axis.name));
+            assert!(declaration["kind"].is_string());
+            let emitted = payload["axes"]
+                .as_array()
+                .expect("axis list")
+                .iter()
+                .find(|entry| entry["name"] == axis.name)
+                .expect("axis is serialized");
+            assert!(
+                emitted["values"]
+                    .as_array()
+                    .is_some_and(|values| !values.is_empty()),
+                "{} has no emitted values",
+                axis.name
+            );
+            assert!(
+                emitted["absence_baseline"]["kind"].is_string(),
+                "{} has no effective absence contract",
+                axis.name
+            );
+            assert_eq!(
+                emitted["preset_baseline_keys"],
+                json!(ny_levers::space::preset_baseline_keys(axis.name)),
+                "{} has the wrong compiled preset baseline chain",
+                axis.name
+            );
+            assert!(
+                emitted["category_prefixes"].is_array(),
+                "{} has no category applicability contract",
+                axis.name
+            );
+        }
+        let reserve = payload["axes"]
+            .as_array()
+            .expect("axis list")
+            .iter()
+            .find(|entry| entry["name"] == "NY_BAB_RESERVE_FRAC")
+            .expect("reserve axis");
+        assert_eq!(reserve["absence_baseline"]["kind"], "equivalent");
+        assert_eq!(reserve["absence_baseline"]["token"], "0.0");
+
+        let kfsb_candidates = payload["axes"]
+            .as_array()
+            .expect("axis list")
+            .iter()
+            .find(|entry| entry["name"] == "NY_MO_KFSB_K")
+            .expect("multi-objective kFSB candidate axis");
+        assert_eq!(
+            kfsb_candidates["preset_baseline_keys"],
+            json!([
+                "bab.branching.kfsb_multi_candidates",
+                "bab.branching.candidates",
+            ])
+        );
+        let kfsb_reduce = payload["axes"]
+            .as_array()
+            .expect("axis list")
+            .iter()
+            .find(|entry| entry["name"] == "NY_MO_KFSB_REDUCE")
+            .expect("multi-objective kFSB reduction axis");
+        assert_eq!(
+            kfsb_reduce["preset_baseline_keys"],
+            json!([
+                "bab.branching.kfsb_multi_reduceop",
+                "bab.branching.reduceop",
+            ])
+        );
+        let kfsb_master = payload["axes"]
+            .as_array()
+            .expect("axis list")
+            .iter()
+            .find(|entry| entry["name"] == "NY_MO_KFSB")
+            .expect("multi-objective kFSB master axis");
+        assert_eq!(
+            kfsb_master["preset_baseline_keys"],
+            json!(["bab.branching.kfsb_multi"])
+        );
+
+        let eta_mode = payload["edges"]
+            .as_array()
+            .expect("edge list")
+            .iter()
+            .find(|entry| entry["child"] == "NY_MARGIN_ROW_BETA_ETA" && entry["kind"] == "equals")
+            .expect("exact beta-mode edge");
+        assert_eq!(eta_mode["parent"], "NY_MARGIN_ROW_BETA_POLYAK");
+        assert!(eta_mode["parents"].is_null());
+        assert_eq!(eta_mode["token"], "0");
+        assert!(eta_mode["bound"].is_null());
+
+        let upfront_cap_gate = payload["edges"]
+            .as_array()
+            .expect("edge list")
+            .iter()
+            .find(|entry| {
+                entry["child"] == "NY_UPFRONT_ATTACK_CAP" && entry["kind"] == "not_equals"
+            })
+            .expect("upfront kill-switch edge");
+        assert_eq!(upfront_cap_gate["parent"], "NY_UPFRONT_ATTACK");
+        assert_eq!(upfront_cap_gate["token"], "0");
+        let upfront_auto_gate = payload["edges"]
+            .as_array()
+            .expect("edge list")
+            .iter()
+            .find(|entry| {
+                entry["child"] == "NY_UPFRONT_ATTACK_AUTO_CAP" && entry["kind"] == "absent"
+            })
+            .expect("upfront contextual-auto edge");
+        assert_eq!(upfront_auto_gate["parent"], "NY_UPFRONT_ATTACK");
+        assert!(upfront_auto_gate["token"].is_null());
+
+        let eta_arming = payload["edges"]
+            .as_array()
+            .expect("edge list")
+            .iter()
+            .find(|entry| {
+                entry["child"] == "NY_MARGIN_ROW_BETA_ETA" && entry["kind"] == "any_armed"
+            })
+            .expect("OR-capable beta arming edge");
+        assert!(eta_arming["parent"].is_null());
+        assert_eq!(
+            eta_arming["parents"],
+            json!(["NY_MARGIN_ROW_BETA", "NY_MARGIN_ROW_CLOSURE_ADAPTIVE"])
+        );
+        assert!(eta_arming["bound"].is_null());
+        assert!(eta_arming["token"].is_null());
     }
 
     /// `--cache` must reach `CacheMode::parse` unmodified, and its default must

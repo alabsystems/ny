@@ -20,10 +20,37 @@
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/malbeware
   csv_name: instances.csv
-  # complete_verifier and mip_solver are passed via run_instance.sh CLI flags,
-  # not parsed by the preset loader. Documented here for reference.
-  # complete_verifier: mip  (set in run_instance.sh)
-  # mip_solver: ay          (set in run_instance.sh; SOLVER POLICY: ay only)
+  # `complete_verifier` IS a typed preset key (`general.complete_verifier`,
+  # preset/mod.rs; resolved in beta_crown/mod.rs `resolve_preset_complete_verifier`,
+  # an explicit CLI `--complete-verifier` still wins). It is deliberately UNSET
+  # here, i.e. `auto`.
+  #
+  # CORRECTION 2026-08-24 (#lever-reachability): the previous comment here said
+  # "complete_verifier and mip_solver are passed via run_instance.sh CLI flags".
+  # That is FALSE and has been for as long as the native entry point has existed.
+  # `vnncomp_scripts/run_instance.sh` is a thin wrapper that execs `ny vnncomp`
+  # and exports no `NY_*`; it passes no strategy flags at all. The scored path
+  # hard-codes `CompleteVerifierArg::Auto`
+  # (commands/vnncomp.rs), so the reference's `complete_verifier: mip` was never
+  # in effect on this category. Verified with `ny vnncomp plan malbeware ...`,
+  # which reports `complete_verifier = auto  [default]`.
+  #
+  # MEASURED 2026-08-24 — setting `mip` here is a NO-OP-to-harmful on THIS
+  # category, and the reason is structural, not budgetary:
+  #   beta_crown/routing.rs `route_conv_model_to_graph` returns `(true, true)`
+  #   whenever `complete_verifier == Mip` AND the model has a Conv2d — malbeware
+  #   has one in all 3 variants (`ny vnncomp plan` reports conv_layers = 1). That
+  #   forces the model to load as a GRAPH, and `is_mip_only` (beta_crown/mod.rs)
+  #   requires `BetaCrownModel::Sequential`. So asking for MIP is exactly what
+  #   disqualifies the MIP-only route it was meant to enable: MIP still runs only
+  #   as the post-BaB escalation, on the same slice `auto` already gives it.
+  #   A/B on idx-82 (16-25, eps-3), same pinned binary, 100s: auto -> timeout,
+  #   mip -> timeout, with ay MIP solves hitting their deadline in BOTH arms.
+  # To route malbeware MIP-first, the conv->Graph rule would have to change; the
+  # preset key alone cannot express it. Left at `auto` until then.
+  #
+  # mip_solver: also a typed key (`solver.mip.mip_solver`); unset = `ay`, which
+  # is the only backend (docs/SOLVER_POLICY.md). Nothing to set.
 
 attack:
   pgd_order: after
@@ -63,6 +90,9 @@ bab:
     method: kfsb
     candidates: 5
     reduceop: max
+    # Exact wave-selector mirrors for governed search; runtime is unchanged.
+    kfsb_multi_candidates: 5
+    kfsb_multi_reduceop: max
   clip:
     relaxed: true
     relaxed_iterations: 20

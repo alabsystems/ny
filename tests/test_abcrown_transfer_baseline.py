@@ -447,7 +447,7 @@ def test_capture_reuses_measurement_provenance_and_binds_telemetry(
 
     assert len(calls) == 1
     assert calls[0]["categories_raw"]
-    assert calls[0]["configs_dir"] == REPO_ROOT / "configs"
+    assert calls[0]["configs_dir"] == REPO_ROOT / "configs" / "vnncomp25"
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["schema"] == baseline.BASELINE_SCHEMA
     assert payload["metric_contract"]["telemetry_environment"] == {

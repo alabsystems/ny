@@ -9,6 +9,7 @@
 //! `clean-elab/src/cert/external/verify.rs`. We emit string-encoded rationals
 //! (`"n"` / `"n/d"`), which Clean's `ExternalRational` deserializer accepts.
 
+use crate::json::{Json, Map};
 use crate::rational::{ensure_healthy, Rat, RatError};
 use std::collections::BTreeMap;
 
@@ -73,29 +74,20 @@ impl LinearConstraint {
         }
     }
 
-    fn to_json(&self) -> Result<serde_json::Value, RatError> {
-        let mut coeffs = serde_json::Map::new();
+    fn to_json(&self) -> Result<Json, RatError> {
+        let mut coeffs = Map::new();
         for (name, coeff) in &self.coefficients {
-            coeffs.insert(
-                name.clone(),
-                serde_json::Value::String(coeff.to_clean_string()?),
-            );
+            coeffs.insert(name.clone(), Json::Str(coeff.to_clean_string()?));
         }
-        let mut constraint = serde_json::Map::new();
-        constraint.insert(
-            "type".to_owned(),
-            serde_json::Value::String("linear_constraint".to_owned()),
-        );
-        constraint.insert(
-            "kind".to_owned(),
-            serde_json::Value::String(self.kind.as_str().to_owned()),
-        );
-        constraint.insert("coefficients".to_owned(), serde_json::Value::Object(coeffs));
+        let mut constraint = Map::new();
+        constraint.insert("type".to_owned(), Json::Str("linear_constraint".to_owned()));
+        constraint.insert("kind".to_owned(), Json::Str(self.kind.as_str().to_owned()));
+        constraint.insert("coefficients".to_owned(), Json::Obj(coeffs));
         constraint.insert(
             "constant".to_owned(),
-            serde_json::Value::String(self.constant.to_clean_string()?),
+            Json::Str(self.constant.to_clean_string()?),
         );
-        Ok(serde_json::Value::Object(constraint))
+        Ok(Json::Obj(constraint))
     }
 }
 
@@ -231,7 +223,7 @@ impl FarkasCertificate {
 /// `i64` emission wall is gone — see `rational.rs`). A poisoned rational arena
 /// is rejected even when a structurally sparse certificate would otherwise
 /// contain no rational fields.
-pub fn entailment_to_json(cert: &EntailmentCertificate) -> Result<serde_json::Value, RatError> {
+pub fn entailment_to_json(cert: &EntailmentCertificate) -> Result<Json, RatError> {
     ensure_healthy()?;
     // behavior-identical: explicit Vec::new()+push (not `.collect()`); the
     // premise count is input-derived and unbounded to the verifier, so a bulk
@@ -242,30 +234,24 @@ pub fn entailment_to_json(cert: &EntailmentCertificate) -> Result<serde_json::Va
         premises.push(p.to_json()?);
     }
     // Explicit loop (not `.map(..).collect::<Result<_,_>>()`): a direct
-    // `Value::String(to_clean_string()?)` push avoids the map-closure and
+    // `Json::Str(to_clean_string()?)` push avoids the map-closure and
     // `Result::map` absent-callee rows plus the collect bulk-alloc obligation
     // — identical elements, order, and first-`Err` early return.
     let mut multipliers = Vec::new();
     for m in cert.multipliers.iter() {
-        multipliers.push(serde_json::Value::String(m.to_clean_string()?));
+        multipliers.push(Json::Str(m.to_clean_string()?));
     }
     let multipliers = multipliers;
-    let mut certificate = serde_json::Map::new();
+    let mut certificate = Map::new();
     certificate.insert(
         "type".to_owned(),
-        serde_json::Value::String("entailment_certificate".to_owned()),
+        Json::Str("entailment_certificate".to_owned()),
     );
-    certificate.insert(
-        "version".to_owned(),
-        serde_json::Value::String("1.0".to_owned()),
-    );
-    certificate.insert("premises".to_owned(), serde_json::Value::Array(premises));
-    certificate.insert(
-        "multipliers".to_owned(),
-        serde_json::Value::Array(multipliers),
-    );
+    certificate.insert("version".to_owned(), Json::Str("1.0".to_owned()));
+    certificate.insert("premises".to_owned(), Json::Arr(premises));
+    certificate.insert("multipliers".to_owned(), Json::Arr(multipliers));
     certificate.insert("conclusion".to_owned(), cert.conclusion.to_json()?);
-    let value = serde_json::Value::Object(certificate);
+    let value = Json::Obj(certificate);
     ensure_healthy()?;
     Ok(value)
 }
@@ -274,7 +260,7 @@ pub fn entailment_to_json(cert: &EntailmentCertificate) -> Result<serde_json::Va
 /// `ExternalEntailmentCert` shape: `version`/`premises`/`multipliers`/
 /// `conclusion`, with no outer `type` tag — chain steps are not the tagged
 /// `ExternalCertificate` enum).
-fn entailment_step_json(cert: &EntailmentCertificate) -> Result<serde_json::Value, RatError> {
+fn entailment_step_json(cert: &EntailmentCertificate) -> Result<Json, RatError> {
     // behavior-identical: explicit Vec::new()+push (not `.collect()`); the
     // premise count is input-derived and unbounded to the verifier, so a bulk
     // `.collect()` raises an UnboundedAllocation obligation. Same elements,
@@ -284,26 +270,20 @@ fn entailment_step_json(cert: &EntailmentCertificate) -> Result<serde_json::Valu
         premises.push(p.to_json()?);
     }
     // Explicit loop (not `.map(..).collect::<Result<_,_>>()`): a direct
-    // `Value::String(to_clean_string()?)` push avoids the map-closure and
+    // `Json::Str(to_clean_string()?)` push avoids the map-closure and
     // `Result::map` absent-callee rows plus the collect bulk-alloc obligation
     // — identical elements, order, and first-`Err` early return.
     let mut multipliers = Vec::new();
     for m in cert.multipliers.iter() {
-        multipliers.push(serde_json::Value::String(m.to_clean_string()?));
+        multipliers.push(Json::Str(m.to_clean_string()?));
     }
     let multipliers = multipliers;
-    let mut step = serde_json::Map::new();
-    step.insert(
-        "version".to_owned(),
-        serde_json::Value::String("1.0".to_owned()),
-    );
-    step.insert("premises".to_owned(), serde_json::Value::Array(premises));
-    step.insert(
-        "multipliers".to_owned(),
-        serde_json::Value::Array(multipliers),
-    );
+    let mut step = Map::new();
+    step.insert("version".to_owned(), Json::Str("1.0".to_owned()));
+    step.insert("premises".to_owned(), Json::Arr(premises));
+    step.insert("multipliers".to_owned(), Json::Arr(multipliers));
     step.insert("conclusion".to_owned(), cert.conclusion.to_json()?);
-    Ok(serde_json::Value::Object(step))
+    Ok(Json::Obj(step))
 }
 
 /// Serialize a composed entailment *chain* to NY's legacy linkage JSON
@@ -317,7 +297,7 @@ fn entailment_step_json(cert: &EntailmentCertificate) -> Result<serde_json::Valu
 /// # Errors
 /// Full bignum values are supported; a poisoned rational arena is rejected,
 /// including for an empty chain.
-pub fn chain_to_json(steps: &[EntailmentCertificate]) -> Result<serde_json::Value, RatError> {
+pub fn chain_to_json(steps: &[EntailmentCertificate]) -> Result<Json, RatError> {
     ensure_healthy()?;
     // behavior-identical: explicit Vec::new()+push (not `.collect()`); the step
     // count is input-derived and unbounded to the verifier, so a bulk
@@ -328,13 +308,10 @@ pub fn chain_to_json(steps: &[EntailmentCertificate]) -> Result<serde_json::Valu
         steps_json.push(entailment_step_json(s)?);
     }
     let steps = steps_json;
-    let mut chain = serde_json::Map::new();
-    chain.insert(
-        "version".to_owned(),
-        serde_json::Value::String("1.0".to_owned()),
-    );
-    chain.insert("steps".to_owned(), serde_json::Value::Array(steps));
-    let value = serde_json::Value::Object(chain);
+    let mut chain = Map::new();
+    chain.insert("version".to_owned(), Json::Str("1.0".to_owned()));
+    chain.insert("steps".to_owned(), Json::Arr(steps));
+    let value = Json::Obj(chain);
     ensure_healthy()?;
     Ok(value)
 }
@@ -344,7 +321,7 @@ pub fn chain_to_json(steps: &[EntailmentCertificate]) -> Result<serde_json::Valu
 /// # Errors
 /// Full bignum values are supported; a poisoned rational arena is rejected,
 /// including for an empty certificate.
-pub fn farkas_to_json(cert: &FarkasCertificate) -> Result<serde_json::Value, RatError> {
+pub fn farkas_to_json(cert: &FarkasCertificate) -> Result<Json, RatError> {
     ensure_healthy()?;
     // behavior-identical: explicit Vec::new()+push (not `.collect()`); the
     // constraint count is input-derived and unbounded to the verifier, so a bulk
@@ -355,36 +332,27 @@ pub fn farkas_to_json(cert: &FarkasCertificate) -> Result<serde_json::Value, Rat
         constraints.push(c.to_json()?);
     }
     // Explicit loop (not `.map(..).collect::<Result<_,_>>()`): a direct
-    // `Value::String(to_clean_string()?)` push avoids the map-closure and
+    // `Json::Str(to_clean_string()?)` push avoids the map-closure and
     // `Result::map` absent-callee rows plus the collect bulk-alloc obligation
     // — identical elements, order, and first-`Err` early return.
     let mut multipliers = Vec::new();
     for m in cert.multipliers.iter() {
-        multipliers.push(serde_json::Value::String(m.to_clean_string()?));
+        multipliers.push(Json::Str(m.to_clean_string()?));
     }
     let multipliers = multipliers;
-    let mut certificate = serde_json::Map::new();
+    let mut certificate = Map::new();
     certificate.insert(
         "type".to_owned(),
-        serde_json::Value::String("farkas_certificate".to_owned()),
+        Json::Str("farkas_certificate".to_owned()),
     );
-    certificate.insert(
-        "version".to_owned(),
-        serde_json::Value::String("1.0".to_owned()),
-    );
-    certificate.insert(
-        "constraints".to_owned(),
-        serde_json::Value::Array(constraints),
-    );
-    certificate.insert(
-        "multipliers".to_owned(),
-        serde_json::Value::Array(multipliers),
-    );
+    certificate.insert("version".to_owned(), Json::Str("1.0".to_owned()));
+    certificate.insert("constraints".to_owned(), Json::Arr(constraints));
+    certificate.insert("multipliers".to_owned(), Json::Arr(multipliers));
     certificate.insert(
         "conclusion".to_owned(),
-        serde_json::Value::String("contradiction".to_owned()),
+        Json::Str("contradiction".to_owned()),
     );
-    let value = serde_json::Value::Object(certificate);
+    let value = Json::Obj(certificate);
     ensure_healthy()?;
     Ok(value)
 }

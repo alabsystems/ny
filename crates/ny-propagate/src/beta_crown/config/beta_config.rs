@@ -10,8 +10,8 @@ use ny_core::{nan_propagating_max, NyError, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::pgd_attack::{
-    AdamClippingParams, PgdAlphaMode, PgdConfig, PgdInitialization, PgdOptimizer,
-    GAMA_LAMBDA_DEFAULT,
+    AdamClippingParams, ExactVjpPgdConfig, PgdAlphaMode, PgdConfig, PgdInitialization,
+    PgdOptimizer, GAMA_LAMBDA_DEFAULT,
 };
 use crate::AlphaCrownConfig;
 
@@ -55,6 +55,17 @@ pub struct BetaCrownConfig {
     /// the fail-closed `CertificateExport` default.
     #[serde(skip)]
     pub verification_artifact_authority: VerificationArtifactAuthority,
+    /// Receipt-owning, immutable per-run parameter authority.
+    ///
+    /// Scored frontends attach the exact [`ny_levers::LeverSet`] that produces
+    /// the flight receipt. It is runtime-only and graph clones retain the same
+    /// [`std::sync::Arc`], so downstream cache identity and migrated readers
+    /// cannot silently reopen process environment. Flight-v3 intentionally
+    /// omits some lower-layer metadata and does not serialize this field.
+    /// Interactive callers retain `None` until they enter the compatibility
+    /// freeze boundary.
+    #[serde(skip)]
+    pub frozen_levers: Option<std::sync::Arc<ny_levers::LeverSet>>,
     /// Maximum number of domains to explore before giving up.
     #[serde(default = "default_max_domains")]
     pub max_domains: usize,
@@ -159,6 +170,14 @@ pub struct BetaCrownConfig {
     /// than standard CROWN. More expensive but significantly improves verification.
     #[serde(default)]
     pub use_crown_ibp: bool,
+    /// Frozen runtime decision for objective-chunk parallel waves.
+    ///
+    /// This is not preset-configurable: scored VNN-COMP derives it once from
+    /// the receipt-owning LeverSet, while the interactive CLI resolves its
+    /// legacy environment compatibility layer once before verification. False
+    /// is the production one-frontier memory guard.
+    #[serde(skip)]
+    pub chunk_wave_parallel_enabled: bool,
     /// Maximum number of sequential CROWN-IBP partial nodes before falling back
     /// to plain IBP intermediate bounds.
     ///
@@ -179,6 +198,25 @@ pub struct BetaCrownConfig {
     /// time-vs-tightness policy knob: any value is sound.
     #[serde(default)]
     pub crown_ibp_per_node_cap_secs: Option<f64>,
+    /// #target-cost-weight: price CROWN-IBP scheduling weights by the MACs of
+    /// the backward walk each target will run (`rows x prefix`) rather than by
+    /// its objective-row count.
+    ///
+    /// The shipped row-count weight is a cost proxy measured wrong by ~9.5x on
+    /// cgan (secs/row spans 27x across the same targets), which is why one wide
+    /// shallow node takes 54% of the collection window while the deep narrow
+    /// targets that carry the value share 2.9%. `false` (default) keeps the
+    /// historical weights EXACTLY. Scheduling only: it never changes what a
+    /// completed bound is, and every declined target keeps its certified IBP
+    /// fallback.
+    #[serde(default)]
+    pub crown_ibp_prefix_cost_weighted: bool,
+    /// #target-cost-weight: maximum fraction of the remaining CROWN-IBP
+    /// collection window one non-final target may be granted. `None` (default)
+    /// applies no cap; values outside `(0, 1)` are ignored. Sound at any value
+    /// — the share only bounds how long a walk may run.
+    #[serde(default)]
+    pub crown_ibp_max_target_share_frac: Option<f64>,
     /// Maximum number of backward layers/nodes for fixed-slope CROWN.
     ///
     /// When set, CROWN backward stops after propagating through this many
@@ -272,6 +310,16 @@ pub struct BetaCrownConfig {
     /// - Mean: balanced (average)
     #[serde(default)]
     pub kfsb_reduce_op: KfsbReduceOp,
+    /// Typed candidate override scoped to the wave-batched multi-objective
+    /// kFSB selector. `None` inherits `fsb_candidates` for shipped-preset
+    /// compatibility; unlike the old delivery route, setting it cannot retune
+    /// ordinary FSB/kFSB branching.
+    #[serde(default)]
+    pub kfsb_multi_candidates: Option<usize>,
+    /// Typed reduce policy scoped to the same wave selector. `None` inherits
+    /// `kfsb_reduce_op`.
+    #[serde(default)]
+    pub kfsb_multi_reduce_op: Option<KfsbReduceOp>,
     /// Bounded, branch-specific depth-2 lookahead advice for the
     /// multi-objective graph kFSB lane.
     ///
@@ -548,6 +596,14 @@ pub struct BetaCrownConfig {
     /// Default: 32768 (a 128×128 initial grid plus refinement for 2 dims).
     #[serde(default = "default_pgd_dense_sweep_points")]
     pub pgd_dense_sweep_points: usize,
+    /// Per-run exact-VJP graph attack policy.
+    ///
+    /// Runtime-only: scored VNN-COMP supplies it from the frozen entry-time
+    /// LeverSet, while interactive preset fields are applied through the
+    /// frontend. Keeping it out of generic config serialization avoids adding
+    /// a second, ungoverned delivery surface.
+    #[serde(skip)]
+    pub pgd_exact_vjp: ExactVjpPgdConfig,
     // --- Relaxed Clipping (Clip-and-Verify) ---
     /// Enable relaxed clipping to tighten input bounds using CROWN constraints.
     ///
@@ -739,7 +795,7 @@ pub struct BetaCrownConfig {
     /// atomic backend transaction and shrink-intersects the result.
     ///
     /// DELIVERY (this key exists because of `measured_gate_delivery.rs`): the
-    /// scored entry point exports exactly one `NY_*` variable, so an env-only gate
+    /// scored entry point exports no `NY_*` variables, so an env-only gate
     /// is dead in competition no matter what it measured. The measurement below
     /// was taken through `NY_ROOT_COMPREHENSIVE_GPU_INTERM_CROWN=1`; this typed key
     /// is how it actually reaches a scored run. The env lever is retained as a
@@ -755,7 +811,7 @@ pub struct BetaCrownConfig {
     /// `#bab-floor`: BaB's guaranteed share of the multi-objective root window,
     /// subtracted BEFORE any root phase sizes itself.
     ///
-    /// DELIVERY: the scored entry point exports exactly one `NY_*`, so the env
+    /// DELIVERY: the scored entry point exports no `NY_*`, so the env
     /// lever these three were measured through is dead in competition. These
     /// typed keys are how a search result reaches a scored run.
     ///
@@ -841,6 +897,12 @@ pub struct BetaCrownConfig {
     /// (including malformed and non-Unicode values).
     #[serde(default)]
     pub kfsb_cert_reuse: bool,
+    /// Entry-time resolved certificate-reuse policy supplied by a scored
+    /// frontend. `None` preserves the interactive environment-over-config
+    /// resolver; `Some` is immutable runtime authority and must not reopen the
+    /// process environment.
+    #[serde(skip)]
+    pub kfsb_cert_reuse_runtime: Option<bool>,
     /// Use the aggregation-critical objective row for the full graph kFSB
     /// scorer on auto-selected, high-dimensional conjunctive workloads.
     ///
@@ -954,6 +1016,145 @@ pub struct BetaCrownConfig {
     #[serde(default)]
     pub input_split_stacked_rebound: bool,
 
+    /// Nested-rebound deadline authority for the input-split dense-spec
+    /// rebound (#dist-shift-5291; the `6f49a660` deadline-presence cliff —
+    /// see `input_split/shared_specs.rs` and the cgan row-7 bisect note
+    /// documented there).
+    ///
+    /// `None` / `Some(true)`: the nested rebound verifier keeps the caller's
+    /// finite deadline — the shipped historical behavior since `6f49a660`.
+    ///
+    /// `Some(false)`: the nested rebound's bound computations run WITHOUT the
+    /// inner finite deadline (the pre-`6f49a660` shape). Wall-clock safety is
+    /// then provided by the OUTER input-split BaB loop, which polls its own
+    /// deadline at the head of every batch iteration
+    /// (`input_split/single_objective.rs` `check_termination`), plus the
+    /// harness's external per-instance budget. What is ceded is INTRA-rebound
+    /// interruptibility: a run can overrun the internal tier by at most one
+    /// rebound batch, so only categories whose per-batch rebound cost is
+    /// known-small (e.g. dist_shift's 25-Gemm FC net) should set `false`.
+    /// Soundness is unaffected either way — the nested deadline only selects
+    /// routes and fallbacks (the BUG #18 deadline-PRESENCE class), never
+    /// bound math.
+    ///
+    /// Preset surface: `bab.branching.input_split.nested_deadline`. The env
+    /// lever `NY_INPUT_SPLIT_NESTED_DEADLINE` overrides in BOTH directions
+    /// (`0` forces drop, `1` forces keep, absent defers to this field, then
+    /// to the declaration default of keep).
+    #[serde(default)]
+    pub input_split_nested_deadline: Option<bool>,
+
+    /// Certified f64 tail re-bounding of knife-edge survivors on the
+    /// grouped-disjunctive input-split lane (#cgan-f64-tail, design B).
+    ///
+    /// `None` (default) = dark. `Some(true)` arms BOTH escalation seams (the
+    /// batch seam at the end of every deferred rebound AND the survivor-polish
+    /// hook on the eager lane); `Some(false)` explicitly disarms. The env
+    /// lever `NY_F64_TAIL` overrides in both directions (`1` force-on, any
+    /// other present value force-off, absent defers here). ADDITIVE parity
+    /// class: only certified `Verified` outcomes mutate anything, and only by
+    /// monotonically raising per-row certified lower bounds through the
+    /// existing grouped funnel.
+    ///
+    /// Preset surface: `bab.branching.input_split.f64_tail.enabled`.
+    #[serde(default)]
+    pub input_split_f64_tail_enabled: Option<bool>,
+
+    /// Escalation guard band for the f64 tail (both seams): a still-unverified
+    /// domain is eligible iff its grouped f32 gap is `>= -band`. `None` keeps
+    /// the legacy 5e-3 default; `NY_F64_TAIL_BAND` overrides when set+valid.
+    /// The cgan ship shape is 5e-4 (inside `CGAN_POLISH_BAND` 5e-3 — the
+    /// scalar f64 conv walk is ~1-10 s/domain, so the band is the cost gate).
+    ///
+    /// Preset surface: `bab.branching.input_split.f64_tail.band`.
+    #[serde(default)]
+    pub input_split_f64_tail_band: Option<f32>,
+
+    /// Hard per-run escalation cap SHARED by both f64-tail seams (0 or `None`
+    /// = unlimited — the legacy env-armed lsnc behavior). Config-only (no env
+    /// override; a new raw env read would raise the ny-levers ratchet). The
+    /// cgan ship shape starts at 8: worst case 8 × 10 s slice ≈ 9% of the
+    /// 900 s budget, owned by the pre-registered wall-parity kill criterion.
+    ///
+    /// Preset surface: `bab.branching.input_split.f64_tail.max_escalations`.
+    #[serde(default)]
+    pub input_split_f64_tail_max_escalations: Option<usize>,
+
+    /// Per-CHILD wall cap, in SECONDS, for the grouped-disjunctive input-split
+    /// per-child bound calls (#cgan-dark-tail FIX-1).
+    ///
+    /// THE SHIPPED DEFAULT IS `None` = NO CAP. With `None` every per-child
+    /// bound keeps exactly the `crown_deadline` it is handed today and the
+    /// route is byte-for-byte unchanged; this key ships DARK and changes
+    /// nothing until a preset names it.
+    ///
+    /// `Some(secs)` (finite, `> 0`) makes each per-child bound call run against
+    /// `min(crown_deadline, now + secs)` — `crown_deadline` remains the HARD
+    /// absolute ceiling and is never extended, only possibly brought forward
+    /// for the duration of one call.
+    ///
+    /// WHY: `disjunctive_multi_clause.rs` sets `crown_deadline` to the ABSOLUTE
+    /// BaB deadline and threads it into every per-child bound, so a single
+    /// child bound is legally entitled to the entire remaining budget — and
+    /// because the BaB trajectory only prints BETWEEN batches, it does so
+    /// invisibly. Measured on cgan row 2 in 13/13 logs: ~290 s (32% of the
+    /// official 900 s budget) expanding 0-10 domains against a running
+    /// 1.3-3.9 domains/s, with tail calls of ~70 s to >=285 s against a 0.13 s
+    /// median over the preceding 1640 calls.
+    ///
+    /// SOUNDNESS: a per-call deadline can only make a bound LOOSER, never
+    /// wrong. It selects routes and fallbacks, never bound math (the BUG #18
+    /// deadline-PRESENCE class). The recovery path already exists and is
+    /// already exercised in production: `screen_child.rs`'s
+    /// `compute_child_bounds` catches the `Err` arm, retries the frozen-root-α
+    /// bound and records `frozen_fallback_completions`. No new soundness
+    /// surface; the moat is unaffected.
+    ///
+    /// Config-only (no env override: a new raw env read would raise the
+    /// ny-levers ratchet).
+    ///
+    /// Preset surface: `bab.branching.input_split.child_bound_max_secs`.
+    #[serde(default)]
+    pub input_split_child_bound_max_secs: Option<f64>,
+
+    /// #cost-observer: SELF-CALIBRATING replacement for
+    /// [`Self::input_split_child_bound_max_secs`].
+    ///
+    /// THE SHIPPED DEFAULT IS `None` = the constant above governs, unchanged
+    /// and byte-for-byte. Naming this key makes each per-child bound call run
+    /// against an allowance DERIVED at runtime from (a) the median cost of the
+    /// calls that have already completed on this row and (b) the wall actually
+    /// remaining — instead of a number chosen in advance.
+    ///
+    /// WHY THE CONSTANT CANNOT BE RIGHT. A/B'd 2026-08-26 at the official
+    /// 1200 s on the two 1200 s cgan rows at `child_bound_max_secs: 20.0`:
+    /// `nonlinear_activations` went `explored 2 -> 957` with ZERO collection
+    /// truncations (20 s is CORRECT there — it removes pure waste), while
+    /// `upsample` took 37 truncations that cut a 27-layer intermediate
+    /// collection to 5-6 layers with the gap unmoved (20 s is an order of
+    /// magnitude TOO SHORT there). The distinguishing fact is the seam's own
+    /// per-call cost on that row on this host — `0.13 s` median versus
+    /// `>= 300 s` — which no constant can carry and nothing in the instance
+    /// declares.
+    ///
+    /// SOUNDNESS: unchanged from the constant, and for the same structural
+    /// reason. The derived allowance is composed by the SAME
+    /// `min(crown_deadline, now + allowance)` law, so the absolute ceiling is
+    /// never extended — only ever brought forward — and an earlier deadline can
+    /// only make a bound LOOSER or fail the call outright (the frozen-root-α
+    /// retry in `screen_child.rs` already catches that arm and already records
+    /// `frozen_fallback_completions`). `ny_core::cost_observer::Slice` has no
+    /// variant that can extend a ceiling, so no allowance the observer can
+    /// emit — including a wrong one — can change what is CONCLUDED from a
+    /// bound, only how much work is spent computing it.
+    ///
+    /// Config-only (no env override: a new raw env read would raise the
+    /// ny-levers ratchet).
+    ///
+    /// Preset surface: `bab.branching.input_split.child_bound_calibration`.
+    #[serde(default)]
+    pub input_split_child_bound_calibration: Option<ChildBoundCalibrationConfig>,
+
     /// Run eligible per-domain warm-alpha refinements concurrently during the
     /// deferred reordered input-split rebound.
     ///
@@ -1024,6 +1225,35 @@ pub struct BetaCrownConfig {
     /// applied identically on both paths.
     #[serde(default)]
     pub input_split_collection_verify_shortcut: bool,
+
+    /// #scored-wall-clamp (default `None`): the ABSOLUTE instant by which the
+    /// process owes its caller a verdict, independent of `timeout`.
+    ///
+    /// `timeout` (and any deadline derived from it) is an EFFORT HORIZON: the
+    /// disjunctive input-split lane sizes every per-node CROWN-IBP grant as a
+    /// fraction of the budget it believes remains, so a NEARER deadline buys
+    /// LOOSER bounds and MORE splits. That makes the search non-monotonic in
+    /// its own timeout, and a frontend may legitimately inflate the timeout
+    /// past the wall it actually has in order to keep a converging trajectory.
+    ///
+    /// What it may NOT do is run that long. Supplying this field lets the two
+    /// separate: effort keeps being shaped by `timeout`, while the loop stops
+    /// here. It can only ever SHORTEN a run — a wall beyond the horizon is
+    /// ignored — so it is never a way to extend a configured timeout.
+    ///
+    /// `None`, the default and the only value any serialized configuration can
+    /// produce, means "no wall of my own": stop and horizon coincide and the
+    /// lane behaves byte-identically to the single-deadline code.
+    ///
+    /// NOT SERIALIZABLE, deliberately, for the same reason
+    /// [`Self::verification_artifact_authority`] is not: this is a LIVE
+    /// instant on the running process's monotonic clock. A preset that
+    /// restated it as a duration would silently forget the seconds already
+    /// spent before the solver was constructed, which is exactly the accounting
+    /// error the field exists to prevent. Frontends compute it once, at their
+    /// own anchor, from the scored budget.
+    #[serde(skip)]
+    pub input_split_scored_wall: Option<Instant>,
 
     /// #relational-bab lever 2 (default OFF): honor `input_split_depth` in
     /// the multi-clause DISJUNCTIVE input-split lane — split the top-k SB
@@ -1198,17 +1428,11 @@ fn default_adv_check() -> i32 {
     -1
 }
 
-/// Pure resolver for the typed kFSB certificate-reuse policy. Kept separate so
-/// tests can cover non-Unicode environment values without mutating process
-/// state; production consumers use [`BetaCrownConfig::kfsb_cert_reuse_armed`].
-pub(crate) fn kfsb_cert_reuse_from_raw(configured: bool, raw: Option<&std::ffi::OsStr>) -> bool {
-    raw.map_or(configured, |value| value == std::ffi::OsStr::new("1"))
-}
-
 impl Default for BetaCrownConfig {
     fn default() -> Self {
         Self {
             verification_artifact_authority: VerificationArtifactAuthority::CertificateExport,
+            frozen_levers: None,
             max_domains: 100_000,
             max_queue_size: default_max_queue_size(),
             // #ml4acopf-bab-queue-mem: 0 = unlimited. Opt-in per preset so
@@ -1223,9 +1447,12 @@ impl Default for BetaCrownConfig {
             root_alpha_phase_checkpoint: false,
             atomic_root_c_margin_iterations: 0,
             use_crown_ibp: false, // Disabled by default (more expensive)
+            chunk_wave_parallel_enabled: false,
             max_crown_ibp_nodes: None,
             crown_ibp_per_node_floor_secs: None,
             crown_ibp_per_node_cap_secs: None,
+            crown_ibp_prefix_cost_weighted: false,
+            crown_ibp_max_target_share_frac: None,
             crown_backward_layers: None,
             alpha_config: AlphaCrownConfig::default(),
             branching_heuristic: BranchingHeuristic::LargestBoundWidth,
@@ -1239,6 +1466,8 @@ impl Default for BetaCrownConfig {
             input_split_sb_primary_spec: None,
             fsb_candidates: default_fsb_candidates(),
             kfsb_reduce_op: KfsbReduceOp::default(), // Min (conservative)
+            kfsb_multi_candidates: None,
+            kfsb_multi_reduce_op: None,
             depth_two_branch_lookahead: DepthTwoBranchLookaheadConfig::default(),
             beta_lr: 0.05,      // α,β-CROWN default: 0.05
             beta_iterations: 0, // Per-domain iterations disabled by default for throughput
@@ -1299,6 +1528,7 @@ impl Default for BetaCrownConfig {
             pgd_dense_low_dim_sweep: false,
             pgd_dense_sweep_max_dims: default_pgd_dense_sweep_max_dims(),
             pgd_dense_sweep_points: default_pgd_dense_sweep_points(),
+            pgd_exact_vjp: ExactVjpPgdConfig::default(),
             enable_relaxed_clip: false,
             relaxed_clip_iterations: default_relaxed_clip_iterations(),
             input_clip_type: InputClipType::default(),
@@ -1334,6 +1564,7 @@ impl Default for BetaCrownConfig {
             mo_beta_graft: false, // #mo-beta-graft (env NY_MO_BETA_GRAFT overrides)
             use_kfsb_multi_branching: false, // #kfsb-multi: CIFAR-100 preset opt-in (env NY_MO_KFSB overrides)
             kfsb_cert_reuse: false, // proof-carrying kFSB simulation reuse; preset-scoped opt-in
+            kfsb_cert_reuse_runtime: None, // scored frontend freezes the governed effective value
             use_multi_objective_critical_kfsb: false, // auto high-dimensional conjunction only
             max_relu_split_depth: default_max_relu_split_depth(),
             min_batch_fill_ratio: default_min_batch_fill_ratio(),
@@ -1344,11 +1575,18 @@ impl Default for BetaCrownConfig {
                 default_input_split_conic_queue_refresh_batch_size(),
             input_split_independent_singleton_disjunction: false,
             input_split_stacked_rebound: false, // #cgan-batched-stack
+            input_split_nested_deadline: None,  // #dist-shift-5291 nested-deadline authority (keep)
+            input_split_f64_tail_enabled: None, // #cgan-f64-tail: dark until the measured gate
+            input_split_f64_tail_band: None,    // #cgan-f64-tail: 5e-3 legacy default beneath
+            input_split_f64_tail_max_escalations: None, // #cgan-f64-tail: unlimited (legacy lsnc)
+            input_split_child_bound_max_secs: None, // #cgan-dark-tail FIX-1: NO CAP (ships dark)
+            input_split_child_bound_calibration: None, // #cost-observer: constant governs (dark)
             input_split_warm_parallel: false,   // #cgan-warm-par (preset-scoped opt-in)
             input_split_override_parallel: false, // bounded complete-clip rebound fan-out
             sat_escape_branch: false, // #nn4sys-seb-dark: nn4sys preset opt-in (env NY_SAT_ESCAPE_BRANCH overrides)
             input_split_batched_ibp_refresh: false, // #cgan-batched-stack
             input_split_collection_verify_shortcut: false, // #relational-bab lever 1
+            input_split_scored_wall: None, // #scored-wall-clamp: no wall of my own
             input_split_disjunctive_multi_dim: false, // #relational-bab lever 2
             input_split_input_leaf_oracle: false, // input-box-only certified leaf seam
             input_split_edge_milp: false, // #relational-bab edge escalation
@@ -1386,13 +1624,13 @@ impl BetaCrownConfig {
     /// setting and exact environment override.
     ///
     /// This is the single production resolution point used by both the engine
-    /// and effective-treatment reporting. Absence inherits the typed setting;
-    /// literal `1` enables; every other present byte string disables.
+    /// and effective-treatment reporting. A scored frontend's frozen override
+    /// wins without reopening the environment. Interactive use layers exact
+    /// `0`/`1` environment input over the typed setting and fails dark on every
+    /// other present byte string.
     pub fn kfsb_cert_reuse_armed(&self) -> bool {
-        kfsb_cert_reuse_from_raw(
-            self.kfsb_cert_reuse,
-            std::env::var_os("NY_MO_KFSB_CERT_REUSE").as_deref(),
-        )
+        self.kfsb_cert_reuse_runtime
+            .unwrap_or_else(|| ny_levers::decls::kfsb::resolve_cert_reuse(self.kfsb_cert_reuse))
     }
 
     /// Whether cutting planes may influence certificate-bearing bounds.
@@ -1445,6 +1683,8 @@ impl BetaCrownConfig {
         crate::types::CrownIbpPerNodeTimeBudget {
             floor_secs: self.crown_ibp_per_node_floor_secs,
             cap_secs: self.crown_ibp_per_node_cap_secs,
+            prefix_cost_weighted: self.crown_ibp_prefix_cost_weighted,
+            max_target_share_frac: self.crown_ibp_max_target_share_frac,
         }
     }
 
@@ -1526,6 +1766,7 @@ impl BetaCrownConfig {
             dense_low_dim_sweep: self.pgd_dense_low_dim_sweep,
             dense_sweep_max_dims: self.pgd_dense_sweep_max_dims,
             dense_sweep_points: self.pgd_dense_sweep_points,
+            exact_vjp: self.pgd_exact_vjp,
         }
     }
 
@@ -1771,12 +2012,40 @@ impl BetaCrownConfig {
         }
     }
 
+    /// Whether typed depth-two kFSB has execution authority on this BaB wave.
+    ///
+    /// This pure resolver is shared by the engine and effective-treatment
+    /// projection. Legacy adaptive-depth and f64 observer variables are
+    /// intentionally absent: they are advice-only and never veto typed policy.
+    /// When typed work receives a budget, its authority has priority and the
+    /// legacy observations remain eligible for later scheduling.
+    #[inline]
+    pub fn depth_two_lookahead_supported_at_round(
+        &self,
+        bab_round: usize,
+        effective_candidates: usize,
+        effective_reduce_op: KfsbReduceOp,
+    ) -> bool {
+        self.depth_two_branch_lookahead.enabled_at_round(bab_round)
+            && self.depth_two_branch_lookahead.validate().is_ok()
+            && matches!(self.branching_heuristic, BranchingHeuristic::Kfsb)
+            // Shared historical prep ranks raw lower bounds. Reinterpreting it
+            // in upper mode would violate Off/Shadow identity until a separate
+            // direction-normalized `-upper` prep exists.
+            && !self.verify_upper_bound
+            && effective_reduce_op == KfsbReduceOp::Min
+            && effective_candidates > 0
+    }
+
     /// Validate all learning rate and optimizer configuration fields.
     ///
     /// Checks top-level `beta_lr`, `alpha_lr`, and delegates to
     /// `adaptive_config.validate()` for Adam hyperparameters.
     /// Call after CLI flag application and preset merging.
     pub fn validate(&self) -> Result<()> {
+        self.pgd_exact_vjp
+            .validate()
+            .map_err(NyError::InvalidConfig)?;
         if Instant::now().checked_add(self.timeout).is_none() {
             return Err(NyError::InvalidConfig(format!(
                 "timeout {:?} is too large for the platform monotonic clock",
@@ -1859,6 +2128,71 @@ impl BetaCrownConfig {
         self.phase_budget.validate()?;
         self.depth_two_branch_lookahead.validate()?;
         self.adaptive_config.validate()
+    }
+}
+
+/// #cost-observer: preset surface for the self-calibrating per-child bound
+/// allowance (`bab.branching.input_split.child_bound_calibration`).
+///
+/// Every field is OPTIONAL and every field is DIMENSIONLESS. That is the whole
+/// contract: an omitted field falls back to
+/// [`ny_core::cost_observer::SlicePolicy`]'s default, and no field carries a
+/// unit, so nothing here has to know how long a bound takes, how big the budget
+/// is, or how fast the host is. Those three facts arrive by measurement.
+///
+/// The block's PRESENCE is the arming switch. Absent — the shipped state —
+/// leaves `input_split_child_bound_max_secs` in charge, unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ChildBoundCalibrationConfig {
+    /// How many times the MEASURED median cost of a completed call another call
+    /// may run before it is cut off. Omitted = 160 (the safe end of the
+    /// `[154, 538]` interval that reproduces the one row where a hand-set cap
+    /// was measured good: 0.13 s median, healthy at 20 s, tail from 70 s).
+    #[serde(default)]
+    pub headroom: Option<f64>,
+    /// Largest share of the REMAINING wall one call may take once calibrated.
+    /// Omitted = 0.25. The `alpha_opt` / `#phase-window` starvation guard,
+    /// against the live remaining budget rather than a fixed number of seconds.
+    #[serde(default)]
+    pub max_share_of_remaining: Option<f64>,
+    /// Share of the remaining wall spent on the probe that finds out which
+    /// regime this row is in, before any call has completed. Omitted = 0.05 —
+    /// small, because on a row where every call is expensive the probe is pure
+    /// overhead before the observer falls back to the caller's own ceiling.
+    #[serde(default)]
+    pub probe_share: Option<f64>,
+    /// Completed observations required before the measured term may govern.
+    /// Omitted = 8.
+    #[serde(default)]
+    pub min_samples: Option<usize>,
+    /// Completed observations retained in the sliding window. Omitted = 128.
+    #[serde(default)]
+    pub window: Option<usize>,
+    /// Multiplicative growth per CONSECUTIVE truncated call — how fast the
+    /// observer corrects an allowance that is too tight. Omitted = 2.0.
+    #[serde(default)]
+    pub growth: Option<f64>,
+}
+
+impl ChildBoundCalibrationConfig {
+    /// Resolve to the runtime policy, field by field, defaulting anything the
+    /// preset did not name. Sanitization of hostile values happens once more
+    /// inside `CostObserver::new`, so this cannot hand a panicking value on.
+    #[must_use]
+    pub fn to_policy(self) -> ny_core::cost_observer::SlicePolicy {
+        let d = ny_core::cost_observer::SlicePolicy::default();
+        ny_core::cost_observer::SlicePolicy {
+            headroom: self.headroom.unwrap_or(d.headroom),
+            max_share_of_remaining: self
+                .max_share_of_remaining
+                .unwrap_or(d.max_share_of_remaining),
+            probe_share: self.probe_share.unwrap_or(d.probe_share),
+            min_samples: self.min_samples.unwrap_or(d.min_samples),
+            window: self.window.unwrap_or(d.window),
+            growth: self.growth.unwrap_or(d.growth),
+            growth_steps_max: d.growth_steps_max,
+        }
     }
 }
 

@@ -31,11 +31,10 @@
 //!
 //! # What is deliberately refused
 //!
-//! Padding is rejected (`None`): ny's MaxPool2d carries a
-//! `use_negative_inf_padding` mode whose interaction with the argmax rule is
-//! not exercised by any instance this lane targets, and a silently wrong
-//! window enumeration is exactly risk R2. VGG16's pools are `2x2 / stride 2 /
-//! pad 0`.
+//! Padding is rejected (`None`): ny's MaxPool2d excludes padded positions from
+//! the max (`-inf` padding), and that interaction with the argmax rule is not
+//! exercised by any instance this lane targets — a silently wrong window
+//! enumeration is exactly risk R2. VGG16's pools are `2x2 / stride 2 / pad 0`.
 
 use ny_core::dd::{dd_add_f64, U_DD};
 

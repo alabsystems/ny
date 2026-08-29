@@ -200,6 +200,14 @@ pub fn build_graph_network(
         // If so, skip this layer - it's a constant computation that doesn't depend on activations.
         let is_constant_input = |inp: &String| {
             context.weights.get(inp).is_some()
+                // An interval-valued frozen constant is still a CONSTANT: the
+                // const-folder produced a rigorous enclosure for it, so a node
+                // whose every input is one of these is a constant computation
+                // and must be skipped exactly like the point case. Without this
+                // the node stays in the graph, reaches its converter with two
+                // constant operands, and fails closed — losing the very taint
+                // repair the carrier exists to make.
+                || context.weights.contains_interval(inp)
                 || context.weights.get_integers(inp).is_some()
                 || constant_tensors_local.contains(inp)
                 || evaluated_constants.contains_key(inp)
@@ -216,7 +224,9 @@ pub fn build_graph_network(
             // downstream layers can't use them and the converter will fail to create
             // unary variants for binary ops that reference them (#411).
             let outputs_have_values = spec.outputs.iter().all(|output| {
-                evaluated_constants.contains_key(output) || context.weights.get(output).is_some()
+                evaluated_constants.contains_key(output)
+                    || context.weights.get(output).is_some()
+                    || context.weights.contains_interval(output)
             });
             if outputs_have_values {
                 debug!(
@@ -376,11 +386,13 @@ pub fn build_graph_network(
 
         // Try to convert the layer - skip unsupported ops with warnings
         // For Concat, use evaluated constants map to find pre-computed constant inputs
-        let layer = match if spec.layer_type == LayerType::Concat {
+        let layer = match (if spec.layer_type == LayerType::Concat {
             context.convert_concat_with_evaluated(spec, &evaluated_constants)
         } else {
             context.convert_layer(spec)
-        } {
+        })
+        .and_then(|layer| guard_interval_constant_inputs(context.weights, spec, layer))
+        {
             Ok(l) => l,
             Err(NyError::UnsupportedOp(msg))
                 if msg.contains("dynamic shape") && options.allow_dynamic_reshape =>
@@ -468,8 +480,17 @@ pub fn build_graph_network(
             Err(e) => return Err(e),
         };
 
-        // Find input node names for this layer
-        let input_nodes = find_graph_input_nodes(
+        // Find input node names for this layer.
+        //
+        // An `UnsupportedOp` from here means something different from a
+        // conversion failure: the layer converted fine, but it cannot be WIRED.
+        // The only case that reports it is a DATA operand that was const-folded
+        // out of the graph, which `find_graph_input_nodes` documents in full.
+        // Degrade it exactly as an unsupported conversion is degraded — one
+        // OpaqueSkip node with conservative [-inf, +inf] bounds — rather than
+        // failing the whole load over one unrepresentable node. Every other
+        // error, dangling references included, stays fatal.
+        let input_nodes = match find_graph_input_nodes(
             context.weights,
             spec,
             &layer,
@@ -477,7 +498,35 @@ pub fn build_graph_network(
             data.tensor_producer,
             &constant_tensors_local,
             &evaluated_constants,
-        )?;
+        ) {
+            Ok(input_nodes) => input_nodes,
+            Err(NyError::UnsupportedOp(msg)) => {
+                warn!(
+                    "Skipping unwirable layer {} (type {:?}) in graph: {}; using conservative unbounded bounds",
+                    spec.name, spec.layer_type, msg
+                );
+                skipped_count += 1;
+                let activation_inputs = find_activation_inputs(
+                    &spec.inputs,
+                    context.weights,
+                    &constant_tensors_local,
+                    &evaluated_constants,
+                );
+                let declared_shape =
+                    declared_output_shape(&spec.outputs, context.tensor_shapes, data.inputs);
+                map_skipped_outputs(
+                    &mut graph,
+                    &mut tensor_to_node,
+                    &spec.outputs,
+                    &activation_inputs,
+                    &spec.name,
+                    &mut last_added_node,
+                    declared_shape,
+                )?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
 
         // Create and add the graph node
         let node = GraphNode::new(spec.name.clone(), layer.clone(), input_nodes.clone());
@@ -588,3 +637,46 @@ pub fn build_graph_network(
 #[cfg(test)]
 #[path = "builder_tests.rs"]
 mod tests;
+
+/// FAIL-CLOSED CHOKEPOINT for interval-valued frozen constants.
+///
+/// An interval constant is invisible to `WeightStore::get`, so a converter that
+/// has not been taught about it normally cannot see the operand at all and
+/// takes its own unsupported path. This guard closes the remaining gap: a
+/// converter that succeeded WITHOUT looking at the operand (a binary op that
+/// decided both sides were activations, say) would otherwise reach
+/// `find_graph_input_nodes` with a name that has no producer node, and that is a
+/// HARD model-load error rather than the sound skip this program promises.
+///
+/// So: if any input of this spec is an interval-valued constant and the produced
+/// layer is not the one that absorbs it, convert the success into
+/// `UnsupportedOp` — which the caller already degrades to a conservative
+/// `OpaqueSkip`. Losing a node's bound is always available and always sound.
+fn guard_interval_constant_inputs(
+    weights: &WeightStore,
+    spec: &LayerSpec,
+    layer: Layer,
+) -> Result<Layer> {
+    if matches!(layer, Layer::IntervalConst(_)) {
+        return Ok(layer);
+    }
+    if let Some(name) = spec
+        .inputs
+        .iter()
+        .find(|name| weights.contains_interval(name))
+    {
+        warn!(
+            "Layer {} ({:?}) reads the interval-valued frozen constant '{}' but lowered to {}, \
+             which cannot carry an enclosure; failing closed to a conservative skip",
+            spec.name,
+            spec.layer_type,
+            name,
+            layer.layer_type()
+        );
+        return Err(NyError::UnsupportedOp(format!(
+            "Layer {} reads interval-valued constant '{}' and has no interval carrier",
+            spec.name, name
+        )));
+    }
+    Ok(layer)
+}

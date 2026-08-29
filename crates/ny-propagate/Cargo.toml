@@ -15,6 +15,12 @@ kani-proofs = []
 # tests use hermetic recording engines; this explicit lane fails fast when the
 # explicitly requested device cannot pass the five-rung sound-authority ladder.
 gpu-tests = []
+# Diagnostic harnesses that PRINT observed behaviour for re-seeding a pinned
+# guard, rather than asserting anything. They are tools, not coverage, so they
+# are absent from the default lane instead of `#[ignore]`d in it — TEST_CONFORMANCE.md:
+# "External tests are absent from the default lane rather than reported as ignored."
+# Distinct from `benchmarks`, which gates wall-clock timing.
+diagnostics = []
 
 [lints]
 workspace = true

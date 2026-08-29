@@ -53,16 +53,13 @@ use core::contracts::ensures;
 use trust::ensures;
 
 /// Errors that can arise while building a certificate.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrownError {
     /// A matrix/vector dimension did not line up.
-    #[error("dimension mismatch: {0}")]
     Dimension(String),
     /// An α slope was outside `[0, 1]` (would make the lower envelope unsound).
-    #[error("alpha[{0}] must lie in [0, 1]")]
     AlphaOutOfRange(usize),
     /// The requested safety threshold exceeds the certified lower bound.
-    #[error("threshold {threshold} exceeds certified lower bound {bound}")]
     ThresholdAboveBound {
         /// Requested threshold.
         threshold: String,
@@ -70,8 +67,46 @@ pub enum CrownError {
         bound: String,
     },
     /// Exact arithmetic failure.
-    #[error(transparent)]
-    Rat(#[from] RatError),
+    Rat(RatError),
+}
+
+// Hand-written replacements for the `thiserror::Error` derive (removed so the
+// crate carries no proc-macro dependency and the bignum stack can be verified
+// rather than assumed). Display strings, `source()` behaviour and the `#[from]`
+// conversion reproduce the derive byte-for-byte; `Rat` was `#[error(transparent)]`,
+// so both `Display` and `source()` forward to the inner `RatError`.
+impl core::fmt::Display for CrownError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CrownError::Dimension(inner) => write!(f, "dimension mismatch: {0}", inner),
+            CrownError::AlphaOutOfRange(inner) => write!(f, "alpha[{0}] must lie in [0, 1]", inner),
+            CrownError::ThresholdAboveBound { threshold, bound } => {
+                write!(
+                    f,
+                    "threshold {threshold} exceeds certified lower bound {bound}"
+                )
+            }
+            CrownError::Rat(inner) => core::fmt::Display::fmt(inner, f),
+        }
+    }
+}
+
+impl core::error::Error for CrownError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            CrownError::Dimension(_)
+            | CrownError::AlphaOutOfRange(_)
+            | CrownError::ThresholdAboveBound { .. } => None,
+            // `#[error(transparent)]` forwards the source chain to the inner error.
+            CrownError::Rat(inner) => core::error::Error::source(inner),
+        }
+    }
+}
+
+impl From<RatError> for CrownError {
+    fn from(source: RatError) -> Self {
+        CrownError::Rat(source)
+    }
 }
 
 /// A one-hidden-layer ReLU network plus an input box.
@@ -312,7 +347,15 @@ impl Relu1Problem {
         // an absent `<{closure} as Fn>::call` shim, so the accumulator update
         // stays in verified code. Captures nothing (only its params + `Rat::ZERO`).
         fn add_mult(v: &mut [Rat], idx: usize, delta: Rat) -> Result<(), RatError> {
-            let cur = v.get(idx).copied().unwrap_or(Rat::ZERO);
+            // Explicit `match`, not `.unwrap_or(Rat::ZERO)`: identical semantics
+            // (`Rat` is `Copy`, so nothing is dropped either way), but the generic
+            // `Option::<T>::unwrap_or` is an absent callee the verifier must treat
+            // as may-panic, since for some `T` the discarded value has a panicking
+            // `Drop`. Writing the match monomorphises `T` to `Rat` and discharges.
+            let cur = match v.get(idx).copied() {
+                Some(x) => x,
+                None => Rat::ZERO,
+            };
             let next = cur.add(delta)?;
             if let Some(slot) = v.get_mut(idx) {
                 *slot = next;

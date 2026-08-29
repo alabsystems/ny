@@ -5,7 +5,7 @@
     "source": "lake-git-dependency",
     "package": "crownproof",
     "git": "https://github.com/alabsystems/clean.git",
-    "rev": "a119ed0cfdafcb3eca4904253fdc51283e2ff0f8",
+    "rev": "9a9b16e44b9233d0c387839ea205a22fb77ac4bb",
     "subDir": "crown-proofs/lean",
     "packagesDir": ".lake/packages",
     "moduleRoot": "Crownproof",

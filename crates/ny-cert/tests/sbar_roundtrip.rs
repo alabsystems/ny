@@ -32,7 +32,7 @@ fn sbar_certificate_emits_clean_json() {
     if let Ok(dir) = std::env::var("NY_CERT_OUT_DIR") {
         std::fs::write(
             format!("{dir}/ny_sbar_entailment.json"),
-            serde_json::to_string_pretty(&json).unwrap(),
+            ny_cert::json::to_string_pretty(&json),
         )
         .unwrap();
     }

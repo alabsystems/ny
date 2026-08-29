@@ -16,6 +16,7 @@
 use super::prelude::*;
 use crate::pgd_attack::{PgdAttacker, PgdConfig};
 use ny_test_utils::CountingGemmEngine;
+use std::time::Instant;
 
 /// Simple 2→1 linear network: output = x0 + 2*x1.
 ///
@@ -190,6 +191,100 @@ fn test_pgd_disabled_returns_original() {
     assert!(
         matches!(result.result, BabVerificationStatus::Timeout),
         "Disabled PGD should return original Timeout result"
+    );
+}
+
+/// A terminal PGD fallback may promote the exact overall deadline only when
+/// the attack loop actually polls that deadline as expired.
+#[ntest::timeout(5000)]
+#[test]
+fn terminal_pgd_timeout_records_the_exact_observed_deadline() {
+    let network = linear_2_to_1();
+    let input = BoundedTensor::new(
+        arr1(&[0.0_f32, 0.0]).into_dyn(),
+        arr1(&[1.0_f32, 1.0]).into_dyn(),
+    )
+    .unwrap();
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        enable_pgd_attack: true,
+        pgd_restarts: 1,
+        pgd_steps: 1,
+        verify_upper_bound: true,
+        ..BetaCrownConfig::default()
+    });
+    let original_result = crate::beta_crown::result::BetaCrownResult {
+        result: BabVerificationStatus::Timeout,
+        domains_explored: 1,
+        time_elapsed: Duration::from_millis(10),
+        max_depth_reached: 0,
+        output_bounds: None,
+        cuts_generated: 0,
+        domains_verified: 0,
+    };
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("one millisecond before now is representable");
+
+    crate::beta_crown::result::reset_global_timeout_deadline_source();
+    crate::beta_crown::result::note_global_timeout_engine_invocation();
+    let result = verifier
+        .try_pgd_attack_with_deadline(&network, &input, 10.0, original_result, Some(expired))
+        .expect("expired PGD fallback should return the original timeout");
+
+    assert!(matches!(result.result, BabVerificationStatus::Timeout));
+    assert_eq!(
+        crate::beta_crown::result::take_global_timeout_deadline_source(),
+        Some(expired),
+        "the terminal source must retain the caller's exact absolute Instant"
+    );
+}
+
+/// Merely returning after a deadline is not enough: a zero-step batched attack
+/// performs its final evaluation without polling the deadline and must not
+/// manufacture terminal-timeout provenance.
+#[ntest::timeout(5000)]
+#[test]
+fn zero_step_batched_pgd_does_not_claim_an_unobserved_deadline() {
+    let network = linear_2_to_1();
+    let input = BoundedTensor::new(
+        arr1(&[0.0_f32, 0.0]).into_dyn(),
+        arr1(&[1.0_f32, 1.0]).into_dyn(),
+    )
+    .unwrap();
+    let verifier = BetaCrownVerifier::new_with_engine(
+        BetaCrownConfig {
+            enable_pgd_attack: true,
+            pgd_restarts: 2,
+            pgd_steps: 0,
+            verify_upper_bound: true,
+            ..BetaCrownConfig::default()
+        },
+        Arc::new(CountingGemmEngine::new()),
+    );
+    let original_result = crate::beta_crown::result::BetaCrownResult {
+        result: BabVerificationStatus::Timeout,
+        domains_explored: 1,
+        time_elapsed: Duration::from_millis(10),
+        max_depth_reached: 0,
+        output_bounds: None,
+        cuts_generated: 0,
+        domains_verified: 0,
+    };
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("one millisecond before now is representable");
+
+    crate::beta_crown::result::reset_global_timeout_deadline_source();
+    crate::beta_crown::result::note_global_timeout_engine_invocation();
+    let result = verifier
+        .try_pgd_attack_with_deadline(&network, &input, 10.0, original_result, Some(expired))
+        .expect("zero-step PGD should return the original timeout");
+
+    assert!(matches!(result.result, BabVerificationStatus::Timeout));
+    assert_eq!(
+        crate::beta_crown::result::take_global_timeout_deadline_source(),
+        None,
+        "a natural zero-step return must fail closed without an expiry poll"
     );
 }
 
@@ -535,17 +630,92 @@ fn test_pgd_revalidation_bounds_gate_rejects_out_of_bounds_2711() {
     );
 }
 
-/// Source guard: the production bounds gate still downgrades out-of-bounds inputs.
+/// Return the body of the `!input_within_bounds(..)` branch in `pgd.rs`, by
+/// brace matching from its opening brace.
+///
+/// String literals are skipped so a `format!`-style `{}` inside a log message
+/// cannot unbalance the scan.
+fn pgd_bounds_gate_branch_body_2711() -> String {
+    const HEAD: &str = "if !input_within_bounds(&cx_input, input) {";
+    let source = include_str!("../pgd.rs");
+    let occurrences = source.matches(HEAD).count();
+    assert_eq!(
+        occurrences, 1,
+        "#2711: expected exactly one `{HEAD}` gate in pgd.rs, found {occurrences}. \
+         The re-validation path must consult `input_within_bounds` on the candidate \
+         BEFORE promoting it to Violated; if the call was renamed or duplicated, \
+         re-point this guard rather than deleting it."
+    );
+
+    let open = source.find(HEAD).expect("occurrence count is 1") + HEAD.len();
+    let bytes = source.as_bytes();
+    let (mut depth, mut idx) = (1_i32, open);
+    let (mut in_string, mut escaped) = (false, false);
+    while idx < bytes.len() {
+        let c = bytes[idx] as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return source[open..idx].to_string();
+            }
+        }
+        idx += 1;
+    }
+    panic!("#2711: the `{HEAD}` branch in pgd.rs is unbalanced — could not find its close");
+}
+
+/// Source guard: the production bounds gate still DOWNGRADES out-of-bounds inputs.
+///
+/// # What is pinned, and why by source text
+///
+/// `cx_input` comes from `PgdAttacker::attack`, which projects every iterate back
+/// into the input box, so no in-process fixture can hand this branch an
+/// out-of-bounds candidate. `input_within_bounds` itself is unit-tested in
+/// `pgd.rs`; what NOTHING else proves is that the caller CONSULTS it — the
+/// computed-but-never-consulted shape this project has now found four times.
+///
+/// # Why structural rather than a verbatim transcription
+///
+/// The previous form pinned a literal three-line block and went red when a
+/// legitimate, unrelated statement was added inside the branch
+/// (`record_global_timeout_deadline_source`, the timeout-provenance bookkeeping
+/// that every other early return in `try_pgd_attack_with_deadline` also performs).
+/// The source was right and the transcription was stale. This form pins the two
+/// things actually owed — the branch downgrades, and it never publishes a
+/// verdict — so unrelated bookkeeping may land inside it, while inverting the
+/// gate, deleting the downgrade, or promoting to `Violated` from inside the
+/// failure branch all still fail.
 #[ntest::timeout(5000)]
 #[test]
 fn test_pgd_revalidation_bounds_gate_source_guard_2711() {
-    assert_pgd_source_contains_2711(
-        r#"
-        if !input_within_bounds(&cx_input, input) {
-            warn!("PGD counterexample is outside input bounds. Downgrading to Unknown.");
-            return Ok(original_result);
-        }
-        "#,
-        "the out-of-bounds downgrade branch",
+    let body = pgd_bounds_gate_branch_body_2711();
+    let normalized = normalize_source_2711(&body);
+
+    assert!(
+        normalized.contains("return Ok(original_result);"),
+        "#2711: the out-of-bounds branch must DOWNGRADE by returning the caller's \
+         original result. Body was:\n{body}"
+    );
+    assert!(
+        !normalized.contains("Violated"),
+        "#2711: the out-of-bounds branch must never construct a Violated verdict — \
+         a counterexample outside the input box is not a counterexample. Body was:\n{body}"
+    );
+    assert!(
+        !normalized.is_empty(),
+        "#2711: the out-of-bounds branch is empty, so the gate falls through to the \
+         Violated promotion below it"
     );
 }

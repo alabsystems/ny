@@ -1524,7 +1524,7 @@ pub(in crate::beta_crown::engine::graph) fn root_comprehensive_gpu_intermediate_
     // #interm-row-chunking DELIVERY: the window count is supplied by the CALLER,
     // resolved from the typed preset key `root_comprehensive_gpu_interm_chunks`
     // with the governed `NY_INTERM_ROW_CHUNKS` lever as an A/B override. It is not
-    // read here because the scored entry point exports exactly one NY_* variable,
+    // read here because the scored entry point exports no NY_* variables,
     // so an env-only setting cannot fire in competition however well it measured
     // (crates/ny-cli/tests/measured_gate_delivery.rs).
     max_chunks: usize,

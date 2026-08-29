@@ -36,7 +36,7 @@ pub(crate) mod optimizer;
 mod result;
 
 pub use attacker::PgdAttacker;
-pub use config::{PgdConfig, PgdInitialization, GAMA_LAMBDA_DEFAULT};
+pub use config::{ExactVjpPgdConfig, PgdConfig, PgdInitialization, GAMA_LAMBDA_DEFAULT};
 pub use optimizer::{
     auto_alpha, project_to_bounds, project_to_bounds_in_place, AdamClippingParams, PgdAlphaMode,
     PgdOptimizer, PgdStepState,

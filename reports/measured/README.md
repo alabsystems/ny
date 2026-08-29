@@ -11,10 +11,17 @@ replay is deliberately host/path-bound to its retained runtime.
 
 The most recent aggregate ledger checked into this repository is
 [`configs/preset_score_at_risk.yaml`](../../configs/preset_score_at_risk.yaml),
-measured 2026-08-07 at `5382ddb8`: regular-16 **1394.5**, extended-9 **477.6**,
-and full-field-25 **1872.1**. Against the exact scorer-derived 2025 regular
-winner, 1566.894737 ([pinned official category table](https://github.com/VNN-COMP/vnncomp2025_results/blob/ea89fbc2518b6729f17c96eeec22c56c88e496a9/SCORING-ZERO-TOL/latex/scored.tex)),
-that snapshot is approximately **172.4 points behind**.
+re-measured 2026-08-11 at `0cb3005a`. Two of its three totals now carry a
+STALE banner added 2026-08-27: only extended-9 is current, at **482.8**
+(corrected from 499.6 when `vit_2023` was rescored to 0.0). Regular-16
+**1406.8** is stale and drifting upward; full-field-25 **1906.4** is stale by
+construction, since 1406.8 + 482.8 is 1889.6. Against the exact scorer-derived 2025
+regular winner, 1566.894737 ([pinned official category table](https://github.com/VNN-COMP/vnncomp2025_results/blob/ea89fbc2518b6729f17c96eeec22c56c88e496a9/SCORING-ZERO-TOL/latex/scored.tex)),
+that stale regular-16 is approximately **160.1 points behind** — an upper bound
+on the real gap, since regular-16 is drifting upward. It supersedes the
+2026-08-07 / `5382ddb8` snapshot (1394.5 / 477.6 / 1872.1), which the
+2026-08-11 rerun of the same command against the same pinned official checkout
+discharged.
 
 This is a ledger snapshot, not an exact live score. Later bank mutations do not
 automatically update it; rerun the scorer and refresh its provenance before
@@ -178,9 +185,10 @@ board — `linearizenn_2024` alone costs 6.7 h of wall for 98.3 points, against
 (`track,onnx,vnnlib,verdict,seconds`) — five columns, no `run_id` slot.
 `scripts/extended_bank/validate_bank.py:parse_source_row` reads a 6-column row
 as `measured_v1` and then rejects it because column 3 holds a verdict, not a
-prepared flag. So **195 extended decided rows carrying 477.6 normalized points
-have nowhere to say whether anybody has ever re-run them**, and this file's
-earlier claim that `traffic_signs_recognition_2023` carries the tag is FALSE —
+prepared flag. So **195 extended decided rows carrying the extended-9 ledger's
+482.8 normalized points have nowhere to say whether anybody has ever re-run
+them**, and this file's earlier claim that `traffic_signs_recognition_2023`
+carries the tag is FALSE —
 that ledger is five-column and untagged like the rest. The disambiguation is
 available whenever someone wants it (`VERDICTS` and `PREPARED_TOKENS` are
 disjoint, so a 6-column `extended_bank_v2` is unambiguous); until then, extended

@@ -8792,6 +8792,8 @@ pub(crate) fn try_graph_mip_escalation(
     graph.set_crown_ibp_per_node_time_budget(ny_propagate::types::CrownIbpPerNodeTimeBudget {
         floor_secs: Some(GRAPH_MIP_CROWN_PER_NODE_FLOOR_SECS),
         cap_secs: None,
+    prefix_cost_weighted: false,
+        max_target_share_frac: None,
     });
     // inc5e — ONE private clone retargeted (`set_output`) to the node whose
     // columns are the encoding's `output_vars` (the peeled logit for a final

@@ -150,6 +150,7 @@ fn run_batched(
         None,
         ibp_enhancement,
         stacked_rebound,
+        None,
     )
     .expect("batched dense-spec kernel should succeed")
 }
@@ -339,6 +340,16 @@ fn stacked_rebound_with_ibp_refresh_is_sound_and_not_looser() {
 /// 3. Fail-closed: on a graph with no whitelisted layer (pure Linear/ReLU),
 ///    enabling `stacked_rebound` must be byte-identical to the historical kernel
 ///    (the whitelist never fires; the refresh is off without `ibp_enhancement`).
+///
+/// NOTE — this A/B moves TWO gates, deliberately. `input_split_stacked_rebound`
+/// is also the SoA batched-backward lane's veto (`batched.rs`, the
+/// `&& !self.config.input_split_stacked_rebound` conjunct), so the `false` leg
+/// runs the #lsnc-batched-bwd fast lane and the `true` leg runs the per-domain
+/// reference loop. That makes this test a second, independent pin on SoA↔
+/// reference bit-parity, and it is how the 5-ULP upper-bound divergence
+/// surfaced when the fast lane's Linear arm drifted off its reference. Both
+/// couplings are supposed to be identities; if this ever goes red, check the
+/// SoA lane (`crown_batched_soa.rs`) before assuming the cgan whitelist fired.
 #[test]
 fn stacked_rebound_is_identity_without_whitelisted_layers() {
     let graph = build_multi_objective_child_parity_graph();
@@ -376,6 +387,7 @@ fn stacked_rebound_is_identity_without_whitelisted_layers() {
             None,
             false,
             stacked,
+            None,
         )
         .expect("batched kernel should succeed")
     };

@@ -101,9 +101,12 @@ def build(official_dir: Path) -> dict:
             "refused at bank time."
         ),
         "source": {
-            "results_txt": str(results_txt.relative_to(official_dir)),
+            # POSIX form: this lands in the COMMITTED reports/ce_falsified_watchlist.json
+            # (whose stored values are "alpha_beta_crown/results.csv"), so `str(Path)`
+            # would rewrite the artifact with backslashes when regenerated on Windows.
+            "results_txt": results_txt.relative_to(official_dir).as_posix(),
             "results_txt_sha256": _sha256(results_txt),
-            "reference_results_csv": str(reference_csv.relative_to(official_dir)),
+            "reference_results_csv": reference_csv.relative_to(official_dir).as_posix(),
             "reference_results_csv_sha256": _sha256(reference_csv),
         },
         "counts": {

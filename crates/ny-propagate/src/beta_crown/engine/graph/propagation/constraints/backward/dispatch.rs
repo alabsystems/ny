@@ -159,13 +159,23 @@ fn apply_constrained_backward_dispatch_result(
             // Authenticate every split path before the first publication. In
             // particular, a deadline during an O(N) bias scan cannot leave the
             // separate NETWORK_INPUT bias installed on its own.
-            for bound in bounds.iter().flatten() {
+            for bound in bounds.iter_dynamic() {
                 verify_constrained_split_path_bias_zero_with_deadline(
                     bound,
                     "Constrained dispatch n-ary split path",
                     params.deadline,
                 )?;
             }
+            // #nary-zip: the slot list is ONNX-ordered (`None` = embedded
+            // constant) and `current.node.inputs` is dynamic-only, so the
+            // pairing is owned by `NaryInputBounds`, which refuses fail-closed
+            // rather than dropping or misattributing a live branch. Resolve it
+            // BEFORE the bias carrier is installed so a refusal cannot leave
+            // the separate NETWORK_INPUT bias published on its own.
+            let paired = bounds.pair_with_dynamic_inputs(
+                &current.node.inputs,
+                "Constrained dispatch n-ary split path",
+            )?;
             // The zero-A bias wrapper is accumulated under NETWORK_INPUT, so
             // its column count MUST be the network-input width. The shared
             // deadline-aware helper constructs that carrier fallibly and polls
@@ -179,20 +189,18 @@ fn apply_constrained_backward_dispatch_result(
                 &mut setup.state.input_accumulated,
                 params.deadline,
             )?;
-            for (input_name, bound_opt) in current.node.inputs.iter().zip(bounds) {
-                if let Some(bound) = bound_opt {
-                    params
-                        .graph
-                        .accumulate_dense_bounds_to_input_with_deadline(
-                            input_name,
-                            bound,
-                            &mut setup.state.node_crown_bounds,
-                            setup.output_dim,
-                            setup.input_dim,
-                            &mut setup.state.input_accumulated,
-                            params.deadline,
-                        )?;
-                }
+            for (input_name, bound) in paired {
+                params
+                    .graph
+                    .accumulate_dense_bounds_to_input_with_deadline(
+                        input_name,
+                        bound,
+                        &mut setup.state.node_crown_bounds,
+                        setup.output_dim,
+                        setup.input_dim,
+                        &mut setup.state.input_accumulated,
+                        params.deadline,
+                    )?;
             }
             Ok(())
         }

@@ -2,12 +2,21 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! Gated, unwired bridge from an exact-decimal VNN-LIB box through the first
+//! Gated bridge from an exact-decimal VNN-LIB box through the first
 //! normalized ONNX `Conv2d` in a constrained-zonotope domain.
 //!
-//! This module is deliberately not called by a command or verdict path.  It
-//! closes the type/provenance seam between three independently qualified
-//! pieces while retaining a fail-closed boundary:
+//! HISTORY AND CURRENT STATUS. This module's stem/propagation surface and the
+//! `qualification` submodule's probes were deliberately unwired from every
+//! command and verdict path through 2026-08-24. Since #cz-hybrid, the
+//! qualification submodule exposes ONE wired production entry —
+//! `qualification::run_wired_metaroom_cz_hybrid` — reached from
+//! `handle_vnncomp_command` via `commands::cz_metaroom_wired`, gated by the
+//! typed `cz_hybrid` preset section's exact instance allowlist and wrapped in
+//! a fail-closed `catch_unwind` boundary. Everything else here remains
+//! probe-only.
+//!
+//! The stem closes the type/provenance seam between three independently
+//! qualified pieces while retaining a fail-closed boundary:
 //!
 //! 1. [`ny_onnx::vnnlib::CertifiedInputBox`] supplies outward binary64 input
 //!    endpoints plus exact-rational point hints.
@@ -25,3 +34,11 @@
 //! graph surfaces reject with a typed error.
 
 include!("cz_metaroom_unwired_impl.rs");
+
+// Qualification probes plus the wired #cz-hybrid cascade core. Declared here
+// (not inside the include!-shared impl file) so the `#[path]` resolves against
+// `src/commands/` for the binary while `examples/cz_metaroom_qualification.rs`
+// keeps its own manual include of the same source. Non-`#[test]` items compile
+// into the release binary; the `#[test]` probes remain test-only as before.
+#[path = "cz_metaroom_qualification.rs"]
+pub(crate) mod qualification;

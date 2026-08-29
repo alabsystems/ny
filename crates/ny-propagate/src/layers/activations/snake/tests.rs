@@ -3,9 +3,47 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::layers::activations::LinearRelaxation;
 use crate::LinearBounds;
 use ndarray::{Array1, Array2, ArrayD, IxDyn};
 use proptest::prelude::*;
+
+/// The exact production Kokoro negative alpha: `alpha[63]` of the
+/// `hexgrad/Kokoro-82M` Generator, f32 bits `0xbcd55dcc`.
+const KOKORO_NEGATIVE_ALPHA_BITS: u32 = 0xbcd5_5dcc;
+
+/// The point-reflection transfer: a sound relaxation of `f_{|a|}` on
+/// `[-u, -l]` becomes a sound relaxation of `f_a` on `[l, u]` by negating the
+/// intercepts and SWAPPING the lower/upper roles (coefficients preserved).
+/// Mirrors the `a < 0` branch of `snake_linear_relaxation` exactly.
+fn reflect(r: LinearRelaxation) -> LinearRelaxation {
+    LinearRelaxation::new(
+        r.upper_slope,
+        -r.upper_intercept,
+        r.lower_slope,
+        -r.lower_intercept,
+    )
+}
+
+/// Bit-level equality for relaxations (distinguishes `-0.0` from `0.0`; NaN
+/// payloads compare by bits).
+fn assert_relaxation_bits_eq(a: LinearRelaxation, b: LinearRelaxation, context: &str) {
+    assert_eq!(
+        (
+            a.lower_slope.to_bits(),
+            a.lower_intercept.to_bits(),
+            a.upper_slope.to_bits(),
+            a.upper_intercept.to_bits(),
+        ),
+        (
+            b.lower_slope.to_bits(),
+            b.lower_intercept.to_bits(),
+            b.upper_slope.to_bits(),
+            b.upper_intercept.to_bits(),
+        ),
+        "{context}: relaxations differ: {a:?} vs {b:?}"
+    );
+}
 
 #[test]
 fn test_new_stores_scalar_alpha() {
@@ -22,7 +60,7 @@ fn test_default_frequency() {
 }
 
 #[test]
-fn test_per_channel_constructor_rejects_empty_or_nonpositive() {
+fn test_per_channel_constructor_rejects_empty_zero_or_nonfinite() {
     assert!(
         SnakeLayer::per_channel(Array1::from_vec(vec![])).is_err(),
         "empty alpha must be rejected"
@@ -32,16 +70,48 @@ fn test_per_channel_constructor_rejects_empty_or_nonpositive() {
         "zero alpha must be rejected"
     );
     assert!(
-        SnakeLayer::per_channel(Array1::from_vec(vec![1.0, -0.5])).is_err(),
-        "negative alpha must be rejected"
+        SnakeLayer::per_channel(Array1::from_vec(vec![1.0, -0.0])).is_err(),
+        "negative-zero alpha must be rejected"
     );
     assert!(
         SnakeLayer::per_channel(Array1::from_vec(vec![1.0, f32::INFINITY])).is_err(),
         "infinite alpha must be rejected"
     );
     assert!(
+        SnakeLayer::per_channel(Array1::from_vec(vec![1.0, f32::NEG_INFINITY])).is_err(),
+        "negative-infinite alpha must be rejected"
+    );
+    assert!(
         SnakeLayer::per_channel(Array1::from_vec(vec![1.0, f32::NAN])).is_err(),
         "NaN alpha must be rejected"
+    );
+    // Negative FINITE non-zero alpha is a valid Snake frequency (certified via
+    // the point reflection); mixed signs within one tensor are the production
+    // Kokoro shape.
+    assert!(
+        SnakeLayer::per_channel(Array1::from_vec(vec![1.0, -0.5])).is_ok(),
+        "negative finite alpha must be accepted"
+    );
+}
+
+/// The per-channel refusal must name the offending index (fail-closed with a
+/// diagnosable message), and must fire per-element even when other elements
+/// are valid negatives.
+#[test]
+fn test_per_channel_rejection_message_carries_index() {
+    let err = SnakeLayer::per_channel(Array1::from_vec(vec![1.0, -0.5, 0.0]))
+        .expect_err("zero alpha at index 2 must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("alpha[2]"),
+        "error must name the offending index, got: {msg}"
+    );
+    let err = SnakeLayer::per_channel(Array1::from_vec(vec![-1.0, f32::NAN]))
+        .expect_err("NaN alpha at index 1 must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("alpha[1]"),
+        "error must name the offending index, got: {msg}"
     );
 }
 
@@ -720,20 +790,19 @@ fn test_relaxation_large_a_width_soundness_regression_3090() {
     }
 }
 
-/// Regression test for #3095: negative `a` causes unsound CROWN relaxation.
-/// The constructor must reject `a <= 0` since Ziyin et al. 2020 defines
-/// Snake only for positive frequency parameters.
+/// Successor of the #3095 gate test: the constructor gate NARROWED from
+/// `a <= 0` to `a == 0 || !finite`. Negative finite non-zero alpha is now
+/// accepted — the envelope transfers by point reflection, and the #3095
+/// chord-path defects stay unreachable because the chord path only ever
+/// executes with `a > 0`. Zero (both signs) and non-finite alpha stay
+/// refused, fail-closed.
 #[test]
-fn test_new_rejects_negative_a_3095() {
-    assert!(
-        SnakeLayer::new(-5.0).is_err(),
-        "negative a should be rejected"
-    );
-    assert!(
-        SnakeLayer::new(-0.001).is_err(),
-        "small negative a should be rejected"
-    );
+fn test_new_gate_is_zero_or_nonfinite_3095() {
     assert!(SnakeLayer::new(0.0).is_err(), "zero a should be rejected");
+    assert!(
+        SnakeLayer::new(-0.0).is_err(),
+        "negative zero a should be rejected"
+    );
     assert!(
         SnakeLayer::new(f32::NEG_INFINITY).is_err(),
         "negative infinity should be rejected"
@@ -751,6 +820,26 @@ fn test_new_rejects_negative_a_3095() {
     assert!(
         SnakeLayer::new(100.0).is_ok(),
         "large positive a should be accepted"
+    );
+    // Negative finite non-zero values are now accepted (point reflection).
+    assert!(
+        SnakeLayer::new(-5.0).is_ok(),
+        "negative a should be accepted"
+    );
+    assert!(
+        SnakeLayer::new(-0.001).is_ok(),
+        "small negative a should be accepted"
+    );
+    // Subnormal alpha of either sign: the positive gate has never floored
+    // small magnitudes (the band relaxation absorbs `|a| < 1e-8` soundly), so
+    // symmetry demands the same for negatives — no invented floor.
+    assert!(
+        SnakeLayer::new(1.0e-45).is_ok(),
+        "positive subnormal a should be accepted (band handles it)"
+    );
+    assert!(
+        SnakeLayer::new(-1.0e-45).is_ok(),
+        "negative subnormal a should be accepted (band handles it)"
     );
 }
 
@@ -874,6 +963,836 @@ proptest! {
                 upper_val >= fx,
                 "Snake upper bound UNSOUND at x={x}: {upper_val} < snake({x})={fx}, \
                  interval=[{l}, {u}], a={a}, gap={}", fx - upper_val
+            );
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Negative alpha: the point-reflection transfer
+//
+// For a < 0, snake_a(x) = x + sin²(ax)/a satisfies EXACTLY (real arithmetic)
+//     snake_a(x) = -snake_{|a|}(-x)
+// since 1/a = -1/|a| and sin² is even. IEEE negation is exact, so the
+// certified positive-alpha envelope transfers per element:
+//     lower_a([l,u]) = -upper_{|a|}([-u,-l]),
+//     upper_a([l,u]) = -lower_{|a|}([-u,-l]).
+// Each existing positive-alpha case below is asserted against its reflected
+// negative twin (bit-compared where the identity is exact), then the DIRECT
+// obligation — envelope encloses f_a at dense sample points against the f64
+// reference — is asserted independently of the reflection.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The reflection identity holds bit-for-bit in the f64 evaluator:
+/// `snake_eval_f64(x, a) == -snake_eval_f64(-x, -a)`. Round-to-nearest is
+/// symmetric under negation and every negation is exact, so this is equality
+/// of BITS, not approximate.
+#[test]
+fn test_eval_f64_point_reflection_is_bit_exact() {
+    let alphas = [0.01, 0.5, 1.0, 5.0, 100.0, 0.026045702];
+    for &a in &alphas {
+        for i in -50..=50 {
+            let x = (i as f64) * 0.37;
+            let direct = snake_eval_f64(x, -a);
+            let reflected = -snake_eval_f64(-x, a);
+            // An exact-zero result carries an unspecified zero SIGN through
+            // the two evaluation orders (`fl(x - d)` gives +0.0 where
+            // `-fl(d - x)` gives -0.0); IEEE `==` is the right equality
+            // there. Every non-zero result must match bit-for-bit.
+            assert_eq!(
+                direct, reflected,
+                "eval reflection identity broke at x={x}, a={a}"
+            );
+            if direct != 0.0 {
+                assert_eq!(
+                    direct.to_bits(),
+                    reflected.to_bits(),
+                    "eval reflection identity not bit-exact at x={x}, a={a}"
+                );
+            }
+        }
+    }
+}
+
+/// Every positive-alpha relaxation case from this suite, bit-compared against
+/// its reflected negative twin. Because the implementation IS the reflection
+/// this pins the transfer's shape (coefficients preserved, intercepts negated,
+/// roles swapped) against future drift; the load-bearing direct-obligation
+/// tests follow separately.
+#[test]
+fn test_relaxation_reflection_identity_bitwise_over_positive_suite() {
+    let kokoro = f32::from_bits(KOKORO_NEGATIVE_ALPHA_BITS).abs();
+    #[allow(clippy::excessive_precision)]
+    let cases: &[(f32, f32, f32)] = &[
+        // (l, u, positive a) — mirrors of the positive suite's cases.
+        (-3.0, 3.0, 0.5),
+        (-3.0, 3.0, 1.0),
+        (-3.0, 3.0, 5.0),
+        (-3.0, 3.0, 10.0),
+        (-10.0, 10.0, 0.01),
+        (1.0, 1.0, 5.0),
+        (0.0, 1e-8, 1e8),
+        (2.0, f32::INFINITY, 1.0),
+        (f32::NEG_INFINITY, 2.0, 1.0),
+        (f32::NEG_INFINITY, f32::INFINITY, 1.0),
+        (-50.0, 50.0, 100.0),
+        (-100.0, 100.0, 1000.0),
+        (-100.0, 100.0, 50.0),
+        (0.0, 3.084_070_9e22, 1e-12),
+        (-1.0, 1.0, kokoro),
+        (-200.0, 200.0, kokoro),
+    ];
+    for &(l, u, a) in cases {
+        assert!(a > 0.0, "case list must hold positive alphas");
+        let negative = snake_linear_relaxation(l, u, -a);
+        let transferred = reflect(snake_linear_relaxation(-u, -l, a));
+        assert_relaxation_bits_eq(
+            negative,
+            transferred,
+            &format!("reflection transfer at l={l}, u={u}, a={a}"),
+        );
+    }
+}
+
+/// Direct-obligation mirror of `test_relaxation_soundness` for negative alpha:
+/// envelope encloses f_a at 61 grid points, f64 reference.
+#[test]
+fn test_relaxation_soundness_negative_alpha() {
+    for &a in &[-0.5f32, -1.0, -5.0, -10.0] {
+        let r = snake_linear_relaxation(-3.0, 3.0, a);
+        for i in 0..61 {
+            let x = -3.0 + (i as f64) * 0.1;
+            let y = snake_eval_f64(x, f64::from(a));
+            let lb = f64::from(r.lower_slope) * x + f64::from(r.lower_intercept);
+            let ub = f64::from(r.upper_slope) * x + f64::from(r.upper_intercept);
+            assert!(lb <= y, "a={a}: lower {lb} > eval {y} at x={x}");
+            assert!(ub >= y, "a={a}: upper {ub} < eval {y} at x={x}");
+        }
+    }
+}
+
+/// Direct-obligation mirror of `test_relaxation_multi_period_soundness`.
+#[test]
+fn test_relaxation_multi_period_soundness_negative_alpha() {
+    let r = snake_linear_relaxation(-10.0, 10.0, -0.01);
+    for i in 0..201 {
+        let x = -10.0 + (i as f64) * 0.1;
+        let y = snake_eval_f64(x, -0.01);
+        let lb = f64::from(r.lower_slope) * x + f64::from(r.lower_intercept);
+        let ub = f64::from(r.upper_slope) * x + f64::from(r.upper_intercept);
+        assert!(lb <= y, "multi-period lower {lb} > eval {y} at x={x}");
+        assert!(ub >= y, "multi-period upper {ub} < eval {y} at x={x}");
+    }
+}
+
+/// Direct-obligation mirror of `test_relaxation_point_interval`.
+#[test]
+fn test_relaxation_point_interval_negative_alpha() {
+    let r = snake_linear_relaxation(1.0, 1.0, -5.0);
+    let y = snake_eval_f32(1.0, -5.0);
+    let lb = r.lower_slope * 1.0 + r.lower_intercept;
+    let ub = r.upper_slope * 1.0 + r.upper_intercept;
+    assert!(lb <= y && y <= ub, "point enclosure: [{lb}, {ub}] vs {y}");
+    assert!(
+        (lb - y).abs() < 1e-4 && (ub - y).abs() < 1e-4,
+        "point interval should be tight: [{lb}, {ub}] vs {y}"
+    );
+}
+
+/// Mirror of the #3083 infinite-endpoint tests. For a < 0 with u = +inf the
+/// LOWER side must still be a sound constant and the upper side +inf; the
+/// reflection maps this onto the certified l = -inf positive case.
+#[test]
+fn test_relaxation_infinite_upper_negative_alpha() {
+    let a = -1.0f32;
+    let l = 2.0f32;
+    let r = snake_linear_relaxation(l, f32::INFINITY, a);
+
+    assert_eq!(
+        r.lower_slope, 0.0,
+        "lower bound must be a constant, got slope {}",
+        r.lower_slope
+    );
+    assert_eq!(r.upper_slope, 0.0);
+    assert!(r.upper_intercept.is_infinite() && r.upper_intercept.is_sign_positive());
+
+    // f is monotone for every real a, so f(x) >= f(l) for x >= l.
+    let fl = snake_eval_f64(f64::from(l), f64::from(a));
+    assert!(
+        f64::from(r.lower_intercept) <= fl,
+        "lower_intercept {} must be <= f(l)={fl}",
+        r.lower_intercept
+    );
+    for &x in &[2.0f64, 5.0, 10.0, 100.0, 1000.0] {
+        let y = snake_eval_f64(x, f64::from(a));
+        assert!(
+            f64::from(r.lower_intercept) <= y,
+            "lower {} > f({x})={y}",
+            r.lower_intercept
+        );
+    }
+}
+
+/// Mirror of `test_relaxation_infinite_lower_soundness` for a < 0.
+#[test]
+fn test_relaxation_infinite_lower_negative_alpha() {
+    let a = -1.0f32;
+    let u = 2.0f32;
+    let r = snake_linear_relaxation(f32::NEG_INFINITY, u, a);
+
+    assert_eq!(r.lower_slope, 0.0);
+    assert!(r.lower_intercept.is_infinite() && r.lower_intercept.is_sign_negative());
+    assert_eq!(
+        r.upper_slope, 0.0,
+        "upper bound must be a constant, got slope {}",
+        r.upper_slope
+    );
+    let fu = snake_eval_f64(f64::from(u), f64::from(a));
+    assert!(
+        f64::from(r.upper_intercept) >= fu,
+        "upper_intercept {} must be >= f(u)={fu}",
+        r.upper_intercept
+    );
+    for &x in &[-1000.0f64, -100.0, -10.0, 0.0, 2.0] {
+        let y = snake_eval_f64(x, f64::from(a));
+        assert!(
+            f64::from(r.upper_intercept) >= y,
+            "upper {} < f({x})={y}",
+            r.upper_intercept
+        );
+    }
+}
+
+/// Mirror of `test_relaxation_both_infinite` for a < 0.
+#[test]
+fn test_relaxation_both_infinite_negative_alpha() {
+    let r = snake_linear_relaxation(f32::NEG_INFINITY, f32::INFINITY, -1.0);
+    assert_eq!(r.lower_slope, 0.0);
+    assert!(r.lower_intercept.is_infinite() && r.lower_intercept.is_sign_negative());
+    assert_eq!(r.upper_slope, 0.0);
+    assert!(r.upper_intercept.is_infinite() && r.upper_intercept.is_sign_positive());
+}
+
+/// Mirror of `test_relaxation_zero_alpha` at the other zero: `-0.0` is
+/// refused by the constructors, but the relaxation itself must resolve it to
+/// the exact identity limit like `+0.0` (IEEE `==` covers both zeros).
+#[test]
+fn test_relaxation_negative_zero_alpha() {
+    let r = snake_linear_relaxation(-1.0, 1.0, -0.0);
+    assert!((r.lower_slope - 1.0).abs() < 0.01);
+    assert!((r.upper_slope - 1.0).abs() < 0.01);
+}
+
+/// Mirror of `test_relaxation_narrow_interval_high_frequency_is_not_a_point`:
+/// for a = -1e8 the deviation hangs BELOW the identity, so it is the LOWER
+/// envelope that must carry the band.
+#[test]
+fn test_relaxation_narrow_interval_high_frequency_negative_alpha() {
+    let a = -1.0e8_f32;
+    let l = 0.0_f32;
+    let u = 1.0e-8_f32;
+    let r = snake_linear_relaxation(l, u, a);
+    for &x in &[f64::from(l), 0.5 * f64::from(u), f64::from(u)] {
+        let y = snake_eval_f64(x, f64::from(a));
+        let lower = f64::from(r.lower_slope) * x + f64::from(r.lower_intercept);
+        let upper = f64::from(r.upper_slope) * x + f64::from(r.upper_intercept);
+        assert!(
+            lower <= y,
+            "high-frequency negative-alpha lower envelope missed by {}",
+            lower - y
+        );
+        assert!(
+            upper >= y,
+            "high-frequency negative-alpha upper envelope missed by {}",
+            y - upper
+        );
+    }
+}
+
+/// Negative twin of `test_tiny_nonzero_alpha_relaxation_retains_global_residual`
+/// (extends the existing `-1e-9` case to the full alpha list): the residual
+/// `sin²(ax)/a` reaches `-1/|a|` at x = pi/(2|a|) and the band must sit on the
+/// LOWER side.
+#[test]
+fn test_tiny_negative_alpha_relaxation_retains_global_residual() {
+    for &a in &[-1e-9_f32, -1e-12_f32, -1e-20_f32] {
+        let x = (std::f64::consts::FRAC_PI_2 / f64::from(a.abs())) as f32;
+        let y = snake_eval_f64(f64::from(x), f64::from(a));
+        assert!(
+            f64::from(x) - y > 0.9 / f64::from(a.abs()),
+            "test point must exercise the non-identity residual for a={a}"
+        );
+
+        let r = snake_linear_relaxation(0.0, x, a);
+        let lower = f64::from(r.lower_slope) * f64::from(x) + f64::from(r.lower_intercept);
+        let upper = f64::from(r.upper_slope) * f64::from(x) + f64::from(r.upper_intercept);
+        assert!(
+            lower <= y,
+            "tiny-negative-alpha lower envelope missed by {}",
+            lower - y
+        );
+        assert!(
+            upper >= y,
+            "tiny-negative-alpha upper envelope missed by {}",
+            y - upper
+        );
+        assert!(r.lower_intercept < 0.0, "band must sit on the lower side");
+        assert_eq!(r.upper_intercept, 0.0, "upper side must stay the identity");
+    }
+}
+
+/// Negative twin of the #3090 regression: large |a|*width falls back to the
+/// conservative band, which after reflection must stay outward on both sides.
+#[test]
+fn test_relaxation_large_a_width_soundness_negative_3090() {
+    for &(a, l, u) in &[
+        (-100.0_f32, -50.0_f32, 50.0_f32),
+        (-1000.0, -100.0, 100.0),
+        (-50.0, -100.0, 100.0),
+    ] {
+        let r = snake_linear_relaxation(l, u, a);
+        let steps = 1000;
+        for i in 0..=steps {
+            let x = f64::from(l) + f64::from(u - l) * (i as f64) / (steps as f64);
+            let y = snake_eval_f64(x, f64::from(a));
+            let lb = f64::from(r.lower_slope) * x + f64::from(r.lower_intercept);
+            let ub = f64::from(r.upper_slope) * x + f64::from(r.upper_intercept);
+            assert!(
+                lb <= y + 1e-2,
+                "a={a}: lower {lb} > eval {y} at x={x} (negative #3090 twin)"
+            );
+            assert!(
+                ub >= y - 1e-2,
+                "a={a}: upper {ub} < eval {y} at x={x} (negative #3090 twin)"
+            );
+        }
+    }
+}
+
+/// Subnormal alpha of either sign is ACCEPTED (matching the positive gate,
+/// which has never floored small magnitudes) and the envelope fails closed to
+/// the loose-but-sound one-sided band — never the chord.
+#[test]
+fn test_subnormal_alpha_band_relaxation_is_sound_and_one_sided() {
+    let a = -1.0e-45_f32;
+    assert!(a != 0.0 && a.is_subnormal(), "test value must be subnormal");
+    let r = snake_linear_relaxation(-1.0, 1.0, a);
+    assert_eq!(r.lower_slope, 1.0);
+    assert_eq!(r.upper_slope, 1.0);
+    assert!(
+        r.lower_intercept <= 0.0,
+        "negative alpha band must sit at or below the identity"
+    );
+    assert_eq!(r.upper_intercept, 0.0);
+    for i in 0..=40 {
+        let x = -1.0 + (i as f64) * 0.05;
+        let y = snake_eval_f64(x, f64::from(a));
+        let lb = f64::from(r.lower_slope) * x + f64::from(r.lower_intercept);
+        let ub = f64::from(r.upper_slope) * x + f64::from(r.upper_intercept);
+        assert!(lb <= y && y <= ub, "subnormal-alpha enclosure at x={x}");
+    }
+}
+
+// ── Negative-alpha IBP twins ─────────────────────────────────────────────
+
+/// Mirror of `test_ibp_soundness_grid` for a = -5, plus the bit-level
+/// reflection cross-check against the positive twin's IBP output:
+/// lower_a([l,u]) = -upper_{|a|}([-u,-l]) and vice versa, exactly.
+#[test]
+fn test_ibp_soundness_grid_negative_alpha() {
+    let layer = SnakeLayer::new(-5.0).expect("negative alpha is a valid Snake");
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![-10.0]).expect("test: valid shape"),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![10.0]).expect("test: valid shape"),
+    )
+    .expect("test: valid bounds");
+    let out = layer.propagate_ibp(&input).expect("test: IBP propagation");
+
+    // Monotone for every real a: IBP is [f(l), f(u)] with directed rounding.
+    for i in 0..201 {
+        let x = -10.0 + (i as f64) * 0.1;
+        let y = snake_eval_f64(x, -5.0);
+        assert!(
+            f64::from(out.lower()[[0]]) <= y,
+            "IBP lower {} > eval {y} at x={x}",
+            out.lower()[[0]]
+        );
+        assert!(
+            f64::from(out.upper()[[0]]) >= y,
+            "IBP upper {} < eval {y} at x={x}",
+            out.upper()[[0]]
+        );
+    }
+
+    // Bit-level reflection: the positive twin on the negated, swapped box.
+    let twin = SnakeLayer::new(5.0).expect("test: valid Snake");
+    let twin_input = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![-10.0]).expect("test: valid shape"),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![10.0]).expect("test: valid shape"),
+    )
+    .expect("test: valid bounds");
+    let twin_out = twin
+        .propagate_ibp(&twin_input)
+        .expect("test: IBP propagation");
+    assert_eq!(
+        out.lower()[[0]].to_bits(),
+        (-twin_out.upper()[[0]]).to_bits(),
+        "IBP lower must be the exact negation of the reflected twin's upper"
+    );
+    assert_eq!(
+        out.upper()[[0]].to_bits(),
+        (-twin_out.lower()[[0]]).to_bits(),
+        "IBP upper must be the exact negation of the reflected twin's lower"
+    );
+}
+
+/// Mirror of `test_ibp_multi_period_tight_bounds` for a = -0.01.
+#[test]
+fn test_ibp_multi_period_tight_bounds_negative_alpha() {
+    let layer = SnakeLayer::new(-0.01).expect("negative alpha is a valid Snake");
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![-10.0]).expect("test: valid shape"),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![10.0]).expect("test: valid shape"),
+    )
+    .expect("test: valid bounds");
+    let out = layer.propagate_ibp(&input).expect("test: IBP propagation");
+
+    let bound_width = out.upper()[[0]] - out.lower()[[0]];
+    assert!(
+        bound_width < 25.0,
+        "Snake IBP bound width {bound_width} should stay near the true range"
+    );
+    let true_width = snake_eval_f32(10.0, -0.01) - snake_eval_f32(-10.0, -0.01);
+    assert!(
+        bound_width <= 2.0 * true_width + 1.0,
+        "bound width {bound_width} > 2x true width {true_width}"
+    );
+}
+
+/// Mirror of `test_ibp_large_alpha` for a = -100.
+#[test]
+fn test_ibp_large_negative_alpha() {
+    let layer = SnakeLayer::new(-100.0).expect("negative alpha is a valid Snake");
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![-10.0]).expect("test: valid shape"),
+        ArrayD::from_shape_vec(IxDyn(&[1]), vec![10.0]).expect("test: valid shape"),
+    )
+    .expect("test: valid bounds");
+    let out = layer.propagate_ibp(&input).expect("test: IBP propagation");
+
+    let bound_width = out.upper()[[0]] - out.lower()[[0]];
+    assert!(
+        bound_width < 20.5,
+        "large negative alpha bound width {bound_width} should be near 20.01"
+    );
+}
+
+// ── Mixed-sign per-channel alpha (the production Kokoro shape) ──────────
+
+/// Mixed-sign per-channel IBP with spatial dims [C, T]: the reflection is
+/// per-ELEMENT — one channel positive, one negative, in one propagation.
+#[test]
+fn test_per_channel_ibp_mixed_sign_alpha_spatial() {
+    let alphas = [0.5f32, -3.0];
+    let layer =
+        SnakeLayer::per_channel(Array1::from_vec(alphas.to_vec())).expect("mixed-sign alpha");
+    let input = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![-2.0, -1.0, 0.0, -3.0, 1.0, 2.0])
+            .expect("test: valid shape"),
+        ArrayD::from_shape_vec(IxDyn(&[2, 3]), vec![1.0, 2.0, 3.0, 0.0, 4.0, 5.0])
+            .expect("test: valid shape"),
+    )
+    .expect("test: valid bounds");
+
+    let out = layer.propagate_ibp(&input).expect("IBP propagation");
+
+    for c in 0..2 {
+        for t in 0..3 {
+            let a = f64::from(alphas[c]);
+            let expected_l = snake_eval_f64(f64::from(input.lower()[[c, t]]), a);
+            let expected_u = snake_eval_f64(f64::from(input.upper()[[c, t]]), a);
+            assert!(
+                f64::from(out.lower()[[c, t]]) <= expected_l
+                    && (f64::from(out.lower()[[c, t]]) - expected_l).abs() < 1e-4,
+                "c{c} t{t}: lower {} vs exact {expected_l} (alpha {})",
+                out.lower()[[c, t]],
+                alphas[c]
+            );
+            assert!(
+                f64::from(out.upper()[[c, t]]) >= expected_u
+                    && (f64::from(out.upper()[[c, t]]) - expected_u).abs() < 1e-4,
+                "c{c} t{t}: upper {} vs exact {expected_u} (alpha {})",
+                out.upper()[[c, t]],
+                alphas[c]
+            );
+        }
+    }
+}
+
+/// Mixed-sign per-channel CROWN: each diagonal entry must carry its own
+/// channel's relaxation — the negative channel through the reflection, the
+/// positive channel unchanged — and both must be sound.
+#[test]
+fn test_per_channel_crown_mixed_sign_alpha() {
+    let kokoro = f32::from_bits(KOKORO_NEGATIVE_ALPHA_BITS);
+    let alphas = [0.5f32, kokoro];
+    let layer =
+        SnakeLayer::per_channel(Array1::from_vec(alphas.to_vec())).expect("mixed-sign alpha");
+    let pre_act = BoundedTensor::new(
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![-1.0, -1.0]).expect("test: valid shape"),
+        ArrayD::from_shape_vec(IxDyn(&[2]), vec![1.0, 1.0]).expect("test: valid shape"),
+    )
+    .expect("test: valid bounds");
+    let bounds = LinearBounds::identity(2);
+    let result = layer
+        .propagate_linear_with_bounds(&bounds, &pre_act)
+        .expect("CROWN propagation");
+
+    for (dim, &a) in alphas.iter().enumerate() {
+        let expected = snake_linear_relaxation(-1.0, 1.0, a);
+        // Same tolerance as the positive per-channel suite: the backward
+        // pass applies its own outward rounding to the coefficients, so the
+        // result sits within an ulp of the per-element relaxation rather
+        // than reproducing it bit-for-bit.
+        assert!(
+            (result.lower_a[[dim, dim]] - expected.lower_slope).abs() < 1e-5,
+            "dim {dim} lower slope: {} vs {}",
+            result.lower_a[[dim, dim]],
+            expected.lower_slope
+        );
+        assert!(
+            (result.upper_a[[dim, dim]] - expected.upper_slope).abs() < 1e-5,
+            "dim {dim} upper slope: {} vs {}",
+            result.upper_a[[dim, dim]],
+            expected.upper_slope
+        );
+        assert!(
+            (result.lower_b[dim] - expected.lower_intercept).abs() < 1e-5,
+            "dim {dim} lower intercept: {} vs {}",
+            result.lower_b[dim],
+            expected.lower_intercept
+        );
+        assert!(
+            (result.upper_b[dim] - expected.upper_intercept).abs() < 1e-5,
+            "dim {dim} upper intercept: {} vs {}",
+            result.upper_b[dim],
+            expected.upper_intercept
+        );
+        // Backward-pass outputs carry ulp-level f32 evaluation slop beyond
+        // the strictly-rounded per-element relaxation (see CROWN_TOLERANCE
+        // in the proptest suite); the zero-tolerance obligation on
+        // `snake_linear_relaxation` itself is asserted by the direct tests.
+        for i in 0..=40 {
+            let x = -1.0 + (i as f64) * 0.05;
+            let y = snake_eval_f64(x, f64::from(a));
+            let lb = f64::from(result.lower_a[[dim, dim]]) * x + f64::from(result.lower_b[dim]);
+            let ub = f64::from(result.upper_a[[dim, dim]]) * x + f64::from(result.upper_b[dim]);
+            assert!(
+                lb <= y + 1e-4,
+                "dim {dim} (a={a}): lower {lb} > eval {y} at x={x}"
+            );
+            assert!(
+                ub >= y - 1e-4,
+                "dim {dim} (a={a}): upper {ub} < eval {y} at x={x}"
+            );
+        }
+    }
+}
+
+// ── The exact production Kokoro value ────────────────────────────────────
+
+/// Pin the exact production checkpoint value `alpha[63] = -0.026045702`
+/// (bits 0xbcd55dcc): accepted by both constructors, IBP sound on the
+/// recorded nn segment boxes, CROWN sound across several periods including
+/// the analytic critical points of f'.
+#[test]
+fn test_kokoro_production_negative_alpha() {
+    let a = f32::from_bits(KOKORO_NEGATIVE_ALPHA_BITS);
+    #[allow(clippy::excessive_precision)]
+    let expected = -0.026045702_f32;
+    assert_eq!(a.to_bits(), expected.to_bits(), "literal drifted");
+
+    // Constructors accept it, scalar and per-channel-among-positives.
+    SnakeLayer::new(a).expect("Kokoro alpha[63] must construct");
+    let mut alphas = vec![0.25f32; 64];
+    alphas[63] = a;
+    let layer = SnakeLayer::per_channel(Array1::from_vec(alphas)).expect("Kokoro alpha tensor");
+
+    // IBP on the recorded nn segment boxes:
+    //   [-1, 1]                      (kokoro_production_generator)
+    //   [-0.0038450854, 1.9374105]   (kokoro_generator_subblock_j3_check)
+    #[allow(clippy::excessive_precision)]
+    let boxes: &[(f32, f32)] = &[(-1.0, 1.0), (-0.0038450854, 1.9374105)];
+    for &(l, u) in boxes {
+        let input = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![l]).expect("test: valid shape"),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![u]).expect("test: valid shape"),
+        )
+        .expect("test: valid bounds");
+        let scalar_layer = SnakeLayer::new(a).expect("valid Snake");
+        let out = scalar_layer.propagate_ibp(&input).expect("IBP");
+        for i in 0..=400 {
+            let x = f64::from(l) + f64::from(u - l) * (i as f64) / 400.0;
+            let y = snake_eval_f64(x, f64::from(a));
+            assert!(
+                f64::from(out.lower()[[0]]) <= y && y <= f64::from(out.upper()[[0]]),
+                "Kokoro IBP enclosure failed at x={x} on [{l}, {u}]"
+            );
+        }
+    }
+
+    // CROWN across several periods (half-period pi/|a| ~= 120.6): dense grid
+    // plus the analytic critical points x = (theta + 2 pi k)/(2a) of f'
+    // (sin(2ax) = ±1) inside the box.
+    let (l, u) = (-200.0f32, 200.0f32);
+    let r = snake_linear_relaxation(l, u, a);
+    let a64 = f64::from(a);
+    let mut samples: Vec<f64> = (0..=2000)
+        .map(|i| f64::from(l) + f64::from(u - l) * (i as f64) / 2000.0)
+        .collect();
+    for theta in [-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2] {
+        // x = (theta + 2 pi k) / (2a); enumerate k so x lands in [l, u].
+        let k_lo = ((2.0 * a64 * f64::from(u) - theta) / std::f64::consts::TAU).ceil() as i64;
+        let k_hi = ((2.0 * a64 * f64::from(l) - theta) / std::f64::consts::TAU).floor() as i64;
+        let (k_lo, k_hi) = (k_lo.min(k_hi), k_lo.max(k_hi));
+        for k in k_lo..=k_hi {
+            let x = (theta + std::f64::consts::TAU * k as f64) / (2.0 * a64);
+            if x >= f64::from(l) && x <= f64::from(u) {
+                samples.push(x);
+            }
+        }
+    }
+    assert!(
+        samples.len() > 2001,
+        "critical-point enumeration must contribute points on a multi-period box"
+    );
+    for &x in &samples {
+        let y = snake_eval_f64(x, a64);
+        let lb = f64::from(r.lower_slope) * x + f64::from(r.lower_intercept);
+        let ub = f64::from(r.upper_slope) * x + f64::from(r.upper_intercept);
+        assert!(lb <= y, "Kokoro CROWN lower {lb} > eval {y} at x={x}");
+        assert!(ub >= y, "Kokoro CROWN upper {ub} < eval {y} at x={x}");
+    }
+
+    // The per-channel layer propagates a 64-channel box without error.
+    let lower = ArrayD::from_shape_vec(IxDyn(&[64]), vec![-1.0f32; 64]).expect("shape");
+    let upper = ArrayD::from_shape_vec(IxDyn(&[64]), vec![1.0f32; 64]).expect("shape");
+    let input = BoundedTensor::new(lower, upper).expect("bounds");
+    let out = layer.propagate_ibp(&input).expect("64-channel IBP");
+    let y63 = snake_eval_f64(1.0, f64::from(a));
+    assert!(
+        f64::from(out.lower()[[63]]) <= snake_eval_f64(-1.0, f64::from(a))
+            && f64::from(out.upper()[[63]]) >= y63,
+        "channel 63 must be bounded by its own (negative) alpha"
+    );
+}
+
+// ── Negative-alpha proptests ─────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(1000) })]
+
+    /// Negative twin of `proptest_snake_relaxation_strict_soundness`:
+    /// f64 reference, ZERO tolerance, 200-point grid, a = -1.0. This is the
+    /// load-bearing direct obligation (the bitwise reflection test alone
+    /// would be a tautology against the reflection implementation).
+    #[test]
+    fn proptest_snake_relaxation_strict_soundness_negative(
+        l in -10.0f32..10.0,
+        width in 0.01f32..20.0,
+    ) {
+        let u = l + width;
+        let a = -1.0_f32;
+        let relax = snake_linear_relaxation(l, u, a);
+        let ls = relax.lower_slope;
+        let li = relax.lower_intercept;
+        let us = relax.upper_slope;
+        let ui = relax.upper_intercept;
+
+        prop_assume!(ls.is_finite() && li.is_finite() && us.is_finite() && ui.is_finite());
+
+        for k in 0..=200 {
+            let t = k as f64 / 200.0;
+            let x = l as f64 + t * (u as f64 - l as f64);
+            let x = x.clamp(l as f64, u as f64);
+            let fx = snake_eval_f64(x, a as f64);
+
+            let lower_val = ls as f64 * x + li as f64;
+            prop_assert!(
+                lower_val <= fx,
+                "negative-alpha Snake lower bound UNSOUND at x={x}: {lower_val} > snake({x})={fx}, \
+                 interval=[{l}, {u}], a={a}, gap={}", lower_val - fx
+            );
+
+            let upper_val = us as f64 * x + ui as f64;
+            prop_assert!(
+                upper_val >= fx,
+                "negative-alpha Snake upper bound UNSOUND at x={x}: {upper_val} < snake({x})={fx}, \
+                 interval=[{l}, {u}], a={a}, gap={}", fx - upper_val
+            );
+        }
+    }
+
+    /// Sampled soundness for RANDOM negative alphas: envelope encloses
+    /// f_a at dense sample points, f64 reference, zero tolerance.
+    #[test]
+    fn proptest_snake_relaxation_random_negative_alpha_sound(
+        l in -50.0f32..50.0,
+        width in 0.0f32..50.0,
+        a in -100.0f32..-1e-4,
+    ) {
+        let u = l + width;
+        let relax = snake_linear_relaxation(l, u, a);
+        prop_assume!(
+            relax.lower_slope.is_finite()
+                && relax.lower_intercept.is_finite()
+                && relax.upper_slope.is_finite()
+                && relax.upper_intercept.is_finite()
+        );
+
+        for k in 0..=200 {
+            let t = k as f64 / 200.0;
+            let x = (l as f64 + t * (u as f64 - l as f64)).clamp(l as f64, u as f64);
+            let fx = snake_eval_f64(x, a as f64);
+            let lower_val = relax.lower_slope as f64 * x + relax.lower_intercept as f64;
+            let upper_val = relax.upper_slope as f64 * x + relax.upper_intercept as f64;
+            prop_assert!(
+                lower_val <= fx,
+                "random negative alpha lower UNSOUND: a={a}, [{l}, {u}], x={x}, gap={}",
+                lower_val - fx
+            );
+            prop_assert!(
+                upper_val >= fx,
+                "random negative alpha upper UNSOUND: a={a}, [{l}, {u}], x={x}, gap={}",
+                fx - upper_val
+            );
+        }
+    }
+
+    /// The reflection consistency property from the task spec: for random
+    /// (l <= u, a > 0), `snake_linear_relaxation(l, u, -a)` must equal
+    /// `reflect(snake_linear_relaxation(-u, -l, a))` coefficient-for-
+    /// coefficient (bitwise). Pins the transfer's shape against drift.
+    #[test]
+    fn proptest_snake_reflection_identity_bits(
+        l in -100.0f32..100.0,
+        width in 0.0f32..100.0,
+        a in 1e-10f32..100.0,
+    ) {
+        let u = l + width;
+        let negative = snake_linear_relaxation(l, u, -a);
+        let transferred = reflect(snake_linear_relaxation(-u, -l, a));
+        prop_assert_eq!(
+            (
+                negative.lower_slope.to_bits(),
+                negative.lower_intercept.to_bits(),
+                negative.upper_slope.to_bits(),
+                negative.upper_intercept.to_bits(),
+            ),
+            (
+                transferred.lower_slope.to_bits(),
+                transferred.lower_intercept.to_bits(),
+                transferred.upper_slope.to_bits(),
+                transferred.upper_intercept.to_bits(),
+            ),
+            "reflection transfer drifted at l={}, u={}, a={}", l, u, a
+        );
+    }
+
+    /// IBP soundness for random negative alphas: dense samples enclosed,
+    /// f64 reference, zero tolerance (the directed rounding must carry it).
+    #[test]
+    fn proptest_snake_ibp_negative_alpha_sound(
+        center in -20.0f32..20.0,
+        width in 0.0f32..20.0,
+        a in -50.0f32..-1e-4,
+    ) {
+        let l = center - width / 2.0;
+        let u = center + width / 2.0;
+        prop_assume!(l <= u);
+
+        let layer = SnakeLayer::new(a).expect("negative alpha is a valid Snake");
+        let input = BoundedTensor::new(
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![l]).expect("shape"),
+            ArrayD::from_shape_vec(IxDyn(&[1]), vec![u]).expect("shape"),
+        ).expect("bounds");
+        let out = layer.propagate_ibp(&input).expect("IBP");
+
+        for k in 0..=100 {
+            let t = k as f64 / 100.0;
+            let x = (l as f64 + t * (u as f64 - l as f64)).clamp(l as f64, u as f64);
+            let fx = snake_eval_f64(x, a as f64);
+            prop_assert!(
+                f64::from(out.lower()[[0]]) <= fx && fx <= f64::from(out.upper()[[0]]),
+                "negative-alpha IBP enclosure failed: a={}, [{}, {}], x={}, f(x)={}, got [{}, {}]",
+                a, l, u, x, fx, out.lower()[[0]], out.upper()[[0]]
+            );
+        }
+    }
+
+    /// Mixed-sign twin of `proptest_snake_ibp_spatial_per_channel_sound_4117`:
+    /// alpha signs ALTERNATE per channel (the Kokoro checkpoint mixes signs
+    /// within one alpha tensor), exercising the per-element reflection through
+    /// the #4117 stride mapping.
+    #[test]
+    fn proptest_snake_ibp_spatial_mixed_sign_per_channel_sound(
+        channels in 2usize..=8,
+        spatial in 2usize..=16,
+        alpha_base in 0.1f32..2.0f32,
+        alpha_step in 0.05f32..0.5f32,
+    ) {
+        let alphas: Vec<f32> = (0..channels)
+            .map(|c| {
+                let magnitude = alpha_base + alpha_step * c as f32;
+                if c % 2 == 0 { magnitude } else { -magnitude }
+            })
+            .collect();
+        let layer = SnakeLayer::per_channel(Array1::from_vec(alphas.clone()))
+            .expect("invariant: generated alphas are finite and non-zero");
+
+        let total = channels * spatial;
+        let lower_flat: Vec<f32> = (0..total)
+            .map(|i| -(1.0 + (i % spatial) as f32 * 0.3 + (i / spatial) as f32 * 0.2))
+            .collect();
+        let upper_flat: Vec<f32> = (0..total)
+            .map(|i| 0.5 + (i % spatial) as f32 * 0.15)
+            .collect();
+
+        let input = BoundedTensor::new(
+            Array2::from_shape_vec((channels, spatial), lower_flat.clone())
+                .expect("invariant: shape matches channels * spatial")
+                .into_dyn(),
+            Array2::from_shape_vec((channels, spatial), upper_flat.clone())
+                .expect("invariant: shape matches channels * spatial")
+                .into_dyn(),
+        )
+        .expect("invariant: lower <= upper elementwise");
+
+        let output = layer
+            .propagate_ibp(&input)
+            .expect("mixed-sign per-channel spatial inputs should propagate");
+        let out_lower = output.lower().as_slice().expect("contiguous");
+        let out_upper = output.upper().as_slice().expect("contiguous");
+
+        for flat_idx in 0..total {
+            let channel = flat_idx / spatial;
+            let alpha = alphas[channel];
+            let l = lower_flat[flat_idx];
+            let u = upper_flat[flat_idx];
+            let expected_l = snake_eval_f64(f64::from(l), f64::from(alpha));
+            let expected_u = snake_eval_f64(f64::from(u), f64::from(alpha));
+
+            prop_assert!(
+                f64::from(out_lower[flat_idx]) <= expected_l
+                    && (f64::from(out_lower[flat_idx]) - expected_l).abs() < 1e-4,
+                "flat_idx={}, channel={}, alpha={}: lower {} vs snake(l={})={}",
+                flat_idx, channel, alpha, out_lower[flat_idx], l, expected_l
+            );
+            prop_assert!(
+                f64::from(out_upper[flat_idx]) >= expected_u
+                    && (f64::from(out_upper[flat_idx]) - expected_u).abs() < 1e-4,
+                "flat_idx={}, channel={}, alpha={}: upper {} vs snake(u={})={}",
+                flat_idx, channel, alpha, out_upper[flat_idx], u, expected_u
             );
         }
     }

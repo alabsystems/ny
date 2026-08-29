@@ -16,6 +16,7 @@ use ny_core::{NyError, Result};
 
 use super::literal_cone::{is_exact_integer_literal_node, LiteralCone, LiteralExemptions};
 use super::quantization_preflight::RawDtypeResolver;
+use super::structural_schema::StructuralAuthentication;
 
 const FLOAT: i32 = 1;
 
@@ -52,6 +53,7 @@ pub(super) fn validate_arithmetic_float32_data_path(
     raw_dtypes: &mut RawDtypeResolver<'_>,
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
+    authenticated: &StructuralAuthentication,
 ) -> Result<()> {
     for value in node
         .input
@@ -75,7 +77,16 @@ pub(super) fn validate_arithmetic_float32_data_path(
             // bookkeeping the loader must erase into a literal before any
             // propagation runs. The refusal is deferred, not dropped — see
             // `literal_cone`.
-            if !is_exact_integer_literal_node(node, literals, raw_dtypes)? {
+            // The same holds for a node the structural pass PROVED is exact
+            // shape control (#cgan-int64-shape-arithmetic). `literal_cone`
+            // cannot answer for those: it deliberately excludes `Shape`, so a
+            // `Shape`-rooted index computation never enters the cone however
+            // static it is. The two tests are alternatives, not a widening —
+            // both land on the SAME deferral, so the node is admitted only if
+            // folding actually erases it.
+            if !is_exact_integer_literal_node(node, literals, raw_dtypes)?
+                && !node_is_structurally_authenticated(node, raw_dtypes, authenticated)?
+            {
                 return Err(refusal);
             }
             exemptions.record(node, &refusal);
@@ -83,6 +94,32 @@ pub(super) fn validate_arithmetic_float32_data_path(
         }
     }
     Ok(())
+}
+
+/// Is every tensor of `node` an INT64 value the structural pass authenticated?
+///
+/// Stricter than testing only the tensor that triggered the refusal: a node
+/// mixing a FLOAT operand with an authenticated one IS on the arithmetic data
+/// path and stays refused.
+fn node_is_structurally_authenticated(
+    node: &NodeProto,
+    raw_dtypes: &mut RawDtypeResolver<'_>,
+    authenticated: &StructuralAuthentication,
+) -> Result<bool> {
+    for value in node
+        .input
+        .iter()
+        .chain(node.output.iter())
+        .filter(|value| !value.is_empty())
+    {
+        let Some(dtype) = raw_dtypes.resolve(value)? else {
+            return Ok(false);
+        };
+        if dtype == FLOAT || !authenticated.contains(value) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn require_minimum_opset(node: &NodeProto, opset: i64, minimum: i64) -> Result<()> {
@@ -236,6 +273,7 @@ mod tests {
                 &mut raw_dtypes,
                 &literals,
                 &mut exemptions,
+                &StructuralAuthentication::default(),
             )
             .is_ok()
                 // A deferred literal-cone refusal is not an acceptance: this

@@ -1675,7 +1675,7 @@ fn interm_round_flag() -> bool {
 fn load_alpha_override() -> Option<Vec<Vec<Rat>>> {
     let path = std::env::var("NYCERT_ALPHA_FILE").ok()?;
     let txt = std::fs::read_to_string(&path).expect("read alpha file");
-    let v: serde_json::Value = serde_json::from_str(&txt).expect("alpha json");
+    let v: ny_cert::json::Json = ny_cert::json::from_str(&txt).expect("alpha json");
     let layers = v.as_array().expect("alpha: top array");
     let out: Vec<Vec<Rat>> = layers
         .iter()
@@ -2417,7 +2417,7 @@ fn main() {
         let ent = entailment_to_json(&entailment)?;
         std::fs::write(
             format!("{out_dir}/entailment.json"),
-            serde_json::to_string(&ent).unwrap(),
+            ny_cert::json::to_string(&ent),
         )
         .unwrap();
         Ok(())
@@ -2455,7 +2455,7 @@ fn main() {
             let far = farkas_to_json(&farkas)?;
             std::fs::write(
                 format!("{out_dir}/farkas.json"),
-                serde_json::to_string(&far).unwrap(),
+                ny_cert::json::to_string(&far),
             )
             .unwrap();
             Ok(())
@@ -2783,21 +2783,21 @@ fn trusted_conj_target(
     })
 }
 
-fn target_authority_json(index: usize, target: &ConjTarget) -> serde_json::Value {
-    let terms: Vec<serde_json::Value> = target
+fn target_authority_json(index: usize, target: &ConjTarget) -> ny_cert::json::Json {
+    let terms: Vec<ny_cert::json::Json> = target
         .provenance
         .terms
         .iter()
         .map(|term| {
-            serde_json::json!({
+            ny_cert::json!({
                 "source_row": term.source_row.0,
                 "multiplier": fmt_rat(&term.multiplier),
             })
         })
         .collect();
-    serde_json::json!({
+    ny_cert::json!({
         "target": index,
-        "label": target.label,
+        "label": target.label.clone(),
         "source_terms": terms,
         "reconstructed_readout": {
             "weights": target.out_w.iter().map(fmt_rat).collect::<Vec<_>>(),
@@ -3072,7 +3072,7 @@ fn exact_leaf_compute(
         Some(LeafOutcome {
             margin_s: fmt_rat(&margin),
             margin_f64: rat_to_f64(&margin),
-            farkas_json: serde_json::to_string(&far).unwrap(),
+            farkas_json: ny_cert::json::to_string(&far),
             max_bits: cert_max_bits(&entailment),
             selfcheck_us,
         })
@@ -3516,10 +3516,10 @@ fn conj_pipeline(
 
     // --- Emit the tree manifest ---------------------------------------------
     let rat_s = |r: &Rat| fmt_rat(r);
-    let box_json = |v: &[Rat]| -> serde_json::Value {
-        serde_json::Value::Array(
+    let box_json = |v: &[Rat]| -> ny_cert::json::Json {
+        ny_cert::json::Json::Arr(
             v.iter()
-                .map(|r| serde_json::Value::String(rat_s(r)))
+                .map(|r| ny_cert::json::Json::Str(rat_s(r)))
                 .collect(),
         )
     };
@@ -3530,12 +3530,12 @@ fn conj_pipeline(
         if screen_only {
             // f64-screen leaf: no exact margin exists and no certificate file
             // was written, so the manifest must not name one.
-            leaf_manifest.push(serde_json::json!({
+            leaf_manifest.push(ny_cert::json!({
                 "id": leaf.id,
                 "lo": box_json(&leaf.lo),
                 "hi": box_json(&leaf.hi),
                 "screened_target": leaf.target,
-                "screened_atom": targets[leaf.target].label,
+                "screened_atom": targets[leaf.target].label.clone(),
                 "margin_approx": leaf.margin_f64,
             }));
         } else {
@@ -3547,37 +3547,37 @@ fn conj_pipeline(
                 "CONJ: leaf {} carries no exact certificate",
                 leaf.id
             );
-            leaf_manifest.push(serde_json::json!({
+            leaf_manifest.push(ny_cert::json!({
                 "id": leaf.id,
                 "lo": box_json(&leaf.lo),
                 "hi": box_json(&leaf.hi),
                 "refuted_target": leaf.target,
-                "refuted_atom": targets[leaf.target].label,
-                "margin": leaf.margin_s,
+                "refuted_atom": targets[leaf.target].label.clone(),
+                "margin": leaf.margin_s.clone(),
                 "margin_approx": leaf.margin_f64,
                 "farkas": format!("leaf_{}.farkas.json", leaf.id),
             }));
         }
     }
-    let split_manifest: Vec<serde_json::Value> = splits
+    let split_manifest: Vec<ny_cert::json::Json> = splits
         .iter()
         .map(|(id, (c, mid, lid, rid))| {
-            serde_json::json!({
-                "id": id, "coord": c, "mid": rat_s(mid),
-                "lo_child": lid, "hi_child": rid,
+            ny_cert::json!({
+                "id": *id, "coord": *c, "mid": rat_s(mid),
+                "lo_child": *lid, "hi_child": *rid,
             })
         })
         .collect();
-    let original_unsafe_rows: Vec<serde_json::Value> = source_rows
+    let original_unsafe_rows: Vec<ny_cert::json::Json> = source_rows
         .iter()
         .map(|row| {
-            serde_json::json!({
+            ny_cert::json!({
                 "source_row": row.id.0,
-                "label": row.label,
+                "label": row.label.clone(),
             })
         })
         .collect();
-    let target_authority: Vec<serde_json::Value> = targets
+    let target_authority: Vec<ny_cert::json::Json> = targets
         .iter()
         .enumerate()
         .map(|(index, target)| target_authority_json(index, target))
@@ -3588,7 +3588,7 @@ fn conj_pipeline(
     // and a non-verdict line; never the certified tree type or
     // `CONJ_RESULT decided=true`.
     if screen_only {
-        let tree = serde_json::json!({
+        let tree = ny_cert::json!({
             "type": "conjunctive_screen_only_tree",
             "version": "1.0",
             "unsafe_atoms": targets.iter().map(|t| t.label.clone()).collect::<Vec<_>>(),
@@ -3606,7 +3606,7 @@ fn conj_pipeline(
         );
         std::fs::write(
             format!("{out_dir}/screen_tree.json"),
-            serde_json::to_string_pretty(&tree).unwrap(),
+            ny_cert::json::to_string_pretty(&tree),
         )
         .unwrap();
         println!(
@@ -3622,7 +3622,7 @@ fn conj_pipeline(
 
     // Certified emit: the per-leaf Farkas certs were self-checked and written
     // by the workers as each leaf closed.
-    let tree = serde_json::json!({
+    let tree = ny_cert::json!({
         "type": "conjunctive_unsat_tree",
         "version": "1.0",
         "unsafe_atoms": targets.iter().map(|t| t.label.clone()).collect::<Vec<_>>(),
@@ -3640,7 +3640,7 @@ fn conj_pipeline(
     );
     std::fs::write(
         format!("{out_dir}/tree.json"),
-        serde_json::to_string_pretty(&tree).unwrap(),
+        ny_cert::json::to_string_pretty(&tree),
     )
     .unwrap();
 

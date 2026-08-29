@@ -23,17 +23,55 @@
 //! Best-effort by construction: a sidecar write failure must NEVER affect the
 //! verdict or the exit code — the recorder logs on stderr (which survives
 //! `RUST_LOG=error` and lands in the per-instance logs) and continues.
+//!
+//! HARD-STOP COVERAGE (#flight-record-hard-stop). The sidecar was originally
+//! written only from the command's post-verdict exit paths, so a row the
+//! deadline watchdog HARD STOPS — the process is SIGKILLed/aborted, it never
+//! returns through those paths — left no record at all. MEASURED on the
+//! `isomorphic_acasxu_2026` sweep: sidecar coverage 32/50 rows and 1/19
+//! TIMEOUT rows, i.e. the recorder was blind on exactly the rows where the
+//! budget question has scoring consequence. [`FlightRecorder::write_hard_stop_sidecar`]
+//! closes that hole from the watchdog thread, immediately before the stop.
+//!
+//! Why an early flush at the stop and not an incremental append:
+//!
+//! * cost — an append/rewrite per [`FlightRecorder::note`] pays file I/O
+//!   inside every command-layer decision seam of every scored row; the
+//!   pre-stop flush pays exactly one write, and only on the rows that are
+//!   hard stopped. A row that finishes normally serializes exactly what it
+//!   serialized before, byte for byte;
+//! * torn files — the hard stop is a SIGKILL (helper) or `abort`, which can
+//!   land mid-`write`. A file appended to as the run proceeds would be
+//!   truncated in the middle of a JSON value precisely on the rows that
+//!   matter. The flush is staged and `rename`d, so it lands whole or not at
+//!   all;
+//! * evidence quality — at the flush point the watchdog has already decided
+//!   what it is committing to RESULTS_FILE, so the record can state it.
+//!
+//! A flush that runs before any verdict was recorded is marked partial in
+//! three redundant places: the `record_status` envelope, a terminal
+//! `run_incomplete` event, and the absence of the `run_complete` event that
+//! closes every completed record. A reader must never mistake it for a
+//! completed run: the lanes it lists are the lanes that ran BEFORE the stop,
+//! and it says nothing about lanes that would have run after.
+//!
+//! What is STILL not covered, so a later audit does not assume otherwise:
+//! the short-grace (safenlp) route, whose timer contract forbids any I/O
+//! between its boundary and the abort, and a process killed only by the
+//! out-of-process helper (budget + grace + 10 s) without its own watchdog
+//! thread ever running. Both leave no record, exactly as before.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Bump when the sidecar shape changes; consumers (the sweep's metadata bank,
 /// the expected-methods contracts) key on this.
 ///
 /// v2: `ambient_env` (NY_* + OMP_NUM_THREADS snapshot, I10 flag-zero) and the
-/// terminal `run_complete` event (lifecycle v0.5).
+/// terminal `run_complete` event (lifecycle v0.5). That original ambient
+/// capture contract is now called `ny-cli/ambient-env/v1`.
 ///
 /// v3: adds a two-stage `levers` envelope. `begin` freezes the registered raw
 /// environment inputs and records `not_materialized`; after the run context is
@@ -41,7 +79,24 @@ use std::sync::Mutex;
 /// replaces that state once with a layered registry receipt or an explicit
 /// `invalid_config` reason. Older v2 sidecars remain a supported input to the
 /// archival/qualification consumers.
+///
+/// `build_id` (#binary-identity) and `ambient_env_schema` were added to v3
+/// WITHOUT a global bump, deliberately. Both are additive fields read by key,
+/// and several Python gates refuse any record whose `schema_version` is not
+/// exactly their pinned constant. A missing `ambient_env_schema` identifies
+/// the legacy v1 capture; current proof requires v3, which captures both the
+/// current and deprecated Rayon worker-count variables.
 const SCHEMA_VERSION: u32 = 3;
+
+/// Current semantic contract for [`FlightRecord::ambient_env`].
+///
+/// v1 was implicit and captured `NY_*` plus `OMP_NUM_THREADS`. v2 added
+/// `RAYON_NUM_THREADS`, which controls the contextual default for margin-row
+/// parallelism. v3 also captures deprecated `RAYON_RS_NUM_CPUS`, which
+/// rayon-core 1.13 still honors whenever `RAYON_NUM_THREADS` is absent. Keeping
+/// this version separate from the broad flight schema lets old v3 records remain
+/// readable without treating them as current proof of a clean environment.
+pub(crate) const AMBIENT_ENV_SCHEMA: &str = "ny-cli/ambient-env/v3";
 
 /// What happened to one method/lane at a seam the command layer controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -58,6 +113,12 @@ pub(crate) enum FlightStatus {
     /// `run_complete` event that closes a record, so consumers can find the
     /// final verdict by type instead of by grepping method names.
     Complete,
+    /// Terminal disposition of a record flushed because the run was about to
+    /// be HARD STOPPED without ever reaching a verdict. Used only by the one
+    /// `run_incomplete` event that closes such a record. Distinct from
+    /// [`Self::Complete`] on the wire so a consumer that types the terminal
+    /// event cannot read a truncated trace as a finished one.
+    Incomplete,
 }
 
 /// One recorded seam: method name, disposition, why, and when.
@@ -93,10 +154,53 @@ pub(crate) enum LeverReceiptState {
     Resolved { receipt: serde_json::Value },
 }
 
+/// Whether a serialized record describes a run that reached its own exit path
+/// or one that was cut off (#flight-record-hard-stop).
+///
+/// Absent — the overwhelmingly common case — means the record was written by a
+/// terminal exit path, and this is the shape every v2/v3 consumer already
+/// reads. The field appears ONLY on a record flushed ahead of a hard stop, so
+/// a completed row's sidecar is unchanged byte for byte.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum RecordStatus {
+    /// The deadline watchdog was about to stop the process and no verdict had
+    /// been recorded. `events` is a PREFIX of the run: every lane it lists did
+    /// run, and a lane it does not list may simply never have been reached.
+    PartialHardStop {
+        /// What fired, and what it committed to RESULTS_FILE.
+        reason: String,
+        /// Seconds since `begin` at which the record was flushed — i.e. how
+        /// far the row actually got before it was cut off.
+        flushed_at_secs: f64,
+    },
+}
+
 /// The per-run record serialized to `<results_file>.flight.json`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct FlightRecord {
     pub(crate) schema_version: u32,
+    /// Partial-record marker; see [`RecordStatus`]. Skipped when the record is
+    /// complete, which keeps the completed-row schema exactly as consumers
+    /// (bank metadata, qualification scripts) already parse it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) record_status: Option<RecordStatus>,
+    /// WHICH VERIFIER produced this row (#binary-identity): the canonical
+    /// `NY_BUILD_STAMP_V1 …` line — derived version, cargo feature tier,
+    /// compiled backend class, impl markers, commit + dirty digest, toolchain.
+    ///
+    /// Every other field here describes the CONDITIONS of a measurement; this
+    /// one describes the PROGRAM. Four times this campaign a bank was
+    /// attributed to the wrong binary — most recently 330 rows sealed against
+    /// `cfe490f1… cuda` and measured by `e3d81cc2… mip-only wgpu` — and in
+    /// none of those cases could the artifact have told anyone, because
+    /// `ny --version` answered `0.3.0` on both sides.
+    ///
+    /// The STAMP, not the content-addressed `NY_BUILD_ID_V1`: hashing the
+    /// executable in the scored child would be charged against a per-instance
+    /// budget as small as 10 s. The `stamp=` digest is shared with the full id
+    /// the sweep manifest carries, so the two cross-link exactly.
+    pub(crate) build_id: String,
     /// `cuda` / `metal` / `gpu` / `cpu-only` from `compute_backend::detect()`.
     pub(crate) backend_kind: String,
     /// The one-line provenance summary sealed alongside the kind.
@@ -117,7 +221,11 @@ pub(crate) struct FlightRecord {
     pub(crate) category: String,
     /// The scored competition budget, not any internal tier.
     pub(crate) budget_secs: u64,
-    /// Every `NY_*` environment variable plus `OMP_NUM_THREADS`, snapshotted
+    /// Semantic version of the following ambient snapshot. Always present on
+    /// current records; absence identifies the legacy implicit v1 contract.
+    pub(crate) ambient_env_schema: &'static str,
+    /// Every `NY_*` environment variable plus `OMP_NUM_THREADS`,
+    /// `RAYON_NUM_THREADS`, and `RAYON_RS_NUM_CPUS`, snapshotted
     /// at `begin` (I10 #flag-zero, week-one enforcement): a dev-override that
     /// shaped this run must be visible in the artifact, because the bank
     /// linter's later refusal of non-allowlisted-flag rows can only judge
@@ -136,6 +244,10 @@ struct RecorderState {
     /// present non-UTF-8 values. Preset materialization must resolve against
     /// this frozen input rather than reopening the process environment.
     raw_levers: ny_levers::RawLeverInputs,
+    /// Runtime authority paired with `record.levers`. A duplicate
+    /// materialization receives this same allocation rather than constructing
+    /// an unrecorded second policy.
+    lever_authority: Option<Arc<ny_levers::LeverSet>>,
     /// Anchor for `at_secs`; monotonic so a wall-clock step cannot produce
     /// negative or wildly wrong offsets in the artifact.
     started: std::time::Instant,
@@ -143,10 +255,22 @@ struct RecorderState {
     /// the `run_complete` event is appended exactly once per serialized
     /// sidecar, however many times `write_sidecar` runs.
     verdict: Option<String>,
+    /// #stop-accounting — the engine's OWN stop reason, as constructed by
+    /// `GraphBabLifecycle::unresolved_reason()` and carried on
+    /// `BabVerificationStatus::Unknown`.
+    ///
+    /// That string names a depth cap, a queue eviction, an unsplittable
+    /// domain — and it was CONSTRUCTED AND THEN THROWN AWAY: the verdict seam
+    /// matches `Unknown { .. }` and returns a reasonless `VnncompResult`, so at
+    /// competition verbosity an `unknown` row carried no stop reason at all and
+    /// a row that quit on a depth cap with 94% of its budget unspent was
+    /// indistinguishable in the record from one that ran out of clock.
+    stop_reason: Option<String>,
 }
 
 /// Filter an arbitrary `(name, value)` stream down to the ambient flags the
-/// record captures: every `NY_*` variable plus `OMP_NUM_THREADS`.
+/// record captures: every `NY_*` variable plus `OMP_NUM_THREADS`,
+/// `RAYON_NUM_THREADS`, and deprecated `RAYON_RS_NUM_CPUS`.
 ///
 /// Takes an iterator instead of reading the process environment so unit tests
 /// need no env mutation — the real environment is process-global and tests run
@@ -155,19 +279,31 @@ pub(crate) fn ambient_env_from(
     vars: impl IntoIterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
     vars.into_iter()
-        .filter(|(name, _)| name.starts_with("NY_") || name == "OMP_NUM_THREADS")
+        .filter(|(name, _)| {
+            name.starts_with("NY_")
+                || matches!(
+                    name.as_str(),
+                    "OMP_NUM_THREADS" | "RAYON_NUM_THREADS" | "RAYON_RS_NUM_CPUS"
+                )
+        })
         .collect()
 }
 
 /// The production capture: the real process environment, lossily decoded so a
 /// non-UTF-8 value stays visible in the artifact rather than silently vanishing.
-fn ambient_env_snapshot() -> BTreeMap<String, String> {
-    ambient_env_from(std::env::vars_os().map(|(name, value)| {
+fn ambient_env_from_os(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> BTreeMap<String, String> {
+    ambient_env_from(vars.into_iter().map(|(name, value)| {
         (
             name.to_string_lossy().into_owned(),
             value.to_string_lossy().into_owned(),
         )
     }))
+}
+
+pub(crate) fn ambient_env_snapshot() -> BTreeMap<String, String> {
+    ambient_env_from_os(std::env::vars_os())
 }
 
 /// Event sink with interior mutability so call sites need no plumbing.
@@ -212,6 +348,8 @@ impl FlightRecorder {
         *self.lock() = Some(RecorderState {
             record: FlightRecord {
                 schema_version: SCHEMA_VERSION,
+                record_status: None,
+                build_id: crate::build_id::current_line().to_string(),
                 backend_kind: backend_kind.to_string(),
                 backend_summary: backend_summary.to_string(),
                 host: crate::compute_backend::host().clone(),
@@ -219,13 +357,16 @@ impl FlightRecorder {
                 load_avg_at_end: None,
                 category: category.to_string(),
                 budget_secs,
+                ambient_env_schema: AMBIENT_ENV_SCHEMA,
                 ambient_env: ambient_env_snapshot(),
                 levers: LeverReceiptState::NotMaterialized,
                 events: Vec::new(),
             },
             raw_levers,
+            lever_authority: None,
             started,
             verdict: None,
+            stop_reason: None,
         });
     }
 
@@ -239,26 +380,38 @@ impl FlightRecorder {
     pub(crate) fn materialize_levers(
         &self,
         config_value: impl FnMut(&'static ny_levers::LeverDecl) -> Option<ny_levers::LeverValue>,
-    ) {
-        if let Some(state) = self.lock().as_mut() {
-            if !matches!(state.record.levers, LeverReceiptState::NotMaterialized) {
-                // Like `finish`, first authority wins. A duplicate call is a
-                // recorder bug, but instrumentation must not rewrite evidence
-                // or perturb the verifier's outcome.
-                return;
-            }
-            state.record.levers = match ny_levers::LeverSet::resolve_layered(
-                ny_levers::all(),
-                &state.raw_levers,
-                config_value,
-            ) {
-                Ok(levers) => LeverReceiptState::Resolved {
+    ) -> Option<Arc<ny_levers::LeverSet>> {
+        let mut guard = self.lock();
+        let state = guard.as_mut()?;
+        if let Some(levers) = &state.lever_authority {
+            // Like `finish`, first authority wins. A duplicate call is a
+            // recorder bug, but instrumentation must not rewrite evidence.
+            // Returning the same Arc also prevents that bug from suppressing
+            // verifier execution or handing runtime an unrecorded snapshot.
+            return Some(Arc::clone(levers));
+        }
+        if !matches!(state.record.levers, LeverReceiptState::NotMaterialized) {
+            return None;
+        }
+        match ny_levers::LeverSet::resolve_layered(
+            ny_levers::all(),
+            &state.raw_levers,
+            config_value,
+        ) {
+            Ok(levers) => {
+                let levers = Arc::new(levers);
+                state.record.levers = LeverReceiptState::Resolved {
                     receipt: levers.receipt(),
-                },
-                Err(error) => LeverReceiptState::InvalidConfig {
+                };
+                state.lever_authority = Some(Arc::clone(&levers));
+                Some(levers)
+            }
+            Err(error) => {
+                state.record.levers = LeverReceiptState::InvalidConfig {
                     reason: error.to_string(),
-                },
-            };
+                };
+                None
+            }
         }
     }
 
@@ -290,6 +443,19 @@ impl FlightRecorder {
         }
     }
 
+    /// #stop-accounting — record the engine's own stop reason for the terminal
+    /// accounting line. Last writer wins: the reason that reaches the verdict
+    /// seam is the one that decided the published verdict.
+    pub(crate) fn note_stop_reason(&self, reason: &str) {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return;
+        }
+        if let Some(state) = self.lock().as_mut() {
+            state.stop_reason = Some(reason.to_string());
+        }
+    }
+
     /// A copy of the current record, for tests and the final serialization.
     pub(crate) fn snapshot(&self) -> Option<FlightRecord> {
         self.lock().as_ref().map(|state| state.record.clone())
@@ -302,10 +468,22 @@ impl FlightRecorder {
     /// keep the verdict that was actually published, not the latest caller's
     /// opinion of it.
     pub(crate) fn finish(&self, verdict: &str) {
+        let mut accounting = None;
         if let Some(state) = self.lock().as_mut() {
             if state.verdict.is_none() {
                 state.verdict = Some(verdict.to_string());
+                accounting = Some((
+                    state.started.elapsed().as_secs_f64(),
+                    state.record.budget_secs,
+                    state.stop_reason.clone(),
+                ));
             }
+        }
+        if let Some((wall_s, budget_secs, stop_reason)) = accounting {
+            eprintln!(
+                "{}",
+                stop_accounting_line(verdict, wall_s, budget_secs, stop_reason.as_deref())
+            );
         }
     }
 
@@ -359,6 +537,120 @@ impl FlightRecorder {
             );
         }
     }
+
+    /// Flush the record from the deadline watchdog, immediately BEFORE the
+    /// process is hard stopped (#flight-record-hard-stop).
+    ///
+    /// The command's post-verdict `write_sidecar` calls can only run on paths
+    /// that return; a watchdog stop never returns through them, which is why
+    /// hard-stopped rows had no sidecar at all. This is the same record, taken
+    /// one instant earlier.
+    ///
+    /// Two dispositions, decided by whether a terminal verdict was recorded:
+    ///
+    /// * `finish` HAS run — the row reached its answer and the stop is only
+    ///   forcing teardown (the measured "published `sat` at 1.7 s, then wedged
+    ///   in exit handlers" class). The record is COMPLETE and is written as
+    ///   such; it is byte-equivalent to what the wedged thread would have
+    ///   written, so this rescues rather than degrades that row's evidence.
+    /// * no verdict yet — the run was cut off. The record is marked
+    ///   [`RecordStatus::PartialHardStop`] and closed with a `run_incomplete`
+    ///   terminal event.
+    ///
+    /// SAFETY OF THE DEADLINE, which outranks the record:
+    ///
+    /// * it never blocks — the state lock is polled for a bounded moment and
+    ///   the flush is abandoned rather than waited on, so a hypothetical lock
+    ///   holder cannot delay the stop;
+    /// * it writes a staged file and `rename`s it, so a stop that lands during
+    ///   the write leaves either the previous sidecar or the new one, never a
+    ///   half-serialized one;
+    /// * it touches only the sidecar path, never RESULTS_FILE, and the caller
+    ///   invokes it only AFTER the watchdog has committed its verdict.
+    pub(crate) fn write_hard_stop_sidecar(&self, results_file: &Path, reason: &str) {
+        // The lock is only ever held for a push or a receipt projection — no
+        // I/O, no waiting — so contention here is a microsecond-scale race,
+        // not a wedge. Poll it briefly, then give up: the stop owns the clock.
+        const LOCK_ATTEMPTS: u32 = 5;
+        const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+        let mut guard = None;
+        for attempt in 0..LOCK_ATTEMPTS {
+            match self.state.try_lock() {
+                Ok(locked) => {
+                    guard = Some(locked);
+                    break;
+                }
+                // Someone else's panic must not cost the record.
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    guard = Some(poisoned.into_inner());
+                    break;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if attempt + 1 < LOCK_ATTEMPTS {
+                        std::thread::sleep(LOCK_POLL);
+                    }
+                }
+            }
+        }
+        let Some(mut guard) = guard else {
+            return;
+        };
+        // Before `begin`, exactly as elsewhere: an entry point that never
+        // opted into flight recording leaves no sidecar.
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        let at_secs = state.started.elapsed().as_secs_f64();
+        let mut record = state.record.clone();
+        match state.verdict.clone() {
+            Some(verdict) => record.events.push(FlightEvent {
+                method: "run_complete".to_string(),
+                status: FlightStatus::Complete,
+                reason: Some(verdict),
+                at_secs: Some(at_secs),
+            }),
+            None => {
+                record.record_status = Some(RecordStatus::PartialHardStop {
+                    reason: reason.to_string(),
+                    flushed_at_secs: at_secs,
+                });
+                record.events.push(FlightEvent {
+                    method: "run_incomplete".to_string(),
+                    status: FlightStatus::Incomplete,
+                    reason: Some(reason.to_string()),
+                    at_secs: Some(at_secs),
+                });
+            }
+        }
+        record.load_avg_at_end = crate::compute_backend::load_average();
+        // Release the lock before touching the filesystem: a note() racing the
+        // stop should never queue behind a write.
+        drop(guard);
+        write_record_atomically(&record, results_file);
+    }
+}
+
+/// Serialize `record` next to the results file so a concurrent hard stop can
+/// never expose a partially written sidecar: stage in the same directory, then
+/// `rename` (atomic on every platform this ships to). Infallible by the same
+/// contract as [`FlightRecorder::write_sidecar`], and silent — the watchdog
+/// path forbids stderr writes, which can block on a full pipe.
+fn write_record_atomically(record: &FlightRecord, results_file: &Path) {
+    let path = sidecar_path(results_file);
+    let Ok(body) = serde_json::to_string_pretty(record) else {
+        return;
+    };
+    let mut staged = path.clone().into_os_string();
+    staged.push(format!(".{}.staging", std::process::id()));
+    let staged = PathBuf::from(staged);
+    if std::fs::write(&staged, body).is_ok() {
+        if std::fs::rename(&staged, &path).is_err() {
+            // Leave nothing behind that a harness could collect as a sidecar.
+            let _ = std::fs::remove_file(&staged);
+        }
+    } else {
+        let _ = std::fs::remove_file(&staged);
+    }
 }
 
 /// The process-global recorder the scored `ny vnncomp` path writes through.
@@ -387,9 +679,113 @@ pub(crate) fn finish(verdict: &str) {
     global().finish(verdict);
 }
 
+/// #stop-accounting — record the engine's own stop reason on the global
+/// recorder. See [`FlightRecorder::note_stop_reason`].
+pub(crate) fn note_stop_reason(reason: &str) {
+    global().note_stop_reason(reason);
+}
+
+/// #stop-accounting — the terminal budget-accounting line, as a PURE function
+/// so the arithmetic is testable without a clock, a model, or a box slot.
+///
+/// One line, on stderr, at every publish path, at default verbosity. It exists
+/// because this campaign's bank cannot currently distinguish the three things a
+/// non-verdict row can be:
+///
+/// * a GENUINE TIMEOUT — `unspent_s` near zero;
+/// * an EARLY QUIT — `unspent_s` large AND a `reason=` naming an effort cap
+///   (depth, queue eviction, unsplittable domain);
+/// * a FAST REFUSAL — `unspent_s` large and a structural reason.
+///
+/// A banked `timeout` whose wall is far under budget is not a capability fact,
+/// and until this line existed the only way to tell was to re-run the row with
+/// `-v` and a dark telemetry variable.
+pub(crate) fn stop_accounting_line(
+    verdict: &str,
+    wall_s: f64,
+    budget_secs: u64,
+    stop_reason: Option<&str>,
+) -> String {
+    let budget = budget_secs as f64;
+    let unspent = (budget - wall_s).max(0.0);
+    let unspent_frac = if budget > 0.0 { unspent / budget } else { 0.0 };
+    format!(
+        "[stop] verdict={verdict} wall_s={wall_s:.2} budget_s={budget_secs} \
+         unspent_s={unspent:.2} unspent_frac={unspent_frac:.3} reason={}",
+        stop_reason.unwrap_or("none-recorded"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #stop-accounting — CONTAINMENT on the arithmetic, not finiteness.
+    ///
+    /// The three shapes this line has to separate are exactly the three causes
+    /// the board audit could not tell apart from a banked row: a genuine
+    /// timeout, an early quit, and a fast refusal.
+    #[test]
+    fn stop_accounting_line_reports_the_unspent_budget_and_the_engine_reason() {
+        // EARLY QUIT: an effort cap ended the search with 94% of the budget
+        // still on the clock. This is the ml4acopf 118_ieee_prop2 shape.
+        let early = stop_accounting_line("unknown", 6.14, 600, Some("Max depth 100 reached"));
+        assert!(early.contains("verdict=unknown"), "{early}");
+        assert!(early.contains("wall_s=6.14"), "{early}");
+        assert!(early.contains("budget_s=600"), "{early}");
+        assert!(early.contains("unspent_s=593.86"), "{early}");
+        assert!(early.contains("unspent_frac=0.990"), "{early}");
+        assert!(
+            early.contains("reason=Max depth 100 reached"),
+            "the engine's own stop reason must survive to the verdict seam: {early}"
+        );
+
+        // GENUINE TIMEOUT: the wall really is the budget.
+        let genuine = stop_accounting_line("timeout", 98.30, 100, None);
+        assert!(genuine.contains("unspent_s=1.70"), "{genuine}");
+        assert!(genuine.contains("unspent_frac=0.017"), "{genuine}");
+        assert!(
+            genuine.contains("reason=none-recorded"),
+            "an unrecorded reason must SAY SO rather than read as an empty one: {genuine}"
+        );
+
+        // A run that overran its budget must report zero unspent, never a
+        // negative one that would read as extra capacity.
+        let overrun = stop_accounting_line("timeout", 105.10, 30, None);
+        assert!(overrun.contains("unspent_s=0.00"), "{overrun}");
+        assert!(overrun.contains("unspent_frac=0.000"), "{overrun}");
+
+        // An unbounded run has no budget to be under.
+        let unbounded = stop_accounting_line("unsat", 12.0, 0, None);
+        assert!(unbounded.contains("unspent_frac=0.000"), "{unbounded}");
+    }
+
+    /// #stop-accounting — the reason recorded by the verdict seam must reach
+    /// the terminal line. A recorder that silently drops it reproduces the very
+    /// defect this exists to remove.
+    #[test]
+    fn recorder_carries_the_engine_stop_reason_to_the_terminal_line() {
+        let recorder = FlightRecorder::new();
+        recorder.begin("cpu-only", "cpu-only [test]", "ml4acopf_2024", 600);
+        recorder.note_stop_reason("   Max depth 100 reached   ");
+        let carried = recorder
+            .lock()
+            .as_ref()
+            .and_then(|state| state.stop_reason.clone());
+        assert_eq!(
+            carried.as_deref(),
+            Some("Max depth 100 reached"),
+            "the reason must be recorded, trimmed, on the live recorder"
+        );
+
+        // An empty reason must never overwrite a real one.
+        recorder.note_stop_reason("  ");
+        let after = recorder
+            .lock()
+            .as_ref()
+            .and_then(|state| state.stop_reason.clone());
+        assert_eq!(after.as_deref(), Some("Max depth 100 reached"));
+    }
 
     #[test]
     fn recorder_captures_events_in_order_with_timing_and_header() {
@@ -451,6 +847,7 @@ mod tests {
         assert_eq!(json["levers"]["status"], "not_materialized");
         assert_eq!(json["backend_kind"], "metal");
         assert_eq!(json["budget_secs"], 300);
+        assert_eq!(json["ambient_env_schema"], AMBIENT_ENV_SCHEMA);
         assert!(
             json["ambient_env"].is_object(),
             "the flag snapshot is always present, even when empty (flag-clean is a measurement)"
@@ -506,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_capture_keeps_ny_flags_and_omp_threads_only_sorted() {
+    fn ambient_capture_keeps_ny_flags_and_thread_controls_only_sorted() {
         // Injected pairs, not the process environment: env is process-global
         // and tests run in parallel, so the capture is tested at the seam
         // that filters, with production supplying the real iterator.
@@ -515,6 +912,8 @@ mod tests {
             ("NY_TEST_FLAG".to_string(), "1".to_string()),
             ("NY_ATTACK_ARMING_BLOCK".to_string(), "1".to_string()),
             ("OMP_NUM_THREADS".to_string(), "8".to_string()),
+            ("RAYON_NUM_THREADS".to_string(), "16".to_string()),
+            ("RAYON_RS_NUM_CPUS".to_string(), "4".to_string()),
             ("NY_A_EARLIER".to_string(), "yes".to_string()),
             // Prefix must anchor at the start: an embedded NY_ is not a flag.
             ("SOME_NY_LOOKALIKE".to_string(), "no".to_string()),
@@ -531,8 +930,33 @@ mod tests {
                 ("NY_A_EARLIER", "yes"),
                 ("NY_TEST_FLAG", "1"),
                 ("OMP_NUM_THREADS", "8"),
+                ("RAYON_NUM_THREADS", "16"),
+                ("RAYON_RS_NUM_CPUS", "4"),
             ],
-            "NY_* plus OMP_NUM_THREADS, sorted by name — deterministic artifact bytes"
+            "NY_* plus OMP/current-and-legacy-Rayon thread controls, sorted by name — deterministic artifact bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambient_capture_keeps_non_utf8_ny_presence_visible() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let captured = ambient_env_from_os([
+            (
+                std::ffi::OsString::from_vec(b"NY_NON_UTF8_\xff".to_vec()),
+                std::ffi::OsString::from_vec(vec![0xfe]),
+            ),
+            (
+                std::ffi::OsString::from_vec(b"UNRELATED_\xff".to_vec()),
+                std::ffi::OsString::from("hidden"),
+            ),
+        ]);
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured.get("NY_NON_UTF8_\u{fffd}").map(String::as_str),
+            Some("\u{fffd}"),
+            "schema v3 preserves non-Unicode NY_* presence with a deterministic lossy spelling"
         );
     }
 
@@ -558,25 +982,33 @@ mod tests {
         ny_test_utils::env::with_serialized_env_vars_removed(&["NY_ALPHA_ZERO_YIELD_FRAC"], || {
             let recorder = FlightRecorder::new();
             recorder.begin("cpu-only", "cpu-only [test]", "custom", 116);
-            recorder.materialize_levers(|decl| {
-                std::ptr::eq(
-                    decl,
-                    &raw const ny_levers::decls::root_alpha::ALPHA_ZERO_YIELD_FRAC,
-                )
-                .then_some(ny_levers::LeverValue::F64(0.25))
-            });
-            recorder.materialize_levers(|decl| {
-                std::ptr::eq(
-                    decl,
-                    &raw const ny_levers::decls::root_alpha::ALPHA_ZERO_YIELD_FRAC,
-                )
-                .then_some(ny_levers::LeverValue::F64(0.5))
-            });
+            let frozen = recorder
+                .materialize_levers(|decl| {
+                    std::ptr::eq(
+                        decl,
+                        &raw const ny_levers::decls::root_alpha::ALPHA_ZERO_YIELD_FRAC,
+                    )
+                    .then_some(ny_levers::LeverValue::F64(0.25))
+                })
+                .expect("valid first materialization returns runtime authority");
+            let duplicate = recorder
+                .materialize_levers(|decl| {
+                    std::ptr::eq(
+                        decl,
+                        &raw const ny_levers::decls::root_alpha::ALPHA_ZERO_YIELD_FRAC,
+                    )
+                    .then_some(ny_levers::LeverValue::F64(0.5))
+                })
+                .expect("duplicate receives the first frozen authority");
+            assert!(
+                Arc::ptr_eq(&frozen, &duplicate),
+                "receipt and every runtime caller must share one allocation"
+            );
             let record = recorder.snapshot().expect("record exists");
             let LeverReceiptState::Resolved { receipt } = record.levers else {
                 panic!("validated config must resolve the receipt");
             };
-            assert_eq!(receipt["schema"], "ny-levers/receipt/v2");
+            assert_eq!(receipt["schema"], "ny-levers/receipt/v3");
             let levers = receipt["levers"].as_array().expect("levers array");
             let zero_yield = levers
                 .iter()
@@ -584,6 +1016,11 @@ mod tests {
                 .expect("declared lever present");
             assert_eq!(zero_yield["value"], 0.25);
             assert_eq!(zero_yield["source"], "config");
+            assert_eq!(
+                frozen.get(&ny_levers::decls::root_alpha::ALPHA_ZERO_YIELD_FRAC),
+                ny_levers::LeverValue::F64(0.25),
+                "the object handed to runtime must be the object serialized into the receipt"
+            );
         });
     }
 
@@ -591,13 +1028,14 @@ mod tests {
     fn inadmissible_typed_projection_is_recorded_without_panicking() {
         let recorder = FlightRecorder::new();
         recorder.begin("cpu-only", "cpu-only [test]", "custom", 116);
-        recorder.materialize_levers(|decl| {
+        let materialized = recorder.materialize_levers(|decl| {
             std::ptr::eq(
                 decl,
                 &raw const ny_levers::decls::root_alpha::ALPHA_ZERO_YIELD_FRAC,
             )
             .then_some(ny_levers::LeverValue::F64(0.95))
         });
+        assert!(materialized.is_none());
 
         let record = recorder.snapshot().expect("record exists");
         let LeverReceiptState::InvalidConfig { reason } = record.levers else {
@@ -611,7 +1049,7 @@ mod tests {
         let recorder = FlightRecorder::new();
         recorder.begin("cpu-only", "cpu-only [test]", "custom", 116);
         recorder.mark_levers_invalid_config("preset field was out of range");
-        recorder.materialize_levers(|_| None);
+        assert!(recorder.materialize_levers(|_| None).is_none());
 
         let record = recorder.snapshot().expect("record exists");
         let LeverReceiptState::InvalidConfig { reason } = record.levers else {
@@ -661,6 +1099,236 @@ mod tests {
         assert!(
             recorder.snapshot().is_none(),
             "a verdict cannot arm a recorder that never began"
+        );
+    }
+
+    #[test]
+    fn a_hard_stopped_run_still_records_which_lanes_ran_marked_partial() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let recorder = FlightRecorder::new();
+        recorder.begin("cpu-only", "cpu-only [test]", "isomorphic_acasxu_2026", 100);
+        recorder.note("internal_timeout_route", FlightStatus::Ran, None);
+        recorder.note(
+            "relational_route",
+            FlightStatus::Ran,
+            Some("dual-network category".into()),
+        );
+        // No `finish`: the watchdog is stopping a run that never got a verdict.
+        recorder.write_hard_stop_sidecar(&results_file, "in-process watchdog; timeout committed");
+
+        let body = std::fs::read_to_string(sidecar_path(&results_file))
+            .expect("a hard-stopped row now leaves a sidecar");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("sidecar is valid JSON");
+        // The record answers the question the audit could not: which lanes ran.
+        let methods: Vec<&str> = json["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|event| event["method"].as_str().expect("method"))
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "internal_timeout_route",
+                "relational_route",
+                "run_incomplete"
+            ],
+            "the prefix that ran, closed by an explicit incomplete terminal"
+        );
+        // Marked partial in three independent places, because a reader that
+        // took this for a completed run would conclude the unlisted lanes were
+        // skipped rather than never reached.
+        assert_eq!(json["record_status"]["status"], "partial_hard_stop");
+        assert_eq!(
+            json["record_status"]["reason"],
+            "in-process watchdog; timeout committed"
+        );
+        assert!(
+            json["record_status"]["flushed_at_secs"].as_f64().is_some(),
+            "a partial record must say how far the row got"
+        );
+        let terminal = json["events"].as_array().expect("events").last().cloned();
+        let terminal = terminal.expect("terminal event");
+        assert_eq!(terminal["status"], "incomplete");
+        assert!(
+            json["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .all(|event| event["method"] != "run_complete"),
+            "run_complete is the completed-run marker and must never appear here"
+        );
+        // Still a v3 record in every other respect, so existing consumers parse it.
+        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["category"], "isomorphic_acasxu_2026");
+        assert_eq!(json["budget_secs"], 100);
+    }
+
+    #[test]
+    fn a_hard_stop_after_the_verdict_writes_a_complete_record_not_a_partial_one() {
+        // The measured "published sat at 1.7 s, then wedged in exit handlers"
+        // class: the row reached its answer and the stop only forces teardown.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let recorder = FlightRecorder::new();
+        recorder.begin("cpu-only", "cpu-only [test]", "cctsdb_yolo_2023", 350);
+        recorder.note("upfront_attack", FlightStatus::Ran, Some("sat".into()));
+        recorder.finish("sat");
+        recorder.write_hard_stop_sidecar(&results_file, "in-process watchdog; verdict preserved");
+
+        let body = std::fs::read_to_string(sidecar_path(&results_file)).expect("sidecar written");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("sidecar is valid JSON");
+        assert!(
+            json.get("record_status").is_none(),
+            "a run that reached its verdict is not partial, whatever ended the process"
+        );
+        let terminal = json["events"]
+            .as_array()
+            .expect("events")
+            .last()
+            .cloned()
+            .expect("terminal event");
+        assert_eq!(terminal["method"], "run_complete");
+        assert_eq!(terminal["status"], "complete");
+        assert_eq!(terminal["reason"], "sat");
+    }
+
+    #[test]
+    fn the_hard_stop_flush_leaves_a_complete_record_untouched_by_a_later_partial() {
+        // Ordering safety: the ordinary post-verdict write and the watchdog
+        // flush can race. Whichever runs second, the sidecar must still carry
+        // the verdict — never a partial that erases it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let recorder = FlightRecorder::new();
+        recorder.begin("cpu-only", "cpu-only [test]", "cersyve", 100);
+        recorder.note("internal_verifier", FlightStatus::Ran, None);
+        recorder.finish("unsat");
+        recorder.write_sidecar(&results_file);
+        recorder.write_hard_stop_sidecar(&results_file, "in-process watchdog");
+
+        let body = std::fs::read_to_string(sidecar_path(&results_file)).expect("sidecar written");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("sidecar is valid JSON");
+        assert!(json.get("record_status").is_none());
+        let terminals: Vec<_> = json["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter(|event| event["method"] == "run_complete")
+            .collect();
+        assert_eq!(terminals.len(), 1, "exactly one terminal disposition");
+        assert_eq!(terminals[0]["reason"], "unsat");
+    }
+
+    #[test]
+    fn the_hard_stop_flush_leaves_no_staging_file_behind() {
+        // A harness collects the instance directory; a leftover staging file
+        // would be a second, unversioned artifact claiming to be a record.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let recorder = FlightRecorder::new();
+        recorder.begin("cpu-only", "cpu-only [test]", "acasxu_2023", 116);
+        recorder.write_hard_stop_sidecar(&results_file, "in-process watchdog");
+
+        let entries: Vec<String> = std::fs::read_dir(tmp.path())
+            .expect("readdir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            entries,
+            ["result.txt.flight.json"],
+            "the record lands under exactly one name, atomically"
+        );
+    }
+
+    #[test]
+    fn before_begin_a_hard_stop_flush_writes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let recorder = FlightRecorder::new();
+        recorder.note("upfront_attack", FlightStatus::Ran, None);
+        recorder.write_hard_stop_sidecar(&results_file, "in-process watchdog");
+        assert!(
+            !sidecar_path(&results_file).exists(),
+            "a run that never armed the recorder cannot be attributed a partial record"
+        );
+    }
+
+    #[test]
+    fn a_hard_stop_flush_onto_an_unwritable_path_is_non_fatal() {
+        // Same contract as the post-verdict write: the deadline outranks the
+        // record, and an unwritable sidecar path must cost neither.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker");
+        let results_file = blocker.join("result.txt");
+
+        let recorder = FlightRecorder::new();
+        recorder.begin("cpu-only", "cpu-only [test]", "safenlp_2024", 20);
+        recorder.note("internal_verifier", FlightStatus::Ran, None);
+        recorder.write_hard_stop_sidecar(&results_file, "in-process watchdog");
+        assert!(
+            recorder.snapshot().is_some(),
+            "the in-memory record survives a failed flush"
+        );
+        assert!(
+            recorder.snapshot().expect("record").record_status.is_none(),
+            "the flush marks the SERIALIZED copy, never the live record"
+        );
+    }
+
+    #[test]
+    fn a_completed_record_is_unchanged_by_the_partial_marker_field() {
+        // The completed-row schema is a consumer contract (bank metadata,
+        // qualification scripts key on v3). Adding the partial envelope must
+        // not add a key to records that are not partial.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let results_file = tmp.path().join("result.txt");
+        let recorder = FlightRecorder::new();
+        recorder.begin("cpu-only", "cpu-only [test]", "acasxu_2023", 116);
+        recorder.note("result_publish", FlightStatus::Ran, Some("unsat".into()));
+        recorder.finish("unsat");
+        recorder.write_sidecar(&results_file);
+
+        let body = std::fs::read_to_string(sidecar_path(&results_file)).expect("sidecar written");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("sidecar is valid JSON");
+        let keys: Vec<&str> = json
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // `serde_json::Value` sorts object keys, so this is the key SET the
+        // completed schema promises — nothing added, nothing dropped.
+        assert_eq!(
+            keys,
+            [
+                "ambient_env",
+                "ambient_env_schema",
+                "backend_kind",
+                "backend_summary",
+                "budget_secs",
+                // #binary-identity: WHICH VERIFIER produced the row. Not
+                // optional in the key set — a record that cannot name its
+                // binary is the exact artifact that let 330 rows be
+                // misattributed on 2026-08-21.
+                "build_id",
+                "category",
+                "events",
+                "host",
+                "levers",
+                "load_avg_at_begin",
+                "load_avg_at_end",
+                "schema_version",
+            ],
+            "no new key may appear on a completed record"
         );
     }
 

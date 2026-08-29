@@ -21,6 +21,31 @@ use super::super::super::super::tensor_ext::BoundedTensorExt;
 use super::super::super::super::BetaCrownVerifier;
 use super::super::super::DomainCrownResult;
 
+/// #oom-shrink-retry: decide whether a batched-lane failure must be SURFACED to
+/// the adaptive caller as a retryable refusal, or absorbed by this function's
+/// local non-shrinking fallback.
+///
+/// Extracted so the decision is directly unit-testable. It used to be inlined
+/// at both failure sites below (`BatchedDomains` construction and the batched
+/// CROWN backward) as duplicated `if retry_refusals { if let Some(reason) = … }`
+/// blocks, testable only by getting a real refusal to travel all the way up
+/// from a layer kernel. No mock `GemmEngine` can do that any more: every
+/// layer-local engine consumer treats a `GpuMemoryExceeded` as non-terminal and
+/// falls back to CPU (see `crown_batched::engine_error_is_terminal`), and the
+/// one arm that did propagate it — the multi-domain Linear engine GEMM — is no
+/// longer on the batched backward's Linear path at all. The surfacing rule is
+/// still live for a real accelerator backend, so the rule is tested here rather
+/// than left untested behind an injection point that no longer exists.
+pub(super) fn surfaced_refusal(
+    retry_refusals: bool,
+    error: &ny_core::NyError,
+) -> Option<MicrobatchRefusalReason> {
+    if !retry_refusals {
+        return None;
+    }
+    MicrobatchRefusalReason::from_error(error)
+}
+
 impl BetaCrownVerifier {
     /// Process multiple graph BaB domains with GPU-batched CROWN computation.
     ///
@@ -366,10 +391,8 @@ impl BetaCrownVerifier {
         ) {
             Ok(b) => b,
             Err(e) => {
-                if retry_refusals {
-                    if let Some(reason) = MicrobatchRefusalReason::from_error(&e) {
-                        return Err(reason);
-                    }
+                if let Some(reason) = surfaced_refusal(retry_refusals, &e) {
+                    return Err(reason);
                 }
                 tracing::warn!(
                     "BatchedDomains creation failed ({}), returning PropagationFailure (#1993)",
@@ -395,10 +418,8 @@ impl BetaCrownVerifier {
             ) {
             Ok(results) => results,
             Err(e) => {
-                if retry_refusals {
-                    if let Some(reason) = MicrobatchRefusalReason::from_error(&e) {
-                        return Err(reason);
-                    }
+                if let Some(reason) = surfaced_refusal(retry_refusals, &e) {
+                    return Err(reason);
                 }
                 // If batched processing fails, fall back to sequential with beta
                 // optimization. Part of #1484.
@@ -477,6 +498,24 @@ impl BetaCrownVerifier {
             if let Some((output, node_cache)) = bounds_result {
                 let l = output.lower_scalar();
                 let u = output.upper_scalar();
+                // #bab-warm-start trace, batched multi-objective twin of the
+                // sequential [child-trace] (NY_BAB_CHILD_TRACE=1).
+                {
+                    static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    static COUNT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    if *TRACE_ON.get_or_init(|| {
+                        std::env::var("NY_BAB_CHILD_TRACE").ok().as_deref() == Some("1")
+                    }) {
+                        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n.is_multiple_of(197) {
+                            eprintln!(
+                                "[bchild-trace] depth={} lower={l:.6} upper={u:.6}",
+                                child.depth,
+                            );
+                        }
+                    }
+                }
                 // #cone-delta increment 2: the result map is already Arc-shared
                 // (out-of-cone entries alias the parent's) — install by move.
                 child.node_bounds = node_cache;

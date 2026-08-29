@@ -182,7 +182,10 @@ const U32_UNIT: f64 = 5.960_464_477_539_063e-8;
 /// Relative slack allowed to the realization probe, so the probe's own f64
 /// evaluation of the functional cannot false-trip a correct bound. Gross
 /// unsoundness is orders of magnitude above this.
-const PROBE_REL_SLACK: f64 = 1e-9;
+// pub(crate): the certified GPU backward's CACHED realization probe
+// (`gpu_backward::cache::probe_guard_cached`, fix A3) applies the same
+// tolerance to the same functional — one constant, not a drifting copy.
+pub(crate) const PROBE_REL_SLACK: f64 = 1e-9;
 
 /// Why the seam declined to produce an authoritative pass. Every variant means
 /// the caller must run the exact CPU backward.
@@ -262,24 +265,21 @@ fn note_refusal(refusal: Refusal) {
     }
 }
 
-/// Pure arming predicate — the SPEC of the gate, unit-tested below.
+/// Pure legacy-environment arming predicate, retained as a regression oracle
+/// for the exact parser used before this gate gained a typed preset route.
+#[cfg(test)]
 #[inline]
 fn armed_from_raw(raw: Option<&str>) -> bool {
     raw == Some("1")
 }
 
-/// Latched raw `NY_MARGIN_ROW_GPU` string, read once through the ny-levers
-/// chokepoint (latch the STRING, derive the DECISION per call).
-fn env_raw() -> Option<&'static str> {
-    static RAW: OnceLock<Option<String>> = OnceLock::new();
-    RAW.get_or_init(|| ny_levers::read_raw(&ny_levers::decls::sound_channel::MARGIN_ROW_GPU))
-        .as_deref()
-}
-
-/// Is the seam armed?
+/// Is the seam armed? The resolved environment/preset decision remains
+/// process-wide and first-read latched, matching the historical raw-string
+/// `OnceLock`'s observable behavior.
 #[inline]
 pub(crate) fn enabled() -> bool {
-    armed_from_raw(env_raw())
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(crate::preset_gates::margin_row_gpu_enabled)
 }
 
 /// Everything the seam needs that the pure-CPU lane does not carry.
@@ -525,6 +525,7 @@ impl Builder<'_, '_> {
     ///
     /// Residual BRANCHES are strictly unary: a nested `Add`, a `Gemm` or a
     /// `ChannelAffine` inside one is a refusal, not a repair.
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
         from: usize,
@@ -532,6 +533,7 @@ impl Builder<'_, '_> {
         out: &mut Vec<GpuCrownLayer>,
         node_abs: &mut Vec<Vec<f32>>,
         relus: &mut Vec<usize>,
+        conv_ops: &mut Vec<usize>,
         rho_star: &mut f64,
     ) -> Result<(), Refusal> {
         let mut tid = from;
@@ -561,6 +563,7 @@ impl Builder<'_, '_> {
                     let (l, rho) = conv(cv)?;
                     *rho_star = rho_star.max(rho);
                     out.push(l);
+                    conv_ops.push(tid - 1);
                     tid = cv.input;
                 }
                 TwinOp::ChannelAffine { .. } => {
@@ -646,10 +649,38 @@ fn build_plan(
 /// TRAVERSAL — rather than re-walking the op list separately — is what makes a
 /// drift between "the k-th Activation" and "the layer whose gates it carries"
 /// unrepresentable. `plan_relu_layers_track_the_emitted_activations` pins it.
-fn build_plan_full(
+pub(crate) fn build_plan_full(
     eng: &BackwardEngine<'_>,
     dom: Option<&DomainGates>,
 ) -> Result<(Plan, Vec<Vec<f32>>, f64, Vec<usize>), Refusal> {
+    let ext = build_plan_ext(eng, dom)?;
+    Ok((ext.plan, ext.node_abs, ext.rho_star, ext.relus))
+}
+
+/// [`build_plan_full`] plus F64-WEIGHT PROVENANCE: the `net.ops` index of every
+/// emitted `Conv2d`, in the SAME fold order as the plan's conv layers.
+///
+/// Consumer: the certified GPU backward (`gpu_backward::transaction`), whose
+/// value lane carries weights as double-single PAIRS split from the engine's
+/// own f64 parameters (so the u32 downcast ball this builder charges via
+/// [`weight_error`] never enters that lane's radius). Deriving the list FROM
+/// THIS TRAVERSAL — exactly like `relus` — is what makes "the k-th Conv2d" and
+/// "the ConvOp whose weights it carries" impossible to misalign; the consumer
+/// still fail-closed-validates shapes per layer. Emitting indices is
+/// behavior-neutral for every other caller ([`build_plan_full`] drops them).
+pub(crate) struct PlanExt {
+    pub(crate) plan: Plan,
+    pub(crate) node_abs: Vec<Vec<f32>>,
+    pub(crate) rho_star: f64,
+    pub(crate) relus: Vec<usize>,
+    /// Fold-order `net.ops` indices of every emitted `Conv2d` layer.
+    pub(crate) conv_ops: Vec<usize>,
+}
+
+pub(crate) fn build_plan_ext(
+    eng: &BackwardEngine<'_>,
+    dom: Option<&DomainGates>,
+) -> Result<PlanExt, Refusal> {
     let net = eng.net;
     let builder = Builder { eng, dom };
     let (w1, b1, (n_y, n_h)) = net.gemm1();
@@ -680,6 +711,7 @@ fn build_plan_full(
     let mut chain: Vec<GpuCrownLayer> = vec![head];
     let mut node_abs: Vec<Vec<f32>> = Vec::new();
     let mut relus: Vec<usize> = Vec::new();
+    let mut conv_ops: Vec<usize> = Vec::new();
     let mut saw_residual = false;
     let mut layer_count = 1usize;
     let mut steps = 0usize;
@@ -706,6 +738,7 @@ fn build_plan_full(
                 let (l, rho) = conv(cv)?;
                 rho_star = rho_star.max(rho);
                 chain.push(l);
+                conv_ops.push(tid - 1);
                 layer_count += 1;
                 tid = cv.input;
             }
@@ -751,6 +784,7 @@ fn build_plan_full(
                     &mut f_branch,
                     &mut node_abs,
                     &mut relus,
+                    &mut conv_ops,
                     &mut rho_star,
                 )?;
                 let mut p_branch = Vec::new();
@@ -760,6 +794,7 @@ fn build_plan_full(
                     &mut p_branch,
                     &mut node_abs,
                     &mut relus,
+                    &mut conv_ops,
                     &mut rho_star,
                 )?;
                 layer_count += f_branch.len() + p_branch.len();
@@ -813,9 +848,21 @@ fn build_plan_full(
                 _ => return Err(Refusal::Unmappable("unexpected segment in a unary plan")),
             }
         }
-        return Ok((Plan::Chain(layers), node_abs, rho_star, relus));
+        return Ok(PlanExt {
+            plan: Plan::Chain(layers),
+            node_abs,
+            rho_star,
+            relus,
+            conv_ops,
+        });
     }
-    Ok((Plan::Segments(segments), node_abs, rho_star, relus))
+    Ok(PlanExt {
+        plan: Plan::Segments(segments),
+        node_abs,
+        rho_star,
+        relus,
+        conv_ops,
+    })
 }
 
 /// Re-gate a SHARED skeleton for one domain: clone `plan`, replacing the `k`-th
@@ -927,7 +974,13 @@ fn retarget_plan(
 ///   downcast — every stable gate and every piece-fix, which are `(1,1,0)` or
 ///   `(0,0,0)` — is left untouched, so a piece-fixed neuron is never widened
 ///   against the ROOT box it no longer lives in.
-fn outward_gate_f32(
+// pub(crate): the certified GPU backward's plan-residency cache
+// (`gpu_backward::cache`, B1) re-runs THIS admission per pass on a cache hit —
+// the cached plan skeleton is dom-independent, but the per-dom gate admission
+// (fractional-alpha refusal, non-f32-exact repair) must stay refusal-
+// equivalent to a fresh `build_plan_ext`, so the check is this function
+// itself, not a copy.
+pub(crate) fn outward_gate_f32(
     alpha: &[f64],
     s: &[f64],
     c: &[f64],
@@ -1109,7 +1162,7 @@ fn weight_error(
 /// treats a seed as exact). `d_j` here is the SUM of the lane's own `Seed::e`
 /// and the EXACT downcast residual `|f64(S as f32) - S|` (exact because the two
 /// values are within a factor of two, so the subtraction is exact).
-fn seed_penalty(
+pub(crate) fn seed_penalty(
     seed: &Seed,
     y_abs: Option<&[f64]>,
     n_y: usize,
@@ -1417,7 +1470,7 @@ pub(crate) fn error_floor_ok(out: &PassOut, xabs: &[f64], rho: f64) -> bool {
 /// For a piece-fixed domain the midpoint must also satisfy every fix — checked
 /// with `forward_points`' `pre_sel` pre-activation collection — and the probe
 /// SKIPS (never trips) when it does not, because a non-member proves nothing.
-fn probe_guard(
+pub(crate) fn probe_guard(
     eng: &BackwardEngine<'_>,
     seed: &Seed,
     dom: Option<&DomainGates>,
@@ -1486,7 +1539,10 @@ fn probe_guard(
 ///
 /// A fix is detected as a gate that DIFFERS from the frozen root gate; the lane
 /// only ever writes `(1,1,0)` or `(0,0,0)` there (`engine::domain_gates`).
-fn domain_fixes(
+// pub(crate): shared with `gpu_backward::cache::probe_guard_cached` (fix A3 —
+// the cached probe must classify fixes with the SAME rule as this per-pass
+// probe, so the classifier is one function, not a copy).
+pub(crate) fn domain_fixes(
     eng: &BackwardEngine<'_>,
     dom: Option<&DomainGates>,
 ) -> Vec<(usize, Vec<(usize, bool)>)> {
@@ -1579,4 +1635,4 @@ fn f32_toward_pos_inf(x: f64) -> Result<f32, Refusal> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -25,24 +25,22 @@
 //!
 //! [`FALSIFY_PORTFOLIO_LANE`] is the second non-diagnostic entry: armed, it
 //! admits the ported `ny-falsify` strategy portfolio into the attack slice,
-//! where it can produce a scored `sat`. Unlike the sign-space lane it has NO
-//! typed preset key and its declaration default is off, so a competition
-//! harness cannot reach it at all. Its wall cap,
-//! [`FALSIFY_PORTFOLIO_SECONDS`], is unreachable behind it.
+//! where it can produce a scored `sat`. It and its wall cap now have typed
+//! preset delivery, but their declaration defaults remain off and no shipped
+//! preset arms them. Delivery permits a controlled scored A/B; it is not
+//! qualification evidence.
 //!
 //! All four of the ORIGINAL entries are dark by default and diagnostic, EXCEPT
 //! [`INPUT_SPLIT_NESTED_DEADLINE`], which ships armed and whose `"0"` opt-out
 //! removes a rebound's interruptibility — recorded as `MoatRisk::High` for that
 //! reason, not because either arm is unsound.
 //!
-//! [`BNN_SIGN_SPACE_LANE`] joined later and is the one entry here that is not
-//! diagnostic: armed, it admits a falsification lane that can produce a scored
-//! `sat`. Its DECLARATION default is still off, but it is no longer dark on
-//! the scored path — the `traffic_signs_recognition_2023` preset arms it
-//! through the typed `attack.bnn_sign_space` config layer, and this variable
-//! is now the OVERRIDE rather than the only way in. Every candidate it
-//! produces still has to survive the unchanged trusted-oracle gate before
-//! publication.
+//! [`BNN_SIGN_SPACE_LANE`] and [`BNN_STE_PGD_LANE`] joined later and are the
+//! non-diagnostic entries here: armed, each admits a falsification lane that
+//! can produce a scored `sat`. Their DECLARATION defaults remain off, but both
+//! are armed on the scored traffic-sign path by typed preset keys; the raw
+//! variables are overrides. Every candidate still has to survive the unchanged
+//! trusted-oracle gate before publication.
 
 use crate::{
     declare_levers, Bucket, DefaultSpec, LeverDecl, LeverKind, MoatRisk, Provenance, ReaderSite,
@@ -97,33 +95,49 @@ const ENVELOPE_RESCALE_READERS: &[ReaderSite] = &[
 const INPUT_SPLIT_PROBE_READERS: &[ReaderSite] = &[ReaderSite {
     scope: INPUT_SPLIT,
     role: "print the per-rebound domain/deadline/stacking line",
-    site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/shared_specs.rs:309",
+    site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/shared_specs.rs:332",
 }];
 
 const INPUT_SPLIT_DEADLINE_READERS: &[ReaderSite] = &[ReaderSite {
     scope: INPUT_SPLIT,
-    role: "drop the nested alpha deadline to restore the pre-6f49a660 shape for an A/B",
-    site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/shared_specs.rs:307",
+    role: "drop the nested alpha deadline (env override layered over the typed preset key \
+           bab.branching.input_split.nested_deadline via read_over_config)",
+    site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/shared_specs.rs \
+           (nested_deadline_dropped)",
 }];
 
-const BNN_SIGN_SPACE_MOVE_READERS: &[ReaderSite] = &[ReaderSite {
-    scope: BNN_SIGN_SPACE,
-    role: "pick which in-box point each lazy row-generation round of the realizability \
-           search adopts from its LP primal: the LP VERTEX (shipped) or the MINIMAL \
-           point on the segment to it that carries the deficient units past their \
-           thresholds",
-    site: "crates/ny-cli/src/commands/beta_crown/sign_space_falsify.rs \
-           (SignSpaceProblem::segment_move)",
-}];
+const BNN_SIGN_SPACE_MOVE_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: BNN_SIGN_SPACE,
+        role: "freeze the exact environment-over-preset minimal-move value in the same \
+               receipt-owned policy carried through every scored BNN route",
+        site: "crates/ny-cli/src/commands/bnn_falsification_policy.rs \
+               (BnnFalsificationPolicy::from_levers)",
+    },
+    ReaderSite {
+        scope: BNN_SIGN_SPACE,
+        role: "lower the frozen value to the point adopted from each realizability LP: \
+               the shipped vertex or the minimal threshold-crossing segment point",
+        site: "crates/ny-cli/src/commands/beta_crown/sign_space_falsify.rs (segment_move)",
+    },
+];
 
-const BNN_SIGN_SPACE_TRUST_READERS: &[ReaderSite] = &[ReaderSite {
-    scope: BNN_SIGN_SPACE,
-    role: "restrict WHERE the realizability LP may put the pixel vector: the full vnnlib \
-           box (shipped) or an L-infinity trust region around the incumbent that is \
-           doubled, never concluded on, whenever the restricted LP fails",
-    site: "crates/ny-cli/src/commands/beta_crown/sign_space_falsify.rs \
-           (SignSpaceProblem::trust_region)",
-}];
+const BNN_SIGN_SPACE_TRUST_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: BNN_SIGN_SPACE,
+        role: "freeze the exact environment-over-preset trust-region arm in the same \
+               receipt-owned policy carried through every scored BNN route",
+        site: "crates/ny-cli/src/commands/bnn_falsification_policy.rs \
+               (BnnFalsificationPolicy::from_levers)",
+    },
+    ReaderSite {
+        scope: BNN_SIGN_SPACE,
+        role: "lower the frozen arm to the full box or the selected L-infinity region; \
+               restricted failure expands and never concludes",
+        site: "crates/ny-cli/src/commands/beta_crown/sign_space_falsify.rs \
+               (core_trust_region)",
+    },
+];
 
 const BNN_SIGN_SPACE_TRACE_READERS: &[ReaderSite] = &[ReaderSite {
     scope: Scope {
@@ -151,24 +165,39 @@ const PRE_SOFTMAX_ATTACK_OBJECTIVE_READERS: &[ReaderSite] = &[ReaderSite {
     site: "crates/ny-cli/src/commands/vnncomp.rs (pre_softmax_attack_objective_armed)",
 }];
 
-const BNN_STE_PGD_READERS: &[ReaderSite] = &[ReaderSite {
-    scope: BNN_SIGN_SPACE,
-    role: "the admission of the STE-PGD falsification lane over the SAME structurally \
-           admitted binarized fragment; disarmed, the lane returns its `Disarmed` outcome \
-           before it reads the model, the property, or constructs any request",
-    site: "crates/ny-cli/src/commands/beta_crown/sign_space_falsify.rs \
-           (ste_pgd_falsify_armed)",
-}];
+const BNN_STE_PGD_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: BNN_SIGN_SPACE,
+        role: "freeze the exact environment-over-preset STE-PGD admission in the \
+               receipt-owned policy before any wrapper fast path",
+        site: "crates/ny-cli/src/commands/bnn_falsification_policy.rs \
+               (BnnFalsificationPolicy::from_levers)",
+    },
+    ReaderSite {
+        scope: BNN_SIGN_SPACE,
+        role: "consume the frozen admission on private, committed-cap, and scheduled \
+               routes; disarmed, no model, property, or request is read",
+        site: "crates/ny-cli/src/commands/vnncomp.rs \
+               (try_ste_pgd_falsify, run_bnn_lane_schedule)",
+    },
+];
 
-const BNN_SIGN_SPACE_READERS: &[ReaderSite] = &[ReaderSite {
-    scope: BNN_SIGN_SPACE,
-    role: "the admission of the LP-guided sign-space falsification lane, over the typed \
-           `attack.bnn_sign_space` preset layer; disarmed, the lane returns its \
-           `Disarmed` outcome before it reads the model, the property, or constructs \
-           any `SignSpaceRequest`",
-    site: "crates/ny-cli/src/commands/beta_crown/sign_space_falsify.rs \
-           (sign_space_falsify_armed)",
-}];
+const BNN_SIGN_SPACE_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: BNN_SIGN_SPACE,
+        role: "freeze the exact environment-over-preset sign-space admission in the \
+               receipt-owned policy before any wrapper fast path",
+        site: "crates/ny-cli/src/commands/bnn_falsification_policy.rs \
+               (BnnFalsificationPolicy::from_levers)",
+    },
+    ReaderSite {
+        scope: BNN_SIGN_SPACE,
+        role: "consume the frozen admission on private, committed-cap, and scheduled \
+               routes; disarmed, no model, property, or request is read",
+        site: "crates/ny-cli/src/commands/vnncomp.rs \
+               (try_sign_space_falsify, run_bnn_lane_schedule)",
+    },
+];
 const FALSIFY_PORTFOLIO_READERS: &[ReaderSite] = &[ReaderSite {
     scope: FALSIFY_PORTFOLIO,
     role: "the admission of the ported `ny-falsify` strategy portfolio (S1 `special`, \
@@ -177,6 +206,43 @@ const FALSIFY_PORTFOLIO_READERS: &[ReaderSite] = &[ReaderSite {
     site: "crates/ny-cli/src/commands/vnncomp/falsify_portfolio.rs \
            (portfolio_falsify_armed)",
 }];
+
+const CONST_INTERVAL: Scope = Scope {
+    package: "ny-onnx",
+    subsystem: "const-fold-interval-carrier",
+};
+
+const CONST_MATMUL_INTERVAL_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: CONST_INTERVAL,
+    role: "the governed environment-only gate on the interval-valued \
+           frozen-constant carrier: read once per model load, before any interval \
+           fold is attempted, so the disarmed arm never allocates a carrier and \
+           the weight store's interval map stays empty",
+    site: "crates/ny-onnx/src/loader/const_fold/mod.rs (interval_carrier_armed)",
+}];
+
+const JOINT_BILINEAR: Scope = Scope {
+    package: "ny-propagate",
+    subsystem: "joint-bilinear-quadratic",
+};
+
+const JOINT_BILINEAR_QUAD_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_BILINEAR,
+        role: "project the typed solver value into the layered VNN-COMP lever receipt",
+        site: "crates/ny-cli/src/commands/vnncomp.rs:solver_preset_gate_config_value",
+    },
+    ReaderSite {
+        scope: JOINT_BILINEAR,
+        role: "the layered env-over-typed-preset gate on the joint (shared-variable) \
+               relaxation of `ReduceSum(A * B)`: queried at dense-spec batch admission so an \
+               eligible armed graph takes the joint-capable scalar route, and again by each \
+               scalar bound evaluation before any joint node bound is collected; the disarmed \
+               arm keeps the historical batched route and returns the caller's CROWN bounds \
+               untouched",
+        site: "crates/ny-propagate/src/joint_bilinear.rs (joint_bilinear_armed)",
+    },
+];
 
 const LANE_SCHEDULER: Scope = Scope {
     package: "ny-cli",
@@ -193,6 +259,35 @@ const LANE_VALUE_SCHEDULER_READERS: &[ReaderSite] = &[ReaderSite {
            before the ledger is built and each lane computes exactly the window it \
            computes today",
     site: "crates/ny-cli/src/commands/lane_schedule.rs (lane_value_scheduler_armed)",
+}];
+
+const UPFRONT_PROBE: Scope = Scope {
+    package: "ny-cli",
+    subsystem: "upfront-attack-probe-first",
+};
+
+const UPFRONT_ATTACK_PROBE_FIRST_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: UPFRONT_PROBE,
+    role: "run the exact-gradient upfront falsification lane ONCE under a small fixed \
+           cap at the TOP of the attack slice, before the LP sign-space and STE-PGD \
+           lanes, instead of only behind them; disarmed, the reader returns before the \
+           probe window is built and the attack slice runs in exactly today's order \
+           with exactly today's windows",
+    site: "crates/ny-cli/src/commands/vnncomp.rs (UpfrontAttackPolicy::from_levers)",
+}];
+
+const SCORED_WALL: Scope = Scope {
+    package: "ny-cli",
+    subsystem: "scored-wall-clamp",
+};
+
+const SCORED_WALL_CLAMP_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: SCORED_WALL,
+    role: "hand the disjunctive input-split BaB an ABSOLUTE stop derived from the \
+           scored budget, separate from the effort horizon its timeout shapes; \
+           disarmed, no wall is supplied and the lane keeps the single-deadline \
+           behaviour in which the caller's 1.4x inflation is also its stop",
+    site: "crates/ny-cli/src/commands/vnncomp.rs (scored_wall_clamp_armed)",
 }];
 
 const LANE_ALLOCATOR: Scope = Scope {
@@ -213,6 +308,25 @@ const LANE_BUDGET_ALLOCATOR_READERS: &[ReaderSite] = &[ReaderSite {
            derives exactly the window it derives today, from the same private helper, \
            in the same order",
     site: "crates/ny-cli/src/commands/lane_allocation.rs (lane_budget_allocator_armed)",
+}];
+
+const LANE_FRAME: Scope = Scope {
+    package: "ny-cli",
+    subsystem: "lane-budget-fixed-frame",
+};
+
+const LANE_BUDGET_FRAME_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: LANE_FRAME,
+    role: "size the whole attack slice ONCE, against ONE reference clock reading, and \
+           commit each lane to exactly the cap today's own rules would hand it, so a \
+           lane that declines or stalls cannot have its unspent seconds absorbed by \
+           whichever downstream lane happens to re-derive its window from the LIVE \
+           remaining budget; the freed seconds fall past the attack slice to the \
+           branch-and-bound residual claimant. Nothing is redistributed and no cap is \
+           optimised -- only WHEN each cap is decided changes. Disarmed, the reader \
+           returns before the frame is built and each lane derives exactly the window \
+           it derives today, from the same private helper, in the same order",
+    site: "crates/ny-cli/src/commands/lane_allocation.rs (lane_budget_frame_armed)",
 }];
 
 const FALSIFY_PORTFOLIO_SECONDS_READERS: &[ReaderSite] = &[ReaderSite {
@@ -243,8 +357,8 @@ before any model load, property parse or `SignSpaceRequest` construction — so 
 that path is byte-identical to the unwired tree.
 
 THIS IS AN OVERRIDE, NOT THE ONLY WAY IN. The typed config layer \
-(`attack.bnn_sign_space` in a `configs/vnncomp*/` preset, resolved through \
-`read_over_config`) is what arms the lane on a scored run, because a \
+(`attack.bnn_sign_space` in a `configs/vnncomp*/` preset, resolved into one \
+entry-time `LeverSet`) is what arms the lane on a scored run, because a \
 competition harness exports no `NY_*`. `traffic_signs_recognition_2023` sets \
 it: measured 30/45 armed vs 27/45 unarmed at the official 480s budget. This \
 variable still WINS wherever it is present, in both directions, which is what \
@@ -317,13 +431,11 @@ centre, where the LP lane's realizability search accepts 7-16 flips per lane \
 and stalls (`docs/BNN_SIGN_SPACE_FALSIFICATION_2026-08-12.md` sections 5 and \
 10).
 
-IT IS AN ENVIRONMENT INSTRUMENT AND NOT A PRESET KEY, deliberately, and for \
-the same reason `NY_BNN_SIGN_SPACE_MINIMAL_MOVE` and \
-`NY_BNN_SIGN_SPACE_TRUST_REGION` are not: promoting it to the typed config \
-layer would let it reach a SCORED run before it has a measurement to stand on. \
-The shipped default changes — and the `attack.*` key gets added — only once an \
-armed-versus-unarmed sweep of the whole 45-row family measures a win with no \
-regression.
+THIS IS AN OVERRIDE, NOT THE ONLY WAY IN. The shipped traffic-sign preset sets \
+`attack.bnn_ste_pgd: true`, resolved with the other three BNN controls into one \
+entry-time `LeverSet`; a competition harness therefore runs the measured lane \
+without exporting any `NY_*`. This variable still wins in both directions and \
+keeps the preset-on versus explicit-off comparison reproducible.
 
 WHAT THE LANE CAN AND CANNOT DO. It returns `ny_mip::SignSpaceOutcome`, which \
 has no verified/unsat variant by construction, so it is structurally incapable \
@@ -339,14 +451,14 @@ MoatRisk::High for the same two honest reasons as `NY_BNN_SIGN_SPACE`: armed, \
 it is a NEW `sat` SOURCE on the path, and it is not free — it spends a bounded \
 slice of the instance budget before the ordinary attack and the BaB verifier, \
 so a row that would have been answered can time out instead.",
-        provenance: Provenance::Unmeasured {
-            why_ok: "Dark by default and env-only, so no scored run reaches it: with the \
-                     variable absent the lane returns `Disarmed` before loading the model \
-                     or parsing the property, which is byte-identical to the unwired tree \
-                     (pinned by `defaults_are_unchanged_with_no_lever_set`). Armed it can \
-                     only add a `sat` that the pre-existing trusted-oracle gate confirms \
-                     against the ORIGINAL graph; it has no verified/unsat outcome, so it \
-                     cannot cause a false `unsat` on any setting.",
+        provenance: Provenance::Measured {
+            commit: "d4105a7a2",
+            date: "2026-08-18",
+            artifact: "reports/measured-2026/traffic_signs_recognition_2023{.csv,_NOTES.md}",
+            delta: "Official 480 s, sequential 45-row traffic-sign sweep with no NY_* \
+                    environment: the preset-on STE-PGD lane moved ny from 30/45 to 36/45, \
+                    gaining six rows and losing none while retaining all three LP-lane \
+                    model_30 eps=1 rows. The resulting 36/45 ties alpha-beta-CROWN.",
         },
         owner: BNN_SIGN_SPACE,
         readers: BNN_STE_PGD_READERS,
@@ -590,8 +702,8 @@ about 25s of headroom, so an armed A/B can convert a banked `sat` into a \
 `timeout`. That is why the shipped default is off and changes only on a \
 measurement.",
         provenance: Provenance::Unmeasured {
-            why_ok: "Dark by default and env-only, so no scored run reaches it: with the \
-                     variable absent the reader returns before the admission guard, no \
+            why_ok: "Dark by default and absent from every shipped preset, so the reader \
+                     returns before the admission guard, no \
                      pre-Softmax tensor is read, and the objective, direction row and DLR \
                      denominator are the historical post-Softmax ones (pinned by \
                      `defaults_are_unchanged_with_no_lever_set`). Armed it changes only \
@@ -673,21 +785,28 @@ stacked. Exact \"1\" arms it. Diagnostic only; it reports the state that \
         bucket: Bucket::Debug,
         moat: MoatRisk::High,
         doc: "\
-Ships ARMED. Exact \"0\" drops the nested alpha deadline on the input-split \
-rebound, restoring the pre-`6f49a660` shape for an A/B; absence and every other \
-value keep the deadline. Note the polarity is inverted relative to the other \
-levers here — the reader tests `== Some(\"0\")`, so this is an OPT-OUT, and the \
-declaration's `Bool` default of `true` records the shipped arm.
+Ships ARMED (keep the deadline). Exact \"0\" drops the nested alpha deadline \
+on the input-split rebound, restoring the pre-`6f49a660` shape; exact \"1\" \
+keeps it; any other present value is a recorded rejection resolving to the \
+safe keep arm. Since #dist-shift-5291 this variable is the OVERRIDE over a \
+typed preset layer: `bab.branching.input_split.nested_deadline` \
+(`BetaCrownConfig::input_split_nested_deadline`) can arm the drop per \
+category, resolved via `read_over_config` at the shared_specs chokepoint — \
+absence of BOTH keeps the declaration default.
 
 MoatRisk::High because dropping the deadline removes this rebound's \
 INTERRUPTIBILITY: the alpha pass can then run past the point the caller \
 intended to reclaim, which changes what the remaining budget can prove. Both \
-arms are sound — this is a scheduling shape, not a bound — but the opt-out must \
-never become the shipped default, and the reader's own comment says so.",
+arms are sound — this is a scheduling shape, not a bound. The drop may ship \
+only through the CATEGORY-SCOPED preset key, only where the per-batch rebound \
+cost is known-small (the outer BaB loop still polls its own deadline between \
+batches), and only behind the measured gate in \
+docs/DIST_SHIFT_NESTED_DEADLINE_2026-08-20.md; it must never become the \
+process-wide default.",
         provenance: Provenance::Unmeasured {
             why_ok: "the shipped arm is the deadline-carrying one; the opt-out \
-                     exists only to reproduce the pre-6f49a660 shape in an A/B \
-                     and has no measured row-level comparison",
+                     reproduces the pre-6f49a660 shape and may ship only \
+                     category-scoped behind the dist_shift 3/arm gate",
         },
         owner: INPUT_SPLIT,
         readers: INPUT_SPLIT_DEADLINE_READERS,
@@ -722,11 +841,11 @@ a 200-free-input row and four of its eight patterns are interior; and `square` \
 is block sign-flip hill climbing against a FLAT objective, which is exactly the \
 `#deadlane` set where every estimated gradient is identically zero.
 
-IT IS AN ENVIRONMENT INSTRUMENT AND NOT A PRESET KEY, for the same reason \
-`NY_BNN_STE_PGD` was not one before its sweep: a competition harness exports no \
-`NY_*`, so an env-only lever cannot reach a scored run. Promoting it to the \
-typed `attack.*` config layer requires an armed-versus-unarmed sweep of a whole \
-family that measures a win with no regression. No such sweep exists. The \
+IT HAS TYPED DELIVERY BUT NO SHIPPED ARM. The `attack.falsify_portfolio` key \
+makes an attributable scored A/B possible; no shipped preset supplies it, and \
+promotion therefore changes no default. Qualification requires an \
+armed-versus-unarmed sweep of a whole family that measures a win with no \
+regression. No such sweep exists. The \
 measurement that gated the port (E1: 42 open-row measurements on `cora_2024`, \
 `traffic_signs` and `soundnessbench`, at official and 10-12x budgets) returned \
 ZERO counterexamples.
@@ -746,8 +865,8 @@ this is a NEW `sat` SOURCE on the scored path, and it is not free — it spends 
 bounded slice of the instance budget ahead of the ordinary attack and the BaB \
 verifier, so a row that would have been answered can time out instead.",
         provenance: Provenance::Unmeasured {
-            why_ok: "Dark by default and env-only, so no scored run reaches it: with the \
-                     variable absent the reader returns before the property parse, the \
+            why_ok: "Dark by default and absent from every shipped preset, so the reader \
+                     returns before the property parse, the \
                      search-box build and the ORT session, which is byte-identical to the \
                      unwired tree. Armed it can only add a `sat` that the pre-existing \
                      trusted-oracle gate confirms against the ORIGINAL graph; the crate \
@@ -798,6 +917,79 @@ on every arm.",
         readers: FALSIFY_PORTFOLIO_SECONDS_READERS,
     };
 
+
+    /// `NY_LANE_BUDGET_FRAME` — sizes every attack-slice lane ONCE, up front,
+    /// so a declining lane's seconds cannot be absorbed by a downstream lane.
+    pub LANE_BUDGET_FRAME = LeverDecl {
+        name: "NY_LANE_BUDGET_FRAME",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Makes the attack slice's lane sizing CONSISTENT. Armed, every lane's window is \
+computed once, against ONE reference reading of the published deadline, from \
+each lane's OWN unchanged rule, and committed before the first lane starts. \
+Exact \"1\" arms it and exact \"0\" disarms it; every other byte string is a \
+RECORDED REJECTION resolving to this declaration's `false` default. Disarmed, \
+the reader returns before the frame is built and each lane derives exactly the \
+window it derives today, from the same private helper, in the same order -- the \
+disarmed arm is the unwired tree.
+
+THE DEFECT IT ADDRESSES, MEASURED. Every attack-slice lane reads the same \
+published deadline at the moment IT starts, but each responds DIFFERENTLY to a \
+second a lane ahead of it did not spend: the LP sign-space lane takes \
+`(live - 45 s) * 0.5` and so absorbs HALF of it; STE-PGD takes \
+`live - 45 s - 100 s` and so absorbs ALL of it until its 4-minute wall binds; \
+the upfront DLR-APGD lane on a `Sign` net takes `(live - 3 s) * 0.5` and \
+absorbs half. On `traffic_signs_recognition_2023` at a 480 s budget, disabling \
+the two BNN falsification lanes freed 327.4 s -- and the upfront attack grew \
+ITSELF from 71.0 s to 234.7 s, which is `0.5 * 327.4 = 163.7 s` of the freed \
+budget, so only ~150 s of 327 reached branch-and-bound. Removing a lane is \
+therefore NOT how the prover is given budget, and this is the mechanism behind \
+two measured nulls: `NY_LANE_VALUE_SCHEDULER` and `NY_LANE_BUDGET_ALLOCATOR` \
+both reallocated real seconds and gained zero rows, because a dynamically \
+sized lane absorbed them before the intended recipient was reached.
+
+WHAT IT CHANGES WHEN ARMED. (i) Each lane is handed a COMMITTED cap through \
+the same `*_granted` seam the Layer-A allocator already uses, still clamped \
+DOWN to the live remaining budget, so no row can exceed its official budget. \
+(ii) A lane whose today-cap is `None` is SKIPPED rather than left to its own \
+live-clock helper -- otherwise a lane today's chain declines for lack of \
+budget would re-derive a full window the moment an upstream lane freed the \
+seconds, which is the absorption itself. (iii) The seconds a lane does not \
+spend reach branch-and-bound through the same `attack_start` subtraction that \
+charges the lanes today. Nothing is redistributed and no cap is optimised: the \
+frame grants exactly today's caps, so the pool equals the grants by \
+construction and the attack slice can never claim a second it does not claim \
+today.
+
+HOW IT COMPOSES. It is the WEAKEST of the three cap authorities and stands \
+down under either of the others: `NY_LANE_BUDGET_ALLOCATOR` already commits \
+every cap up front (a strict superset), and `NY_LANE_VALUE_SCHEDULER` owns the \
+two BNN lanes in flight. Exactly one mechanism holds a lane's cap at any time.
+
+MoatRisk::High for the same honest reason its two siblings carry: armed, this \
+changes HOW MUCH BUDGET each falsification lane gets on a scored row, so a row \
+that would have been answered can be answered differently. It never changes \
+WHETHER a candidate is accepted -- that is the unchanged \
+`gate_sat_with_trusted_oracle` on every arm -- and it cannot produce an \
+`unsat`, because no lane it sizes has a verdict-bearing return type.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "DARK by default and absent from every shipped preset. Typed delivery \
+                     permits a controlled A/B but does not qualify it. It is a \
+                     CORRECTNESS fix to the budget machinery, not a scoring claim -- the \
+                     counterfactual that motivated it showed the prover still timing out \
+                     2 of 2 with 206 s instead of 55-63 s, so correct routing may well \
+                     change no verdict at all. The A/B that would make it Measured is a \
+                     full-family sweep at scored budgets, which the development host \
+                     cannot run: it throttles under sustained load and has flipped a \
+                     genuinely winnable row 4 times in 5. Until that sweep exists the \
+                     default must stay off.",
+        },
+        owner: LANE_FRAME,
+        readers: LANE_BUDGET_FRAME_READERS,
+    };
 
     /// `NY_LANE_BUDGET_ALLOCATOR` — chooses the attack-slice caps jointly and
     /// up front by solving the Layer-A multiple-choice knapsack.
@@ -857,8 +1049,8 @@ is the unchanged `gate_sat_with_trusted_oracle` on every arm -- and it cannot \
 produce an `unsat`, because no allocated lane has a verdict-bearing return type \
 and `ny_mip::lane_allocation`'s public surface cannot name one.",
         provenance: Provenance::Unmeasured {
-            why_ok: "DARK by default, so no scored run reaches it: a competition harness \
-                     exports no `NY_*` and this lever has no typed preset key. The \
+            why_ok: "DARK by default and absent from every shipped preset. Typed delivery \
+                     permits a controlled A/B but does not qualify it. The \
                      allocator itself is verdict-neutral by construction (it selects \
                      which lane runs under what cap and can never change what a lane may \
                      publish), so the worst outcome on the armed arm is a MISSED row and \
@@ -948,6 +1140,386 @@ because no scheduled lane has a verdict-bearing return type.",
         },
         owner: LANE_SCHEDULER,
         readers: LANE_VALUE_SCHEDULER_READERS,
+    };
+
+    /// `NY_UPFRONT_ATTACK_PROBE_FIRST` — runs the upfront exact-gradient
+    /// falsification lane under a small fixed cap at the TOP of the attack
+    /// slice, ahead of the two BNN lanes, instead of only behind them.
+    ///
+    /// ARMED ON THE SCORED PATH for `traffic_signs_recognition_2023` only,
+    /// through the typed preset key `attack.upfront_attack_probe_first`. This
+    /// variable remains an OVERRIDE in both directions.
+    pub UPFRONT_ATTACK_PROBE_FIRST = LeverDecl {
+        name: "NY_UPFRONT_ATTACK_PROBE_FIRST",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Admits ONE extra consultation of the EXISTING upfront DLR-APGD falsification \
+lane at the TOP of the attack slice, under a small fixed cap \
+(`UPFRONT_ATTACK_PROBE_CAP`, 5 s), before the LP sign-space and STE-PGD lanes \
+run. Exact \"1\" arms it and exact \"0\" disarms it; every other byte string is a \
+RECORDED REJECTION that SUPPRESSES the typed config layer beneath it and \
+resolves to this declaration's `false` default, so the probe fails CLOSED. Disarmed, \
+the reader returns before a probe window is built and before the lane is \
+consulted a second time, so the attack slice runs in exactly today's order, \
+under exactly today's windows — the disarmed arm is the unwired tree.
+
+THIS IS AN OVERRIDE, NOT THE ONLY WAY IN. The typed config layer \
+(`attack.upfront_attack_probe_first` in a `configs/vnncomp*/` preset, resolved \
+through the shared entry-time LeverSet) is what arms the probe on a scored run, because a \
+competition harness exports no `NY_*`. Exactly one preset sets it — \
+`traffic_signs_recognition_2023`, the category whose 45-row armed-vs-dark sweep \
+is measured and banked — and \
+`only_the_traffic_signs_preset_arms_the_probe_first_lane` fails if any other \
+shipped preset carries the key. This variable still WINS wherever it is \
+present, in both directions, which is what keeps the unarmed baseline \
+reproducible on the shipped configuration.
+
+THE DEFECT IT ADDRESSES, MEASURED. On the five `traffic_signs` \
+`model_30_idx_{6371,178}` eps>=3 rows the verdict is decided by the LAST 0.2% \
+of the wall. Fifteen default-path runs at HEAD `002abbb2e` (5 rows x 3 reps, \
+480 s, sequential): every row is won by `upfront_attack` in 1-2 exact gradient \
+steps and 2-3 ORT forwards, ~0.1-0.2 s of work — but that lane runs THIRD, and \
+lands at t=242.7-336.8 s behind an LP sign-space walk that exhausts (216-217 s, \
+or refuses in 0.02 s on `max_free_units`) and an STE-PGD lane that burns its \
+full 240 s cap and exhausts. The seconds ahead of the winner are measured \
+waste on these rows, and they are also the only route by which the rows can be \
+lost: a prefix inflated by sustained host load (the documented flake mode on \
+this host) walks the winning search into the 456 s internal solver cap.
+
+WHAT IT CHANGES WHEN ARMED. Exactly one thing: the upfront lane is consulted \
+once more, FIRST, with `LaneWindow::Cap(5 s)` — the same seam the Layer-A \
+allocator uses to hand a lane a committed cap. A candidate it produces becomes \
+a verdict only by passing the EXISTING, UNCHANGED \
+`gate_sat_with_trusted_oracle`; anything else falls through to the ordinary \
+slice, in the ordinary order, and the ordinary (uncapped) upfront consultation \
+still happens behind the two BNN lanes exactly as today. The probe is charged \
+against the same `attack_start` subtraction every attack-slice lane pays, so \
+it cannot push branch-and-bound past the scored deadline.
+
+WHY THE CAP IS SMALL. The rows this recovers are won in 1-2 gradient steps; \
+the cap is insurance against paying for a lane that cannot win here. On the \
+three `model_30` eps=1 rows the LP walk owns, the armed arm costs those rows \
+5.0-5.1 s of a 217 s LP window and they are still won by the LP lane.
+
+MoatRisk::High for the honest reason `NY_LANE_VALUE_SCHEDULER` carries: armed, \
+this changes WHICH LANE RUNS WHEN and takes a bounded number of seconds from \
+the lanes behind it, so a row that would have been answered can be answered \
+differently. It never changes WHETHER a candidate is accepted — that is the \
+unchanged trusted-oracle gate on every arm — and it cannot produce an `unsat`, \
+because the lane it consults returns a claimed counterexample INPUT and has no \
+verdict-bearing return variant.",
+        provenance: Provenance::Measured {
+            commit: "d16e10a9762ef457be4748bd002aae99fbc9fde9",
+            date: "2026-08-21",
+            artifact: "reports/measured-2026/traffic_signs_recognition_2023_NOTES.md \
+                       (section: the probe-first 45-row A/B)",
+            delta: "ALL 45 traffic_signs rows, dark vs armed, arms INTERLEAVED per row, \
+                    sequential, one process at a time, official 480 s, no --timeout-cap, \
+                    every run's flight sidecar recording its own `ambient_env` (dark {} \
+                    x45, armed {NY_UPFRONT_ATTACK_PROBE_FIRST: \"1\"} x45). \
+                    VERDICTS: 0 rows lost in either direction. The one row that differs \
+                    is `model_64_idx_178_eps_3` (dark `timeout` 453.94 -> armed `sat` \
+                    203.61), and it is NOT claimed: it is the documented 1-in-5 coin \
+                    flip this family already records. The other known-flaky row, \
+                    `model_48_idx_6371_eps_5`, timed out on BOTH arms in the same leg, \
+                    which is the same-leg control saying the host, not the lever, is \
+                    what moves those two. \
+                    LATENCY: the probe wins 15 rows, 12 of them the `model_30` eps>=3 \
+                    instances, which move from t=242-336 s to t=1.4-5.6 s (up to 209x); \
+                    family summed solve time 7558 s -> 5335 s. \
+                    COST, which is the half that decides it: on all 30 rows the probe \
+                    CANNOT win, its slice measures 5.00-5.03 s — the cap, exactly, with \
+                    no tail. The three `model_30` eps=1 rows the LP walk owns keep their \
+                    winner and a bit-identical search (78 flips / 311 LP solves on \
+                    `idx_1703`, both arms). One apparent excursion (+36.9 s on \
+                    `model_48_idx_1703_eps_3`) was re-measured 3x3: the slow trajectory \
+                    (margin +14, 466 flips, 2512 LP solves, 226 s) appears in the DARK \
+                    arm too, so it is the STE lane's own multi-modal variance and not a \
+                    probe cost; per-arm medians differ by 5.1 s, the cap. \
+                    WALL SAFETY: worst case is UNMOVED — dark 468.65 s, armed 468.70 s \
+                    of 480 s — because on rows that exhaust their budget the probe \
+                    DISPLACES seconds rather than adding them (deltas -17.4 to +4.0 s on \
+                    the nine banked timeouts). \
+                    HONEST SCOPE: this is a LATENCY result, not a solved-row result. \
+                    36/45 either way. It is armed by preset because this family TIES \
+                    alpha-beta-CROWN at 36/45, where the time term is the only one left, \
+                    and because it removes the load-inflation loss mode from twelve rows \
+                    ny already scores. The host was NOT idle (load 2.1-20.6).",
+        },
+        owner: UPFRONT_PROBE,
+        readers: UPFRONT_ATTACK_PROBE_FIRST_READERS,
+    };
+
+    /// `NY_SCORED_WALL_CLAMP` — stop the disjunctive input-split BaB at an
+    /// ABSOLUTE instant derived from the scored budget, while its effort
+    /// horizon keeps whatever value the lane's own policy chose.
+    ///
+    /// ARMED ON THE SCORED PATH for `isomorphic_acasxu_2026` only, through the
+    /// typed preset key `solver.scored_wall_clamp`. This variable remains an
+    /// OVERRIDE in both directions.
+    pub SCORED_WALL_CLAMP = LeverDecl {
+        name: "NY_SCORED_WALL_CLAMP",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Supplies the grouped-disjunctive input-split BaB with `input_split_scored_wall`: \
+the absolute instant, derived ONCE at the command anchor as \
+`command_start + internal_timeout_secs(scored_budget)`, by which this process \
+owes RESULTS_FILE a verdict. Exact \"1\" arms it and exact \"0\" disarms it; every \
+other byte string is a RECORDED REJECTION that SUPPRESSES the typed config \
+layer beneath it and resolves to this declaration's `false` default, so the \
+clamp fails OPEN — into today's behaviour, which is the shipped, banked one. \
+Disarmed, no wall is passed, the lane's `BabWall::stop` equals its horizon, and \
+the search is byte-identical to the single-deadline code.
+
+THE DEFECT, MEASURED. `isomorphic_acasxu_2026` is a RELATIONAL category, and \
+the relational lane multiplies its BaB deadline by \
+`DEFAULT_REL_BAB_DEADLINE_MULT = 1.4` on purpose: this search is NON-MONOTONIC \
+in its own timeout, because every per-node CROWN-IBP grant is a fraction of the \
+budget still believed to REMAIN, so a nearer deadline buys looser bounds, more \
+splits, and a non-converging tree. The multiplier bought that trajectory with \
+wall-clock it did not have. On the banked 50-row sweep at the official 100 s \
+budget, EIGHTEEN rows ran past the 95 s internal tier and were SIGKILLed by the \
+in-process watchdog at 105.0-105.1 s — 105 % of the official budget. On the \
+competition harness an external kill at 100 s leaves those rows with NO verdict \
+token at all, which scores worse than a timeout.
+
+WHAT IT CHANGES WHEN ARMED. Exactly one thing: the loop's termination checks \
+consult the wall instead of the horizon. Every bound deadline below them — \
+`crown_deadline`, the initial-bounds fraction, every `lifecycle.deadline(..)` \
+handed to a per-node collector — still derives from the UNCHANGED horizon, so \
+the trajectory up to the wall is the trajectory the multiplier bought. That \
+separation is the whole point: clamping the horizon instead (equivalently, \
+setting the multiplier to 1.0) also stops the overrun, but it degrades the \
+bounds and LOSES rows — measured directly, see the delta.
+
+SOUNDNESS. It can only ever SHORTEN a search, and a shortened sound search \
+returns `timeout`, never a verdict. `BabWall::clamped` ignores a wall beyond \
+the horizon, so it is not a route to extending a configured timeout either. No \
+`unsat` is reachable except through the unchanged fully-closed certified tree, \
+and no `sat` except through the unchanged `gate_sat_with_trusted_oracle`.
+
+MoatRisk::High, honestly: armed, a row that would have DECIDED after the wall \
+now publishes `timeout`. That is a verdict change. It is also the correct one — \
+a decision past the official budget scores zero, and on this family it was \
+measured to be worth zero: the single banked row that ever decided late \
+(`instance_6`, 100.9 s) scored nothing, was demoted to `timeout` by the \
+watchdog anyway, and did not reproduce.",
+        provenance: Provenance::Measured {
+            commit: "f6291f26b426c41759d5f02fc84f535d4e9acad3",
+            date: "2026-08-21",
+            artifact: "reports/measured-2026/isomorphic_acasxu_2026_NOTES.md \
+                       (section: the scored-wall clamp)",
+            delta: "ALL 50 isomorphic_acasxu_2026 rows at the official 100 s budget, \
+                    sequential (jobs=1, one child at a time), no --timeout-cap, on a host \
+                    with NO foreign CPU load (recorded at launch and at exit inside the \
+                    sweep process), zero NY_* set — armed through the preset alone. \
+                    \
+                    COMPLIANCE, which is the defect: max per-row wall 98.3 s of 100 s, \
+                    ZERO rows over budget, ZERO hard stops, ZERO `budget overrun` \
+                    annotations. The 18 rows that previously ran to a 105.0-105.1 s \
+                    SIGKILL now publish `timeout` at 92.9-98.3 s. Dark, on the same \
+                    binary and the same host, those rows still exit 137 at 105.0-105.1 s. \
+                    \
+                    VERDICTS: 32/50 = 64.0, against the banked 31/50 = 62.0. ZERO rows \
+                    lost — every one of the 31 banked solves is still solved, and the same \
+                    four rows (14/21/33/48) are `sat`. The row won is `instance_6`, the \
+                    documented near-miss that decided at 100.9 s and was demoted: it now \
+                    returns `unsat` at 97.0 s, INSIDE the official budget. \
+                    \
+                    THE DECOUPLING IS WHAT WINS IT, measured directly against the obvious \
+                    alternative. Clamping the HORIZON instead (NY_REL_BAB_DEADLINE_MULT=1.0) \
+                    collapses the search: on instance_4 the naive arm is at \
+                    verified_in_batch=0 and queue 48,967 by t_bab=64 s with 7/7 \
+                    PerNodeDeadlineExceeded and IBP-grade bounds (78,424 explored / 50,626 \
+                    verified), while the clamped arm holds verified_in_batch=1711 to the \
+                    wall (86,481 / 73,144). Same stop, opposite bound quality. \
+                    \
+                    OTHER FAMILIES: 3 cersyve rows (non-relational) and 3 \
+                    monotonic_acasxu_2026 rows (the OTHER relational family), armed vs \
+                    dark, interleaved: identical verdicts, walls identical to within 5 ms. \
+                    \
+                    HONEST SCOPE. An earlier 50-row sweep of the same binary scored 28/50 \
+                    and is banked in the artifacts as a NEGATIVE control, not a result: \
+                    ~6 of 14 cores were taken by another session, and under that load a \
+                    SINGLE row varies by 34 s within one arm (instance_43 dark 64.6-83.6 s, \
+                    armed 62.4-96.8 s) — larger than the effect being measured. Row-level \
+                    claims on this family are only meaningful on an idle host.",
+        },
+        owner: SCORED_WALL,
+        readers: SCORED_WALL_CLAMP_READERS,
+    };
+
+    /// `NY_CONST_MATMUL_INTERVAL` — the interval-valued carrier for a
+    /// both-constant fold that binary32 cannot represent exactly. Ships DARK.
+    pub CONST_MATMUL_INTERVAL = LeverDecl {
+        name: "NY_CONST_MATMUL_INTERVAL",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Admits a SOUND interval-valued carrier for a both-constant `MatMul`/`Add`/`Relu` \
+fold whose value is not exactly representable in binary32. The official lever \
+surface is Unsafe + EnvOnly: the retired `solver.const_matmul_interval` spelling \
+remains deserializable only so semantic validation can reject either boolean with \
+an explicit quarantine error. Exact \"1\" now arms the containment-audited runtime \
+carrier and exact \"0\" disarms it; every other byte string is a recorded rejection \
+that resolves to the declaration's `false` default. The route remains dark, Unsafe, \
+and deliberately unreachable from a scored preset.
+
+WHAT IS BROKEN WITHOUT IT. `try_fold_matmul_exact` folds a both-constant MatMul \
+only when every product AND every partial sum is exactly representable in \
+binary32, which a length-6 binary32 dot product essentially never is. \
+`convert_matmul` then fails the node closed to an unbounded `OpaqueSkip`. On \
+lsnc_relu that loses the Lyapunov matrix Q itself, which reclassifies two plain \
+`activation @ constant Q` Linears as BilinearCrown, raises \"MatMul requires at \
+least 2D inputs\" on their rank-1 activations, and kills alpha-CROWN, batched \
+CROWN and flat CROWN in turn: the root bound is [-inf, +inf] on all 8 outputs \
+and the verifier never runs.
+
+WHAT THE ARMED ARM DOES, AND WHAT IT REFUSES TO DO. It computes the fold as an \
+outward-rounded ENCLOSURE `[lower, upper]` — products exact in binary64, every \
+accumulation stepped with `next_down_f64`/`next_up_f64`, every cast pushed out \
+with `next_down_f32`/`next_up_f32`, plus a Higham `gamma_n * S` term with the \
+BINARY32 unit roundoff so the carrier also contains what any binary32 \
+implementation of the same contraction computes, in any summation order. It does \
+NOT round the value to a point. A point fold would be strictly TIGHTER than the \
+truth — it proves a property of a network with `round(W)` and publishes it as a \
+property of the network with `W` — which is the class of error retracted in \
+807bf511 (nineteen false `unsat` verdicts on this same family), one layer down. \
+The ordering the carrier establishes is `point fold < interval carrier <= \
+today's fail-closed +-inf`, and only the middle term is both sound and finite.
+
+FAIL-CLOSED BY CONSTRUCTION, NOT BY REVIEW. The enclosure is stored in a \
+SEPARATE `WeightStore` map that `WeightStore::get` does not see, so no existing \
+consumer of a frozen constant can silently compute with a midpoint — it simply \
+fails to find the constant and takes its existing unsupported path. Downstream, \
+an interval constant is carried only by the dedicated `Layer::IntervalConst` \
+variant; every propagation, MIP-encoding and export site that has not been \
+taught about that variant either fails to compile or hits an existing \
+`UnsupportedOp`/`bail!` arm. A path that refuses produces no verdict; there is \
+no arm in which the midpoint is used as if it were exact.
+
+MoatRisk::High, honestly and for one reason: armed, this is a BOUND path on a \
+benchmark family where ny has already published false `unsat` verdicts once. The \
+containment argument is clean and is pinned against exact rational ground truth \
+on the real lsnc constants, but the live failure mode of this program is not a \
+bad interval — it is a sound interval that one untaught propagation path drops, \
+which is indistinguishable in its output from the unsound point fold. That is \
+why the carrier is dark, why the enclosure is invisible to the point API, and \
+why the new layer variant exists at all.",
+        provenance: Provenance::Measured {
+            commit: "f5a54507",
+            date: "2026-08-23",
+            artifact: "reports/measured-2026/lsnc_relu_artifacts/\
+                       const_matmul_interval_AB_NOT_BANKABLE/README.md",
+            delta: "ZERO POINTS, and that is the finding, not a shortfall. 80 rows \
+                    of lsnc_relu, sequential, official 25 s budget, both arms back \
+                    to back on one binary. DARK: 9 sat / 71 unknown / 0 unsat — \
+                    0 verdict differences against the bank across all 80 rows, \
+                    identical sat set, per-row wall within +-0.10 s, which is the \
+                    unset-is-byte-identical requirement MEASURED at the scored path \
+                    rather than asserted. ARMED: 9 sat / 71 TIMEOUT / 0 unsat. Every \
+                    unknown became a timeout; not one became a proof. What actually \
+                    moved is the mechanism: the root bound goes from [-inf, +inf] on \
+                    all 8 outputs, with alpha-CROWN/batched-CROWN/flat-CROWN dead and \
+                    /Concat_2 tainted, to FINITE, with beta-CROWN running — root gap \
+                    -29.86 -> -0.0008 in ~6 s, depth 13, 5801 domains — and the 25 s \
+                    budget going from 8.1 s used (the PGD floor, ~17 s untouched) to \
+                    18.2-18.8 s used. This EXACTLY reproduces the ceiling: 3621fee6a \
+                    measured an UNSOUND zero-width point fold of the same cone, which \
+                    is a hard upper bound on any sound carrier, at 9 sat / 0 unsat \
+                    with the gap flat at ~1e-4 from t=16 s to t=80 s. So the carrier \
+                    is a NECESSARY GATE THAT BUYS NO PROOFS BY ITSELF; the residue is \
+                    a relaxation floor, a second wall, and not a constant-fold \
+                    problem. Contention judged by FOREIGN %CPU (raw load average is \
+                    not a proxy on this host): dark 134%->174%, armed 174%->511%. The \
+                    verdict difference is structural and does not turn on wall time; \
+                    the domain counts and gap values are depressed and must not be \
+                    quoted as throughput. NO unsat appeared in either arm, so the \
+                    obligation to adjudicate every proof on a family that once \
+                    published nineteen false unsat verdicts (807bf511) was not \
+                    exercised — the absence is the result",
+        },
+        owner: CONST_INTERVAL,
+        readers: CONST_MATMUL_INTERVAL_READERS,
+    };
+
+    /// `NY_JOINT_BILINEAR_QUAD` — the joint (correlation-preserving) relaxation
+    /// of a fully-reduced elementwise product. Ships DARK.
+    pub JOINT_BILINEAR_QUAD = LeverDecl {
+        name: "NY_JOINT_BILINEAR_QUAD",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Admits a JOINT upper/lower bound for `ReduceSum(A * B)` where both operands are \
+functions of the same network input. Exact \"1\" arms it and exact \"0\" disarms \
+it; every other byte string is a RECORDED REJECTION that resolves to this \
+declaration's `false` default. The typed `solver.joint_bilinear_quad` key makes a \
+deliberate scored treatment reachable, but no shipped preset supplies it. A \
+present environment value still wins in both directions through the central \
+layered resolver.
+
+WHAT IS BROKEN WITHOUT IT. Every factor-wise relaxation ny has for a binary \
+`Mul` — McCormick, `mul.middle`, interval product — bounds the two operands \
+INDEPENDENTLY and then multiplies. When the property is a Lyapunov decrease \
+stated as `(f(x) - x)^T Q (f(x) + x)`, the two factors share `x`, and treating \
+them as independent throws away exactly the correlation that makes the property \
+true. It is a structural loss, not a tuning loss: no amount of branching \
+recovers it cheaply, because each split has to pay for the decorrelation again.
+
+WHAT THE ARMED ARM DOES. For each `ReduceSum(MulBinary(A, B))` that reduces to \
+a scalar, it takes CROWN affine certificates for A and B over the CURRENT box, \
+splits each into a midpoint affine plus a bounded residual, and bounds \
+`sum_i A_i B_i` as ONE quadratic form over the input box plus interval residual \
+cross terms. The quadratic is bounded by a centre/radius split whose curvature \
+term uses a Jacobi eigen-sweep AND charges the exact reconstruction residual \
+`H - U diag(lambda) U'` back into the bound, so a badly converged sweep can only \
+loosen the result — the identity holds for any real `U` and `lambda`. The \
+tightened scalar box then reaches the graph output through a downstream IBP \
+resweep that uses `node_ibp_step`, the same per-node dispatch as the \
+foundational forward pass.
+
+MEASURED, on lsnc_relu quadrotor2d row 2, boxes centred on the certified \
+maximizer: factor-wise CROWN crosses the 1e-6 threshold at ~48 input splits, \
+the joint bound at ~24 — about 2^24 fewer domains. At 18 splits the bound is \
+0.0259 against factor-wise 0.117 on a truth of -0.0013.
+
+SHRINK-ONLY AND FAIL-OPEN BY CONSTRUCTION. The result is published only as one \
+operand of `intersection_per_element` against the caller's own CROWN bounds, and \
+every refusal path — unsupported shape, non-finite certificate, deadline, a \
+disjoint intersection, an input wider than 64 dimensions — returns `None` and \
+leaves the caller's bounds byte-identical. The f64 arithmetic publishes through \
+an f32 cast stepped one ulp outward on each side, and the bound carries an \
+explicit operation-count rounding margin.
+
+MoatRisk::High, honestly and for one reason: armed, this is a BOUND path on a \
+benchmark family where ny has already published false `unsat` verdicts once \
+(807bf511, nineteen of them, from an unsound relaxed clip). There is no \
+alpha-beta-CROWN on the development host, so every `unsat` this lever enables \
+has to be adjudicated against an independently constructed reference on the \
+same domain before it is counted. That is why it is dark, and why it has no \
+shipped preset value.",
+        provenance: Provenance::Measured {
+            commit: "5d4e3954",
+            date: "2026-08-23",
+            artifact: "reports/measured-2026/lsnc_relu_artifacts/\
+                       joint_bilinear_quad/README.md",
+            delta: "see the artifact: the offline attribution that motivated it \
+                    (S2 = 100% of ny's own gap at 36 splits, where the network is \
+                    exactly affine on the box and there is no intermediate-bound \
+                    term left) and the measured per-row effect of arming it",
+        },
+        owner: JOINT_BILINEAR,
+        readers: JOINT_BILINEAR_QUAD_READERS,
     };
 
 }

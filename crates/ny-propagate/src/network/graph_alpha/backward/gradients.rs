@@ -38,7 +38,7 @@ pub(crate) fn envelope_grad_enabled() -> bool {
 /// [`envelope_grad_enabled`] with the typed preset answer layered in.
 ///
 /// DELIVERY, and the reason this function exists: `vnncomp_scripts/run_instance.sh`
-/// exports exactly ONE `NY_*` variable, so an env-only lever cannot fire in
+/// exports no `NY_*` variables, so an env-only lever cannot fire in
 /// competition however well it measures (`ny-cli/tests/measured_gate_delivery.rs`
 /// guards that). The preset key `bab.alpha_crown.alpha_envelope_grad` is the
 /// path that actually reaches a scored run.

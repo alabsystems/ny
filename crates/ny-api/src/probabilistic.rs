@@ -41,6 +41,11 @@ pub use ny_propagate::probabilistic::distributional::{
     propagate_distribution, AnalyticDistribution, DistributionalBound,
 };
 
+/// The CROWN linear-relaxation carrier ([`propagate_distribution`]'s first
+/// argument): sound elementwise-linear lower/upper enclosures
+/// `A_L·x + b_L <= f(x) <= A_U·x + b_U` over the input box.
+pub use ny_propagate::LinearBounds;
+
 /// Distribution-aware (DA-CROWN) refinements: path-specific variance tightening
 /// and distributional objective / gradient for alpha-CROWN guidance.
 pub use ny_propagate::probabilistic::distributional_alpha::{

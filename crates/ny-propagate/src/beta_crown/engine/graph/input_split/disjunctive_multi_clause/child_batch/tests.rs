@@ -26,6 +26,7 @@ use super::super::super::fresh_domain_clip::FreshDomainClipTelemetry;
 use super::super::super::shared::{MultiObjBounds, MultiObjInputDomain};
 use super::super::process_batch::process_disjunctive_domain_batch;
 use super::super::screen_child::WarmAlphaTelemetry;
+use super::super::BabWall;
 use super::{force_child_batch, force_clip_planes};
 use crate::beta_crown::config::{BetaCrownConfig, InputClipType};
 use crate::beta_crown::engine::graph::propagation::batched::SPEC_GATE_TEST_LOCK;
@@ -386,11 +387,13 @@ fn run_leg(force: bool, clip_planes: Option<bool>, config: BetaCrownConfig) -> L
         },
         None,
         &warm_alpha_telemetry,
+        None,
+        None,
         &fresh_domain_clip_telemetry,
         // No MulBinary alphas in this fixture (pre-existing merge fixup:
         // ddb123c1 merged S1's call site without the alphas parameter).
         None,
-        Duration::from_mins(1),
+        BabWall::clamped(Duration::from_mins(1), None, Instant::now()),
         &mut queue,
         &mut lifecycle,
         &mut domains_verified_by_clip,

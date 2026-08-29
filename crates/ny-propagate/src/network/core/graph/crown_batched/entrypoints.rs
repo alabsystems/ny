@@ -24,16 +24,53 @@ impl GraphNetwork {
     /// flattening to 1D. Essential for transformer models where operations
     /// like attention have cross-position interactions.
     ///
-    /// Supported layers:
-    /// - Linear, ReLU, GELU, SiLU, Softmax, LayerNorm (full batched support)
-    /// - All elementwise activations: Tanh, Sigmoid, Exp, Log, Sqrt, Reciprocal,
-    ///   Softplus, HardSwish, Mish, Selu, Elu, Celu, Softsign, Arctan, Sin, Cos, Tan,
-    ///   LeakyReLU, HardSigmoid, Clip, ThresholdedRelu, Abs, PowConstant,
-    ///   Floor, Ceil, Round, Sign
-    /// - Conv1d, Conv2d, ConvTranspose1d, ConvTranspose2d
-    /// - Add, MatMul, MulBinary, BilinearCrown (binary)
-    /// - Transpose, MulConstant, DivConstant, AddConstant, SubConstant
-    /// - Flatten, Reshape, Squeeze, Unsqueeze (passthrough)
+    /// # Layer coverage
+    ///
+    /// Rewritten from the code it describes: the unary set below is exactly the
+    /// supported arms of [`Layer::propagate_crown_backward_batched`]
+    /// (`layers/layer_enum/dispatch.rs`), and the multi-input set is exactly the
+    /// arms of `dispatch_special_batched_operator`
+    /// (`crown_batched/dispatch.rs`). Both matches are exhaustive with no
+    /// catch-all, so a new `Layer` variant is a compile error until it is placed.
+    ///
+    /// **Unary, full batched backward**
+    /// - Linear, RoPE
+    /// - Conv1d, Conv2d, ConvTranspose1d, ConvTranspose2d (Conv2d additionally
+    ///   has a Patches fast path in the backward loop)
+    /// - Every elementwise activation (the `for_each_elementwise_activation!`
+    ///   list — ReLU, GELU, SiLU, Tanh, Sigmoid, Erf, Exp, Log, Sqrt,
+    ///   Reciprocal, Softplus, HardSwish, Mish, Selu, Softsign, Arctan, Tan,
+    ///   Sin, Cos, Elu, Celu, LeakyReLU, HardSigmoid, Clip, ThresholdedRelu,
+    ///   Abs, PowConstant, Floor, Ceil, Round, Trunc, Sign, PRelu, Shrink,
+    ///   Snake, Compare)
+    /// - Softmax family: Softmax, CausalSoftmax, LogSoftmax, LogSumExp
+    /// - Normalization: LayerNorm, RmsNorm, InstanceNorm1d, GroupNorm, BatchNorm,
+    ///   AdaIN1d (fixed-style)
+    /// - Constant arithmetic: AddConstant, SubConstant, MulConstant, DivConstant
+    /// - Reductions: ReduceMean, ReduceSum, ReduceMax, ReduceMin, CumSum
+    ///   (CumSum requires a last-axis grouped layout)
+    /// - Shape: Flatten, Reshape, Squeeze, Unsqueeze (pass-through), Transpose,
+    ///   Slice, Tile, Pad, Resize
+    /// - QdqPerturbation, EpsilonExpand
+    ///
+    /// **Multi-input, handled by the special dispatcher**
+    /// - Add, Sub, MatMul, MulBinary, BilinearCrown, ExpandLikeLastAxis
+    /// - Concat — only when the join is a provable last-axis column split of two
+    ///   dynamic operands (see the arm's guards); other joins keep the fallback
+    /// - Where — embedded-constant select, sign-provable condition, and exact
+    ///   constant-mask column split; a data-dependent condition keeps the
+    ///   fallback
+    ///
+    /// **Not supported — these degrade to partial CROWN / IBP at the node (sound,
+    /// looser)**
+    /// - AveragePool, MaxPool2d
+    /// - Gather, ScatterAdd, IndexAdd, ScatterND
+    /// - Topk, ArgMax, ArgMin, ArgSort, NonZero
+    /// - Div, Atan2, MinBinary, MaxBinary, CompareTensor
+    /// - IntervalConst, SkipMerge, OpaqueSkip
+    /// - SelfAttention — rejected up front with `UnsupportedOp` (see the fast-fail
+    ///   note in `propagate_crown_batched_inner`), so the caller reaches the dense
+    ///   backward that does handle it
     #[inline]
     #[instrument(skip(self, input), fields(num_nodes = self.nodes.len(), input_shape = ?input.shape()))]
     pub fn propagate_crown_batched(&self, input: &BoundedTensor) -> Result<BoundedTensor> {

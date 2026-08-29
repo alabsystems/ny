@@ -26,7 +26,7 @@ pub const CLEAN_LAKE_PACKAGE: &str = "crownproof";
 /// Canonical internal Clean Git remote. Publication rewrites this dependency.
 pub const CLEAN_GIT_URL: &str = "https://github.com/alabsystems/clean.git";
 /// Audited Clean revision containing every theorem in [`CITED_THEOREMS`].
-pub const CLEAN_GIT_REV: &str = "a119ed0cfdafcb3eca4904253fdc51283e2ff0f8";
+pub const CLEAN_GIT_REV: &str = "9a9b16e44b9233d0c387839ea205a22fb77ac4bb";
 /// Clean's Lake package root within its repository.
 pub const CLEAN_LAKE_SUBDIR: &str = "crown-proofs/lean";
 /// Lean module directory below the Clean Lake package root.
@@ -547,8 +547,9 @@ fn cited_theorem_on_attribute_line(line: &str) -> Option<String> {
     }
     let end = trimmed.find(']')?;
     let attribute = trimmed.get(..=end)?;
-    // Spell the stable filtering operation directly so verification does not
-    // depend on resolving the generic Filter/collect adapter chain.
+    // Explicit loop (not `.chars().filter(..).collect()`): the filter adapter is
+    // an absent-callee for the panic-freedom checker; the loop keeps the identical
+    // non-whitespace chars in order.
     let mut compact = String::new();
     for c in attribute.chars() {
         if !c.is_whitespace() {
@@ -577,6 +578,8 @@ fn function_name_on_line(line: &str) -> Option<String> {
     while let Some(word) = words.next() {
         if word == "fn" {
             let word = words.next()?;
+            // Explicit loop (not `take_while(..).collect()`): identical leading
+            // ident-char run; clears the take_while absent-callee.
             let mut name = String::new();
             for c in word.chars() {
                 if !is_ident_char(c) {
@@ -635,26 +638,114 @@ pub fn citations_in_source(src: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[derive(Debug, serde::Deserialize)]
+    // Hand-written `lake-manifest.json` decoding (previously
+    // `#[derive(serde::Deserialize)]` with `#[serde(rename = ...)]` on the
+    // camelCase keys). The derive was removed so ny-cert carries no proc-macro
+    // dependency — serde's `derive` feature pulls in `serde_derive`, and an
+    // in-process proc macro breaks the evidence-grade TCB boundary that lets the
+    // bignum stack be *verified* rather than assumed.
+    //
+    // The structs are kept (not replaced by raw `crate::json::Json` navigation) so
+    // that the `{package:?}` / `{mathlib:?}` diagnostics below stay byte-identical:
+    // field names, declaration order, and `Option`/`bool` typing all feed `Debug`.
+    // The decoders below reproduce the derive's semantics exactly — unknown fields
+    // are ignored, a missing required field is an error, and an `Option<String>`
+    // field decodes to `None` when absent *or* explicitly `null`.
+
+    #[derive(Debug)]
     struct LakeManifest {
-        #[serde(rename = "packagesDir")]
         packages_dir: String,
         packages: Vec<LakePackage>,
         name: String,
     }
 
-    #[derive(Debug, serde::Deserialize)]
+    #[derive(Debug)]
     struct LakePackage {
         url: String,
-        #[serde(rename = "type")]
         kind: String,
-        #[serde(rename = "subDir")]
         sub_dir: Option<String>,
         rev: String,
         name: String,
-        #[serde(rename = "inputRev")]
         input_rev: Option<String>,
         inherited: bool,
+    }
+
+    fn json_object<'a>(
+        value: &'a crate::json::Json,
+        what: &str,
+    ) -> Result<&'a crate::json::Map, String> {
+        value
+            .as_object()
+            .ok_or_else(|| format!("{what} must be a JSON object"))
+    }
+
+    fn json_string(obj: &crate::json::Map, key: &str) -> Result<String, String> {
+        let value = obj
+            .get(key)
+            .ok_or_else(|| format!("missing field `{key}`"))?;
+        value
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("field `{key}` must be a string"))
+    }
+
+    /// `Option<String>` field, with serde's derive semantics: an absent field and an
+    /// explicit `null` both decode to `None`.
+    fn json_opt_string(obj: &crate::json::Map, key: &str) -> Result<Option<String>, String> {
+        match obj.get(key) {
+            None | Some(crate::json::Json::Null) => Ok(None),
+            Some(value) => value
+                .as_str()
+                .map(|text| Some(text.to_owned()))
+                .ok_or_else(|| format!("field `{key}` must be a string or null")),
+        }
+    }
+
+    fn json_bool(obj: &crate::json::Map, key: &str) -> Result<bool, String> {
+        let value = obj
+            .get(key)
+            .ok_or_else(|| format!("missing field `{key}`"))?;
+        value
+            .as_bool()
+            .ok_or_else(|| format!("field `{key}` must be a boolean"))
+    }
+
+    impl LakeManifest {
+        fn from_json(value: &crate::json::Json) -> Result<Self, String> {
+            let obj = json_object(value, "lake-manifest")?;
+            let packages_dir = json_string(obj, "packagesDir")?;
+            let packages_value = obj
+                .get("packages")
+                .ok_or_else(|| "missing field `packages`".to_owned())?;
+            let packages_array = packages_value
+                .as_array()
+                .ok_or_else(|| "field `packages` must be an array".to_owned())?;
+            let mut packages = Vec::with_capacity(packages_array.len());
+            for package in packages_array {
+                packages.push(LakePackage::from_json(package)?);
+            }
+            let name = json_string(obj, "name")?;
+            Ok(Self {
+                packages_dir,
+                packages,
+                name,
+            })
+        }
+    }
+
+    impl LakePackage {
+        fn from_json(value: &crate::json::Json) -> Result<Self, String> {
+            let obj = json_object(value, "lake-manifest package")?;
+            Ok(Self {
+                url: json_string(obj, "url")?,
+                kind: json_string(obj, "type")?,
+                sub_dir: json_opt_string(obj, "subDir")?,
+                rev: json_string(obj, "rev")?,
+                name: json_string(obj, "name")?,
+                input_rev: json_opt_string(obj, "inputRev")?,
+                inherited: json_bool(obj, "inherited")?,
+            })
+        }
     }
 
     fn parse_clean_lake_requirement(lakefile: &str) -> Result<(), String> {
@@ -823,7 +914,9 @@ mod tests {
 
         let manifest_text = std::fs::read_to_string(lean_root.join("lake-manifest.json"))
             .map_err(|e| format!("read lake-manifest.json (run `lake update`): {e}"))?;
-        let manifest: LakeManifest = serde_json::from_str(&manifest_text)
+        let manifest_json: crate::json::Json = crate::json::from_str(&manifest_text)
+            .map_err(|e| format!("parse lake-manifest.json: {e}"))?;
+        let manifest = LakeManifest::from_json(&manifest_json)
             .map_err(|e| format!("parse lake-manifest.json: {e}"))?;
         if manifest.name != "nyproof" {
             return Err(format!(
@@ -1258,9 +1351,9 @@ theorem holed : True := by sorry\n";
             .collect();
         let map_text = std::fs::read_to_string(dir.join("proofs/cite-map.json"))
             .map_err(|e| format!("read cite-map: {e}"))?;
-        let map_json: serde_json::Value =
-            serde_json::from_str(&map_text).map_err(|e| format!("parse cite-map: {e}"))?;
-        let expected_corpus = serde_json::json!({
+        let map_json: crate::json::Json =
+            crate::json::from_str(&map_text).map_err(|e| format!("parse cite-map: {e}"))?;
+        let expected_corpus = crate::json!({
             "source": "lake-git-dependency",
             "package": CLEAN_LAKE_PACKAGE,
             "git": CLEAN_GIT_URL,

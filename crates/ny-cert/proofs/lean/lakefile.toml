@@ -5,7 +5,7 @@ defaultTargets = ["NyProof"]
 [[require]]
 name = "crownproof"
 git = "https://github.com/alabsystems/clean.git"
-rev = "bcd59e3c94306b7cebc42de080f3fdd59c766435"
+rev = "9a9b16e44b9233d0c387839ea205a22fb77ac4bb"
 subDir = "crown-proofs/lean"
 
 [[require]]

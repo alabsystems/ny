@@ -958,22 +958,8 @@ pub(crate) fn conv_forward_blocked_f32(
     mask: Option<(&[u64], &[u64], usize)>,
 ) {
     let (co, _, _, _) = c.kernel;
-    let p = c.oshape.1 * c.oshape.2;
-    let k = c.k_fwd;
     let r = src.ncols();
-    debug_assert_eq!(dst.nrows(), co * p);
-    debug_assert_eq!(dst.ncols(), r);
-    // #tableau-support-mask: the column blocking is driven by the mask when one
-    // is supplied (so a block is either wholly computed or wholly skipped), and
-    // by the cache-tuned default otherwise.
-    let rmax = r.max(1);
-    let (blk, nblk) = match mask {
-        Some((_, _, n)) => (r.div_ceil(n), n),
-        None => {
-            let b = ((1usize << 15) / co.max(1)).clamp(64.min(rmax), rmax);
-            (b, r.div_ceil(b))
-        }
-    };
+    let (blk, nblk) = conv_f32_blocking(mask, r, co);
     let src_flat = src.as_slice().expect("standard layout");
     // f32 scratch of the whole input tensor (read once from f64, then reused
     // across the tap reduction from f32 — the bandwidth win). f64->f32 conversion
@@ -985,12 +971,14 @@ pub(crate) fn conv_forward_blocked_f32(
     // the rest is provably exact `0.0` and the scratch is already zeroed, so the
     // converted values are identical either way.
     let mut src32: Vec<f32> = vec![0.0; src_flat.len()];
+    let src32_rows = src32.len() / r.max(1);
     match mask {
         Some((src_mask, _, _)) => {
             src32
                 .par_chunks_mut(r)
                 .zip(src_flat.par_chunks(r))
                 .zip(src_mask.par_iter())
+                .with_min_len(par_min_len(r, src32_rows))
                 .for_each(|((drow, srow), &m)| {
                     for b in 0..nblk {
                         if m & (1u64 << b) == 0 {
@@ -1015,19 +1003,127 @@ pub(crate) fn conv_forward_blocked_f32(
                 });
         }
     }
+    conv_f32_core(
+        c,
+        &src32,
+        r,
+        dst,
+        abs_w,
+        mask.map(|(_, out, _)| out),
+        blk,
+        nblk,
+    );
+}
+
+/// f32-STORED forward conv (`NY_MARGIN_ROW_TABLEAU_F32` storage lane): the
+/// source tableau is ALREADY `f32`, so the per-layer cast pass of
+/// [`conv_forward_blocked_f32`] is deleted (that pass is a full extra
+/// read+write of a multi-GB tensor per lane per layer), and the f32
+/// accumulator is stored into the f32 `dst` DIRECTLY.
+///
+/// EXACTNESS OF THE STORE: the value [`conv_forward_blocked_f32`] writes today
+/// is `f64::from(acc)` — an exact widening of the same f32 accumulator — so
+/// storing `acc` itself is the same number, bit for bit (class (a) of the
+/// storage-soundness taxonomy in `root.rs`; zero new rounding). The shared
+/// [`conv_f32_core`] guarantees the accumulation is the identical code path.
+/// The caller's `gamma_n_f32(k_fwd + 8)` slack still budgets one input
+/// f64->f32 conversion that no longer happens — a sound over-count.
+pub(crate) fn conv_forward_f32_native(
+    c: &ConvOp,
+    src: &Array2<f32>,
+    dst: &mut Array2<f32>,
+    abs_w: bool,
+    mask: Option<(&[u64], &[u64], usize)>,
+) {
+    let (co, _, _, _) = c.kernel;
+    let r = src.ncols();
+    let (blk, nblk) = conv_f32_blocking(mask, r, co);
+    let src_flat = src.as_slice().expect("standard layout");
+    conv_f32_core(
+        c,
+        src_flat,
+        r,
+        dst,
+        abs_w,
+        mask.map(|(_, out, _)| out),
+        blk,
+        nblk,
+    );
+}
+
+/// Column blocking shared by both f32 conv entries.
+///
+/// #tableau-support-mask: the column blocking is driven by the mask when one
+/// is supplied (so a block is either wholly computed or wholly skipped), and
+/// by the cache-tuned default otherwise.
+fn conv_f32_blocking(mask: Option<(&[u64], &[u64], usize)>, r: usize, co: usize) -> (usize, usize) {
+    let rmax = r.max(1);
+    match mask {
+        Some((_, _, n)) => (r.div_ceil(n), n),
+        None => {
+            let b = ((1usize << 15) / co.max(1)).clamp(64.min(rmax), rmax);
+            (b, r.div_ceil(b))
+        }
+    }
+}
+
+/// Element type an f32 conv accumulator may be stored into.
+///
+/// `f64` widens exactly (the shipped `root_f32` compute lane); `f32` stores the
+/// accumulator bits directly (the `NY_MARGIN_ROW_TABLEAU_F32` storage lane).
+/// Both stores publish the SAME number, so the two lanes share one kernel and
+/// the refactor is bit-identity-testable
+/// (`conv_f32_native_store_is_bitwise_the_widened_path`).
+pub(crate) trait ConvF32Dst: Copy + Send + Sync {
+    fn from_acc(a: f32) -> Self;
+}
+impl ConvF32Dst for f64 {
+    #[inline]
+    fn from_acc(a: f32) -> f64 {
+        f64::from(a)
+    }
+}
+impl ConvF32Dst for f32 {
+    #[inline]
+    fn from_acc(a: f32) -> f32 {
+        a
+    }
+}
+
+/// Shared spatial/tap loop of the f32 forward conv (see
+/// [`conv_forward_blocked_f32`] for the algorithm and soundness notes). Moved
+/// VERBATIM out of the former monolith so the f32-store lane cannot drift from
+/// the shipped f32-compute lane.
+#[allow(clippy::too_many_arguments)]
+fn conv_f32_core<O: ConvF32Dst>(
+    c: &ConvOp,
+    src32: &[f32],
+    r: usize,
+    dst: &mut Array2<O>,
+    abs_w: bool,
+    out_mask: Option<&[u64]>,
+    blk: usize,
+    nblk: usize,
+) {
+    let (co, _, _, _) = c.kernel;
+    let p = c.oshape.1 * c.oshape.2;
+    let k = c.k_fwd;
+    debug_assert_eq!(dst.nrows(), co * p);
+    debug_assert_eq!(dst.ncols(), r);
+    debug_assert_eq!(src32.len() % r.max(1), 0);
     // f32 weights (small, cached in registers/L1). |w| for the abs (D) lane.
     let w32: Vec<f32> = if abs_w {
         c.wmat.iter().map(|&w| (w as f32).abs()).collect()
     } else {
         c.wmat.iter().map(|&w| w as f32).collect()
     };
-    let out_mask = mask.map(|(_, out, _)| out);
     let mut dst3 = dst
         .view_mut()
         .into_shape_with_order((co, p, r))
         .expect("standard layout reshape");
     dst3.axis_iter_mut(Axis(1))
         .into_par_iter()
+        .with_min_len(par_min_len(co * blk, p))
         .enumerate()
         .for_each_init(
             || vec![0.0f32; co * blk],
@@ -1066,7 +1162,7 @@ pub(crate) fn conv_forward_blocked_f32(
                         let mut arow = out_sp.row_mut(oc);
                         let dr = arow.as_slice_mut().expect("contiguous output row");
                         for (d, &a) in dr[rc..rc + rb].iter_mut().zip(&acc[oc * rb..oc * rb + rb]) {
-                            *d = f64::from(a);
+                            *d = O::from_acc(a);
                         }
                     }
                 }
@@ -1257,6 +1353,7 @@ pub(crate) fn conv_forward_blocked(
         .expect("standard layout reshape");
     dst3.axis_iter_mut(Axis(1))
         .into_par_iter()
+        .with_min_len(par_min_len(co * r_blk, p))
         .enumerate()
         .for_each_init(
             || vec![0.0f64; co * r_blk],
@@ -1294,6 +1391,41 @@ pub(crate) fn conv_forward_blocked(
         );
 }
 
+/// Minimum spatial positions per rayon task, so a task is worth its own wakeup.
+///
+/// These conv kernels parallelise over spatial position: one work unit per
+/// `sp`. That is right for a ResNet layer and badly wrong for a 4x4 probe net,
+/// where a unit is a few microseconds and rayon's per-task sleep/wake costs
+/// more than the arithmetic. Sampling `engine_and_bab_bit_identical_across_
+/// backward_gate` -- 261s wall for 31.7s of CPU, i.e. 88% IDLE -- put the
+/// process in `rayon_core::sleep::Sleep::wake_specific_thread` contending on a
+/// pthread mutex, not in any kernel of ours.
+///
+/// Grouping positions until a task carries ~16Ki output elements keeps large
+/// convs fully parallel (min_len collapses to 1) while a small one degenerates
+/// to a single task and skips the scheduler entirely. Positions are computed
+/// independently into disjoint output rows, so grouping them changes no
+/// accumulation order and the result stays BIT-IDENTICAL -- which the conv-grain
+/// oracles assert directly.
+const PAR_MIN_TASK_ELEMS: usize = 1 << 14;
+
+fn par_min_len(elems_per_unit: usize, units: usize) -> usize {
+    let units = units.max(1);
+    // WHOLE JOB IS TINY: one task, so rayon is entered but never splits. This is
+    // the 4x4 probe-net case the oracles hammer.
+    if units.saturating_mul(elems_per_unit) < PAR_MIN_TASK_ELEMS {
+        return units;
+    }
+    // OTHERWISE: coarsen toward ~16Ki-element tasks, but never so far that the
+    // machine goes idle. Grouping purely by work took
+    // `engine_and_bab_bit_identical_across_backward_gate` -- 101s of real CPU,
+    // not a tiny job -- down to ~9 tasks on 14 cores and made it SLOWER
+    // (16.31s -> 20.54s). The floor keeps at least one task per thread.
+    let by_work = PAR_MIN_TASK_ELEMS.div_ceil(elems_per_unit.max(1)).max(1);
+    let keep_cores_busy = (units / rayon::current_num_threads().max(1)).max(1);
+    by_work.min(keep_cores_busy)
+}
+
 /// Row-parallel forward conv: one rayon work unit per output row `(oc, sp)`,
 /// i.e. `co*P` independent units. Each row folds its taps in ascending `t`
 /// order into a freshly zeroed accumulator — bit-identical to
@@ -1314,6 +1446,7 @@ pub(crate) fn conv_forward_rowgrain(
     let dst_slice = dst.as_slice_mut().expect("standard layout");
     dst_slice
         .par_chunks_mut(r)
+        .with_min_len(par_min_len(r, co * p))
         .enumerate()
         .for_each(|(row, acc)| {
             // Rows are output-channel major: row = oc*P + sp. rayon hands each
@@ -1357,6 +1490,7 @@ pub(crate) fn conv_forward_ocgrain(
     let dst_slice = dst.as_slice_mut().expect("standard layout");
     dst_slice
         .par_chunks_mut(p * r)
+        .with_min_len(par_min_len(p * r, co))
         .enumerate()
         .for_each(|(oc, dchunk)| {
             let wrow = &c.wmat[oc * k..(oc + 1) * k];
@@ -1472,6 +1606,7 @@ pub(crate) fn conv_backward_icgrain(
     // absolute-weight certified-error lane remain bit-identical.
     dst_slice
         .par_chunks_mut(r)
+        .with_min_len(par_min_len(r, ci * ip))
         .enumerate()
         .for_each(|(input_row, acc)| {
             let ic = input_row / ip;
@@ -1533,6 +1668,7 @@ pub(crate) fn conv_backward_blocked(
         .expect("standard layout reshape");
     dst3.axis_iter_mut(Axis(1))
         .into_par_iter()
+        .with_min_len(par_min_len(ci * r_blk, ip))
         .enumerate()
         .for_each_init(
             || vec![0.0f64; ci * r_blk],

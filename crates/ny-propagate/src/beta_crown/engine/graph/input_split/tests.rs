@@ -2,7 +2,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use super::batching::{bound_deferred_domains_batch, tighten_obj_lower_bounds};
+use super::batching::{
+    bound_deferred_domains_batch, bound_deferred_domains_batch_with_metrics,
+    tighten_obj_lower_bounds,
+};
 use super::grouped_semantics::{disjunctive_domain_priority, disjunctive_domain_verified};
 use super::mul_binary::maybe_optimize_mul_binary_alphas;
 use super::multi_objective::{multi_objective_bab_timeout, multi_objective_loop_batch_decision};
@@ -19,6 +22,7 @@ use crate::beta_crown::result::BabVerificationStatus;
 use crate::beta_crown::BranchingHeuristic;
 use crate::layers::ConcatLayer;
 use crate::layers::ReLULayer;
+use crate::layers::ReduceSumLayer;
 use crate::{GraphNetwork, GraphNode, Layer, LinearBounds, LinearLayer, MulBinaryLayer};
 use ndarray::{arr1, arr2, Array1, Array2};
 use ny_tensor::BoundedTensor;
@@ -340,6 +344,7 @@ mod adv_check_witness;
 mod batching_rebound;
 mod disjunctive_domain_verified;
 mod disjunctive_reorder_batching;
+mod lane_gap;
 mod metrics_emission;
 mod multi_objective_parity;
 mod multi_objective_reorder_batching;
@@ -1172,12 +1177,177 @@ fn test_batched_specs_accepts_mul_binary_alphas_4284() {
         None,
         false,
         false,
+        None,
     )
     .expect("batched specs with mul_binary_alphas should succeed");
 
     assert_eq!(batched.bounds.len(), 2, "expected bounds for both domains");
     assert_batched_contains_baseline_4284(&batched.bounds[0], &baseline_a.0, 0);
     assert_batched_contains_baseline_4284(&batched.bounds[1], &baseline_b.0, 1);
+}
+
+fn build_joint_bilinear_dense_spec_route_fixture(
+) -> (GraphNetwork, Array2<f32>, BoundedTensor, BoundedTensor) {
+    // y = sum_i x_i * (-x_i).  Factor-wise MulBinary relaxation loses the
+    // shared-x correlation and admits a positive upper bound; the joint pass
+    // recovers y <= 0.  The topology is the exact ReduceSum(A * B) shape the
+    // dark relaxation recognizes.
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "left",
+        Layer::Linear(
+            LinearLayer::new(arr2(&[[1.0_f32, 0.0], [0.0, 1.0]]), None)
+                .expect("valid identity factor"),
+        ),
+    ));
+    graph.add_node(GraphNode::from_input(
+        "right",
+        Layer::Linear(
+            LinearLayer::new(arr2(&[[-1.0_f32, 0.0], [0.0, -1.0]]), None)
+                .expect("valid negated factor"),
+        ),
+    ));
+    graph.add_node(GraphNode::binary(
+        "product",
+        Layer::MulBinary(MulBinaryLayer),
+        "left",
+        "right",
+    ));
+    graph.add_node(GraphNode::new(
+        "sum",
+        Layer::ReduceSum(ReduceSumLayer::new(vec![-1], true)),
+        vec!["product".to_string()],
+    ));
+    graph.set_output("sum");
+
+    let wide = BoundedTensor::new(
+        arr1(&[-1.0_f32, -1.0]).into_dyn(),
+        arr1(&[1.0_f32, 1.0]).into_dyn(),
+    )
+    .expect("valid wide joint box");
+    let narrow = BoundedTensor::new(
+        arr1(&[-0.5_f32, -0.75]).into_dyn(),
+        arr1(&[0.5_f32, 0.75]).into_dyn(),
+    )
+    .expect("valid narrow joint box");
+    (graph, arr2(&[[1.0_f32]]), wide, narrow)
+}
+
+/// Route-parity regression for the reordered dense-spec rebound.
+///
+/// The absent and explicit-OFF arms must retain the historical batched kernel
+/// and identical bounds.  Once the joint relaxation is armed, the same batch
+/// must use the scalar fallback that owns the post-CROWN joint intersection;
+/// on this correlated fixture that route must materially tighten the bound.
+#[test]
+fn joint_bilinear_armed_routes_dense_specs_through_scalar_fallback() {
+    let (graph, spec_matrix, wide, narrow) = build_joint_bilinear_dense_spec_route_fixture();
+    let inputs = [&wide, &narrow];
+    let root_node_bounds = graph
+        .collect_node_bounds(&wide)
+        .expect("representative shared root bounds should collect");
+    let lever = &ny_levers::decls::dark_probes::JOINT_BILINEAR_QUAD;
+
+    ny_test_utils::env::with_env_edits(|env| {
+        let run = || {
+            compute_crown_or_ibp_bounds_batched_specs(
+                &graph,
+                &inputs,
+                &spec_matrix,
+                None,
+                Some(&root_node_bounds),
+                None,
+                None,
+                None,
+                None,
+                true,
+                false,
+                None,
+            )
+            .expect("dense-spec rebound should succeed")
+        };
+
+        env.remove(lever.name);
+        let absent = run();
+        env.set(lever.name, "0");
+        let off = run();
+
+        assert_eq!(
+            absent.rebound_timing.mode,
+            crate::beta_crown::DenseSpecReboundMode::BatchedFastPath,
+            "the shipped-dark arm must keep the historical batched route"
+        );
+        assert_eq!(
+            off.rebound_timing.mode,
+            crate::beta_crown::DenseSpecReboundMode::BatchedFastPath,
+            "an explicit zero must keep the historical batched route"
+        );
+        for (domain, (baseline, explicit_off)) in absent.bounds.iter().zip(&off.bounds).enumerate()
+        {
+            assert_eq!(
+                baseline.lower(),
+                explicit_off.lower(),
+                "domain {domain}: gate-off lower bounds changed"
+            );
+            assert_eq!(
+                baseline.upper(),
+                explicit_off.upper(),
+                "domain {domain}: gate-off upper bounds changed"
+            );
+        }
+
+        env.set(lever.name, "1");
+        let armed = run();
+        assert_eq!(
+            armed.rebound_timing.mode,
+            crate::beta_crown::DenseSpecReboundMode::RayonFallback,
+            "the armed joint pass must not be bypassed by batched backward"
+        );
+        assert!(
+            off.bounds[0].upper_scalar() > 1.0,
+            "fixture lost its factor-wise relaxation gap: {}",
+            off.bounds[0].upper_scalar()
+        );
+        assert!(
+            armed.bounds[0].upper_scalar() <= 1.0e-4,
+            "joint-capable scalar fallback did not recover sum(-x_i^2) <= 0: {}",
+            armed.bounds[0].upper_scalar()
+        );
+
+        // Arming the research lever must not impose the scalar fallback on an
+        // unrelated graph.  The cheap topology predicate is necessary-only:
+        // every graph on which the joint pass could publish is caught, while a
+        // graph with no ReduceSum(MulBinary) candidate keeps batched throughput.
+        let mut affine_graph = GraphNetwork::new();
+        affine_graph.add_node(GraphNode::from_input(
+            "affine",
+            Layer::Linear(
+                LinearLayer::new(arr2(&[[1.0_f32, -1.0]]), None)
+                    .expect("valid unrelated affine graph"),
+            ),
+        ));
+        affine_graph.set_output("affine");
+        let unrelated = compute_crown_or_ibp_bounds_batched_specs(
+            &affine_graph,
+            &inputs,
+            &spec_matrix,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            false,
+            None,
+        )
+        .expect("unrelated dense-spec rebound should succeed");
+        assert_eq!(
+            unrelated.rebound_timing.mode,
+            crate::beta_crown::DenseSpecReboundMode::BatchedFastPath,
+            "arming joint bilinear must not de-batch an ineligible graph"
+        );
+    });
 }
 
 /// DIAGNOSTIC (#relational-bab): does the batched fast-path rebound match the
@@ -1267,6 +1437,7 @@ fn batched_fast_path_matches_scalar_crown_ibp_on_sub_towers() {
         None,
         false,
         false,
+        None,
     )
     .expect("batched fast path");
     let bflat = batched.bounds[0].flatten();
@@ -1429,6 +1600,7 @@ mod relational_bab_levers {
                 &config,
                 None,
                 0,
+                None,
             )
             .expect("rebound");
             domains.pop().unwrap()

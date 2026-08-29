@@ -304,6 +304,11 @@ fn assert_plain_cast_is_directionally_unsound(lower: f32, lower_extra: f32, uppe
 
 #[test]
 fn test_crown_merge_accumulator_preserves_three_term_cancellation_2657() {
+    // Excluded from overlapping an env WRITER. Caught under the Trust
+    // toolchain at --test-threads=8: `budget_bytes: 0` is the leaked
+    // NY_DENSE_BUDGET_MB printed verbatim, from a sibling in THIS file that
+    // sets it to 0 -- not an f64 cancellation defect.
+    let _env = crate::tests::lock_env_shared();
     let graph = test_graph();
     let mut accumulator = CrownMergeAccumulator::new();
     let mut input_accumulated = false;
@@ -365,6 +370,12 @@ fn test_crown_merge_accumulator_preserves_three_term_cancellation_2657() {
 
 #[test]
 fn test_merge_binary64_cancellation_bias_is_directed_and_coeff_error_is_carried() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     use ny_tensor::BoundedTensor;
 
     let large = 2.0_f32.powi(60);
@@ -400,6 +411,12 @@ fn test_merge_binary64_cancellation_bias_is_directed_and_coeff_error_is_carried(
 
 #[test]
 fn test_merge_error_addition_rounds_up_per_addend() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     let large = 2.0_f64.powi(60);
     let mut existing = Some(array![[large]]);
     let incoming = array![[1.0_f32]];
@@ -455,6 +472,12 @@ fn test_crown_merge_accumulator_downcasts_with_directed_rounding_2657() {
 
 #[test]
 fn test_crown_merge_accumulator_missing_network_input_merge_errors_2657() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     let graph = test_graph();
     let mut accumulator = CrownMergeAccumulator::new();
     let mut input_accumulated = true;
@@ -485,6 +508,12 @@ fn test_crown_merge_accumulator_missing_network_input_merge_errors_2657() {
 
 #[test]
 fn test_crown_merge_accumulator_has_only_key_after_dense_promotion_4023() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     let mut accumulator = CrownMergeAccumulator::new();
     accumulator.insert(
         NETWORK_INPUT.to_string(),
@@ -511,6 +540,12 @@ fn test_crown_merge_accumulator_has_only_key_after_dense_promotion_4023() {
 
 #[test]
 fn test_crown_merge_accumulator_indexed_take_by_idx_round_trips_4296() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     let exec_order = vec!["hidden".to_string(), "output".to_string()];
     let mut accumulator = CrownMergeAccumulator::new_indexed(&exec_order);
     accumulator.insert(
@@ -551,6 +586,12 @@ fn test_crown_merge_accumulator_indexed_take_by_idx_round_trips_4296() {
 /// #4382 regression: merge_crown with compatible Patches keeps them in Patches
 /// form instead of promoting to Dense.
 fn test_crown_merge_accumulator_merge_crown_patches_stays_patches_4382() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     let mut accumulator = CrownMergeAccumulator::new();
     accumulator.insert(
         "residual".to_string(),
@@ -792,6 +833,12 @@ fn mixed_merge_budget_refusal_preserves_pending_anchored_patches_in_both_stores(
 
 #[test]
 fn expired_merge_preserves_pending_anchored_patches_in_both_stores() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     let expired = Instant::now()
         .checked_sub(Duration::from_millis(1))
         .expect("system uptime exceeds one millisecond");
@@ -826,6 +873,12 @@ fn expired_merge_preserves_pending_anchored_patches_in_both_stores() {
 
 #[test]
 fn expired_frontier_snapshot_is_atomic_for_anchored_patches() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     let expired = Instant::now()
         .checked_sub(Duration::from_millis(1))
         .expect("system uptime exceeds one millisecond");
@@ -987,6 +1040,12 @@ fn test_crown_merge_accumulator_indexed_network_input_dense_promotion_4296() {
 
 #[test]
 fn expired_take_preserves_f64_sidecar_for_later_publication() {
+    // Excluded from overlapping an env WRITER. Siblings in THIS FILE set
+    // NY_DENSE_BUDGET_MB=0; an unguarded reader that races one sees
+    // `budget_bytes: 0` in CrownMergeAccumulator staging. Every reader here
+    // is guarded as a class -- three had already failed one at a time
+    // (2026-08-19, 2026-08-20 x2), each printing the leaked value verbatim.
+    let _env = crate::tests::lock_env_shared();
     let expired = Instant::now()
         .checked_sub(Duration::from_millis(1))
         .expect("system uptime exceeds one millisecond");

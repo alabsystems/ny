@@ -14,7 +14,7 @@
 //! - `activations`: ReLU family and element-wise activations
 //! - `softmax`: Softmax, LogSoftmax, GELU, LogSumExp, CausalSoftmax layers
 //! - `normalization`: LayerNorm, BatchNorm
-//! - `convolution`: Conv1d, Conv2d
+//! - `convolution`: Conv1d, Conv2d, Conv3d
 //! - `pooling`: AveragePool, MaxPool
 //! - `binary_ops`: MatMul, Add, Mul, Concat, Sub, Div, Atan2
 //! - `arithmetic`: Constant arithmetic operations
@@ -34,10 +34,12 @@ pub(crate) mod arithmetic;
 pub(crate) mod attention;
 /// Binary operations (MatMul, Add, Mul, Sub, Div, Atan2, Concat, Min, Max).
 pub(crate) mod binary_ops;
-/// Convolutional layers (Conv1d, Conv2d, ConvTranspose1d, ConvTranspose2d).
+/// Convolutional layers (Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d).
 pub(crate) mod convolution;
 /// Double-precision (f64) layer implementations for soundness-critical propagation.
 pub(crate) mod float64;
+/// Affine layers whose frozen constant is an ENCLOSURE rather than a point.
+pub(crate) mod interval_const;
 /// Fully-connected linear layers (y = Wx + b) with faer-accelerated GEMM.
 pub(crate) mod linear;
 /// Miscellaneous layers (SkipMerge, OpaqueSkip, Floor, Ceil, Round, Sign, Reciprocal, Where, NonZero).
@@ -93,15 +95,18 @@ pub use binary_ops::{
     AddLayer, Atan2Layer, BilinearCrownLayer, CompareTensorLayer, ConcatLayer, DivLayer,
     MatMulIbpMode, MatMulLayer, MaxBinaryLayer, MinBinaryLayer, MulBinaryLayer, SubLayer,
 };
-/// Convolutional layer types (Conv1d, Conv2d, ConvTranspose1d, ConvTranspose2d).
-pub use convolution::{Conv1dLayer, Conv2dLayer, ConvTranspose1dLayer, ConvTranspose2dLayer};
+/// Convolutional layer types (Conv1d, Conv2d, Conv3d, ConvTranspose1d, ConvTranspose2d).
+pub use convolution::{
+    Conv1dLayer, Conv2dLayer, Conv3dLayer, ConvTranspose1dLayer, ConvTranspose2dLayer,
+};
 /// Fully-connected linear layer (y = Wx + b).
+pub use interval_const::IntervalConstLayer;
 pub use linear::LinearLayer;
-/// Miscellaneous layer types (Floor, Ceil, Round, Sign, Reciprocal, Compare, Where, NonZero, SkipMerge).
+/// Miscellaneous layer types (Floor, Ceil, Round, Sign, Reciprocal, Compare, Where, NonZero, SkipMerge, EpsilonExpand).
 pub use misc::{
-    CeilLayer, CompareLayer, CompareOp, FloorLayer, NonZeroLayer, OpaqueSkipLayer,
-    QdqPerturbationLayer, ReciprocalLayer, RoundLayer, SignLayer, SkipMergeLayer, TruncLayer,
-    WhereLayer,
+    CeilLayer, CompareLayer, CompareOp, EpsilonExpandLayer, FloorLayer, NonZeroLayer,
+    OpaqueSkipLayer, QdqPerturbationLayer, ReciprocalLayer, RoundLayer, SignLayer, SkipMergeLayer,
+    TruncLayer, WhereLayer,
 };
 /// Normalization layer types (BatchNorm, InstanceNorm1d, LayerNorm, RmsNorm) and CROWN mode configuration.
 pub use normalization::{

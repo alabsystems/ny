@@ -34,7 +34,6 @@
 
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use ndarray::{Array2, ArrayD, Axis, IxDyn};
 use ny_core::{GemmEngine, NyError, Result};
@@ -58,6 +57,7 @@ use super::process_batch::{
     try_edge_milp_escalation,
 };
 use super::push_survivors::concretize_postclip_lower_bounds;
+use super::BabWall;
 
 /// #lsnc-child-batch (S1) gate. Default ON (flipped after the parity test +
 /// the end-to-end lsnc verdict-identity A/B ran green: instances 0/1/3/5/6
@@ -185,7 +185,7 @@ pub(super) fn process_reorder_prescreen_child_batch(
     thresholds: &[f32],
     clause_sizes: &[usize],
     engine: Option<&dyn GemmEngine>,
-    bab_timeout: Duration,
+    bab_wall: BabWall,
     queue: &mut BinaryHeap<MultiObjInputDomain>,
     lifecycle: &mut GraphBabLifecycle,
     domains_verified_by_clip: &mut usize,
@@ -201,7 +201,7 @@ pub(super) fn process_reorder_prescreen_child_batch(
     let mut edge_alpha_budget = verifier.config.input_split_edge_alpha_top;
 
     for mut domain in domains {
-        if lifecycle.start_time.elapsed() > bab_timeout {
+        if bab_wall.expired(lifecycle.start_time) {
             return Ok(Some(lifecycle.timeout_result()));
         }
         if lifecycle.domains_explored >= verifier.config.max_domains {
@@ -255,7 +255,7 @@ pub(super) fn process_reorder_prescreen_child_batch(
                     spec_matrix,
                     &row_indices,
                     engine,
-                    lifecycle.deadline(bab_timeout),
+                    lifecycle.deadline(bab_wall.horizon()),
                 ) {
                     domain.obj_bounds =
                         super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
@@ -275,7 +275,7 @@ pub(super) fn process_reorder_prescreen_child_batch(
             thresholds,
             clause_sizes,
             engine,
-            lifecycle.deadline(bab_timeout),
+            lifecycle.deadline(bab_wall.horizon()),
         ) {
             lifecycle.domains_verified += 1;
             continue;

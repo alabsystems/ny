@@ -44,43 +44,52 @@ fn run_exhausting_input_split_verify() {
 
 #[ntest::timeout(60000)]
 #[test]
-fn domain_limit_exit_exports_frontier_when_gated_on_and_nothing_when_off() {
-    crate::tests::with_serialized_env_vars(&[("NY_POSTBAB_BAB_SEEDS", "0")], || {
-        // Gate OFF (explicit '0' = the unset default): no recording.
-        reset_bab_frontier_export();
-        run_exhausting_input_split_verify();
-        assert!(
-            take_bab_frontier_seeds().is_empty(),
-            "gate off must record nothing (byte-identical pipeline)"
-        );
-    });
+fn domain_limit_gate_accepts_only_exact_modes_1_and_2() {
+    crate::tests::with_env_edits(|env| {
+        // The producer and consumer both expose exactly modes 1/2. Mode 3 is
+        // deliberately retired; whitespace is not normalized for the mode.
+        let cases = [
+            (None, false),
+            (Some("0"), false),
+            (Some("1"), true),
+            (Some("2"), true),
+            (Some("3"), false),
+            (Some(" 1"), false),
+            (Some("1 "), false),
+            (Some("bad"), false),
+        ];
+        env.remove("NY_POSTBAB_BAB_SEEDS_K");
+        let mut mode_1_seeds = None;
+        for (raw, expected_live) in cases {
+            match raw {
+                Some(value) => env.set("NY_POSTBAB_BAB_SEEDS", value),
+                None => env.remove("NY_POSTBAB_BAB_SEEDS"),
+            }
 
-    crate::tests::with_serialized_env_vars(&[("NY_POSTBAB_BAB_SEEDS", "2")], || {
-        // Gate mode 2 (#bab-frontier v2) must also record: same channel, and
-        // with no JointMarginCloser attached the seeds carry no corners (the
-        // consumer's extreme-corner fallback covers them).
-        reset_bab_frontier_export();
-        run_exhausting_input_split_verify();
-        let seeds = take_bab_frontier_seeds();
-        assert!(
-            !seeds.is_empty(),
-            "mode 2 must record at the exhaust exit like mode 1"
-        );
-        assert!(
-            seeds.iter().all(|s| s.corners.is_empty()),
-            "no closer attached => no corner payload"
-        );
-    });
+            reset_bab_frontier_export();
+            run_exhausting_input_split_verify();
+            let seeds = take_bab_frontier_seeds();
+            assert_eq!(
+                !seeds.is_empty(),
+                expected_live,
+                "raw mode {raw:?} must {} the producer",
+                if expected_live { "arm" } else { "not arm" }
+            );
+            if raw == Some("2") {
+                assert!(
+                    seeds.iter().all(|s| s.corners.is_empty()),
+                    "mode 2 with no JointMarginCloser attached carries no corner payload"
+                );
+            }
+            if raw == Some("1") {
+                mode_1_seeds = Some(seeds);
+            }
+        }
 
-    crate::tests::with_serialized_env_vars(&[("NY_POSTBAB_BAB_SEEDS", "1")], || {
-        // Gate ON: the surviving queue at the domain-limit exit is exported.
+        // Inspect one live run in detail: the surviving queue at the domain-limit
+        // exit is exported in violation-priority order as valid input subboxes.
+        let seeds = mode_1_seeds.expect("exact mode 1 must export a frontier");
         reset_bab_frontier_export();
-        run_exhausting_input_split_verify();
-        let seeds = take_bab_frontier_seeds();
-        assert!(
-            !seeds.is_empty(),
-            "domain-limit exhaustion with surviving unverified domains must export a frontier"
-        );
         for (i, seed) in seeds.iter().enumerate() {
             assert_eq!(seed.center.len(), 2, "seed {i}: original X-space arity");
             assert_eq!(seed.box_lo.len(), 2);

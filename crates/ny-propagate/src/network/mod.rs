@@ -17,7 +17,13 @@ pub(crate) mod backward_dispatch;
 mod core;
 /// Shared CPU Dense-materialization policy used by sequential CROWN fallbacks.
 pub mod crown_memory;
+mod crown_quality;
+pub(crate) use crown_quality::honest_provenance_enabled;
 mod dispatch;
+/// Compile-time dispatch-coverage matrix: per-`Layer`, per-dispatcher record of
+/// SUPPORTED / DELIBERATELY-FALLS-BACK / REFUSED, enforced by exhaustive
+/// no-catch-all matches plus runtime cross-checks against the real dispatchers.
+pub mod dispatch_matrix;
 pub mod dsp;
 /// Double-precision (f64) network propagation for soundnessbench/sat_relu.
 pub mod f64_propagate;
@@ -63,7 +69,7 @@ pub(crate) use core::extract_relu_gpu_layer_with_alpha;
 pub use core::graph::crown_block_wise::LayerNormValidationStats;
 pub use core::graph::crown_block_wise::{BlockSpec, BlockSpecEntry, BlockWiseCrownResult};
 pub(crate) use core::graph::dispatch_plan::CrownDispatchPlan;
-pub(crate) use core::graph::merge_accumulator::CrownMergeAccumulator;
+pub(crate) use core::graph::merge_accumulator::{CrownMergeAccumulator, SoleCarrierWitness};
 pub use core::graph::{
     forward_linear_admission_record, forward_linear_measured_rate, ForwardLinearAdmissionRecord,
     ForwardLinearRateObservation,
@@ -172,6 +178,7 @@ pub(crate) use core::tighten_crown_output_with_provenance_and_deadline;
 // Compatibility re-export: ny-build imports ny_propagate::network::broadcast_shapes.
 // Canonical location is now crate::shape::broadcast_shapes.
 pub use crate::shape::broadcast_shapes;
+pub use graph_crown_f64_tail::f64_tail_unsupported_census;
 pub use relu_relax::relu_crown_relaxation;
 // Test-only: decomposed normalization CROWN for proptest (#318, #3387).
 #[cfg(test)]

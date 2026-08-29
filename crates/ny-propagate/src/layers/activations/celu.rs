@@ -173,6 +173,7 @@ impl CeluLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::assert_relaxation_sound_exact;
     use crate::LinearBounds;
     use ndarray::{array, ArrayD, IxDyn};
     use proptest::prelude::*;
@@ -728,6 +729,116 @@ mod tests {
             .propagate_ibp(&input)
             .expect_err("NaN must not be absorbed alongside a tainted element");
         assert!(matches!(err, NyError::NumericalInstability(_)));
+    }
+
+    /// ZERO-tolerance f64 pin on the CONSTANT / SATURATING branches, across
+    /// several alphas. Companion to `proptest_celu_relaxation_strict_soundness`
+    /// below, which structurally cannot reach any of these: it draws finite
+    /// `l, u` and then `prop_assume!`s the coefficients finite, and every branch
+    /// exercised here needs an infinite endpoint or a deep tail.
+    ///
+    /// CELU is `globally_convex`, so it takes a different lower-bound path
+    /// through `elu_family_linear_relaxation` than ELU/SELU — which is exactly
+    /// why it is worth pinning separately rather than assuming the ELU result
+    /// transfers.
+    ///
+    /// At x = -20, -50, -100, -1000 the certified lower bound IS the saturation
+    /// constant `-alpha`, and `celu_f64_reference` there evaluates to exactly
+    /// `-f64::from(alpha)`. So this asserts, at zero tolerance, that the
+    /// published asymptote is not one ULP on the wrong side — the property
+    /// SELU's twin got wrong.
+    #[test]
+    fn celu_saturating_branches_are_exact_in_f64() {
+        for alpha in [0.5f32, 1.0, 2.0] {
+            let alpha64 = f64::from(alpha);
+            let reference = move |x: f64| celu_f64_reference(x, alpha64);
+
+            let cases: [(f32, f32, &[f64], &str); 5] = [
+                (
+                    f32::NEG_INFINITY,
+                    f32::INFINITY,
+                    &[-1000.0, -100.0, -50.0, -20.0, -1.0, 0.0, 1.0, 100.0],
+                    "CELU [-inf, +inf]",
+                ),
+                (
+                    f32::NEG_INFINITY,
+                    0.0,
+                    &[-1000.0, -100.0, -50.0, -20.0, -1.0, 0.0],
+                    "CELU [-inf, 0]",
+                ),
+                (
+                    f32::NEG_INFINITY,
+                    -5.0,
+                    &[-1000.0, -100.0, -50.0, -20.0, -5.0],
+                    "CELU [-inf, -5]",
+                ),
+                (
+                    f32::NEG_INFINITY,
+                    3.0,
+                    &[-1000.0, -100.0, -50.0, -20.0, 0.0, 1.5, 3.0],
+                    "CELU [-inf, 3]",
+                ),
+                (
+                    f32::NEG_INFINITY,
+                    100.0,
+                    &[-1000.0, -100.0, -50.0, -20.0, 0.0, 100.0],
+                    "CELU [-inf, 100]",
+                ),
+            ];
+
+            for (l, u, samples, name) in cases {
+                let label = format!("{name} alpha={alpha}");
+                let r = celu_linear_relaxation(l, u, alpha);
+                // Non-vacuity: the helper deliberately does not assert it, and
+                // the (0, -inf, 0, +inf) fallback passes every sample.
+                assert_eq!(
+                    r.lower_slope, 0.0,
+                    "{label}: expected a CONSTANT lower bound"
+                );
+                assert_eq!(
+                    r.upper_slope, 0.0,
+                    "{label}: expected a CONSTANT upper bound"
+                );
+                assert!(
+                    r.lower_intercept.is_finite(),
+                    "{label}: lower intercept went vacuous ({})",
+                    r.lower_intercept
+                );
+                assert_relaxation_sound_exact(l, u, r, &reference, samples, &label);
+            }
+
+            // l finite, u = +inf: tangent lower, +inf upper plane.
+            let r = celu_linear_relaxation(-100.0, f32::INFINITY, alpha);
+            assert!(
+                r.upper_intercept.is_infinite() && r.upper_intercept.is_sign_positive(),
+                "CELU [-100, +inf] alpha={alpha}: upper must be the +inf plane, got {}",
+                r.upper_intercept
+            );
+            assert_relaxation_sound_exact(
+                -100.0,
+                f32::INFINITY,
+                r,
+                &reference,
+                &[-100.0, -50.0, -20.0, -1.0, 0.0, 1.0, 100.0],
+                &format!("CELU [-100, +inf] alpha={alpha}"),
+            );
+
+            // Finite deep tail: the chord slope has underflowed to zero and the
+            // published constants sit directly on the asymptote.
+            let r = celu_linear_relaxation(-1000.0, -900.0, alpha);
+            assert!(
+                r.lower_intercept.is_finite() && r.upper_intercept.is_finite(),
+                "CELU [-1000, -900] alpha={alpha}: went vacuous ({r:?})"
+            );
+            assert_relaxation_sound_exact(
+                -1000.0,
+                -900.0,
+                r,
+                &reference,
+                &[-1000.0, -950.0, -900.0],
+                &format!("CELU [-1000, -900] alpha={alpha}"),
+            );
+        }
     }
 
     // ── Strict zero-tolerance CROWN relaxation proptest (#3292) ──────────

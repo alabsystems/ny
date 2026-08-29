@@ -8,7 +8,7 @@
   `Bab.tiny_checks` use only `[propext, Quot.sound]` — fully constructive but for propext.)
   This file makes that machine-checkable and reproducible rather than memory-resident:
 
-      lake exe cache get && lake env lean NyProof/AxiomAudit.lean
+      lake exe cache get && lake build NyProof.AxiomAudit && lake env lean NyProof/AxiomAudit.lean
 
   The captured output is committed alongside as `AXIOM_AUDIT.txt`. Any divergence (a `sorryAx`,
   an unexpected axiom, an unknown constant) is a soundness regression in the cited base.

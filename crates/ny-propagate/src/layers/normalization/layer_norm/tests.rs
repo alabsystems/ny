@@ -1431,10 +1431,13 @@ fn test_crown_scalar_sampling_inf_no_coefficient_inversion_3128() {
 }
 
 // ── LayerNorm IBP NaN integration tests (#2627) ─────────────────────────────
-// LayerNorm IBP rejects non-finite input bounds with NumericalInstability error
-// per Category B domain validation policy (ibp/common.rs:84-92). The input guard
-// fires before the nan_propagating_min/max fold sites, preventing NaN from
-// reaching the normalization arithmetic (0/0, inf/inf).
+// LayerNorm IBP rejects NaN input bounds with NumericalInstability error per
+// Category B domain validation policy (ibp/common.rs). The input guard fires
+// before the nan_propagating_min/max fold sites, preventing NaN from reaching
+// the normalization arithmetic (0/0, inf/inf). ±Inf input bounds are NOT an
+// error: a deep stack legitimately saturates upstream boxes to ±inf, and the
+// entry point substitutes the conservative fallback enclosure instead (see
+// tests/deep_ibp_overflow_saturates.rs).
 
 /// LayerNorm IBP with NaN in lower bound returns NumericalInstability error.
 /// Exercises the non-finite input guard at ibp/common.rs:87-92.

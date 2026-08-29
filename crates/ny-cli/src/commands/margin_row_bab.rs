@@ -24,7 +24,11 @@ use prost::Message;
 
 use ny_onnx::onnx_proto::{GraphProto, ModelProto, NodeProto, TensorProto};
 use ny_propagate::margin_row::{
-    run_margin_row_lane, BabStats, MarginRowOutcome, TwinOpSpec, TwinSpec,
+    run_margin_row_lane, run_margin_row_lane_with_policy, BabStats,
+    BackwardIntermExecutionEvidence, EpochExecutionEvidence, FrontierExecutionEvidence,
+    FrontierRoute, MarginRowOutcome, MarginRowRuntimePolicy, PolicyExecutionEvidence,
+    RootAlphaExecutionEvidence, RootPrecisionExecutionEvidence, TwinOpSpec, TwinSpec,
+    WidthExecutionEvidence,
 };
 
 use super::vnncomp::VnncompResult;
@@ -32,12 +36,1310 @@ use super::vnncomp::VnncompResult;
 /// f64 unit roundoff.
 const U: f64 = 1.110_223_024_625_156_5e-16;
 
+const MARGIN_ROW_FRONTIER_EXECUTION_METHOD: &str = "margin_row_frontier_execution";
+const MARGIN_ROW_FRONTIER_EXECUTION_SCHEMA: &str = "ny-cli/margin-row-frontier-execution/v1";
+const MARGIN_ROW_WIDTH_EXECUTION_METHOD: &str = "margin_row_width_execution";
+const MARGIN_ROW_WIDTH_EXECUTION_SCHEMA: &str = "ny-margin-row-width-execution/v2";
+const MARGIN_ROW_EPOCH_EXECUTION_METHOD: &str = "margin_row_epoch_execution";
+const MARGIN_ROW_EPOCH_EXECUTION_SCHEMA: &str = "ny-cli/margin-row-epoch-execution/v1";
+const MARGIN_ROW_DOMAIN_ALPHA_EXECUTION_METHOD: &str = "margin_row_domain_alpha_execution";
+const MARGIN_ROW_DOMAIN_ALPHA_EXECUTION_SCHEMA: &str =
+    "ny-cli/margin-row-domain-alpha-execution/v1";
+const MARGIN_ROW_POLICY_EXECUTION_METHOD: &str = "margin_row_policy_execution";
+const MARGIN_ROW_POLICY_EXECUTION_SCHEMA: &str = "ny-cli/margin-row-policy-execution/v1";
+const MARGIN_ROW_BACKWARD_INTERM_EXECUTION_METHOD: &str = "margin_row_backward_interm_execution";
+const MARGIN_ROW_BACKWARD_INTERM_EXECUTION_SCHEMA: &str =
+    "ny-cli/margin-row-backward-interm-execution/v1";
+const MARGIN_ROW_ROOT_PRECISION_EXECUTION_METHOD: &str = "margin_row_root_precision_execution";
+const MARGIN_ROW_ROOT_PRECISION_EXECUTION_SCHEMA: &str =
+    "ny-cli/margin-row-root-precision-execution/v1";
+const MARGIN_ROW_ROOT_ALPHA_EXECUTION_METHOD: &str = "margin_row_root_alpha_execution";
+const MARGIN_ROW_ROOT_ALPHA_EXECUTION_SCHEMA: &str = "ny-cli/margin-row-root-alpha-execution/v1";
+const MARGIN_ROW_CONCURRENT_OVERLAP_EXECUTION_METHOD: &str =
+    "margin_row_concurrent_overlap_execution";
+const MARGIN_ROW_CONCURRENT_OVERLAP_EXECUTION_SCHEMA: &str =
+    "ny-cli/margin-row-concurrent-overlap-execution/v1";
+
+fn render_margin_row_concurrent_overlap_execution() -> String {
+    format!(
+        "schema={MARGIN_ROW_CONCURRENT_OVERLAP_EXECUTION_SCHEMA} phase=work \
+         worker_active=true verifier_active=true"
+    )
+}
+
+fn render_margin_row_frontier_execution(
+    outcome: &str,
+    evidence: FrontierExecutionEvidence,
+) -> String {
+    format!(
+        "schema={MARGIN_ROW_FRONTIER_EXECUTION_SCHEMA} phase=terminal route={} outcome={outcome} \
+         tree_started={} configured={} contextual={} steps={} counterfactual_differences={} \
+         max_open={} max_batch={}",
+        evidence.route.stable_token(),
+        evidence.steps > 0,
+        evidence.configured,
+        evidence.contextual,
+        evidence.steps,
+        evidence.counterfactual_differences,
+        evidence.max_open,
+        evidence.max_batch,
+    )
+}
+
+fn render_margin_row_width_execution(outcome: &str, evidence: WidthExecutionEvidence) -> String {
+    format!(
+        "schema={MARGIN_ROW_WIDTH_EXECUTION_SCHEMA} phase=terminal outcome={outcome} \
+         configured_k_head={} contextual_k_head={} configured_k_trunk={} \
+         contextual_k_trunk={} adaptive_enabled={} contextual_adaptive={} \
+         tier0_exact={} effective_k_head_max={} effective_k_trunk_max={} \
+         effective_contextual_k_head_max={} effective_contextual_k_trunk_max={} \
+         outer_head_selection_calls={} outer_head_available_max={} \
+         outer_head_selected_total={} outer_head_binding_scored_calls={} \
+         outer_trunk_selection_calls={} outer_trunk_available_max={} \
+         outer_trunk_selected_total={} outer_trunk_binding_scored_calls={} \
+         nested_head_selection_calls={} nested_trunk_selection_calls={} \
+         configured_adaptive_threshold_opportunities={} \
+         configured_adaptive_escalations={} \
+         contextual_adaptive_threshold_opportunities={} \
+         contextual_adaptive_escalations={} policy_mismatch={}",
+        evidence.configured_k_head,
+        evidence.contextual_k_head,
+        evidence.configured_k_trunk,
+        evidence.contextual_k_trunk,
+        evidence.adaptive_enabled,
+        evidence.contextual_adaptive,
+        evidence.tier0_exact,
+        evidence.effective_k_head_max,
+        evidence.effective_k_trunk_max,
+        evidence.effective_contextual_k_head_max,
+        evidence.effective_contextual_k_trunk_max,
+        evidence.outer_head_selection_calls,
+        evidence.outer_head_available_max,
+        evidence.outer_head_selected_total,
+        evidence.outer_head_binding_scored_calls,
+        evidence.outer_trunk_selection_calls,
+        evidence.outer_trunk_available_max,
+        evidence.outer_trunk_selected_total,
+        evidence.outer_trunk_binding_scored_calls,
+        evidence.nested_head_selection_calls,
+        evidence.nested_trunk_selection_calls,
+        evidence.configured_adaptive_threshold_opportunities,
+        evidence.configured_adaptive_escalations,
+        evidence.contextual_adaptive_threshold_opportunities,
+        evidence.contextual_adaptive_escalations,
+        evidence.policy_mismatch,
+    )
+}
+
+fn render_margin_row_epoch_execution(
+    outcome: &str,
+    route: FrontierRoute,
+    evidence: &EpochExecutionEvidence,
+) -> String {
+    format!(
+        "schema={MARGIN_ROW_EPOCH_EXECUTION_SCHEMA} phase=terminal route={} outcome={outcome} \
+         configured_depth={} configured_attempts={} configured_tier0={} \
+         configured_universe={} configured_retain={} configured_parent_topk={} \
+         configured_debug={} policy_mismatch={} tree_entries={} \
+         configured_depth_admissions={} configured_depth_nested_with_stats={} \
+         adaptive_depth_admissions={} attempt_cap_decisions={} \
+         attempt_cap_counterfactual_differences={} attempt_cap_refusals={} \
+         generation_refusals={} deadline_refusals={} attempts_started={} \
+         attempt_failures={} attempts_closed={} outer_full_attempts={} \
+         outer_incremental_attempts={} nested_full_attempts={} \
+         nested_incremental_attempts={} full_rebuilds_completed={} \
+         full_rebuild_refusals={} parent_refreshes_started={} \
+         parent_refreshes_completed={} parent_refreshes_accepted={} \
+         parent_refresh_refusals={} parent_refresh_columns={} \
+         parent_refresh_tightened={} parent_refresh_stabilized={} \
+         nested_started={} nested_runs_with_stats={} nested_unsat={} \
+         nested_unknown={} nested_errors={} closures={} debug_emissions={} \
+         outer_tier0_calls={} outer_tier0_scored_calls={} \
+         outer_tier0_exact_binding_scored_calls={} \
+         outer_universe_counterfactual_scored_calls={} \
+         outer_retain_counterfactual_scored_calls={} nested_full_tier0_calls={} \
+         nested_incremental_tier0_calls={}",
+        route.stable_token(),
+        evidence.policy.depth,
+        evidence.policy.max_attempts,
+        evidence.policy.tier0_exact,
+        evidence.policy.tier0_universe,
+        evidence.policy.retain_per_layer,
+        evidence.policy.parent_topk,
+        evidence.policy.debug_trace,
+        evidence.policy_mismatch,
+        evidence.tree_entries,
+        evidence.configured_depth_admissions,
+        evidence.configured_depth_nested_with_stats,
+        evidence.adaptive_depth_admissions,
+        evidence.attempt_cap_decisions,
+        evidence.attempt_cap_counterfactual_differences,
+        evidence.attempt_cap_refusals,
+        evidence.generation_refusals,
+        evidence.deadline_refusals,
+        evidence.attempts_started,
+        evidence.attempt_failures,
+        evidence.attempts_closed,
+        evidence.outer_full_attempts,
+        evidence.outer_incremental_attempts,
+        evidence.nested_full_attempts,
+        evidence.nested_incremental_attempts,
+        evidence.full_rebuilds_completed,
+        evidence.full_rebuild_refusals,
+        evidence.parent_refreshes_started,
+        evidence.parent_refreshes_completed,
+        evidence.parent_refreshes_accepted,
+        evidence.parent_refresh_refusals,
+        evidence.parent_refresh_columns,
+        evidence.parent_refresh_tightened,
+        evidence.parent_refresh_stabilized,
+        evidence.nested_started,
+        evidence.nested_runs_with_stats,
+        evidence.nested_unsat,
+        evidence.nested_unknown,
+        evidence.nested_errors,
+        evidence.closures,
+        evidence.debug_emissions,
+        evidence.outer_tier0_calls,
+        evidence.outer_tier0_scored_calls,
+        evidence.outer_tier0_exact_binding_scored_calls,
+        evidence.outer_universe_counterfactual_scored_calls,
+        evidence.outer_retain_counterfactual_scored_calls,
+        evidence.nested_full_tier0_calls,
+        evidence.nested_incremental_tier0_calls,
+    )
+}
+
+fn render_margin_row_domain_alpha_execution(
+    outcome: &str,
+    route: FrontierRoute,
+    evidence: PolicyExecutionEvidence,
+) -> String {
+    format!(
+        "schema={MARGIN_ROW_DOMAIN_ALPHA_EXECUTION_SCHEMA} phase=terminal route={} \
+         outcome={outcome} configured_enabled={} configured_iters={} \
+         configured_eta_bits={} policy_mismatch={} gate_evals={} \
+         movable_domains={} movable_slots={} warm_entries_applied={} \
+         ascent_domains={} outer_ascent_domains={} proposals={} \
+         trial_passes_completed={} trial_pass_failures={} finite_trial_scores={} \
+         accepted_trials={} carried_entries={} iters_counterfactual_domains={} \
+         eta_counterfactual_scored_domains={} outer_finite_trial_scores={} \
+         outer_iters_counterfactual_domains={} \
+         outer_eta_counterfactual_scored_domains={}",
+        route.stable_token(),
+        evidence.domain_alpha_enabled,
+        evidence.domain_alpha_iters,
+        evidence.domain_alpha_eta_bits,
+        evidence.policy_mismatch,
+        evidence.domain_alpha_gate_evals,
+        evidence.domain_alpha_movable_evals,
+        evidence.domain_alpha_movable_slots,
+        evidence.domain_alpha_warm_applied,
+        evidence.domain_alpha_ascent_calls,
+        evidence.domain_alpha_outer_ascent_calls,
+        evidence.domain_alpha_trials_started,
+        evidence.domain_alpha_trial_passes_completed,
+        evidence.domain_alpha_trial_pass_failures,
+        evidence.domain_alpha_finite_trial_scores,
+        evidence.domain_alpha_trials_accepted,
+        evidence.domain_alpha_carried_entries,
+        evidence.domain_alpha_iters_counterfactual_domains,
+        evidence.domain_alpha_eta_counterfactual_scored_domains,
+        evidence.domain_alpha_outer_finite_trial_scores,
+        evidence.domain_alpha_outer_iters_counterfactual_domains,
+        evidence.domain_alpha_outer_eta_counterfactual_scored_domains,
+    )
+}
+
+fn render_margin_row_policy_execution(outcome: &str, evidence: PolicyExecutionEvidence) -> String {
+    format!(
+        "schema={MARGIN_ROW_POLICY_EXECUTION_SCHEMA} phase=terminal outcome={outcome} \
+         beta_per_column={} beta_columns={} column_retire={} parallel_prebuild={} \
+         beta_per_column_evals={} beta_columns_binding_evals={} \
+         beta_columns_max_candidates={} newly_retired_columns={} \
+         inherited_retirement_evals={} parallel_prebuild_batches={} \
+         parallel_prebuild_domains={} policy_mismatch={}",
+        evidence.beta_per_column,
+        evidence.beta_columns,
+        evidence.column_retire,
+        evidence.parallel_prebuild,
+        evidence.beta_per_column_evals,
+        evidence.beta_columns_binding_evals,
+        evidence.beta_columns_max_candidates,
+        evidence.newly_retired_columns,
+        evidence.inherited_retirement_evals,
+        evidence.parallel_prebuild_batches,
+        evidence.parallel_prebuild_domains,
+        evidence.policy_mismatch,
+    )
+}
+
+fn render_margin_row_backward_interm_execution(
+    evidence: BackwardIntermExecutionEvidence,
+) -> String {
+    format!(
+        "schema={MARGIN_ROW_BACKWARD_INTERM_EXECUTION_SCHEMA} phase=terminal outcome={} \
+         enabled={} configured_secs={} configured_chunk={} configured_chunk_secs={} \
+         effective_chunk_secs={} configured_topk={} eligible_layers={} \
+         suppressed_setup_layers={} layers_started={} chunks_completed={} \
+         columns_completed={} deadline_capped={} budget_exhausted={} \
+         chunk_secs_capped={} chunk_counterfactual_chunks={} chunk_ceiling_binding_chunks={} \
+         fixed_width_chunks={} \
+         adaptive_width_changes={} topk_binding_layers={} \
+         policy_mismatch={}",
+        evidence.outcome(),
+        evidence.enabled,
+        evidence.configured_secs,
+        evidence.configured_chunk,
+        evidence.configured_chunk_secs,
+        evidence.effective_chunk_secs,
+        evidence.configured_topk,
+        evidence.eligible_layers,
+        evidence.suppressed_setup_layers,
+        evidence.layers_started,
+        evidence.chunks_completed,
+        evidence.columns_completed,
+        evidence.deadline_capped,
+        evidence.budget_exhausted,
+        evidence.chunk_secs_capped,
+        evidence.chunk_counterfactual_chunks,
+        evidence.chunk_ceiling_binding_chunks,
+        evidence.fixed_width_chunks,
+        evidence.adaptive_width_changes,
+        evidence.topk_binding_layers,
+        evidence.policy_mismatch,
+    )
+}
+
+fn render_margin_row_root_precision_execution(evidence: RootPrecisionExecutionEvidence) -> String {
+    format!(
+        "schema={MARGIN_ROW_ROOT_PRECISION_EXECUTION_SCHEMA} phase=terminal outcome=completed \
+         configured_root_f32={} configured_tableau_f32={} outward_eligible={} \
+         eligible_conv_ops={} root_f32_conv_ops={} root_f64_conv_ops={} \
+         eligible_store_ops={} tableau_f32_store_ops={} tableau_f64_store_ops={} \
+         tableau_refused={} policy_mismatch={}",
+        evidence.configured_root_f32,
+        evidence.configured_tableau_f32,
+        evidence.outward_eligible,
+        evidence.eligible_conv_ops,
+        evidence.root_f32_conv_ops,
+        evidence.root_f64_conv_ops,
+        evidence.eligible_store_ops,
+        evidence.tableau_f32_store_ops,
+        evidence.tableau_f64_store_ops,
+        evidence.tableau_refused,
+        evidence.policy_mismatch,
+    )
+}
+
+fn optional_bits(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_owned(), |bits| bits.to_string())
+}
+
+fn render_margin_row_root_alpha_execution(
+    outcome: &str,
+    evidence: &RootAlphaExecutionEvidence,
+) -> String {
+    format!(
+        "schema={MARGIN_ROW_ROOT_ALPHA_EXECUTION_SCHEMA} phase=terminal outcome={outcome} \
+         alpha_enabled={} alpha_iters={} alpha_secs_bits={} alpha_lr_bits={} \
+         alpha_cols={} alpha_guard={} rebake_enabled={} rebake_rounds={} \
+         rebake_secs_bits={} eligible={} standalone_suppressed={} \
+         standalone_attempted={} standalone_completed={} \
+         standalone_effective_secs_bits={} standalone_deadline_capped={} \
+         standalone_budget_exhausted={} standalone_iters_cap_exhausted={} \
+         standalone_fail_classes={} standalone_iters_attempted={} \
+         standalone_candidate_steps={} \
+         standalone_legacy_steps={} standalone_adam_steps={} standalone_passes={} \
+         standalone_max_steer_cols={} standalone_frozen_improvements={} \
+         standalone_accepted={} standalone_moved_neurons={} \
+         standalone_guard_opportunities={} standalone_guard_baseline_evals={} \
+         standalone_guard_candidate_evals={} standalone_guard_reversions={} \
+         standalone_frozen_before_bits={} standalone_frozen_best_bits={} \
+         standalone_published_before_bits={} standalone_published_after_bits={} \
+         rebake_suppressed={} rebake_attempted={} rebake_completed={} \
+         rebake_effective_secs_bits={} rebake_deadline_capped={} \
+         rebake_budget_exhausted={} rebake_round_cap_exhausted={} \
+         rebake_entry_unbaked_alpha={} rebake_baseline_evals={} \
+         rebake_rounds_started={} rebake_alpha_completed={} \
+         rebake_alpha_iters_attempted={} rebake_alpha_candidate_steps={} \
+         rebake_alpha_legacy_steps={} \
+         rebake_alpha_adam_steps={} rebake_alpha_passes={} \
+         rebake_alpha_max_fail_classes={} rebake_alpha_max_steer_cols={} \
+         rebake_alpha_moved_neurons={} rebake_rebuilds_completed={} \
+         rebake_rounds_scored={} rebake_rounds_accepted={} \
+         rebake_fixed_point_stops={} rebake_affordability_refusals={} \
+         rebake_aborts={} rebake_published_before_bits={} \
+         rebake_published_after_bits={} policy_mismatch={}",
+        evidence.alpha_enabled,
+        evidence.alpha_iters,
+        evidence.alpha_secs.to_bits(),
+        evidence.alpha_lr.to_bits(),
+        evidence.alpha_cols,
+        evidence.alpha_guard,
+        evidence.rebake_enabled,
+        evidence.rebake_rounds,
+        evidence.rebake_secs.to_bits(),
+        evidence.eligible,
+        evidence.standalone_suppressed,
+        evidence.standalone_attempted,
+        evidence.standalone_completed,
+        evidence.standalone_effective_secs.to_bits(),
+        evidence.standalone_deadline_capped,
+        evidence.standalone_budget_exhausted,
+        evidence.standalone_iters_cap_exhausted,
+        evidence.standalone_fail_classes,
+        evidence.standalone_iters_attempted,
+        evidence.standalone_candidate_steps,
+        evidence.standalone_legacy_steps,
+        evidence.standalone_adam_steps,
+        evidence.standalone_passes,
+        evidence.standalone_max_steer_cols,
+        evidence.standalone_frozen_improvements,
+        evidence.standalone_accepted,
+        evidence.standalone_moved_neurons,
+        evidence.standalone_guard_opportunities,
+        evidence.standalone_guard_baseline_evals,
+        evidence.standalone_guard_candidate_evals,
+        evidence.standalone_guard_reversions,
+        optional_bits(evidence.standalone_frozen_before_bits),
+        optional_bits(evidence.standalone_frozen_best_bits),
+        optional_bits(evidence.standalone_published_before_bits),
+        optional_bits(evidence.standalone_published_after_bits),
+        evidence.rebake_suppressed,
+        evidence.rebake_attempted,
+        evidence.rebake_completed,
+        evidence.rebake_effective_secs.to_bits(),
+        evidence.rebake_deadline_capped,
+        evidence.rebake_budget_exhausted,
+        evidence.rebake_round_cap_exhausted,
+        evidence.rebake_entry_unbaked_alpha,
+        evidence.rebake_baseline_evals,
+        evidence.rebake_rounds_started,
+        evidence.rebake_alpha_completed,
+        evidence.rebake_alpha_iters_attempted,
+        evidence.rebake_alpha_candidate_steps,
+        evidence.rebake_alpha_legacy_steps,
+        evidence.rebake_alpha_adam_steps,
+        evidence.rebake_alpha_passes,
+        evidence.rebake_alpha_max_fail_classes,
+        evidence.rebake_alpha_max_steer_cols,
+        evidence.rebake_alpha_moved_neurons,
+        evidence.rebake_rebuilds_completed,
+        evidence.rebake_rounds_scored,
+        evidence.rebake_rounds_accepted,
+        evidence.rebake_fixed_point_stops,
+        evidence.rebake_affordability_refusals,
+        evidence.rebake_aborts,
+        optional_bits(evidence.rebake_published_before_bits),
+        optional_bits(evidence.rebake_published_after_bits),
+        evidence.policy_mismatch,
+    )
+}
+
+/// Publish one terminal receipt only when the lane reached a stats-owning
+/// state. Compile/root-build failures carry no tree decision and deliberately
+/// earn no optimizer engagement credit.
+fn note_margin_row_execution(out: &MarginRowOutcome) {
+    let (outcome, stats) = match out {
+        MarginRowOutcome::Unsat(stats) => ("unsat", Some(stats)),
+        MarginRowOutcome::Unknown { stats, .. } => ("unknown", stats.as_ref()),
+    };
+    if let Some(stats) = stats {
+        crate::flight::note(
+            MARGIN_ROW_FRONTIER_EXECUTION_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_frontier_execution(
+                outcome,
+                stats.frontier_execution,
+            )),
+        );
+        crate::flight::note(
+            MARGIN_ROW_WIDTH_EXECUTION_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_width_execution(
+                outcome,
+                stats.width_execution,
+            )),
+        );
+        crate::flight::note(
+            MARGIN_ROW_EPOCH_EXECUTION_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_epoch_execution(
+                outcome,
+                stats.frontier_execution.route,
+                &stats.epoch_execution,
+            )),
+        );
+        crate::flight::note(
+            MARGIN_ROW_DOMAIN_ALPHA_EXECUTION_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_domain_alpha_execution(
+                outcome,
+                stats.frontier_execution.route,
+                stats.policy_execution,
+            )),
+        );
+        crate::flight::note(
+            MARGIN_ROW_POLICY_EXECUTION_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_policy_execution(
+                outcome,
+                stats.policy_execution,
+            )),
+        );
+        crate::flight::note(
+            MARGIN_ROW_BACKWARD_INTERM_EXECUTION_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_backward_interm_execution(
+                stats.backward_interm_execution,
+            )),
+        );
+        crate::flight::note(
+            MARGIN_ROW_ROOT_PRECISION_EXECUTION_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_root_precision_execution(
+                stats.root_precision_execution,
+            )),
+        );
+        crate::flight::note(
+            MARGIN_ROW_ROOT_ALPHA_EXECUTION_METHOD,
+            crate::flight::FlightStatus::Ran,
+            Some(render_margin_row_root_alpha_execution(
+                outcome,
+                &stats.root_alpha_execution,
+            )),
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn margin_row_frontier_execution_receipt_is_exact_and_versioned() {
+    let evidence = FrontierExecutionEvidence {
+        route: FrontierRoute::Joint,
+        configured: 1,
+        contextual: 8,
+        steps: 4,
+        counterfactual_differences: 3,
+        max_open: 8,
+        max_batch: 1,
+    };
+    assert_eq!(
+        render_margin_row_frontier_execution("unknown", evidence),
+        "schema=ny-cli/margin-row-frontier-execution/v1 phase=terminal route=joint \
+         outcome=unknown tree_started=true configured=1 contextual=8 steps=4 \
+         counterfactual_differences=3 max_open=8 max_batch=1",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn margin_row_width_execution_receipt_is_exact_and_versioned() {
+    let evidence = WidthExecutionEvidence {
+        configured_k_head: 16,
+        contextual_k_head: 8,
+        configured_k_trunk: 12,
+        contextual_k_trunk: 8,
+        adaptive_enabled: true,
+        contextual_adaptive: false,
+        tier0_exact: 0,
+        effective_k_head_max: 32,
+        effective_k_trunk_max: 32,
+        effective_contextual_k_head_max: 8,
+        effective_contextual_k_trunk_max: 8,
+        outer_head_selection_calls: 4,
+        outer_head_available_max: 40,
+        outer_head_selected_total: 64,
+        outer_head_binding_scored_calls: 3,
+        outer_trunk_selection_calls: 4,
+        outer_trunk_available_max: 48,
+        outer_trunk_selected_total: 48,
+        outer_trunk_binding_scored_calls: 2,
+        nested_head_selection_calls: 5,
+        nested_trunk_selection_calls: 6,
+        configured_adaptive_threshold_opportunities: 7,
+        configured_adaptive_escalations: 2,
+        contextual_adaptive_threshold_opportunities: 0,
+        contextual_adaptive_escalations: 0,
+        policy_mismatch: false,
+    };
+    assert_eq!(
+        render_margin_row_width_execution("unknown", evidence),
+        "schema=ny-margin-row-width-execution/v2 phase=terminal outcome=unknown \
+         configured_k_head=16 contextual_k_head=8 configured_k_trunk=12 \
+         contextual_k_trunk=8 adaptive_enabled=true contextual_adaptive=false \
+         tier0_exact=0 effective_k_head_max=32 effective_k_trunk_max=32 \
+         effective_contextual_k_head_max=8 effective_contextual_k_trunk_max=8 \
+         outer_head_selection_calls=4 outer_head_available_max=40 \
+         outer_head_selected_total=64 outer_head_binding_scored_calls=3 \
+         outer_trunk_selection_calls=4 outer_trunk_available_max=48 \
+         outer_trunk_selected_total=48 outer_trunk_binding_scored_calls=2 \
+         nested_head_selection_calls=5 nested_trunk_selection_calls=6 \
+         configured_adaptive_threshold_opportunities=7 \
+         configured_adaptive_escalations=2 \
+         contextual_adaptive_threshold_opportunities=0 \
+         contextual_adaptive_escalations=0 policy_mismatch=false",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn margin_row_epoch_execution_receipt_is_exact_and_versioned() {
+    let evidence = EpochExecutionEvidence {
+        policy: ny_propagate::margin_row::EpochRuntimePolicy {
+            depth: 3,
+            max_attempts: 4,
+            tier0_exact: 8,
+            tier0_universe: 128,
+            retain_per_layer: 256,
+            parent_topk: 16,
+            debug_trace: true,
+        },
+        tree_entries: 1,
+        configured_depth_admissions: 2,
+        configured_depth_nested_with_stats: 3,
+        adaptive_depth_admissions: 4,
+        attempt_cap_decisions: 5,
+        attempt_cap_counterfactual_differences: 6,
+        attempt_cap_refusals: 7,
+        generation_refusals: 8,
+        deadline_refusals: 9,
+        attempts_started: 10,
+        attempt_failures: 11,
+        attempts_closed: 12,
+        outer_full_attempts: 13,
+        outer_incremental_attempts: 14,
+        nested_full_attempts: 15,
+        nested_incremental_attempts: 16,
+        full_rebuilds_completed: 17,
+        full_rebuild_refusals: 18,
+        parent_refreshes_started: 19,
+        parent_refreshes_completed: 20,
+        parent_refreshes_accepted: 21,
+        parent_refresh_refusals: 22,
+        parent_refresh_columns: 23,
+        parent_refresh_tightened: 24,
+        parent_refresh_stabilized: 25,
+        nested_started: 26,
+        nested_runs_with_stats: 27,
+        nested_unsat: 28,
+        nested_unknown: 29,
+        nested_errors: 30,
+        closures: 31,
+        debug_emissions: 32,
+        outer_tier0_calls: 33,
+        outer_tier0_scored_calls: 34,
+        outer_tier0_exact_binding_scored_calls: 35,
+        outer_universe_counterfactual_scored_calls: 36,
+        outer_retain_counterfactual_scored_calls: 37,
+        nested_full_tier0_calls: 38,
+        nested_incremental_tier0_calls: 39,
+        policy_mismatch: true,
+    };
+    assert_eq!(
+        render_margin_row_epoch_execution("unknown", FrontierRoute::Classwise, &evidence),
+        "schema=ny-cli/margin-row-epoch-execution/v1 phase=terminal route=classwise \
+         outcome=unknown configured_depth=3 configured_attempts=4 configured_tier0=8 \
+         configured_universe=128 configured_retain=256 configured_parent_topk=16 \
+         configured_debug=true policy_mismatch=true tree_entries=1 \
+         configured_depth_admissions=2 configured_depth_nested_with_stats=3 \
+         adaptive_depth_admissions=4 attempt_cap_decisions=5 \
+         attempt_cap_counterfactual_differences=6 attempt_cap_refusals=7 \
+         generation_refusals=8 deadline_refusals=9 attempts_started=10 \
+         attempt_failures=11 attempts_closed=12 outer_full_attempts=13 \
+         outer_incremental_attempts=14 nested_full_attempts=15 \
+         nested_incremental_attempts=16 full_rebuilds_completed=17 \
+         full_rebuild_refusals=18 parent_refreshes_started=19 \
+         parent_refreshes_completed=20 parent_refreshes_accepted=21 \
+         parent_refresh_refusals=22 parent_refresh_columns=23 \
+         parent_refresh_tightened=24 parent_refresh_stabilized=25 nested_started=26 \
+         nested_runs_with_stats=27 nested_unsat=28 nested_unknown=29 nested_errors=30 \
+         closures=31 debug_emissions=32 outer_tier0_calls=33 \
+         outer_tier0_scored_calls=34 outer_tier0_exact_binding_scored_calls=35 \
+         outer_universe_counterfactual_scored_calls=36 \
+         outer_retain_counterfactual_scored_calls=37 nested_full_tier0_calls=38 \
+         nested_incremental_tier0_calls=39",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn margin_row_domain_alpha_execution_receipt_is_exact_and_versioned() {
+    let evidence = PolicyExecutionEvidence {
+        beta_per_column: false,
+        beta_columns: 8,
+        column_retire: false,
+        parallel_prebuild: false,
+        domain_alpha_enabled: true,
+        domain_alpha_iters: 4,
+        domain_alpha_eta_bits: 0.125f64.to_bits(),
+        beta_per_column_evals: 0,
+        beta_columns_binding_evals: 0,
+        beta_columns_max_candidates: 0,
+        newly_retired_columns: 0,
+        inherited_retirement_evals: 0,
+        parallel_prebuild_batches: 0,
+        parallel_prebuild_domains: 0,
+        domain_alpha_gate_evals: 1,
+        domain_alpha_movable_evals: 2,
+        domain_alpha_movable_slots: 3,
+        domain_alpha_warm_applied: 4,
+        domain_alpha_ascent_calls: 5,
+        domain_alpha_trials_started: 6,
+        domain_alpha_trial_passes_completed: 7,
+        domain_alpha_trial_pass_failures: 8,
+        domain_alpha_finite_trial_scores: 9,
+        domain_alpha_trials_accepted: 10,
+        domain_alpha_carried_entries: 11,
+        domain_alpha_iters_counterfactual_domains: 12,
+        domain_alpha_eta_counterfactual_scored_domains: 13,
+        domain_alpha_outer_ascent_calls: 14,
+        domain_alpha_outer_finite_trial_scores: 15,
+        domain_alpha_outer_iters_counterfactual_domains: 16,
+        domain_alpha_outer_eta_counterfactual_scored_domains: 17,
+        policy_mismatch: true,
+    };
+    assert_eq!(
+        render_margin_row_domain_alpha_execution("unknown", FrontierRoute::Classwise, evidence,),
+        "schema=ny-cli/margin-row-domain-alpha-execution/v1 phase=terminal \
+         route=classwise outcome=unknown configured_enabled=true configured_iters=4 \
+         configured_eta_bits=4593671619917905920 policy_mismatch=true gate_evals=1 \
+         movable_domains=2 movable_slots=3 warm_entries_applied=4 ascent_domains=5 \
+         outer_ascent_domains=14 proposals=6 trial_passes_completed=7 \
+         trial_pass_failures=8 finite_trial_scores=9 accepted_trials=10 \
+         carried_entries=11 iters_counterfactual_domains=12 \
+         eta_counterfactual_scored_domains=13 outer_finite_trial_scores=15 \
+         outer_iters_counterfactual_domains=16 \
+         outer_eta_counterfactual_scored_domains=17",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn margin_row_policy_execution_receipt_is_exact_and_versioned() {
+    let evidence = PolicyExecutionEvidence {
+        beta_per_column: true,
+        beta_columns: 4,
+        column_retire: true,
+        parallel_prebuild: false,
+        domain_alpha_enabled: false,
+        domain_alpha_iters: 2,
+        domain_alpha_eta_bits: 0.25f64.to_bits(),
+        beta_per_column_evals: 3,
+        beta_columns_binding_evals: 2,
+        beta_columns_max_candidates: 7,
+        newly_retired_columns: 5,
+        inherited_retirement_evals: 4,
+        parallel_prebuild_batches: 0,
+        parallel_prebuild_domains: 0,
+        domain_alpha_gate_evals: 0,
+        domain_alpha_movable_evals: 0,
+        domain_alpha_movable_slots: 0,
+        domain_alpha_warm_applied: 0,
+        domain_alpha_ascent_calls: 0,
+        domain_alpha_trials_started: 0,
+        domain_alpha_trial_passes_completed: 0,
+        domain_alpha_trial_pass_failures: 0,
+        domain_alpha_finite_trial_scores: 0,
+        domain_alpha_trials_accepted: 0,
+        domain_alpha_carried_entries: 0,
+        domain_alpha_iters_counterfactual_domains: 0,
+        domain_alpha_eta_counterfactual_scored_domains: 0,
+        domain_alpha_outer_ascent_calls: 0,
+        domain_alpha_outer_finite_trial_scores: 0,
+        domain_alpha_outer_iters_counterfactual_domains: 0,
+        domain_alpha_outer_eta_counterfactual_scored_domains: 0,
+        policy_mismatch: false,
+    };
+    assert_eq!(
+        render_margin_row_policy_execution("unsat", evidence),
+        "schema=ny-cli/margin-row-policy-execution/v1 phase=terminal outcome=unsat \
+         beta_per_column=true beta_columns=4 column_retire=true parallel_prebuild=false \
+         beta_per_column_evals=3 beta_columns_binding_evals=2 \
+         beta_columns_max_candidates=7 newly_retired_columns=5 \
+         inherited_retirement_evals=4 parallel_prebuild_batches=0 \
+         parallel_prebuild_domains=0 policy_mismatch=false",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn margin_row_backward_interm_execution_receipt_is_exact_and_versioned() {
+    let evidence = BackwardIntermExecutionEvidence {
+        enabled: true,
+        configured_secs: 20.0,
+        configured_chunk: 256,
+        configured_chunk_secs: 2.0,
+        effective_chunk_secs: 2.0,
+        configured_topk: 1024,
+        eligible_layers: 4,
+        suppressed_setup_layers: 0,
+        layers_started: 3,
+        chunks_completed: 7,
+        columns_completed: 769,
+        deadline_capped: false,
+        budget_exhausted: true,
+        chunk_secs_capped: false,
+        chunk_counterfactual_chunks: 2,
+        chunk_ceiling_binding_chunks: 1,
+        fixed_width_chunks: 0,
+        adaptive_width_changes: 3,
+        topk_binding_layers: 1,
+        policy_mismatch: false,
+    };
+    assert_eq!(
+        render_margin_row_backward_interm_execution(evidence),
+        "schema=ny-cli/margin-row-backward-interm-execution/v1 phase=terminal \
+         outcome=exhausted enabled=true configured_secs=20 configured_chunk=256 \
+         configured_chunk_secs=2 effective_chunk_secs=2 configured_topk=1024 \
+         eligible_layers=4 suppressed_setup_layers=0 layers_started=3 \
+         chunks_completed=7 columns_completed=769 \
+         deadline_capped=false budget_exhausted=true chunk_secs_capped=false \
+         chunk_counterfactual_chunks=2 chunk_ceiling_binding_chunks=1 \
+         fixed_width_chunks=0 adaptive_width_changes=3 \
+         topk_binding_layers=1 policy_mismatch=false",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn margin_row_root_precision_execution_receipt_is_exact_and_versioned() {
+    let evidence = RootPrecisionExecutionEvidence {
+        configured_root_f32: true,
+        configured_tableau_f32: false,
+        outward_eligible: true,
+        eligible_conv_ops: 7,
+        root_f32_conv_ops: 7,
+        root_f64_conv_ops: 0,
+        eligible_store_ops: 19,
+        tableau_f32_store_ops: 0,
+        tableau_f64_store_ops: 19,
+        tableau_refused: false,
+        policy_mismatch: false,
+    };
+    assert_eq!(
+        render_margin_row_root_precision_execution(evidence),
+        "schema=ny-cli/margin-row-root-precision-execution/v1 phase=terminal \
+         outcome=completed configured_root_f32=true configured_tableau_f32=false \
+         outward_eligible=true eligible_conv_ops=7 root_f32_conv_ops=7 \
+         root_f64_conv_ops=0 eligible_store_ops=19 tableau_f32_store_ops=0 \
+         tableau_f64_store_ops=19 tableau_refused=false policy_mismatch=false",
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn margin_row_root_alpha_execution_receipt_is_exact_and_versioned() {
+    let evidence = RootAlphaExecutionEvidence {
+        alpha_enabled: true,
+        alpha_iters: 16,
+        alpha_secs: 12.5,
+        alpha_lr: 0.05,
+        alpha_cols: 4,
+        alpha_guard: true,
+        rebake_enabled: true,
+        rebake_rounds: 3,
+        rebake_secs: 45.0,
+        eligible: true,
+        standalone_attempted: 1,
+        standalone_completed: 1,
+        standalone_effective_secs: 10.0,
+        standalone_deadline_capped: true,
+        standalone_iters_cap_exhausted: true,
+        standalone_fail_classes: 9,
+        standalone_iters_attempted: 16,
+        standalone_candidate_steps: 16,
+        standalone_adam_steps: 16,
+        standalone_passes: 17,
+        standalone_max_steer_cols: 4,
+        standalone_frozen_improvements: 3,
+        standalone_accepted: true,
+        standalone_moved_neurons: 21,
+        standalone_guard_opportunities: 1,
+        standalone_guard_baseline_evals: 1,
+        standalone_guard_candidate_evals: 1,
+        standalone_frozen_before_bits: Some((-1.25f64).to_bits()),
+        standalone_frozen_best_bits: Some((-1.0f64).to_bits()),
+        standalone_published_before_bits: Some((-0.5f64).to_bits()),
+        standalone_published_after_bits: Some(0.25f64.to_bits()),
+        rebake_attempted: 1,
+        rebake_completed: 1,
+        rebake_effective_secs: 30.0,
+        rebake_deadline_capped: true,
+        rebake_budget_exhausted: true,
+        rebake_entry_unbaked_alpha: true,
+        rebake_baseline_evals: 1,
+        rebake_rounds_started: 2,
+        rebake_alpha_completed: 2,
+        rebake_alpha_iters_attempted: 12,
+        rebake_alpha_candidate_steps: 11,
+        rebake_alpha_adam_steps: 11,
+        rebake_alpha_passes: 13,
+        rebake_alpha_max_fail_classes: 7,
+        rebake_alpha_max_steer_cols: 4,
+        rebake_alpha_moved_neurons: 17,
+        rebake_rebuilds_completed: 2,
+        rebake_rounds_scored: 2,
+        rebake_rounds_accepted: 1,
+        rebake_affordability_refusals: 1,
+        rebake_published_before_bits: Some((-1.0f64).to_bits()),
+        rebake_published_after_bits: Some((-0.5f64).to_bits()),
+        ..RootAlphaExecutionEvidence::default()
+    };
+    assert_eq!(
+        render_margin_row_root_alpha_execution("unknown", &evidence),
+        "schema=ny-cli/margin-row-root-alpha-execution/v1 phase=terminal outcome=unknown \
+         alpha_enabled=true alpha_iters=16 alpha_secs_bits=4623226492472524800 \
+         alpha_lr_bits=4587366580439587226 alpha_cols=4 alpha_guard=true \
+         rebake_enabled=true rebake_rounds=3 rebake_secs_bits=4631530004285489152 \
+         eligible=true standalone_suppressed=0 standalone_attempted=1 \
+         standalone_completed=1 standalone_effective_secs_bits=4621819117588971520 \
+         standalone_deadline_capped=true standalone_budget_exhausted=false \
+         standalone_iters_cap_exhausted=true standalone_fail_classes=9 \
+         standalone_iters_attempted=16 standalone_candidate_steps=16 \
+         standalone_legacy_steps=0 standalone_adam_steps=16 standalone_passes=17 \
+         standalone_max_steer_cols=4 standalone_frozen_improvements=3 \
+         standalone_accepted=true standalone_moved_neurons=21 \
+         standalone_guard_opportunities=1 standalone_guard_baseline_evals=1 \
+         standalone_guard_candidate_evals=1 standalone_guard_reversions=0 \
+         standalone_frozen_before_bits=13831680355561635840 \
+         standalone_frozen_best_bits=13830554455654793216 \
+         standalone_published_before_bits=13826050856027422720 \
+         standalone_published_after_bits=4598175219545276416 \
+         rebake_suppressed=0 rebake_attempted=1 rebake_completed=1 \
+         rebake_effective_secs_bits=4629137466983448576 rebake_deadline_capped=true \
+         rebake_budget_exhausted=true rebake_round_cap_exhausted=false \
+         rebake_entry_unbaked_alpha=true rebake_baseline_evals=1 \
+         rebake_rounds_started=2 rebake_alpha_completed=2 \
+         rebake_alpha_iters_attempted=12 rebake_alpha_candidate_steps=11 \
+         rebake_alpha_legacy_steps=0 rebake_alpha_adam_steps=11 \
+         rebake_alpha_passes=13 rebake_alpha_max_fail_classes=7 \
+         rebake_alpha_max_steer_cols=4 rebake_alpha_moved_neurons=17 \
+         rebake_rebuilds_completed=2 rebake_rounds_scored=2 \
+         rebake_rounds_accepted=1 rebake_fixed_point_stops=0 \
+         rebake_affordability_refusals=1 rebake_aborts=0 \
+         rebake_published_before_bits=13830554455654793216 \
+         rebake_published_after_bits=13826050856027422720 policy_mismatch=false",
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MarginRowReserveRoute {
     NotApplicable,
     Fixed,
     AdaptivePreserved,
     AdaptiveReleasedAlphaBetaTier,
+}
+
+/// Immutable entry-time policy for the margin-row lane scheduler.
+///
+/// The `configured_*` fields are the effective values consumed by this run.
+/// Their `contextual_*` peers are the exact lower-layer values recorded in
+/// [`ny_levers::Resolved::lower_value`]. Keeping both answers in one `Copy`
+/// value lets execution evidence compare a treatment with the policy it
+/// replaced without reopening either process environment or preset files.
+///
+/// Fractions are stored as IEEE-754 bits. Besides making this type `Eq`, that
+/// preserves the exact f64 widened from a typed f32 preset and distinguishes
+/// every receipt identity admitted by the declarations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarginRowScheduleRuntimePolicy {
+    pub(crate) configured_reserve_secs: u64,
+    pub(crate) contextual_reserve_secs: u64,
+    pub(crate) configured_adaptive_reserve: bool,
+    pub(crate) contextual_adaptive_reserve: bool,
+    pub(crate) configured_reserve_max_frac_bits: Option<u64>,
+    pub(crate) contextual_reserve_max_frac_bits: Option<u64>,
+    pub(crate) configured_adaptive_release_frac_bits: u64,
+    pub(crate) contextual_adaptive_release_frac_bits: u64,
+    pub(crate) configured_concurrent: bool,
+    pub(crate) contextual_concurrent: bool,
+    pub(crate) configured_early_exit: bool,
+    pub(crate) contextual_early_exit: bool,
+    pub(crate) configured_verifier_threads: Option<usize>,
+    pub(crate) contextual_verifier_threads: Option<usize>,
+    pub(crate) configured_concurrent_threads: Option<usize>,
+    pub(crate) contextual_concurrent_threads: Option<usize>,
+}
+
+impl Default for MarginRowScheduleRuntimePolicy {
+    fn default() -> Self {
+        let release_bits = DEFAULT_ADAPTIVE_RELEASE_FRAC.to_bits();
+        Self {
+            configured_reserve_secs: 45,
+            contextual_reserve_secs: 45,
+            configured_adaptive_reserve: false,
+            contextual_adaptive_reserve: false,
+            configured_reserve_max_frac_bits: None,
+            contextual_reserve_max_frac_bits: None,
+            configured_adaptive_release_frac_bits: release_bits,
+            contextual_adaptive_release_frac_bits: release_bits,
+            configured_concurrent: false,
+            contextual_concurrent: false,
+            configured_early_exit: true,
+            contextual_early_exit: true,
+            configured_verifier_threads: None,
+            contextual_verifier_threads: None,
+            configured_concurrent_threads: None,
+            contextual_concurrent_threads: None,
+        }
+    }
+}
+
+/// Result of the one process-wide attempt to configure Rayon for the internal
+/// verifier. `actual_threads` is populated only when a global registry is
+/// known to exist; observing it on the untouched route would initialize Rayon
+/// and change the historical no-cap path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlobalRayonOutcome {
+    pub(crate) route: GlobalRayonRoute,
+    pub(crate) requested_threads: Option<usize>,
+    pub(crate) actual_threads: Option<usize>,
+    pub(crate) host_threads: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GlobalRayonRoute {
+    NotRequested,
+    Applied,
+    AlreadyInitialized,
+}
+
+impl GlobalRayonRoute {
+    pub(crate) const fn stable_token(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Applied => "applied",
+            Self::AlreadyInitialized => "already_initialized",
+        }
+    }
+}
+
+impl GlobalRayonOutcome {
+    pub(crate) const NOT_REQUESTED: Self = Self {
+        route: GlobalRayonRoute::NotRequested,
+        requested_threads: None,
+        actual_threads: None,
+        host_threads: None,
+    };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GlobalRayonBuildFailure {
+    pub(crate) requested_threads: usize,
+    pub(crate) host_threads: Option<usize>,
+    pub(crate) error: String,
+}
+
+impl MarginRowScheduleRuntimePolicy {
+    fn exact_u64(
+        decl: &'static ny_levers::LeverDecl,
+        value: &ny_levers::LeverValue,
+    ) -> Result<u64, String> {
+        match value {
+            ny_levers::LeverValue::U64(value) => Ok(*value),
+            other => Err(format!("{} resolved to non-u64 value {other:?}", decl.name)),
+        }
+    }
+
+    fn exact_bool(
+        decl: &'static ny_levers::LeverDecl,
+        value: &ny_levers::LeverValue,
+    ) -> Result<bool, String> {
+        match value {
+            ny_levers::LeverValue::Bool(value) => Ok(*value),
+            other => Err(format!(
+                "{} resolved to non-boolean value {other:?}",
+                decl.name
+            )),
+        }
+    }
+
+    fn exact_open_fraction_bits(
+        decl: &'static ny_levers::LeverDecl,
+        value: &ny_levers::LeverValue,
+    ) -> Result<u64, String> {
+        match value {
+            ny_levers::LeverValue::F64(value)
+                if value.is_finite() && *value > 0.0 && *value < 1.0 =>
+            {
+                Ok(value.to_bits())
+            }
+            other => Err(format!(
+                "{} resolved outside the finite open unit interval: {other:?}",
+                decl.name
+            )),
+        }
+    }
+
+    fn exact_optional_open_fraction_bits(
+        decl: &'static ny_levers::LeverDecl,
+        value: &ny_levers::LeverValue,
+    ) -> Result<Option<u64>, String> {
+        match value {
+            ny_levers::LeverValue::Unset => Ok(None),
+            _ => Self::exact_open_fraction_bits(decl, value).map(Some),
+        }
+    }
+
+    fn exact_optional_usize(
+        decl: &'static ny_levers::LeverDecl,
+        value: &ny_levers::LeverValue,
+    ) -> Result<Option<usize>, String> {
+        match value {
+            ny_levers::LeverValue::Unset => Ok(None),
+            ny_levers::LeverValue::U64(value) => usize::try_from(*value)
+                .map(Some)
+                .map_err(|_| format!("{} resolved outside platform usize: {value}", decl.name)),
+            other => Err(format!(
+                "{} resolved to non-optional-usize value {other:?}",
+                decl.name
+            )),
+        }
+    }
+
+    fn from_resolved(
+        reserve_secs: &ny_levers::Resolved,
+        adaptive_reserve: &ny_levers::Resolved,
+        reserve_max_frac: &ny_levers::Resolved,
+        adaptive_release_frac: &ny_levers::Resolved,
+        concurrent: &ny_levers::Resolved,
+        early_exit: &ny_levers::Resolved,
+        verifier_threads: &ny_levers::Resolved,
+        concurrent_threads: &ny_levers::Resolved,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            configured_reserve_secs: Self::exact_u64(reserve_secs.decl, &reserve_secs.value)?,
+            contextual_reserve_secs: Self::exact_u64(reserve_secs.decl, &reserve_secs.lower_value)?,
+            configured_adaptive_reserve: Self::exact_bool(
+                adaptive_reserve.decl,
+                &adaptive_reserve.value,
+            )?,
+            contextual_adaptive_reserve: Self::exact_bool(
+                adaptive_reserve.decl,
+                &adaptive_reserve.lower_value,
+            )?,
+            configured_reserve_max_frac_bits: Self::exact_optional_open_fraction_bits(
+                reserve_max_frac.decl,
+                &reserve_max_frac.value,
+            )?,
+            contextual_reserve_max_frac_bits: Self::exact_optional_open_fraction_bits(
+                reserve_max_frac.decl,
+                &reserve_max_frac.lower_value,
+            )?,
+            configured_adaptive_release_frac_bits: Self::exact_open_fraction_bits(
+                adaptive_release_frac.decl,
+                &adaptive_release_frac.value,
+            )?,
+            contextual_adaptive_release_frac_bits: Self::exact_open_fraction_bits(
+                adaptive_release_frac.decl,
+                &adaptive_release_frac.lower_value,
+            )?,
+            configured_concurrent: Self::exact_bool(concurrent.decl, &concurrent.value)?,
+            contextual_concurrent: Self::exact_bool(concurrent.decl, &concurrent.lower_value)?,
+            configured_early_exit: Self::exact_bool(early_exit.decl, &early_exit.value)?,
+            contextual_early_exit: Self::exact_bool(early_exit.decl, &early_exit.lower_value)?,
+            configured_verifier_threads: Self::exact_optional_usize(
+                verifier_threads.decl,
+                &verifier_threads.value,
+            )?,
+            contextual_verifier_threads: Self::exact_optional_usize(
+                verifier_threads.decl,
+                &verifier_threads.lower_value,
+            )?,
+            configured_concurrent_threads: Self::exact_optional_usize(
+                concurrent_threads.decl,
+                &concurrent_threads.value,
+            )?,
+            contextual_concurrent_threads: Self::exact_optional_usize(
+                concurrent_threads.decl,
+                &concurrent_threads.lower_value,
+            )?,
+        })
+    }
+
+    /// Resolve the scheduler from the run's receipt-owning frozen lever set.
+    /// Missing or ill-typed entries fail closed instead of consulting a second
+    /// authority.
+    pub(crate) fn from_levers(levers: &ny_levers::LeverSet) -> Result<Self, String> {
+        use ny_levers::decls::margin_row::{
+            MARGIN_ROW_ADAPTIVE_RELEASE_FRAC, MARGIN_ROW_ADAPTIVE_RESERVE, MARGIN_ROW_CONCURRENT,
+            MARGIN_ROW_CONCURRENT_THREADS, MARGIN_ROW_EARLY_EXIT, MARGIN_ROW_RESERVE_MAX_FRAC,
+            MARGIN_ROW_RESERVE_SECS, VERIFIER_THREADS,
+        };
+
+        let resolved = |decl: &'static ny_levers::LeverDecl| {
+            levers
+                .resolved(decl)
+                .ok_or_else(|| format!("{} is missing from the frozen LeverSet", decl.name))
+        };
+        Self::from_resolved(
+            resolved(&MARGIN_ROW_RESERVE_SECS)?,
+            resolved(&MARGIN_ROW_ADAPTIVE_RESERVE)?,
+            resolved(&MARGIN_ROW_RESERVE_MAX_FRAC)?,
+            resolved(&MARGIN_ROW_ADAPTIVE_RELEASE_FRAC)?,
+            resolved(&MARGIN_ROW_CONCURRENT)?,
+            resolved(&MARGIN_ROW_EARLY_EXIT)?,
+            resolved(&VERIFIER_THREADS)?,
+            resolved(&MARGIN_ROW_CONCURRENT_THREADS)?,
+        )
+    }
+
+    /// Resolve the historical process-over-preset layers once for compatibility
+    /// and research entry points. Scored VNN-COMP execution uses
+    /// [`Self::from_levers`] instead.
+    pub(crate) fn from_layered_process(preset: Option<&Path>) -> Self {
+        use ny_levers::decls::margin_row::{
+            MARGIN_ROW_ADAPTIVE_RELEASE_FRAC, MARGIN_ROW_ADAPTIVE_RESERVE, MARGIN_ROW_CONCURRENT,
+            MARGIN_ROW_CONCURRENT_THREADS, MARGIN_ROW_EARLY_EXIT, MARGIN_ROW_RESERVE_MAX_FRAC,
+            MARGIN_ROW_RESERVE_SECS, VERIFIER_THREADS,
+        };
+
+        let loaded = preset.and_then(|path| crate::preset::load_preset(path).ok());
+        let margin_row = loaded.as_ref().map(|config| &config.margin_row);
+
+        // Compatibility callers still resolve process-over-preset layering at
+        // entry, but the declaration registry remains the only environment
+        // parser. Filter typed floats exactly as the historical preset readers
+        // did before handing their admissible values to the shared resolver.
+        let reserve_secs = ny_levers::read_over_config(
+            &MARGIN_ROW_RESERVE_SECS,
+            margin_row
+                .and_then(|row| row.reserve_secs)
+                .map(ny_levers::LeverValue::U64),
+        )
+        .expect("typed reserve seconds satisfy the scheduler declaration");
+        let adaptive_reserve = ny_levers::read_over_config(
+            &MARGIN_ROW_ADAPTIVE_RESERVE,
+            margin_row
+                .and_then(|row| row.adaptive_reserve)
+                .map(ny_levers::LeverValue::Bool),
+        )
+        .expect("typed adaptive-reserve gate satisfies the scheduler declaration");
+        let reserve_max_frac = ny_levers::read_over_config(
+            &MARGIN_ROW_RESERVE_MAX_FRAC,
+            margin_row
+                .and_then(|row| row.reserve_max_frac)
+                .map(f64::from)
+                .and_then(valid_reserve_fraction)
+                .map(ny_levers::LeverValue::F64),
+        )
+        .expect("filtered reserve ceiling satisfies the scheduler declaration");
+        let adaptive_release_frac = ny_levers::read_over_config(
+            &MARGIN_ROW_ADAPTIVE_RELEASE_FRAC,
+            margin_row
+                .and_then(|row| row.release_frac)
+                .map(f64::from)
+                .and_then(valid_reserve_fraction)
+                .map(ny_levers::LeverValue::F64),
+        )
+        .expect("filtered release threshold satisfies the scheduler declaration");
+        let concurrent = ny_levers::read_over_config(
+            &MARGIN_ROW_CONCURRENT,
+            margin_row
+                .and_then(|row| row.concurrent)
+                .map(ny_levers::LeverValue::Bool),
+        )
+        .expect("typed concurrent gate satisfies the scheduler declaration");
+        let early_exit = ny_levers::read_over_config(
+            &MARGIN_ROW_EARLY_EXIT,
+            margin_row
+                .and_then(|row| row.early_exit)
+                .map(ny_levers::LeverValue::Bool),
+        )
+        .expect("typed early-exit gate satisfies the scheduler declaration");
+        let verifier_threads = ny_levers::read_over_config(
+            &VERIFIER_THREADS,
+            margin_row
+                .and_then(|row| row.verifier_threads)
+                .map(|value| ny_levers::LeverValue::U64(value as u64)),
+        )
+        .expect("typed verifier-thread cap satisfies the scheduler declaration");
+        let concurrent_threads = ny_levers::read_over_config(
+            &MARGIN_ROW_CONCURRENT_THREADS,
+            margin_row
+                .and_then(|row| row.concurrent_threads)
+                .map(|value| ny_levers::LeverValue::U64(value as u64)),
+        )
+        .expect("typed concurrent-thread cap satisfies the scheduler declaration");
+
+        Self::from_resolved(
+            &reserve_secs,
+            &adaptive_reserve,
+            &reserve_max_frac,
+            &adaptive_release_frac,
+            &concurrent,
+            &early_exit,
+            &verifier_threads,
+            &concurrent_threads,
+        )
+        .expect("scheduler declarations preserve their exact runtime value types")
+    }
+
+    pub(crate) fn configured_reserve_max_frac(self) -> Option<f64> {
+        self.configured_reserve_max_frac_bits.map(f64::from_bits)
+    }
+
+    pub(crate) fn configured_adaptive_release_frac(self) -> f64 {
+        f64::from_bits(self.configured_adaptive_release_frac_bits)
+    }
+
+    pub(crate) const fn early_exit_armed(self) -> bool {
+        self.configured_early_exit
+    }
+
+    pub(crate) fn verifier_thread_cap(self) -> Option<std::num::NonZeroUsize> {
+        self.configured_verifier_threads
+            .and_then(std::num::NonZeroUsize::new)
+    }
+
+    pub(crate) const fn concurrent_threads_override(self) -> Option<usize> {
+        self.configured_concurrent_threads
+    }
+}
+
+/// Apply the frozen verifier cap to Rayon's process-global registry exactly
+/// once. The caller must invoke this on the main thread before any optional
+/// scored Rayon work.
+pub(crate) fn configure_global_rayon(
+    policy: MarginRowScheduleRuntimePolicy,
+) -> Result<GlobalRayonOutcome, GlobalRayonBuildFailure> {
+    let host_threads = std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZeroUsize::get);
+    let Some(requested) = policy
+        .verifier_thread_cap()
+        .map(std::num::NonZeroUsize::get)
+    else {
+        return Ok(GlobalRayonOutcome {
+            host_threads,
+            ..GlobalRayonOutcome::NOT_REQUESTED
+        });
+    };
+
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(requested)
+        .build_global()
+    {
+        Ok(()) => Ok(GlobalRayonOutcome {
+            route: GlobalRayonRoute::Applied,
+            requested_threads: Some(requested),
+            actual_threads: Some(rayon::current_num_threads()),
+            host_threads,
+        }),
+        Err(error) if std::error::Error::source(&error).is_none() => Ok(GlobalRayonOutcome {
+            route: GlobalRayonRoute::AlreadyInitialized,
+            requested_threads: Some(requested),
+            actual_threads: Some(rayon::current_num_threads()),
+            host_threads,
+        }),
+        Err(error) => Err(GlobalRayonBuildFailure {
+            requested_threads: requested,
+            host_threads,
+            error: error.to_string(),
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,29 +1366,45 @@ impl MarginRowReserveDecision {
     /// is the only thing authorized to arm scored sparse root CROWN
     /// ([`Self::enables_scored_sparse_crown`]), and a scheduling ceiling must
     /// not smuggle that in.
+    #[allow(dead_code)]
     pub(crate) fn capped_to_internal_budget(
         mut self,
         internal_budget_secs: u64,
         preset: Option<&Path>,
     ) -> Self {
+        self.apply_internal_budget_cap(internal_budget_secs, margin_row_reserve_max_frac(preset))
+    }
+
+    /// Apply the cap from the immutable receipt-owned scheduler policy.
+    pub(crate) fn capped_to_internal_budget_with_policy(
+        mut self,
+        internal_budget_secs: u64,
+        policy: MarginRowScheduleRuntimePolicy,
+    ) -> Self {
+        self.apply_internal_budget_cap(internal_budget_secs, policy.configured_reserve_max_frac())
+    }
+
+    fn apply_internal_budget_cap(
+        &mut self,
+        internal_budget_secs: u64,
+        max_fraction: Option<f64>,
+    ) -> Self {
         // Nothing to cap: skip the preset load entirely. `min` against any
         // ceiling would return 0 anyway, so this is byte-identical and keeps
         // the non-reserving categories off the filesystem.
         if self.reserve_secs == 0 {
-            return self;
+            return *self;
         }
-        self.reserve_secs = capped_reserve_secs(
-            self.reserve_secs,
-            internal_budget_secs,
-            margin_row_reserve_max_frac(preset),
-        );
-        self
+        self.reserve_secs =
+            capped_reserve_secs(self.reserve_secs, internal_budget_secs, max_fraction);
+        *self
     }
 }
 
 /// Dark opt-in: cap the margin-row reserve at this fraction of the INTERNAL
 /// budget. Absent or invalid ⇒ no ceiling ⇒ byte-identical to the shipped
 /// fixed-seconds policy.
+#[cfg(test)]
 pub(crate) const RESERVE_MAX_FRAC_ENV: &str = "NY_MARGIN_ROW_RESERVE_MAX_FRAC";
 
 /// Accept a ceiling fraction only if it is finite and strictly inside
@@ -100,6 +1418,7 @@ fn valid_reserve_fraction(fraction: f64) -> Option<f64> {
 /// Parse the ceiling fraction from its environment form. Everything the
 /// parser or [`valid_reserve_fraction`] rejects (absent, malformed, `0`,
 /// `>= 1`, non-finite) declines the ceiling and keeps the shipped policy.
+#[cfg(test)]
 fn reserve_max_fraction(raw: Option<&str>) -> Option<f64> {
     raw.and_then(|value| value.parse::<f64>().ok())
         .and_then(valid_reserve_fraction)
@@ -120,17 +1439,14 @@ fn reserve_max_fraction(raw: Option<&str>) -> Option<f64> {
 /// Sound by construction: same argument as [`capped_reserve_secs`] — this only
 /// schedules wall time between two independently sound lanes, so it is
 /// verdict-neutral and can at worst make a lane fail to prove.
+#[allow(dead_code)]
 pub(crate) fn margin_row_reserve_max_frac(preset: Option<&Path>) -> Option<f64> {
-    resolve_reserve_max_frac(
-        std::env::var(RESERVE_MAX_FRAC_ENV).ok().as_deref(),
-        preset
-            .and_then(|p| crate::preset::load_preset(p).ok())
-            .and_then(|c| c.margin_row.reserve_max_frac),
-    )
+    MarginRowScheduleRuntimePolicy::from_layered_process(preset).configured_reserve_max_frac()
 }
 
 /// The pure half of [`margin_row_reserve_max_frac`], kept separate so the
 /// precedence rules are testable without mutating process-global environment.
+#[cfg(test)]
 fn resolve_reserve_max_frac(env_raw: Option<&str>, typed: Option<f32>) -> Option<f64> {
     match env_raw {
         // PRESENT (even if declined) ⇒ the environment decides, full stop.
@@ -201,12 +1517,14 @@ fn capped_reserve_secs(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum AdaptiveReserveGateEnv<'a> {
     Absent,
     Unicode(&'a str),
     NonUnicode,
 }
 
+#[cfg(test)]
 fn adaptive_reserve_gate_env(raw: Option<&std::ffi::OsStr>) -> AdaptiveReserveGateEnv<'_> {
     match raw {
         None => AdaptiveReserveGateEnv::Absent,
@@ -220,6 +1538,7 @@ fn adaptive_reserve_gate_env(raw: Option<&std::ffi::OsStr>) -> AdaptiveReserveGa
 /// Resolve the typed production policy plus an exact sealed A/B override.
 /// Only raw Unicode `"1"` enables and `"0"` disables. Any other present value
 /// fails closed to the fixed-reserve policy, even if the preset is typed on.
+#[cfg(test)]
 fn adaptive_reserve_enabled(typed_enabled: bool, gate: AdaptiveReserveGateEnv<'_>) -> bool {
     match gate {
         AdaptiveReserveGateEnv::Absent => typed_enabled,
@@ -231,6 +1550,7 @@ fn adaptive_reserve_enabled(typed_enabled: bool, gate: AdaptiveReserveGateEnv<'_
 /// Dark opt-in: the reserve share of the INTERNAL budget at or above which the
 /// adaptive route releases the reserve entirely. Absent or invalid ⇒
 /// [`DEFAULT_ADAPTIVE_RELEASE_FRAC`].
+#[cfg(test)]
 pub(crate) const RELEASE_FRAC_ENV: &str = "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC";
 
 /// Release when the fixed reserve would take >= 40% of the internal budget.
@@ -247,16 +1567,13 @@ const DEFAULT_ADAPTIVE_RELEASE_FRAC: f64 = 0.40;
 /// Shares [`valid_reserve_fraction`]'s admission rule, so a malformed or
 /// out-of-range value in either source falls back to the shipped default
 /// rather than silently disabling or universalizing the release.
+#[allow(dead_code)]
 pub(crate) fn margin_row_release_frac(preset: Option<&Path>) -> f64 {
-    resolve_release_frac(
-        std::env::var(RELEASE_FRAC_ENV).ok().as_deref(),
-        preset
-            .and_then(|p| crate::preset::load_preset(p).ok())
-            .and_then(|c| c.margin_row.release_frac),
-    )
+    MarginRowScheduleRuntimePolicy::from_layered_process(preset).configured_adaptive_release_frac()
 }
 
 /// The pure half of [`margin_row_release_frac`].
+#[cfg(test)]
 fn resolve_release_frac(env_raw: Option<&str>, typed: Option<f32>) -> f64 {
     env_raw
         .and_then(|raw| raw.parse::<f64>().ok())
@@ -330,6 +1647,53 @@ fn reserve_policy(
     }
 }
 
+/// Does this [`TwinSpec`] satisfy the head contract the margin-row COMPILER
+/// enforces (`ny_propagate::margin_row::net::TwinNet::compile`)?
+///
+/// #twinwall-reserve-admission. [`extract_twin_spec`] admits any net built from
+/// the supported op set; the compiler additionally requires the tail to be
+/// `... trunk-ReLU ... -> Gemm1 -> ReLU -> Gemm2` with exactly two Gemms. Those
+/// two admissions were not the same predicate, so a net inside the op set but
+/// outside the head shape ARMED the reserve and then declined at run time —
+/// MEASURED on malbeware (`Conv -> ReLU -> Flatten -> Gemm`, ONE Gemm): the
+/// reserve held back 45 s of a 95 s internal budget and the lane refused in
+/// 0.0 s with `expected 2 gemms, got 1`, so the internal verifier ran on 46 s
+/// instead of 95 s.
+///
+/// This mirrors the compiler's checks EXACTLY and allocates nothing: the op
+/// index of a `TwinOpSpec` equals the op index of the `TwinOp` it compiles to
+/// (the compiler pushes one op per spec op, in order), and op `k` publishes
+/// tensor id `k + 1`. Fail-closed: any deviation returns `false`, which returns
+/// the reserve to the internal verifier — never the other way round.
+fn twin_spec_compiles_to_margin_row_head(spec: &TwinSpec) -> bool {
+    let gemms: Vec<usize> = spec
+        .ops
+        .iter()
+        .enumerate()
+        .filter(|(_, op)| matches!(op, TwinOpSpec::Gemm { .. }))
+        .map(|(idx, _)| idx)
+        .collect();
+    let [i_gemm1, i_gemm2] = gemms[..] else {
+        return false;
+    };
+    // `... -> Gemm1 -> Relu -> Gemm2` with Gemm2 last.
+    if i_gemm2 != spec.ops.len() - 1 || i_gemm1 + 2 != i_gemm2 {
+        return false;
+    }
+    // Head wiring: the head ReLU consumes Gemm1's output and Gemm2 consumes
+    // the head ReLU's.
+    match (spec.ops.get(i_gemm1 + 1), spec.ops.get(i_gemm2)) {
+        (Some(TwinOpSpec::Relu { input: r_in }), Some(TwinOpSpec::Gemm { input: g2_in, .. }))
+            if *r_in == i_gemm1 + 1 && *g2_in == i_gemm1 + 2 => {}
+        _ => return false,
+    }
+    // The compiler also requires at least one TRUNK ReLU (a ReLU seen before
+    // the first Gemm); without one the lane has nothing to branch on.
+    spec.ops[..i_gemm1]
+        .iter()
+        .any(|op| matches!(op, TwinOpSpec::Relu { .. }))
+}
+
 /// Resolve the per-instance reserve after structural admission.
 ///
 /// A typed category preset or exact `NY_MARGIN_ROW_ADAPTIVE_RESERVE=1` enables
@@ -337,19 +1701,41 @@ fn reserve_policy(
 /// from budget arithmetic. All parse, extraction, and environment uncertainty
 /// retains the fixed policy. No verifier or margin-row bound/verdict code is
 /// changed by this decision.
+#[allow(dead_code)]
 pub(crate) fn margin_row_reserve_decision(
     onnx: &Path,
     vnnlib: &Path,
     preset: Option<&Path>,
     internal_budget_secs: u64,
 ) -> MarginRowReserveDecision {
-    let configured_secs = margin_row_reserve_secs(preset);
+    margin_row_reserve_decision_with_policy(
+        onnx,
+        vnnlib,
+        internal_budget_secs,
+        MarginRowScheduleRuntimePolicy::from_layered_process(preset),
+    )
+}
+
+/// Resolve the per-instance reserve from an immutable, receipt-owned scheduler
+/// policy. This is the scored-use seam: it never consults process environment
+/// or reloads the category preset.
+pub(crate) fn margin_row_reserve_decision_with_policy(
+    onnx: &Path,
+    vnnlib: &Path,
+    internal_budget_secs: u64,
+    policy: MarginRowScheduleRuntimePolicy,
+) -> MarginRowReserveDecision {
+    let configured_secs = policy.configured_reserve_secs;
     // No reserve unless this category opted in: skip the expensive
     // structural probe entirely when there is nothing to reserve.
+    //
+    // #twinwall-reserve-admission: the probe must accept EXACTLY what the
+    // margin-row compiler accepts. Extraction alone is not enough — see
+    // [`twin_spec_compiles_to_margin_row_head`].
     if configured_secs == 0
         || !ny_propagate::margin_row::margin_row_bab_enabled()
         || parse_vnnlib_robustness(vnnlib).is_none()
-        || extract_twin_spec(onnx).is_none()
+        || !extract_twin_spec(onnx).is_some_and(|spec| twin_spec_compiles_to_margin_row_head(&spec))
     {
         return MarginRowReserveDecision {
             configured_secs,
@@ -357,18 +1743,13 @@ pub(crate) fn margin_row_reserve_decision(
             route: MarginRowReserveRoute::NotApplicable,
         };
     }
-    let typed_adaptive = preset
-        .and_then(|path| crate::preset::load_preset(path).ok())
-        .and_then(|config| config.margin_row.adaptive_reserve)
-        .unwrap_or(false);
-    let gate = std::env::var_os("NY_MARGIN_ROW_ADAPTIVE_RESERVE");
     reserve_policy(
         configured_secs,
-        adaptive_reserve_enabled(typed_adaptive, adaptive_reserve_gate_env(gate.as_deref())),
+        policy.configured_adaptive_reserve,
         adaptive_release_target(
             configured_secs,
             internal_budget_secs,
-            margin_row_release_frac(preset),
+            policy.configured_adaptive_release_frac(),
         ),
     )
 }
@@ -395,17 +1776,9 @@ pub(crate) fn margin_row_reserve_decision(
 ///     to use the 45 s default, but it is not a sealed A/B and therefore does
 ///     not establish the reserve's net production effect.
 ///
+#[allow(dead_code)]
 pub(crate) fn margin_row_reserve_secs(preset: Option<&Path>) -> u64 {
-    if let Ok(v) = std::env::var("NY_MARGIN_ROW_RESERVE_SECS") {
-        if let Ok(n) = v.parse() {
-            return n; // explicit override wins
-        }
-    }
-    // Per-category opt-in: `margin_row: { reserve_secs: N }` in the preset.
-    preset
-        .and_then(|p| crate::preset::load_preset(p).ok())
-        .and_then(|c| c.margin_row.reserve_secs)
-        .unwrap_or(45)
+    MarginRowScheduleRuntimePolicy::from_layered_process(preset).configured_reserve_secs
 }
 
 fn log_classwise_stats(stats: &BabStats) {
@@ -544,6 +1917,7 @@ pub(crate) fn try_margin_row_unsat(
     onnx: &Path,
     vnnlib: &Path,
     instance_deadline: Option<Instant>,
+    runtime_policy: MarginRowRuntimePolicy,
 ) -> MarginRowTry {
     if !ny_propagate::margin_row::margin_row_bab_enabled() {
         return MarginRowTry::FinishedWithoutVerdict;
@@ -604,7 +1978,18 @@ pub(crate) fn try_margin_row_unsat(
     // stops cooperatively well before the external cap fires.
     let cap = deadline.saturating_duration_since(t0);
     let out = match run_capped_detached(cap, "inline", move || {
-        run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(deadline), 20_000)
+        let out = run_margin_row_lane_with_policy(
+            &spec,
+            &lo,
+            &hi,
+            t,
+            &adv,
+            Some(deadline),
+            20_000,
+            runtime_policy,
+        );
+        note_margin_row_execution(&out);
+        out
     }) {
         DetachedTake::Finished(out) => out,
         DetachedTake::StillRunning => return MarginRowTry::StillRunning,
@@ -646,11 +2031,259 @@ pub(crate) fn try_margin_row_unsat(
     }
 }
 
+#[derive(Default)]
+struct ConcurrentLaneExecutionState {
+    allocation_receipt_recorded: std::sync::atomic::AtomicBool,
+    worker_active: std::sync::atomic::AtomicBool,
+    verifier_active: std::sync::atomic::AtomicBool,
+    overlap_recorded: std::sync::atomic::AtomicBool,
+}
+
+impl ConcurrentLaneExecutionState {
+    fn new(allocation_receipt_recorded: bool) -> Self {
+        Self {
+            allocation_receipt_recorded: std::sync::atomic::AtomicBool::new(
+                allocation_receipt_recorded,
+            ),
+            ..Self::default()
+        }
+    }
+
+    fn mark_worker_started(&self) {
+        self.worker_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.observe_overlap();
+    }
+
+    fn mark_worker_finished(&self) {
+        self.worker_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn mark_verifier_started(&self) {
+        self.verifier_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.observe_overlap();
+    }
+
+    fn mark_verifier_finished(&self) {
+        self.verifier_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn observe_overlap(&self) {
+        if self.worker_active.load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .verifier_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+            && !self
+                .overlap_recorded
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            crate::flight::note(
+                MARGIN_ROW_CONCURRENT_OVERLAP_EXECUTION_METHOD,
+                crate::flight::FlightStatus::Ran,
+                Some(render_margin_row_concurrent_overlap_execution()),
+            );
+        }
+    }
+}
+
+struct ConcurrentWorkerActiveGuard(std::sync::Arc<ConcurrentLaneExecutionState>);
+
+impl Drop for ConcurrentWorkerActiveGuard {
+    fn drop(&mut self) {
+        self.0.mark_worker_finished();
+    }
+}
+
+/// Stable result of concurrent-lane admission. A configured gate is not an
+/// execution event unless this route reaches [`Self::Spawned`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConcurrentLaneAdmissionRoute {
+    Disabled,
+    AuthorityDisabled,
+    CpuDevice,
+    NoDeadline,
+    ShortBudget,
+    Model,
+    Property,
+    InputShape,
+    NoSafeRemainder,
+    GlobalUnavailable,
+    PrivatePoolFailed,
+    SpawnFailed,
+    Spawned,
+}
+
+impl ConcurrentLaneAdmissionRoute {
+    pub(crate) const fn stable_token(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::AuthorityDisabled => "authority_disabled",
+            Self::CpuDevice => "cpu_device",
+            Self::NoDeadline => "no_deadline",
+            Self::ShortBudget => "short_budget",
+            Self::Model => "model",
+            Self::Property => "property",
+            Self::InputShape => "input_shape",
+            Self::NoSafeRemainder => "no_safe_remainder",
+            Self::GlobalUnavailable => "global_unavailable",
+            Self::PrivatePoolFailed => "private_pool_failed",
+            Self::SpawnFailed => "spawn_failed",
+            Self::Spawned => "spawned",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConcurrentLanePoolRoute {
+    NotConsulted,
+    SharedGlobal,
+    ExplicitPrivate,
+    VerifierRemainder,
+    NoSafeRemainder,
+    GlobalUnavailable,
+}
+
+impl ConcurrentLanePoolRoute {
+    pub(crate) const fn stable_token(self) -> &'static str {
+        match self {
+            Self::NotConsulted => "not_consulted",
+            Self::SharedGlobal => "shared_global",
+            Self::ExplicitPrivate => "explicit_private",
+            Self::VerifierRemainder => "verifier_remainder",
+            Self::NoSafeRemainder => "no_safe_remainder",
+            Self::GlobalUnavailable => "global_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrivatePoolRoute {
+    NotRequested,
+    Built,
+    BuildFailed,
+}
+
+impl PrivatePoolRoute {
+    pub(crate) const fn stable_token(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Built => "built",
+            Self::BuildFailed => "build_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConcurrentLaneResourceOutcome {
+    pub(crate) pool_route: ConcurrentLanePoolRoute,
+    pub(crate) lane_threads: Option<usize>,
+    pub(crate) private_pool_route: PrivatePoolRoute,
+}
+
+impl ConcurrentLaneResourceOutcome {
+    pub(crate) const NOT_CONSULTED: Self = Self {
+        pool_route: ConcurrentLanePoolRoute::NotConsulted,
+        lane_threads: None,
+        private_pool_route: PrivatePoolRoute::NotRequested,
+    };
+}
+
+fn concurrent_lane_pool_plan(
+    policy: MarginRowScheduleRuntimePolicy,
+    global: GlobalRayonOutcome,
+) -> ConcurrentLaneResourceOutcome {
+    if let Some(threads) = policy.concurrent_threads_override() {
+        return ConcurrentLaneResourceOutcome {
+            pool_route: if threads == 0 {
+                ConcurrentLanePoolRoute::SharedGlobal
+            } else {
+                ConcurrentLanePoolRoute::ExplicitPrivate
+            },
+            lane_threads: Some(threads),
+            private_pool_route: PrivatePoolRoute::NotRequested,
+        };
+    }
+
+    if policy.verifier_thread_cap().is_none() {
+        return ConcurrentLaneResourceOutcome {
+            pool_route: ConcurrentLanePoolRoute::SharedGlobal,
+            lane_threads: Some(0),
+            private_pool_route: PrivatePoolRoute::NotRequested,
+        };
+    }
+
+    let (Some(host_threads), Some(actual_threads)) = (global.host_threads, global.actual_threads)
+    else {
+        return ConcurrentLaneResourceOutcome {
+            pool_route: ConcurrentLanePoolRoute::GlobalUnavailable,
+            lane_threads: None,
+            private_pool_route: PrivatePoolRoute::NotRequested,
+        };
+    };
+    let Some(remainder) = host_threads
+        .checked_sub(actual_threads)
+        .filter(|value| *value > 0)
+    else {
+        return ConcurrentLaneResourceOutcome {
+            pool_route: ConcurrentLanePoolRoute::NoSafeRemainder,
+            lane_threads: None,
+            private_pool_route: PrivatePoolRoute::NotRequested,
+        };
+    };
+    ConcurrentLaneResourceOutcome {
+        pool_route: ConcurrentLanePoolRoute::VerifierRemainder,
+        lane_threads: Some(remainder),
+        private_pool_route: PrivatePoolRoute::NotRequested,
+    }
+}
+
+/// Admission route plus the worker handle, present exactly for `spawned`.
+pub(crate) struct ConcurrentLaneAdmission {
+    pub(crate) route: ConcurrentLaneAdmissionRoute,
+    pub(crate) lane: Option<ConcurrentLane>,
+    pub(crate) resources: ConcurrentLaneResourceOutcome,
+}
+
+impl ConcurrentLaneAdmission {
+    fn refused(route: ConcurrentLaneAdmissionRoute) -> Self {
+        debug_assert_ne!(route, ConcurrentLaneAdmissionRoute::Spawned);
+        Self {
+            route,
+            lane: None,
+            resources: ConcurrentLaneResourceOutcome::NOT_CONSULTED,
+        }
+    }
+
+    fn refused_with_resources(
+        route: ConcurrentLaneAdmissionRoute,
+        resources: ConcurrentLaneResourceOutcome,
+    ) -> Self {
+        debug_assert_ne!(route, ConcurrentLaneAdmissionRoute::Spawned);
+        Self {
+            route,
+            lane: None,
+            resources,
+        }
+    }
+
+    fn spawned(lane: ConcurrentLane, resources: ConcurrentLaneResourceOutcome) -> Self {
+        Self {
+            route: ConcurrentLaneAdmissionRoute::Spawned,
+            lane: Some(lane),
+            resources,
+        }
+    }
+}
+
 /// Handle to a margin-row lane running CONCURRENTLY with the internal
 /// verifier (#epoch-bab).
 pub(crate) struct ConcurrentLane {
     rx: std::sync::mpsc::Receiver<Option<VnncompResult>>,
     handle: std::thread::JoinHandle<()>,
+    execution: std::sync::Arc<ConcurrentLaneExecutionState>,
 }
 
 pub(crate) enum ConcurrentLaneTake {
@@ -660,6 +2293,27 @@ pub(crate) enum ConcurrentLaneTake {
 }
 
 impl ConcurrentLane {
+    /// Release early-publication authority only after the main thread has
+    /// durably recorded the scheduler allocation receipt. A worker that closes
+    /// before this point sends its proof through the ordinary channel; it never
+    /// waits for this bit.
+    pub(crate) fn mark_allocation_receipt_recorded(&self) {
+        self.execution
+            .allocation_receipt_recorded
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Mark the internal verifier active. Whichever side becomes active second
+    /// emits the one-shot exact overlap marker.
+    pub(crate) fn mark_verifier_started(&self) {
+        self.execution.mark_verifier_started();
+    }
+
+    /// Mark the internal verifier inactive after its invocation returns.
+    pub(crate) fn mark_verifier_finished(&self) {
+        self.execution.mark_verifier_finished();
+    }
+
     /// Collect the concurrent lane's verdict, waiting up to `grace` for it to
     /// Peek for a verdict WITHOUT consuming the handle (#twinwall-join).
     /// The same lane is consulted twice per instance: once on the short grace
@@ -716,14 +2370,17 @@ impl ConcurrentLane {
 /// preset that asks for the lane); otherwise the typed
 /// `margin_row.concurrent` preset key decides; absent from both ⇒ OFF, i.e.
 /// byte-identical to the shipped reserve-only path.
+#[allow(dead_code)]
 pub(crate) fn concurrent_lane_armed(preset: Option<&Path>) -> bool {
-    if let Ok(raw) = std::env::var("NY_MARGIN_ROW_CONCURRENT") {
-        return raw.trim() == "1";
-    }
-    preset
-        .and_then(|p| crate::preset::load_preset(p).ok())
-        .and_then(|c| c.margin_row.concurrent)
-        .unwrap_or(false)
+    MarginRowScheduleRuntimePolicy::from_layered_process(preset).configured_concurrent
+}
+
+/// Read the concurrent selector exclusively from the immutable scheduler
+/// policy used by scored execution.
+pub(crate) const fn concurrent_lane_armed_with_policy(
+    policy: MarginRowScheduleRuntimePolicy,
+) -> bool {
+    policy.configured_concurrent
 }
 
 /// Resolve the typed f32-root-tableau gate. Returns `None` when the preset
@@ -732,25 +2389,6 @@ pub(crate) fn root_f32_from_preset(preset: Option<&Path>) -> Option<bool> {
     preset
         .and_then(|p| crate::preset::load_preset(p).ok())
         .and_then(|c| c.margin_row.root_f32)
-}
-
-/// Resolve the typed branch-width keys (#margin-row-branch-width). `None`s
-/// leave the propagate-side defaults untouched.
-// STAGED AHEAD OF ITS CONSUMER. Added by 043d7ff75 but nothing calls it yet,
-// so the crate fails -D warnings on dead_code. DELETE THIS ATTRIBUTE with the
-// commit that wires the preset key through; it is not a permanent exemption.
-#[allow(dead_code)]
-pub(crate) fn branch_width_from_preset(
-    preset: Option<&Path>,
-) -> (Option<usize>, Option<usize>, Option<bool>) {
-    let Some(c) = preset.and_then(|p| crate::preset::load_preset(p).ok()) else {
-        return (None, None, None);
-    };
-    (
-        c.margin_row.k_head,
-        c.margin_row.k_trunk,
-        c.margin_row.k_adaptive,
-    )
 }
 
 /// Resolve the typed backward-interm key (#backward-interm).
@@ -762,6 +2400,36 @@ pub(crate) fn backward_interm_from_preset(preset: Option<&Path>) -> Option<bool>
     preset
         .and_then(|p| crate::preset::load_preset(p).ok())
         .and_then(|c| c.margin_row.backward_interm)
+}
+
+/// Resolve the typed closure-adaptive tier ladder gate (#closure-adaptive).
+///
+/// WITHOUT THIS READER AND ITS CALL SITE THE ENTIRE LADDER IS DEAD CODE IN
+/// COMPETITION. `run_instance.sh` exports no `NY_*`, so the env half
+/// (`NY_MARGIN_ROW_CLOSURE_ADAPTIVE`) can never arm it on a scored run; the
+/// typed key is the only route. The ladder shipped without this bridge — its
+/// own search-space entry (`ny-levers/src/space.rs:504-507`) records the gap
+/// rather than closing it, which is exactly how three other mechanisms
+/// (`NY_EPOCH_DEPTH`, `NY_CGAN_RECLAIM`, `NY_MARGIN_ROW_CLIP_ROWS`) ended up
+/// built, correct and unreachable.
+pub(crate) fn closure_adaptive_from_preset(preset: Option<&Path>) -> Option<bool> {
+    preset
+        .and_then(|p| crate::preset::load_preset(p).ok())
+        .and_then(|c| c.margin_row.closure_adaptive)
+}
+
+/// Resolve the typed branching reduction (#branch-reduceop).
+pub(crate) fn branch_reduce_max_from_preset(preset: Option<&Path>) -> Option<bool> {
+    preset
+        .and_then(|p| crate::preset::load_preset(p).ok())
+        .and_then(|c| c.margin_row.branch_reduce_max)
+}
+
+/// Resolve the typed backward-interm SECONDS cap (#backward-interm budget).
+pub(crate) fn bi_secs_from_preset(preset: Option<&Path>) -> Option<u64> {
+    preset
+        .and_then(|p| crate::preset::load_preset(p).ok())
+        .and_then(|c| c.margin_row.bi_secs)
 }
 
 /// Start the margin-row lane on a BACKGROUND THREAD, concurrently with the
@@ -782,14 +2450,71 @@ pub(crate) fn backward_interm_from_preset(preset: Option<&Path>) -> Option<bool>
 /// instance deadline. `None` = not started (lane disabled, structural
 /// mismatch, or too little budget), in which case the caller falls back to
 /// the inline post-verifier attempt exactly as before.
+#[allow(dead_code)]
 pub(crate) fn spawn_concurrent_lane(
     onnx: &Path,
     vnnlib: &Path,
     preset: Option<&Path>,
     instance_deadline: Option<Instant>,
+    runtime_policy: MarginRowRuntimePolicy,
 ) -> Option<ConcurrentLane> {
+    let schedule_policy = MarginRowScheduleRuntimePolicy::from_layered_process(preset);
+    let global_rayon_outcome = configure_global_rayon(schedule_policy).ok()?;
+    let device = preset
+        .and_then(|path| crate::preset::load_preset(path).ok())
+        .and_then(|config| config.general.device);
+    let gpu_device_premise = device
+        .as_deref()
+        .is_some_and(|device| matches!(device, "wgpu" | "cuda" | "metal" | "gpu"));
+    let admission = spawn_concurrent_lane_impl(
+        onnx,
+        vnnlib,
+        instance_deadline,
+        runtime_policy,
+        schedule_policy,
+        global_rayon_outcome,
+        gpu_device_premise,
+        true,
+    );
+    admission.lane
+}
+
+/// Policy-aware concurrent admission for scored execution. Every refusal has
+/// a stable route, and the returned lane starts with early publication blocked
+/// until [`ConcurrentLane::mark_allocation_receipt_recorded`] is called.
+pub(crate) fn spawn_concurrent_lane_with_schedule_policy(
+    onnx: &Path,
+    vnnlib: &Path,
+    instance_deadline: Option<Instant>,
+    runtime_policy: MarginRowRuntimePolicy,
+    schedule_policy: MarginRowScheduleRuntimePolicy,
+    global_rayon_outcome: GlobalRayonOutcome,
+    gpu_device_premise: bool,
+) -> ConcurrentLaneAdmission {
+    spawn_concurrent_lane_impl(
+        onnx,
+        vnnlib,
+        instance_deadline,
+        runtime_policy,
+        schedule_policy,
+        global_rayon_outcome,
+        gpu_device_premise,
+        false,
+    )
+}
+
+fn spawn_concurrent_lane_impl(
+    onnx: &Path,
+    vnnlib: &Path,
+    instance_deadline: Option<Instant>,
+    runtime_policy: MarginRowRuntimePolicy,
+    schedule_policy: MarginRowScheduleRuntimePolicy,
+    global_rayon_outcome: GlobalRayonOutcome,
+    gpu_device_premise: bool,
+    allocation_receipt_recorded: bool,
+) -> ConcurrentLaneAdmission {
     if !ny_propagate::margin_row::margin_row_bab_enabled() {
-        return None;
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::AuthorityDisabled);
     }
     // OPT-IN (`NY_MARGIN_ROW_CONCURRENT=1`). Default OFF so the shipped path is
     // reserve-only: the 45s default feeds a lane that runs after the verifier.
@@ -819,8 +2544,8 @@ pub(crate) fn spawn_concurrent_lane(
     // row recorded >= 50 s of lane time against a 45 s shipped reserve, and
     // the reserve slice only starts after the internal verifier returns).
     // The env var still wins wherever it is present, in both directions.
-    if !concurrent_lane_armed(preset) {
-        return None;
+    if !concurrent_lane_armed_with_policy(schedule_policy) {
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::Disabled);
     }
     // THE PREMISE MUST HOLD. Running concurrently is ~free only because the
     // internal verifier is on the GPU while this lane is on the CPU. On a
@@ -830,26 +2555,26 @@ pub(crate) fn spawn_concurrent_lane(
     // ny, and has 28 solves within 45s of its budget wall. Spawn only where
     // the premise is true; elsewhere the inline post-verifier attempt still
     // runs, exactly as before.
-    let device = preset
-        .and_then(|p| crate::preset::load_preset(p).ok())
-        .and_then(|c| c.general.device);
-    let gpu = device
-        .as_deref()
-        .is_some_and(|d| matches!(d, "wgpu" | "cuda" | "metal" | "gpu"));
-    if !gpu {
-        return None;
+    if !gpu_device_premise {
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::CpuDevice);
     }
-    let deadline = instance_deadline?;
+    let Some(deadline) = instance_deadline else {
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::NoDeadline);
+    };
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining < Duration::from_secs(10) {
-        return None;
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::ShortBudget);
     }
     // Structural admission happens on THIS thread (cheap, and keeps the
     // fail-closed decision on the same path the inline lane uses).
-    let spec = extract_twin_spec(onnx)?;
-    let (lo, hi, t, adv) = parse_vnnlib_robustness(vnnlib)?;
+    let Some(spec) = extract_twin_spec(onnx) else {
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::Model);
+    };
+    let Some((lo, hi, t, adv)) = parse_vnnlib_robustness(vnnlib) else {
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::Property);
+    };
     if lo.len() != spec.n_in {
-        return None;
+        return ConcurrentLaneAdmission::refused(ConcurrentLaneAdmissionRoute::InputShape);
     }
     // Leave the tail to the caller's own wrap-up (result write, witness
     // gating) exactly as the inline lane does.
@@ -870,41 +2595,124 @@ pub(crate) fn spawn_concurrent_lane(
     // lane's speed is what decides whether it closes inside the budget — so
     // the trade is not obviously a win in either direction and is left as a
     // knob until measured. NY_MARGIN_ROW_CONCURRENT_THREADS=n to bound it.
-    let lane_threads = std::env::var("NY_MARGIN_ROW_CONCURRENT_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
+    // #verifier-thread-cap: derive the lane only from the ACTUAL global pool.
+    // A refused global cap must never manufacture a private remainder from the
+    // requested value, and zero spare capacity is a refusal rather than an
+    // oversubscribing one-thread pool.
+    let mut resources = concurrent_lane_pool_plan(schedule_policy, global_rayon_outcome);
+    if resources.pool_route == ConcurrentLanePoolRoute::NoSafeRemainder {
+        return ConcurrentLaneAdmission::refused_with_resources(
+            ConcurrentLaneAdmissionRoute::NoSafeRemainder,
+            resources,
+        );
+    }
+    if resources.pool_route == ConcurrentLanePoolRoute::GlobalUnavailable {
+        return ConcurrentLaneAdmission::refused_with_resources(
+            ConcurrentLaneAdmissionRoute::GlobalUnavailable,
+            resources,
+        );
+    }
+    let lane_threads = resources
+        .lane_threads
+        .expect("an admitted lane pool plan has an exact width");
+    let private_pool = if lane_threads == 0 {
+        None
+    } else {
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(lane_threads)
+            .thread_name(|i| format!("margin-row-{i}"))
+            .build()
+        {
+            Ok(pool) => {
+                resources.private_pool_route = PrivatePoolRoute::Built;
+                Some(pool)
+            }
+            Err(error) => {
+                eprintln!("margin-row BaB: private {lane_threads}-thread pool REFUSED: {error}");
+                resources.private_pool_route = PrivatePoolRoute::BuildFailed;
+                return ConcurrentLaneAdmission::refused_with_resources(
+                    ConcurrentLaneAdmissionRoute::PrivatePoolFailed,
+                    resources,
+                );
+            }
+        }
+    };
+    if let Some(pool) = &private_pool {
+        eprintln!(
+            "margin-row BaB: CONCURRENT lane confined to a private {}-thread pool",
+            pool.current_num_threads(),
+        );
+    }
+    let early_exit = schedule_policy.early_exit_armed();
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::Builder::new()
+    let execution = std::sync::Arc::new(ConcurrentLaneExecutionState::new(
+        allocation_receipt_recorded,
+    ));
+    let worker_execution = std::sync::Arc::clone(&execution);
+    let handle = match std::thread::Builder::new()
         .name("margin-row-concurrent".into())
         .spawn(move || {
             let t0 = Instant::now();
-            let run = || run_margin_row_lane(&spec, &lo, &hi, t, &adv, Some(lane_deadline), 20_000);
-            let out = if lane_threads == 0 {
-                run()
+            let run = || {
+                worker_execution.mark_worker_started();
+                let out = {
+                    // Only the solver call owns the overlap claim. Private-pool
+                    // construction before it and terminal receipt/log/channel
+                    // bookkeeping after it are deliberately outside this guard.
+                    let _active =
+                        ConcurrentWorkerActiveGuard(std::sync::Arc::clone(&worker_execution));
+                    run_margin_row_lane_with_policy(
+                        &spec,
+                        &lo,
+                        &hi,
+                        t,
+                        &adv,
+                        Some(lane_deadline),
+                        20_000,
+                        runtime_policy,
+                    )
+                };
+                note_margin_row_execution(&out);
+                out
+            };
+            let out = if let Some(pool) = private_pool {
+                pool.install(run)
             } else {
-                match rayon::ThreadPoolBuilder::new()
-                    .num_threads(lane_threads)
-                    .thread_name(|i| format!("margin-row-{i}"))
-                    .build()
-                {
-                    Ok(pool) => pool.install(run),
-                    // Pool creation failed: fall back to the global pool
-                    // rather than silently dropping the lane.
-                    Err(_) => run(),
-                }
+                run()
             };
             let verdict = match out {
                 MarginRowOutcome::Unsat(stats) => {
+                    let lane_secs = t0.elapsed().as_secs_f64();
                     eprintln!(
-                        "margin-row BaB (concurrent): UNSAT in {:.1}s (root_bound={:.4}, \
+                        "margin-row BaB (concurrent): UNSAT in {lane_secs:.1}s (root_bound={:.4}, \
                          expansions={}, maxDepth={}, ledger={:?})",
-                        t0.elapsed().as_secs_f64(),
-                        stats.root_bound,
-                        stats.expansions,
-                        stats.max_depth,
-                        stats.ledger_ok
+                        stats.root_bound, stats.expansions, stats.max_depth, stats.ledger_ok
                     );
+                    // #twinwall-early-exit. The row is certified; the internal
+                    // verifier's remaining budget can only re-derive the same
+                    // answer or nothing at all. Publish and end the instance.
+                    // Returns only if publication was declined (route not
+                    // armed, or the main thread already claimed it), in which
+                    // case the verdict goes down the channel as before.
+                    if early_exit
+                        && worker_execution
+                            .allocation_receipt_recorded
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        crate::commands::vnncomp::publish_lane_unsat_and_exit(lane_secs);
+                    } else if early_exit {
+                        eprintln!(
+                            "margin-row BaB: early exit DEFERRED — schedule allocation receipt \
+                             was not recorded when the proof completed; sending verdict through \
+                             the ordinary channel"
+                        );
+                    } else {
+                        eprintln!(
+                            "margin-row BaB: early exit DISARMED \
+                             (NY_MARGIN_ROW_EARLY_EXIT/margin_row.early_exit); the verdict waits \
+                             for the internal verifier to return"
+                        );
+                    }
                     Some(VnncompResult::Unsat)
                 }
                 MarginRowOutcome::Unknown { reason, .. } => {
@@ -916,10 +2724,24 @@ pub(crate) fn spawn_concurrent_lane(
                 }
             };
             let _ = tx.send(verdict);
-        })
-        .ok()?;
+        }) {
+        Ok(handle) => handle,
+        Err(_) => {
+            return ConcurrentLaneAdmission::refused_with_resources(
+                ConcurrentLaneAdmissionRoute::SpawnFailed,
+                resources,
+            );
+        }
+    };
     eprintln!("margin-row BaB: started CONCURRENT lane alongside the internal verifier");
-    Some(ConcurrentLane { rx, handle })
+    ConcurrentLaneAdmission::spawned(
+        ConcurrentLane {
+            rx,
+            handle,
+            execution,
+        },
+        resources,
+    )
 }
 
 // --------------------------------------------------------------------------
@@ -1775,7 +3597,11 @@ pub(crate) mod research {
             std::thread::sleep(Duration::from_millis(20));
             worker_flag.store(true, std::sync::atomic::Ordering::Release);
         });
-        let lane = ConcurrentLane { rx, handle };
+        let lane = ConcurrentLane {
+            rx,
+            handle,
+            execution: std::sync::Arc::new(ConcurrentLaneExecutionState::default()),
+        };
         assert!(matches!(
             lane.take(Duration::from_secs(1)),
             ConcurrentLaneTake::Verdict(VnncompResult::Unsat)
@@ -1790,7 +3616,11 @@ pub(crate) mod research {
     fn concurrent_lane_joins_disconnected_worker_fail_closed() {
         let (tx, rx) = std::sync::mpsc::channel::<Option<VnncompResult>>();
         let handle = std::thread::spawn(move || drop(tx));
-        let lane = ConcurrentLane { rx, handle };
+        let lane = ConcurrentLane {
+            rx,
+            handle,
+            execution: std::sync::Arc::new(ConcurrentLaneExecutionState::default()),
+        };
         assert!(matches!(
             lane.take(Duration::from_secs(1)),
             ConcurrentLaneTake::FinishedWithoutVerdict
@@ -1804,7 +3634,11 @@ pub(crate) mod research {
             std::thread::sleep(Duration::from_millis(100));
             let _ = tx.send(None);
         });
-        let lane = ConcurrentLane { rx, handle };
+        let lane = ConcurrentLane {
+            rx,
+            handle,
+            execution: std::sync::Arc::new(ConcurrentLaneExecutionState::default()),
+        };
         assert!(matches!(
             lane.take(Duration::from_millis(5)),
             ConcurrentLaneTake::StillRunning
@@ -2158,6 +3992,281 @@ pub(crate) mod research {
             times.sort_by(|a, b| a.total_cmp(b));
             let ms = times[2] * 1e3;
             eprintln!("[scaling] {r:>4} {ms:>8.2} {:>8.3}", ms / r as f64);
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    //  #percol-alpha COLUMN-SCALING microbenchmark (`col-scaling`)
+    // ----------------------------------------------------------------------
+    //
+    // THE QUESTION. Per-domain alpha (abc's `optimized_bounds.py`: 10 Adam
+    // iterations, one private lower slope per unstable neuron per domain) needs
+    // ONE FRESH CERTIFIED BACKWARD PASS PER OPTIMIZER STEP. abc only affords
+    // that because a single pass serves a 512-child batch. So the whole design
+    // hinges on: HOW DOES ny's CERTIFIED BACKWARD PASS COST SCALE WITH COLUMN
+    // COUNT? Near-flat => stacking the frontier amortizes and per-domain alpha
+    // is affordable. Roughly linear => amortization buys nothing and the alpha
+    // inner loop must be made cheap some other way.
+    //
+    // WHY `pass-scaling` ABOVE IS NOT THE ANSWER. It times `eng.run(...)` with
+    // dom=None and NO collection over R in 1..256. The SCORED eval pass
+    // (`bab.rs:3236-3247`) runs with `Some(&dom)` and
+    // `Collect { unst_abs: true, rows: .., unst_rows: beta_armed }`. Domain
+    // gate overrides and the unstable-neuron collections are exactly the two
+    // things a per-domain-alpha design would multiply, so they have to be in
+    // the measurement. This probe adds them, plus R = 512 / 1280.
+    //
+    // NOT A LEVER. Read-only timing; nothing here is reachable from a verdict
+    // path. Driven by NON-`NY_` env names on purpose: these are bench knobs,
+    // not levers, and the `ny-levers` ratchet must not be fed a new raw `NY_*`
+    // read for a diagnostic.
+    //   COLSCALE_ONNX    absolute .onnx path   (default cifar100 resnet_medium)
+    //   COLSCALE_VNNLIB  absolute .vnnlib path (default idx_4597, a wall row)
+    //   COLSCALE_COLS    comma list of R       (default 1,2,4,8,16,32,64,128,256,512,1280)
+    //   COLSCALE_REPS    timed reps per point  (default 5, median reported)
+    //   COLSCALE_DEPTH   trunk splits in the deep-domain arm (default 20)
+    pub(crate) fn probe_col_scaling() {
+        use ndarray::Array2;
+
+        fn env_or(key: &str, default: &str) -> String {
+            std::env::var(key).unwrap_or_else(|_| default.to_string())
+        }
+        fn rss_gib() -> f64 {
+            // statm field 2 = resident pages.
+            std::fs::read_to_string("/proc/self/statm")
+                .ok()
+                .and_then(|s| s.split_whitespace().nth(1).map(str::to_owned))
+                .and_then(|p| p.parse::<f64>().ok())
+                .map_or(f64::NAN, |pages| {
+                    pages * 4096.0 / (1024.0 * 1024.0 * 1024.0)
+                })
+        }
+
+        let onnx = env_or(
+            "COLSCALE_ONNX",
+            &format!("{BENCH_ROOT}/cifar100_2024/onnx/CIFAR100_resnet_medium.onnx"),
+        );
+        let vnnlib = env_or(
+            "COLSCALE_VNNLIB",
+            &format!(
+                "{BENCH_ROOT}/cifar100_2024/vnnlib/\
+                 CIFAR100_resnet_medium_prop_idx_4597_sidx_282_eps_0.0039.vnnlib"
+            ),
+        );
+        let cols: Vec<usize> = env_or("COLSCALE_COLS", "1,2,4,8,16,32,64,128,256,512,1280")
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let reps: usize = env_or("COLSCALE_REPS", "5").parse().unwrap_or(5);
+        let depth: usize = env_or("COLSCALE_DEPTH", "20").parse().unwrap_or(20);
+
+        let (spec, lo, hi, t, adv) = instance_at(&onnx, &vnnlib);
+        let net = TwinNet::compile(&spec).expect("compile");
+        let root = RootGates::build(&net, &lo, &hi, RoundMode::Outward, None).expect("root");
+        let eng = BackwardEngine::new(&net, &root);
+        let n_y = net.n_y;
+
+        // ---- shape census: what the pass actually walks ----
+        let n_unst: usize = root.layers.iter().map(|l| l.unst.len()).sum();
+        let n_trunk: usize = root.layers.iter().map(|l| l.n).sum();
+        let widest = net.tsize.iter().copied().max().unwrap_or(0);
+        eprintln!(
+            "[colscale] onnx={} vnnlib={}",
+            Path::new(&onnx)
+                .file_name()
+                .map_or_else(|| "?".into(), |s| s.to_string_lossy()),
+            Path::new(&vnnlib)
+                .file_name()
+                .map_or_else(|| "?".into(), |s| s.to_string_lossy())
+        );
+        eprintln!(
+            "[colscale] n_in={} n_y={} trunk_relus={} trunk_neurons={n_trunk} unstable={n_unst} \
+             widest_tensor={widest} cores={}",
+            net.n_in,
+            n_y,
+            root.layers.len(),
+            rayon::current_num_threads()
+        );
+
+        // ---- nf: the REAL column count of a scored eval pass ----
+        // Root-fail set exactly as `Probe::new` / the lane derive it.
+        let (al0, au0) = eng.y_rows(None).expect("y_rows");
+        let ybox = YBox::from_rows(&eng, &al0, &au0);
+        let mb_all = MarginBatch::new(&net, t, &adv).expect("mb_all");
+        let gates0 = head_gates(&ybox, root.mode);
+        let ms_all = margin_seed(&mb_all, &gates0, &ybox, root.mode);
+        let ald = row_dots(&root, &al0);
+        let aud = row_dots(&root, &au0);
+        let m2v = compose_viay(&eng, &mb_all, &gates0, &al0, &au0, &ald, &aud, root.mode);
+        let fail: Vec<usize> = (0..adv.len())
+            .filter(|&k| ms_all.m1[k].max(m2v[k]) < 0.0)
+            .map(|k| adv[k])
+            .collect();
+        let mb = MarginBatch::new(&net, t, &fail).expect("mb fail");
+        let nf = mb.nf();
+        let ms = margin_seed(&mb, &gates0, &ybox, root.mode);
+        eprintln!(
+            "[colscale] adv={} root_fail_nf={nf}  (a scored eval pass runs at R=nf unless \
+             col-retire narrows it)",
+            adv.len()
+        );
+
+        // ---- a DEEP domain: `depth` trunk splits spread over the layers ----
+        // NOTE the convention: a trunk split is `(layer, POSITION-IN-`unst`,
+        // sign)`, not `(layer, absolute-neuron, sign)` — `domain_gates_split_only`
+        // (engine.rs:1690-1692) does `rec.unst[pos]` itself.
+        let mut splits: Vec<(usize, usize, i8)> = Vec::new();
+        'outer: loop {
+            let before = splits.len();
+            for (li, lg) in root.layers.iter().enumerate() {
+                let taken = splits.iter().filter(|s| s.0 == li).count();
+                if taken < lg.unst.len() {
+                    let sign = if splits.len().is_multiple_of(2) { 1i8 } else { -1i8 };
+                    splits.push((li, taken, sign));
+                    if splits.len() >= depth {
+                        break 'outer;
+                    }
+                }
+            }
+            if splits.len() == before {
+                break;
+            }
+        }
+        let dom = domain_gates(&root, &splits);
+        eprintln!(
+            "[colscale] deep domain: {} trunk splits over {} layers (gate overrides on {} layers)",
+            splits.len(),
+            splits.iter().map(|s| s.0).collect::<HashSet<_>>().len(),
+            dom.layers.len()
+        );
+
+        // ---- seed builder: tile the REAL margin seed's columns out to R ----
+        // Column VALUES cannot change the cost (every skip in the walk tests a
+        // WEIGHT against zero, never a seed entry), but using the real seed
+        // keeps magnitudes — and therefore the certified error lane's work —
+        // representative.
+        let make_seed = |r: usize| -> Seed {
+            let mut s = Array2::<f64>::zeros((n_y, r));
+            let mut e = Array2::<f64>::zeros((n_y, r));
+            let se = ms.seed.e.as_ref();
+            for c in 0..r {
+                let src = if nf == 0 { None } else { Some(c % nf) };
+                for j in 0..n_y {
+                    match src {
+                        Some(sc) => {
+                            s[[j, c]] = ms.seed.s[[j, sc]];
+                            e[[j, c]] = se.map_or(0.0, |m| m[[j, sc]]);
+                        }
+                        None => s[[j, c]] = f64::from(u8::from(j == c % n_y)),
+                    }
+                }
+            }
+            Seed { s, e: Some(e) }
+        };
+
+        // ---- the four arms ----
+        // base       : root gates, no collection      (== `pass-scaling`)
+        // dom        : deep-domain gates, no collection
+        // dom+abs    : + unst_abs                     (== the SCORED eval pass)
+        // dom+rows   : + unst_rows                    (the alpha-gradient capture)
+        let arms: [(&str, bool, bool, bool); 4] = [
+            ("base", false, false, false),
+            ("dom", true, false, false),
+            ("dom+abs", true, true, false),
+            ("dom+rows", true, true, true),
+        ];
+        eprintln!(
+            "[colscale] median of {reps} timed reps (1 warm), single Lower pass, Outward \
+             (certified error lane ON)"
+        );
+        eprintln!(
+            "[colscale] {:>5} {:>10} {:>10} {:>10} {:>10}   {:>9} {:>9}",
+            "R", "base_ms", "dom_ms", "domabs_ms", "domrows_ms", "abs/col", "rss_GiB"
+        );
+        let mut base_at_one = f64::NAN;
+        let mut abs_at_one = f64::NAN;
+        let mut rows: Vec<(usize, [f64; 4])> = Vec::new();
+        for &r in &cols {
+            if r == 0 {
+                continue;
+            }
+            let seed = make_seed(r);
+            let mut out = [f64::NAN; 4];
+            for (ai, &(_, use_dom, unst_abs, unst_rows)) in arms.iter().enumerate() {
+                let collect = ny_propagate::margin_row::engine::Collect {
+                    unst_abs,
+                    rows: None,
+                    unst_rows,
+                };
+                let dref = use_dom.then_some(&dom);
+                let warm = eng.run_collect(&seed, dref, LaneDir::Lower, None, collect);
+                if let Err(e) = warm {
+                    eprintln!("[colscale] R={r} arm={} ERR {e}", arms[ai].0);
+                    continue;
+                }
+                let mut times = Vec::with_capacity(reps);
+                for _ in 0..reps {
+                    let t0 = Instant::now();
+                    let p = eng
+                        .run_collect(&seed, dref, LaneDir::Lower, None, collect)
+                        .expect("pass");
+                    times.push(t0.elapsed().as_secs_f64());
+                    std::hint::black_box(&p.b[0]);
+                }
+                times.sort_by(f64::total_cmp);
+                out[ai] = times[times.len() / 2] * 1e3;
+            }
+            if r == 1 {
+                base_at_one = out[0];
+                abs_at_one = out[2];
+            }
+            eprintln!(
+                "[colscale] {r:>5} {:>10.2} {:>10.2} {:>10.2} {:>10.2}   {:>9.3} {:>9.2}",
+                out[0],
+                out[1],
+                out[2],
+                out[3],
+                out[2] / r as f64,
+                rss_gib()
+            );
+            rows.push((r, out));
+        }
+
+        // ---- the decision numbers ----
+        eprintln!("[colscale] --- marginal cost of the 2nd..Nth column (scored arm dom+abs) ---");
+        eprintln!(
+            "[colscale] {:>5} {:>12} {:>12} {:>14}",
+            "R", "x_vs_R=1", "marg_ms/col", "amortized?"
+        );
+        for &(r, out) in &rows {
+            if r == 1 || !abs_at_one.is_finite() {
+                continue;
+            }
+            let marg = (out[2] - abs_at_one) / (r as f64 - 1.0);
+            eprintln!(
+                "[colscale] {r:>5} {:>12.2} {:>12.3} {:>14}",
+                out[2] / abs_at_one,
+                marg,
+                if out[2] / abs_at_one < 2.0 {
+                    "FLAT"
+                } else {
+                    "not-flat"
+                }
+            );
+        }
+        if base_at_one.is_finite() && abs_at_one.is_finite() {
+            eprintln!(
+                "[colscale] collection overhead at R=1: unst_abs adds {:.1}% over base",
+                100.0 * (abs_at_one / base_at_one - 1.0)
+            );
+        }
+        for &(r, out) in &rows {
+            eprintln!(
+                "[colscale] R={r:<5} dom/base={:.3}  domabs/dom={:.3}  domrows/domabs={:.3}",
+                out[1] / out[0],
+                out[2] / out[1],
+                out[3] / out[2]
+            );
         }
     }
 
@@ -3095,6 +5204,351 @@ pub(crate) mod research {
             "MOAT BROKEN on metaroom GT-sat rows: {violations:?}"
         );
     }
+
+    #[cfg(test)]
+    fn frozen_schedule_set(
+        environment: &[(&str, &str)],
+        config: &[(&str, ny_levers::LeverValue)],
+    ) -> ny_levers::LeverSet {
+        let registry = ny_levers::all();
+        let raw = ny_levers::RawLeverInputs::capture_with(registry, |name| {
+            environment
+                .iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, value)| std::ffi::OsString::from(*value))
+        });
+        ny_levers::LeverSet::resolve_layered(registry, &raw, |decl| {
+            config
+                .iter()
+                .find(|(candidate, _)| *candidate == decl.name)
+                .map(|(_, value)| value.clone())
+        })
+        .expect("schedule fixture must satisfy the real declarations")
+    }
+
+    #[test]
+    fn frozen_schedule_policy_preserves_effective_context_and_float_bits() {
+        use ny_levers::decls::margin_row::{
+            MARGIN_ROW_ADAPTIVE_RELEASE_FRAC, MARGIN_ROW_ADAPTIVE_RESERVE, MARGIN_ROW_CONCURRENT,
+            MARGIN_ROW_CONCURRENT_THREADS, MARGIN_ROW_EARLY_EXIT, MARGIN_ROW_RESERVE_MAX_FRAC,
+            MARGIN_ROW_RESERVE_SECS, VERIFIER_THREADS,
+        };
+
+        let typed_max = f64::from(0.25_f32);
+        let typed_release = f64::from(0.47_f32);
+        let env_max = 0.333_333_333_333_333_3_f64;
+        let levers = frozen_schedule_set(
+            &[
+                (MARGIN_ROW_RESERVE_SECS.name, "82"),
+                (MARGIN_ROW_ADAPTIVE_RESERVE.name, "0"),
+                (MARGIN_ROW_RESERVE_MAX_FRAC.name, "0.3333333333333333"),
+                (MARGIN_ROW_ADAPTIVE_RELEASE_FRAC.name, "0.375"),
+                (MARGIN_ROW_CONCURRENT.name, " 1 "),
+                (MARGIN_ROW_EARLY_EXIT.name, "garbage"),
+                (VERIFIER_THREADS.name, "0"),
+                (MARGIN_ROW_CONCURRENT_THREADS.name, "+3"),
+            ],
+            &[
+                (MARGIN_ROW_RESERVE_SECS.name, ny_levers::LeverValue::U64(0)),
+                (
+                    MARGIN_ROW_ADAPTIVE_RESERVE.name,
+                    ny_levers::LeverValue::Bool(true),
+                ),
+                (
+                    MARGIN_ROW_RESERVE_MAX_FRAC.name,
+                    ny_levers::LeverValue::F64(typed_max),
+                ),
+                (
+                    MARGIN_ROW_ADAPTIVE_RELEASE_FRAC.name,
+                    ny_levers::LeverValue::F64(typed_release),
+                ),
+                (
+                    MARGIN_ROW_CONCURRENT.name,
+                    ny_levers::LeverValue::Bool(false),
+                ),
+                (
+                    MARGIN_ROW_EARLY_EXIT.name,
+                    ny_levers::LeverValue::Bool(true),
+                ),
+                (VERIFIER_THREADS.name, ny_levers::LeverValue::U64(8)),
+                (
+                    MARGIN_ROW_CONCURRENT_THREADS.name,
+                    ny_levers::LeverValue::U64(5),
+                ),
+            ],
+        );
+        let policy = MarginRowScheduleRuntimePolicy::from_levers(&levers).unwrap();
+
+        assert_eq!(policy.configured_reserve_secs, 82);
+        assert_eq!(policy.contextual_reserve_secs, 0);
+        assert!(!policy.configured_adaptive_reserve);
+        assert!(policy.contextual_adaptive_reserve);
+        assert_eq!(
+            policy.configured_reserve_max_frac_bits,
+            Some(env_max.to_bits())
+        );
+        assert_eq!(
+            policy.contextual_reserve_max_frac_bits,
+            Some(typed_max.to_bits())
+        );
+        assert_eq!(
+            policy.configured_adaptive_release_frac_bits,
+            0.375_f64.to_bits()
+        );
+        assert_eq!(
+            policy.contextual_adaptive_release_frac_bits,
+            typed_release.to_bits()
+        );
+        assert!(policy.configured_concurrent);
+        assert!(!policy.contextual_concurrent);
+        assert!(!policy.configured_early_exit);
+        assert!(policy.contextual_early_exit);
+        assert_eq!(policy.configured_verifier_threads, Some(0));
+        assert_eq!(policy.contextual_verifier_threads, Some(8));
+        assert_eq!(policy.configured_concurrent_threads, Some(3));
+        assert_eq!(policy.contextual_concurrent_threads, Some(5));
+    }
+
+    #[test]
+    fn frozen_schedule_usize_ownership_preserves_kills_and_fallthrough() {
+        use ny_levers::decls::margin_row::{MARGIN_ROW_CONCURRENT_THREADS, VERIFIER_THREADS};
+
+        let verifier_rejected = frozen_schedule_set(
+            &[(VERIFIER_THREADS.name, "malformed")],
+            &[(VERIFIER_THREADS.name, ny_levers::LeverValue::U64(8))],
+        );
+        let policy = MarginRowScheduleRuntimePolicy::from_levers(&verifier_rejected).unwrap();
+        assert_eq!(policy.configured_verifier_threads, None);
+        assert_eq!(policy.contextual_verifier_threads, None);
+
+        let concurrent_ignored = frozen_schedule_set(
+            &[(MARGIN_ROW_CONCURRENT_THREADS.name, " 3 ")],
+            &[(
+                MARGIN_ROW_CONCURRENT_THREADS.name,
+                ny_levers::LeverValue::U64(5),
+            )],
+        );
+        let policy = MarginRowScheduleRuntimePolicy::from_levers(&concurrent_ignored).unwrap();
+        assert_eq!(policy.configured_concurrent_threads, Some(5));
+        assert_eq!(policy.contextual_concurrent_threads, None);
+    }
+
+    #[test]
+    fn frozen_schedule_policy_rejects_an_ill_typed_runtime_value() {
+        use ny_levers::decls::margin_row::{
+            MARGIN_ROW_ADAPTIVE_RELEASE_FRAC, MARGIN_ROW_ADAPTIVE_RESERVE, MARGIN_ROW_CONCURRENT,
+            MARGIN_ROW_CONCURRENT_THREADS, MARGIN_ROW_EARLY_EXIT, MARGIN_ROW_RESERVE_MAX_FRAC,
+            MARGIN_ROW_RESERVE_SECS, VERIFIER_THREADS,
+        };
+
+        let levers = frozen_schedule_set(&[], &[]);
+        let mut reserve = levers.resolved(&MARGIN_ROW_RESERVE_SECS).unwrap().clone();
+        reserve.value = ny_levers::LeverValue::Bool(true);
+        let error = MarginRowScheduleRuntimePolicy::from_resolved(
+            &reserve,
+            levers.resolved(&MARGIN_ROW_ADAPTIVE_RESERVE).unwrap(),
+            levers.resolved(&MARGIN_ROW_RESERVE_MAX_FRAC).unwrap(),
+            levers.resolved(&MARGIN_ROW_ADAPTIVE_RELEASE_FRAC).unwrap(),
+            levers.resolved(&MARGIN_ROW_CONCURRENT).unwrap(),
+            levers.resolved(&MARGIN_ROW_EARLY_EXIT).unwrap(),
+            levers.resolved(&VERIFIER_THREADS).unwrap(),
+            levers.resolved(&MARGIN_ROW_CONCURRENT_THREADS).unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("resolved to non-u64"), "{error}");
+    }
+
+    #[test]
+    fn schedule_policy_drives_cap_and_concurrent_without_second_authority() {
+        let policy = MarginRowScheduleRuntimePolicy {
+            configured_reserve_max_frac_bits: Some(0.25_f64.to_bits()),
+            configured_concurrent: true,
+            ..Default::default()
+        };
+        let decision = MarginRowReserveDecision {
+            configured_secs: 45,
+            reserve_secs: 45,
+            route: MarginRowReserveRoute::Fixed,
+        }
+        .capped_to_internal_budget_with_policy(100, policy);
+        assert_eq!(decision.reserve_secs, 25);
+        assert!(concurrent_lane_armed_with_policy(policy));
+    }
+
+    #[test]
+    fn concurrent_lane_pool_plan_uses_actual_capacity_and_exact_overrides() {
+        let global = GlobalRayonOutcome {
+            route: GlobalRayonRoute::Applied,
+            requested_threads: Some(4),
+            actual_threads: Some(4),
+            host_threads: Some(20),
+        };
+
+        let shared = concurrent_lane_pool_plan(MarginRowScheduleRuntimePolicy::default(), global);
+        assert_eq!(shared.pool_route, ConcurrentLanePoolRoute::SharedGlobal);
+        assert_eq!(shared.lane_threads, Some(0));
+
+        let explicit_zero = MarginRowScheduleRuntimePolicy {
+            configured_verifier_threads: Some(4),
+            configured_concurrent_threads: Some(0),
+            ..Default::default()
+        };
+        let planned = concurrent_lane_pool_plan(explicit_zero, global);
+        assert_eq!(planned.pool_route, ConcurrentLanePoolRoute::SharedGlobal);
+        assert_eq!(planned.lane_threads, Some(0));
+
+        let mut explicit = explicit_zero;
+        explicit.configured_concurrent_threads = Some(7);
+        let planned = concurrent_lane_pool_plan(explicit, global);
+        assert_eq!(planned.pool_route, ConcurrentLanePoolRoute::ExplicitPrivate);
+        assert_eq!(planned.lane_threads, Some(7));
+
+        let derived = MarginRowScheduleRuntimePolicy {
+            configured_verifier_threads: Some(4),
+            ..Default::default()
+        };
+        for route in [
+            GlobalRayonRoute::Applied,
+            GlobalRayonRoute::AlreadyInitialized,
+        ] {
+            let planned =
+                concurrent_lane_pool_plan(derived, GlobalRayonOutcome { route, ..global });
+            assert_eq!(
+                planned.pool_route,
+                ConcurrentLanePoolRoute::VerifierRemainder
+            );
+            assert_eq!(planned.lane_threads, Some(16));
+        }
+
+        let exhausted = concurrent_lane_pool_plan(
+            derived,
+            GlobalRayonOutcome {
+                actual_threads: Some(20),
+                ..global
+            },
+        );
+        assert_eq!(
+            exhausted.pool_route,
+            ConcurrentLanePoolRoute::NoSafeRemainder
+        );
+        assert_eq!(exhausted.lane_threads, None);
+
+        let oversized = concurrent_lane_pool_plan(
+            derived,
+            GlobalRayonOutcome {
+                actual_threads: Some(24),
+                ..global
+            },
+        );
+        assert_eq!(
+            oversized.pool_route,
+            ConcurrentLanePoolRoute::NoSafeRemainder
+        );
+
+        let unavailable = concurrent_lane_pool_plan(
+            derived,
+            GlobalRayonOutcome {
+                host_threads: None,
+                ..global
+            },
+        );
+        assert_eq!(
+            unavailable.pool_route,
+            ConcurrentLanePoolRoute::GlobalUnavailable
+        );
+        assert_eq!(unavailable.lane_threads, None);
+    }
+
+    #[test]
+    fn concurrent_admission_routes_and_overlap_state_are_exact() {
+        assert_eq!(
+            render_margin_row_concurrent_overlap_execution(),
+            "schema=ny-cli/margin-row-concurrent-overlap-execution/v1 phase=work \
+             worker_active=true verifier_active=true"
+        );
+        for (route, token) in [
+            (ConcurrentLaneAdmissionRoute::Disabled, "disabled"),
+            (
+                ConcurrentLaneAdmissionRoute::AuthorityDisabled,
+                "authority_disabled",
+            ),
+            (ConcurrentLaneAdmissionRoute::CpuDevice, "cpu_device"),
+            (ConcurrentLaneAdmissionRoute::NoDeadline, "no_deadline"),
+            (ConcurrentLaneAdmissionRoute::ShortBudget, "short_budget"),
+            (ConcurrentLaneAdmissionRoute::Model, "model"),
+            (ConcurrentLaneAdmissionRoute::Property, "property"),
+            (ConcurrentLaneAdmissionRoute::InputShape, "input_shape"),
+            (
+                ConcurrentLaneAdmissionRoute::NoSafeRemainder,
+                "no_safe_remainder",
+            ),
+            (
+                ConcurrentLaneAdmissionRoute::GlobalUnavailable,
+                "global_unavailable",
+            ),
+            (
+                ConcurrentLaneAdmissionRoute::PrivatePoolFailed,
+                "private_pool_failed",
+            ),
+            (ConcurrentLaneAdmissionRoute::SpawnFailed, "spawn_failed"),
+            (ConcurrentLaneAdmissionRoute::Spawned, "spawned"),
+        ] {
+            assert_eq!(route.stable_token(), token);
+        }
+        for (route, token) in [
+            (GlobalRayonRoute::NotRequested, "not_requested"),
+            (GlobalRayonRoute::Applied, "applied"),
+            (GlobalRayonRoute::AlreadyInitialized, "already_initialized"),
+        ] {
+            assert_eq!(route.stable_token(), token);
+        }
+        for (route, token) in [
+            (ConcurrentLanePoolRoute::NotConsulted, "not_consulted"),
+            (ConcurrentLanePoolRoute::SharedGlobal, "shared_global"),
+            (ConcurrentLanePoolRoute::ExplicitPrivate, "explicit_private"),
+            (
+                ConcurrentLanePoolRoute::VerifierRemainder,
+                "verifier_remainder",
+            ),
+            (
+                ConcurrentLanePoolRoute::NoSafeRemainder,
+                "no_safe_remainder",
+            ),
+            (
+                ConcurrentLanePoolRoute::GlobalUnavailable,
+                "global_unavailable",
+            ),
+        ] {
+            assert_eq!(route.stable_token(), token);
+        }
+        for (route, token) in [
+            (PrivatePoolRoute::NotRequested, "not_requested"),
+            (PrivatePoolRoute::Built, "built"),
+            (PrivatePoolRoute::BuildFailed, "build_failed"),
+        ] {
+            assert_eq!(route.stable_token(), token);
+        }
+
+        let state = ConcurrentLaneExecutionState::new(false);
+        assert!(!state
+            .allocation_receipt_recorded
+            .load(std::sync::atomic::Ordering::Acquire));
+        state.mark_worker_started();
+        assert!(!state
+            .overlap_recorded
+            .load(std::sync::atomic::Ordering::SeqCst));
+        state.mark_verifier_started();
+        assert!(state
+            .overlap_recorded
+            .load(std::sync::atomic::Ordering::SeqCst));
+        state.mark_verifier_started();
+        assert!(state
+            .overlap_recorded
+            .load(std::sync::atomic::Ordering::SeqCst));
+        state.mark_verifier_finished();
+        state.mark_worker_finished();
+    }
+
     /// The ceiling declines for every input that is not a finite fraction
     /// strictly inside `(0, 1)`, so an unset/typo'd/hostile value can never
     /// silently change the shipped scheduling policy.
@@ -3147,6 +5601,87 @@ pub(crate) mod research {
         assert_eq!(capped_reserve_secs(0, 95, Some(0.25)), 0);
         // Degenerate budgets floor to zero rather than panicking.
         assert_eq!(capped_reserve_secs(45, 0, Some(0.25)), 0);
+    }
+
+    #[cfg(test)]
+    fn twin_gemm(input: usize, n_out: usize, n_in: usize) -> TwinOpSpec {
+        TwinOpSpec::Gemm {
+            input,
+            weight: vec![0.0; n_out * n_in],
+            bias: vec![0.0; n_out],
+            shape: (n_out, n_in),
+        }
+    }
+
+    /// #twinwall-reserve-admission: the reserve probe must accept EXACTLY the
+    /// head shape `TwinNet::compile` accepts. malbeware
+    /// (`Conv -> ReLU -> Flatten -> Gemm`) has ONE Gemm, so the compiler
+    /// refuses it — the probe must refuse it too, or the reserve holds back
+    /// 45 s the lane can never spend.
+    #[test]
+    fn reserve_admission_matches_the_compiler_head_contract() {
+        // Twin-wall shape: trunk ReLU, then Gemm -> ReLU -> Gemm at the tail.
+        let ok = TwinSpec {
+            n_in: 4,
+            ops: vec![
+                TwinOpSpec::Relu { input: 0 },
+                twin_gemm(1, 3, 4),
+                TwinOpSpec::Relu { input: 2 },
+                twin_gemm(3, 2, 3),
+            ],
+        };
+        assert!(twin_spec_compiles_to_margin_row_head(&ok));
+
+        // The malbeware shape, minus the Conv the predicate never inspects.
+        let malbeware_shaped = TwinSpec {
+            n_in: 4,
+            ops: vec![
+                TwinOpSpec::Relu { input: 0 },
+                TwinOpSpec::Flatten { input: 1 },
+                twin_gemm(2, 2, 4),
+            ],
+        };
+        assert!(
+            !twin_spec_compiles_to_margin_row_head(&malbeware_shaped),
+            "one-Gemm head must NOT arm the reserve"
+        );
+
+        // Three Gemms: also outside the contract.
+        let three_gemms = TwinSpec {
+            n_in: 4,
+            ops: vec![
+                TwinOpSpec::Relu { input: 0 },
+                twin_gemm(1, 3, 4),
+                TwinOpSpec::Relu { input: 2 },
+                twin_gemm(3, 3, 3),
+                twin_gemm(4, 2, 3),
+            ],
+        };
+        assert!(!twin_spec_compiles_to_margin_row_head(&three_gemms));
+
+        // Right Gemm count, wrong wiring: no ReLU between the two heads.
+        let no_head_relu = TwinSpec {
+            n_in: 4,
+            ops: vec![
+                TwinOpSpec::Relu { input: 0 },
+                twin_gemm(1, 3, 4),
+                TwinOpSpec::Flatten { input: 2 },
+                twin_gemm(3, 2, 3),
+            ],
+        };
+        assert!(!twin_spec_compiles_to_margin_row_head(&no_head_relu));
+
+        // Right head, but no TRUNK ReLU before Gemm1 — the compiler's
+        // "no trunk relus" refusal.
+        let no_trunk_relu = TwinSpec {
+            n_in: 4,
+            ops: vec![
+                twin_gemm(0, 3, 4),
+                TwinOpSpec::Relu { input: 1 },
+                twin_gemm(2, 2, 3),
+            ],
+        };
+        assert!(!twin_spec_compiles_to_margin_row_head(&no_trunk_relu));
     }
 
     /// The typed `margin_row.reserve_max_frac` key arms the ceiling only for
@@ -3412,6 +5947,8 @@ pub(crate) mod research {
     /// model or property NAME again — the decision is budget-only.
     #[test]
     fn reserve_path_carries_no_instance_name_literals() {
+        assert_eq!(RESERVE_MAX_FRAC_ENV, "NY_MARGIN_ROW_RESERVE_MAX_FRAC");
+        assert_eq!(RELEASE_FRAC_ENV, "NY_MARGIN_ROW_ADAPTIVE_RELEASE_FRAC");
         let src = include_str!("margin_row_bab.rs");
         let reserve_region = src
             .split_once("pub(crate) const RELEASE_FRAC_ENV")
@@ -3525,6 +6062,36 @@ pub(crate) mod research {
         assert_eq!(root_f32_from_preset(Some(&off)), Some(false));
         assert_eq!(root_f32_from_preset(Some(&silent)), None);
         assert_eq!(root_f32_from_preset(None), None);
+    }
+
+    /// `#tableau-f32` (`margin_row.tableau_f32`): pin the schema half of the
+    /// delivery route — the key parses, in both directions, and a silent
+    /// preset leaves it `None` so the propagate-side cell stays unwritten and
+    /// the lever resolves exactly as before promotion. The cell write itself
+    /// is `preset_gates::apply`'s one-liner, exercised by
+    /// `validate_delivered_lever_values` on every preset load (a compiled
+    /// `Deliver::PresetKey` axis whose dotted key is missing from the schema
+    /// is a load-time error), so reachability cannot silently regress to
+    /// `Source::LegacyEnv`-only.
+    #[test]
+    fn tableau_f32_preset_key_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let on = dir.path().join("on.yaml");
+        std::fs::write(&on, "margin_row:\n  tableau_f32: true\n").expect("write");
+        let off = dir.path().join("off.yaml");
+        std::fs::write(&off, "margin_row:\n  tableau_f32: false\n").expect("write");
+        let silent = dir.path().join("silent.yaml");
+        std::fs::write(&silent, "margin_row:\n  reserve_secs: 0\n").expect("write");
+
+        let load = |p: &Path| {
+            crate::preset::load_preset(p)
+                .expect("preset loads")
+                .margin_row
+                .tableau_f32
+        };
+        assert_eq!(load(&on), Some(true));
+        assert_eq!(load(&off), Some(false));
+        assert_eq!(load(&silent), None);
     }
 
     /// A preset that arms the concurrent lane must not ALSO bill the internal
@@ -3782,6 +6349,9 @@ pub(crate) mod research {
                 require_probe_instance()?;
                 probe_pass_scaling();
             }
+            // #percol-alpha: self-contained (defaults to cifar100 resnet_medium
+            // idx_4597), so it does NOT take the NY_PROBE_* precondition.
+            "col-scaling" => probe_col_scaling(),
             "serial-parallel-oracle" => {
                 require_probe_instance()?;
                 oracle_serial_vs_parallel();
@@ -3815,7 +6385,7 @@ pub(crate) mod research {
             }
             _ => anyhow::bail!(
                 "unknown margin-row probe {probe:?}; expected instance, root-build, \
-                 pass-scaling, serial-parallel-oracle, inc2a-root-parity-1498, \
+                 pass-scaling, col-scaling, serial-parallel-oracle, inc2a-root-parity-1498, \
                  inc2a-enclosure-1498, inc2b-trajectory-1498, inc2b-l5-parity, \
                  inc2c-close-4429, inc2c-close-1498, inc2c-close-2551, \
                  inc2c-moat-6232, extractor-smoke, cifar-moat, cifar-closure, \

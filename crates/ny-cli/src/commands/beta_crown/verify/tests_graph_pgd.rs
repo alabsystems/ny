@@ -18,7 +18,7 @@ use ny_propagate::{
         PadLayer, PadMode, PowConstantLayer, ReLULayer, ReshapeLayer, SigmoidLayer, SliceLayer,
         SoftmaxLayer, SqrtLayer, SubConstantLayer, SubLayer, TanhLayer, TransposeLayer,
     },
-    GraphNetwork, GraphNode, Layer, Network, PgdConfig,
+    ExactVjpPgdConfig, GraphNetwork, GraphNode, Layer, Network, PgdConfig,
 };
 use ny_tensor::BoundedTensor;
 use ny_test_utils::CountingGemmEngine;
@@ -46,32 +46,15 @@ const PRESERVE_LEADING_AXIS_TOL: f32 = 1e-5;
 /// falling back to per-restart dispatch — costs `num_restarts` times this.
 const BATCHED_GEMM_DISPATCH_MAX: usize = 1 + 2 * 5;
 
-/// Serializes the tests that pin `NY_PGD_EXACT_BATCHED` (a process-global env
-/// var) so they cannot interleave under the parallel runner.
-static EXACT_BATCHED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// RAII guard that forces the batched routing (`NY_PGD_EXACT_BATCHED=0`) for the
-/// duration of a test, then clears it. Exact-eligible graphs (single Linear,
-/// Reshape/Flatten + Linear) route to the sequential EXACT-gradient lane by
-/// default now (#soundnessbench); these `*_batched_*` regressions still need to
-/// exercise the BATCHED lane, so they opt back into it via the documented kill
-/// switch — which this also covers.
-/// Mutation routed through the blessed env choke point (clippy env wall);
-/// field order matters: `_var` restores before `_lock` releases.
-struct ForceBatchedRouting {
-    _var: ny_test_utils::env::ScopedEnvVar,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-impl ForceBatchedRouting {
-    fn new() -> Self {
-        let lock = EXACT_BATCHED_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let var = ny_test_utils::env::ScopedEnvVar::set("NY_PGD_EXACT_BATCHED", "0");
-        Self {
-            _var: var,
-            _lock: lock,
-        }
+fn generic_batched_pgd_config(num_restarts: usize, num_steps: usize) -> PgdConfig {
+    PgdConfig {
+        num_restarts,
+        num_steps,
+        exact_vjp: ExactVjpPgdConfig {
+            prefer_exact_batched: false,
+            ..ExactVjpPgdConfig::default()
+        },
+        ..PgdConfig::default()
     }
 }
 
@@ -472,11 +455,9 @@ fn graph_pgd_configured_gama_reaches_generic_batched_spsa_route() {
     let run = |graph: &GraphNetwork, gama_lambda: Option<f32>| {
         GENERIC_BATCHED_GAMA_OBJECTIVE_EVALS.store(0, std::sync::atomic::Ordering::Relaxed);
         let config = PgdConfig {
-            num_restarts: 2,
-            num_steps: 2,
             osi_steps: 0,
             gama_lambda,
-            ..PgdConfig::default()
+            ..generic_batched_pgd_config(2, 2)
         };
         let result =
             try_graph_pgd_upfront_with_config(graph, &input, &spec, config, Some(&engine), true)
@@ -497,13 +478,10 @@ fn graph_pgd_configured_gama_reaches_generic_batched_spsa_route() {
         graph_supports_exact_gradients(&exact_graph),
         "linear graph must exercise the exact-eligible override case"
     );
-    {
-        let _force_batched = ForceBatchedRouting::new();
-        assert!(
-            run(&exact_graph, Some(50.0)) > 0,
-            "NY_PGD_EXACT_BATCHED=0 must not bypass configured GAMA"
-        );
-    }
+    assert!(
+        run(&exact_graph, Some(50.0)) > 0,
+        "the typed generic-batched route must not bypass configured GAMA"
+    );
     assert_eq!(
         run(&graph, None),
         0,
@@ -518,24 +496,18 @@ fn graph_pgd_configured_gama_reaches_generic_batched_spsa_route() {
 
 #[test]
 fn graph_pgd_batched_reduces_gemm_dispatches_3955() {
-    let _force_batched = ForceBatchedRouting::new();
     let graph = make_single_linear_graph(1.0, 10.0);
     let input = make_interval_input(0.0, 1.0);
     let spec = make_upper_bound_spec(0.0, 1.0, 0.0);
     let engine = CountingGemmEngine::new();
 
-    let result = try_graph_pgd_upfront(
+    let result = try_graph_pgd_upfront_with_config(
         &graph,
         &input,
         &spec,
-        10,
-        5,
-        Default::default(),
-        20,
-        None,
+        generic_batched_pgd_config(10, 5),
         Some(&engine),
         true,
-        false,
     )
     .expect("batched graph PGD should not error");
 
@@ -633,24 +605,18 @@ fn graph_pgd_preserve_leading_axis_matches_sequential_conv2d_4096() {
 
 #[test]
 fn graph_pgd_batched_handles_fixed_reshape_graphs_4093() {
-    let _force_batched = ForceBatchedRouting::new();
     let graph = make_fixed_reshape_linear_graph();
     let input = make_rank4_interval_input(0.0, 1.0);
     let spec = make_multi_input_upper_bound_spec(4, 0.0, 1.0, -1.0);
     let engine = CountingGemmEngine::new();
 
-    let result = try_graph_pgd_upfront(
+    let result = try_graph_pgd_upfront_with_config(
         &graph,
         &input,
         &spec,
-        10,
-        5,
-        Default::default(),
-        20,
-        None,
+        generic_batched_pgd_config(10, 5),
         Some(&engine),
         true,
-        false,
     )
     .expect("reshape graphs should use the batched graph PGD path");
 
@@ -667,24 +633,18 @@ fn graph_pgd_batched_handles_fixed_reshape_graphs_4093() {
 
 #[test]
 fn graph_pgd_batched_handles_fixed_flatten_graphs_4093() {
-    let _force_batched = ForceBatchedRouting::new();
     let graph = make_fixed_flatten_linear_graph();
     let input = make_rank4_interval_input(0.0, 1.0);
     let spec = make_multi_input_upper_bound_spec(4, 0.0, 1.0, -1.0);
     let engine = CountingGemmEngine::new();
 
-    let result = try_graph_pgd_upfront(
+    let result = try_graph_pgd_upfront_with_config(
         &graph,
         &input,
         &spec,
-        10,
-        5,
-        Default::default(),
-        20,
-        None,
+        generic_batched_pgd_config(10, 5),
         Some(&engine),
         true,
-        false,
     )
     .expect("flatten graphs should use the batched graph PGD path");
 

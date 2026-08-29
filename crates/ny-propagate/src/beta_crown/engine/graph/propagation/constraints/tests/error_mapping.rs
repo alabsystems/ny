@@ -10,8 +10,8 @@ use ndarray::{arr1, arr2};
 
 use crate::beta_crown::{GraphCrownContext, GraphNeuronConstraint, GraphSplitHistory};
 use crate::{
-    BetaCrownConfig, BetaCrownVerifier, BoundedTensor, GraphNetwork, GraphNode, Layer, LinearLayer,
-    ReLULayer,
+    AddLayer, BetaCrownConfig, BetaCrownVerifier, BoundedTensor, GraphNetwork, GraphNode, Layer,
+    LinearLayer, ReLULayer,
 };
 
 use super::two_neuron::{build_two_neuron_input_bounds, build_two_neuron_relu_graph};
@@ -88,6 +88,42 @@ fn infeasible_active_history() -> GraphSplitHistory {
         is_active: true,
         score: 0.0,
     })
+}
+
+/// Correlated branches whose exact sum is zero, while forward interval
+/// propagation alone sees `[-2, 2]`:
+///
+/// ```text
+///            /-> (+1) -\
+///   input --<           +--> Add --> ReLU
+///            \-> (-1) -/
+/// ```
+///
+/// This models the real child-cache shape behind #la-union-merge: a targeted
+/// CROWN walk may have a tight post-ReLU enclosure even though the separately
+/// stored pre-activation interval remains loose.
+fn build_correlated_zero_relu_graph() -> GraphNetwork {
+    let positive =
+        LinearLayer::new(arr2(&[[1.0]]), Some(arr1(&[0.0]))).expect("valid positive arm");
+    let negative =
+        LinearLayer::new(arr2(&[[-1.0]]), Some(arr1(&[0.0]))).expect("valid negative arm");
+
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input("positive", Layer::Linear(positive)));
+    graph.add_node(GraphNode::from_input("negative", Layer::Linear(negative)));
+    graph.add_node(GraphNode::binary(
+        "sum",
+        Layer::Add(AddLayer),
+        "positive",
+        "negative",
+    ));
+    graph.add_node(GraphNode::new(
+        "relu",
+        Layer::ReLU(ReLULayer),
+        vec!["sum".to_string()],
+    ));
+    graph.set_output("relu");
+    graph
 }
 
 /// Regression test for #1978: `propagate_crown_with_graph_constraints` must return
@@ -216,10 +252,10 @@ fn test_infeasible_active_returns_infeasible_domain_variant_2926() {
 /// into a false infeasible domain.
 ///
 /// Setup: two-neuron ReLU graph, neuron 0 constrained active.
-/// We inject stale inherited bounds where the unconstrained neuron's cached
-/// ReLU interval is disjoint from the fresh child-domain ReLU repropagation.
-/// The forward pass must keep the fresh child bounds instead of treating the
-/// child as infeasible.
+/// We inject stale inherited bounds where both the active and unconstrained
+/// neurons' cached ReLU intervals are disjoint from fresh child-domain ReLU
+/// repropagation. The forward pass must keep the fresh child bounds instead of
+/// treating the child as infeasible.
 #[test]
 fn test_inherited_relu_cache_conflict_falls_back_to_fresh_child_bounds_4354() {
     use std::sync::Arc;
@@ -236,9 +272,9 @@ fn test_inherited_relu_cache_conflict_falls_back_to_fresh_child_bounds_4354() {
         score: 0.0,
     });
 
-    // Inject base_bounds where relu1's CROWN-IBP bound for neuron 1 has
-    // crown_l = 5.0, crown_u = 6.0. The actual relu output for neuron 1
-    // (pre-activation [-1, 1], relu → [0, 1]) has relu_upper = 1.0.
+    // Inject base_bounds where relu1's CROWN-IBP bounds for both neurons have
+    // crown_l = 5.0, crown_u = 6.0. Their actual ReLU outputs
+    // (pre-activation [-1, 1], ReLU → [0, 1]) have relu_upper = 1.0.
     // Intersection: lower = max(0.0, 5.0) = 5.0, upper = min(1.0, 6.0) = 1.0.
     // Fresh child-domain bounds are still sound ([0, 1]), so the inherited
     // cache must be dropped instead of marking the child infeasible.
@@ -251,11 +287,13 @@ fn test_inherited_relu_cache_conflict_falls_back_to_fresh_child_bounds_4354() {
                 .expect("valid linear1 bounds"),
         ),
     );
-    // relu1 CROWN-IBP bounds: neuron 0 = [0, 1] (fine), neuron 1 = [5, 6] (stale/conflicting)
+    // relu1 CROWN-IBP bounds: both entries are stale/conflicting. Neuron 0
+    // exercises the active-arm fallback; neuron 1 exercises the unconstrained
+    // fallback retained from #4354.
     base_bounds.insert(
         "relu1".to_string(),
         Arc::new(
-            BoundedTensor::new(arr1(&[0.0, 5.0]).into_dyn(), arr1(&[1.0, 6.0]).into_dyn())
+            BoundedTensor::new(arr1(&[5.0, 5.0]).into_dyn(), arr1(&[6.0, 6.0]).into_dyn())
                 .expect("valid relu1 bounds"),
         ),
     );
@@ -299,6 +337,66 @@ fn test_inherited_relu_cache_conflict_falls_back_to_fresh_child_bounds_4354() {
     assert!(
         linear2_lower.abs() <= 1e-6 && (linear2_upper - 7.0).abs() <= 1e-6,
         "downstream linear node should stay finite after the ReLU fallback, got [{linear2_lower}, {linear2_upper}]"
+    );
+}
+
+/// A feasible active split must preserve a tighter inherited post-ReLU CROWN
+/// enclosure. Before this regression, the `Some(true)` arm rebuilt only
+/// `[max(pre_l, 0), pre_u]`, discarding exactly the warm-start progress that
+/// the adjacent unconstrained arm retains.
+#[test]
+fn active_split_preserves_tighter_inherited_post_relu_enclosure() {
+    use std::sync::Arc;
+
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
+    let graph = build_correlated_zero_relu_graph();
+    let input = BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn())
+        .expect("valid input bounds");
+    let history = GraphSplitHistory::new().with_constraint(GraphNeuronConstraint {
+        node_name: "relu".to_string(),
+        neuron_idx: 0,
+        is_active: true,
+        score: 0.0,
+    });
+
+    // Both entries are sound: the two affine arms cancel exactly, so the true
+    // pre- and post-ReLU value is zero. The pre-activation cache deliberately
+    // retains its loose IBP enclosure while the post-ReLU entry represents a
+    // tighter targeted CROWN result.
+    let mut base_bounds: HashMap<String, Arc<BoundedTensor>> = HashMap::new();
+    for name in ["positive", "negative"] {
+        base_bounds.insert(
+            name.to_string(),
+            Arc::new(
+                BoundedTensor::new(arr1(&[-1.0]).into_dyn(), arr1(&[1.0]).into_dyn())
+                    .expect("valid affine-arm bounds"),
+            ),
+        );
+    }
+    base_bounds.insert(
+        "sum".to_string(),
+        Arc::new(
+            BoundedTensor::new(arr1(&[-2.0]).into_dyn(), arr1(&[2.0]).into_dyn())
+                .expect("valid loose pre-activation bounds"),
+        ),
+    );
+    base_bounds.insert(
+        "relu".to_string(),
+        Arc::new(
+            BoundedTensor::new(arr1(&[0.0]).into_dyn(), arr1(&[0.0]).into_dyn())
+                .expect("valid exact inherited post-ReLU bounds"),
+        ),
+    );
+
+    let (cache, _) = verifier
+        .compute_constrained_forward_bounds(&graph, &input, &history, Some(&base_bounds), None)
+        .expect("active child forward propagation should succeed");
+    let relu = cache.get("relu").expect("child ReLU bounds");
+    assert_eq!(relu.lower()[[0]].to_bits(), 0.0f32.to_bits());
+    assert_eq!(
+        relu.upper()[[0]].to_bits(),
+        0.0f32.to_bits(),
+        "active split discarded the inherited post-ReLU upper bound"
     );
 }
 

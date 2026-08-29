@@ -76,6 +76,12 @@
 #   TOTAL MEASURED LOSS 301.4 normalized (REGULAR 96.6 + EXTENDED 204.8),
 #   against a 390.3 whole-benchmark stake. FULL-FIELD 1872.1 -> 1570.7.
 #
+#   STAKE BASELINE. The per-benchmark numbers above are read from the
+#   2026-08-07 / 5382ddb8 ledger, which the 2026-08-11 / 0cb3005a refresh has
+#   since superseded: full field 1872.1 -> 1906.4 and ml4acopf_2024 68.3 ->
+#   71.4 (the other four stakes are unchanged). Re-run this sweep before
+#   quoting the loss arithmetic as current.
+#
 # TWO OF THESE WERE UNKNOWN TO EVERY LANE BEFORE THIS SWEEP:
 #   * cgan_2023 is a REGULAR-track category and its Reshape refusal had not been
 #     recorded anywhere. The 2026-08-02 re-sweep note in the previous revision of
@@ -138,52 +144,36 @@ waivers:
     cost: >-
       cctsdb_yolo_2023 (extended): the second of the category's two models; see
       patch-1.onnx. Jointly 100.0 -> 0.0 banked normalized, LOSS 100.0.
-  # ---- 819b0554: INT64 shape arithmetic is not an authenticated static source -
+  # ---- 819b0554: INT64 shape arithmetic — RETIRED 2026-08-25 ----------------
   #
-  # RE-POINTED 2026-08-08. These two entries were written on 2026-08-07 against
-  # "cannot authenticate rank of shape input". `709f23b6` ("admit ml4acopf's
-  # literal `Tensor.expand` cone — 819b0554 recovery") opened THAT gate, which
-  # exposed the NEXT refusal from the same file and the same gate commit:
+  # The two cgan entries that lived here are DELETED: both models load at HEAD.
+  # The three-edit path this file wrote out on 2026-08-08 was implemented as
+  # specified, and the escape hatch it warned about was NOT widened:
   #
-  #   raw ONNX INT64 structural value 'onnx::Cast_363' is produced by 'Div_59'
-  #   (Div), which is not an exact static shape-control producer
+  #   1. `require_static_source` accepts Add/Sub/Mul/Div through
+  #      `require_all_inputs_static`. Safety is carried by the RECURSION, not
+  #      by the operator list — every input must itself authenticate and the
+  #      recursion bottoms out only at an initializer, `Constant` or `Shape`.
+  #   2. `is_int64_layout_chain_input` accepts the same ops consumer-side.
+  #   3. `validate_arithmetic_float32_data_path` consults the structural
+  #      authentication, which `validate_structural_schemas` now returns as a
+  #      `StructuralAuthentication` ledger. It does NOT admit the node: it
+  #      DEFERS the FLOAT32 refusal into the `LiteralExemptions` ratchet, so
+  #      the node is admitted only if constant folding actually erases it, and
+  #      re-raises the original message verbatim if it survives.
   #
-  # Same model, same gate (819b0554), same measured cost — only the first
-  # refusal moved, so `error_contains` is re-pointed rather than the debt
-  # retired. `git log -S` confirms both strings were introduced by 819b0554.
+  # MEASURED 2026-08-25, both directions, by loading the shipped files:
+  #   cGAN_imgSz32_nCh_3_small_transformer.onnx   REFUSED -> LOADS
+  #     (the exact refusal named above: 'onnx::Cast_363' produced by 'Div_59')
+  #   cctsdb_yolo_2023/onnx/patch-1.onnx          REFUSED -> REFUSED, verbatim
+  #   cctsdb_yolo_2023/onnx/patch-3.onnx          REFUSED -> REFUSED, verbatim
   #
-  # WHAT IT WOULD TAKE TO RETIRE THIS, established 2026-08-08. The refusal is
-  # over-strict for cgan specifically: `Div_59 = Gather(Shape(input.47), Const)
-  # / Const` where `input.47` is `[1, 256, 8, 8]` and the graph input is
-  # `[1, 5]` — every dimension concrete, so the value is a compile-time constant
-  # <= 256, far below the 2^24 point where distinct i64s share one f32 mirror.
-  # Admitting it needs THREE coordinated edits, not one:
-  #   1. `require_static_source` must accept Add/Sub/Mul/Div via
-  #      `require_all_inputs_static` (every leaf still an initializer/Constant/
-  #      Shape, so a runtime-rooted chain like cctsdb's stays refused);
-  #   2. `is_int64_layout_chain_input` must accept the same ops consumer-side;
-  #   3. `validate_arithmetic_float32_data_path` must consult the structural
-  #      authentication. Its existing `is_exact_integer_literal_node` escape
-  #      hatch does NOT apply: `literal_cone` deliberately excludes `Shape`
-  #      ("only as static as ny's shape inference"), routing Shape-rooted
-  #      programs to the structural machinery instead.
-  # Edits 1 and 2 were prototyped and verified inert on their own (the model
-  # still fails at 3), and were NOT landed: partial gate-opening carries the
-  # risk without the capability gain.
-  - model: benchmarks/vnncomp2025/benchmarks/cgan_2023/onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx
-    error_contains: "is not an exact static shape-control producer"
-    gate: 819b0554
-    since: "2026-08-04"
-    cost: >-
-      cgan_2023 (REGULAR): 1 of the category's 8 models, 2/21 instances and 2/13
-      banked solved rows. 57.1 -> 47.6 banked normalized, LOSS 9.5. Previously
-      UNRECORDED — this file's own 2026-08-02 note certified cgan_2023 as
-      "LOAD-OK at BOTH", which 819b0554 invalidated two days later.
-  - model: benchmarks/vnncomp2026/benchmarks/cgan2026/1.0/onnx/cGAN_imgSz32_nCh_3_small_transformer.onnx
-    error_contains: "is not an exact static shape-control producer"
-    gate: 819b0554
-    since: "2026-08-04"
-    cost: >-
-      cgan2026 (unscored 2026 benchmark, no ledger): 2/21 instances. 0.0 banked
-      normalized at risk TODAY, LOSS 0.0 — recorded so the category cannot be
-      swept for the first time against a model that silently does not load.
+  # The cctsdb controls are the point: its Slice starts/ends come from
+  # Gather(GRAPH INPUT '0') -> Cast(->INT64), a RUNTIME-rooted chain, so the
+  # recursion meets a graph input rather than an initializer and refuses
+  # exactly as before. Regression coverage:
+  # crates/ny-onnx/tests/cgan_int64_shape_arithmetic_admission.rs.
+  #
+  # RE-SWEEP OWED, per this file's own rule: cgan_2023's rows are still banked
+  # as zeros from the period when the model did not load. Recovering the load
+  # does not recover the 9.5 normalized until `reports/` is re-run at HEAD.

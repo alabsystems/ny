@@ -1,0 +1,42 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# isomorphic_acasxu_2026 — VNN-COMP 2026 relational (dual-network) category.
+#
+# THIS PRESET CARRIES EXACTLY ONE KEY, AND IT IS A DEADLINE POLICY.
+#
+# Relational categories deliberately bypass the YAML preset path for model and
+# solver SHAPE: they do not verify the preset's network, they build a DIFFERENCE
+# network from two of them, so a preset's batch sizes, bound-prop method and
+# branching tuning describe a graph that is never constructed. That bypass is
+# correct and is left alone.
+#
+# A deadline policy is not a shape. The family's measured defect was caused
+# precisely by the deadline having no preset-reachable authority over it:
+#
+#   * the official per-instance budget is 100 s and the internal tier is 95 s;
+#   * the relational lane multiplies its branch-and-bound deadline by
+#     `DEFAULT_REL_BAB_DEADLINE_MULT = 1.4` on purpose — this search is
+#     NON-MONOTONIC in its own timeout, because every per-node CROWN-IBP grant
+#     is a fraction of the budget still believed to REMAIN, so a nearer deadline
+#     buys looser bounds, more splits and a non-converging tree;
+#   * before `scored_wall_clamp` that inflated number was ALSO the stop, so on
+#     the banked 50-row sweep EIGHTEEN rows ran past 95 s and were SIGKILLed by
+#     the in-process watchdog at 105.0-105.1 s — 105 % of the official budget.
+#     On the competition harness an external kill at 100 s leaves those rows
+#     with NO verdict token at all, which scores worse than a timeout.
+#
+# `solver.scored_wall_clamp` separates the two numbers: effort keeps being
+# shaped by the inflated horizon, the loop stops at an absolute instant derived
+# once from the scored budget at the command anchor. It can only ever SHORTEN a
+# run, and a shortened sound search returns `timeout`, never a verdict.
+#
+# A competition harness exports no `NY_*`, so this key is the only route by
+# which the fix reaches a scored run. `NY_SCORED_WALL_CLAMP` remains an override
+# in both directions for measurement.
+#
+# MEASUREMENT: reports/measured-2026/isomorphic_acasxu_2026_NOTES.md.
+
+solver:
+  scored_wall_clamp: true

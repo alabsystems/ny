@@ -18,5 +18,31 @@
 pub use ny_propagate::Network as SequentialNetwork;
 pub use ny_propagate::{GraphNetwork, GraphNode, NETWORK_INPUT};
 
-/// Graph-level soundness provenance and sqrt-domain guard inspection.
-pub use ny_propagate::{count_sqrt_negative_domain_graph, soundness_provenance_for_graph};
+/// Soundness provenance and sqrt-domain guard inspection, for both carriers.
+///
+/// The `_graph` pair inspects a [`GraphNetwork`]; the `_network` pair inspects a
+/// [`SequentialNetwork`]. Both are needed: a consumer that streams a sequential
+/// carrier (see [`crate::streaming`]) has no graph to scan.
+pub use ny_propagate::{
+    count_sqrt_negative_domain_graph, count_sqrt_negative_domain_network,
+    soundness_provenance_for_graph, soundness_provenance_for_network,
+};
+
+/// Per-node CROWN-IBP intermediate-bound collection results.
+///
+/// [`GraphNetwork::collect_crown_ibp_bounds_dag_with_status`] and its siblings
+/// return a [`GraphCrownIbpBoundsResult`]: per-node bounds keyed by node name,
+/// the [`BoundsProvenance`] that produced each one, and the
+/// [`CrownIbpFallbackEvent`]s recorded along the way. Without these types the
+/// collection API is callable but its result is unnameable, which forces a
+/// consumer that wants per-layer bound reporting past the facade.
+///
+/// [`BoundsProvenance::ForwardFallback`] carries a [`CrownIbpFallbackReason`]:
+/// some reasons (demand-pruned nodes, already-stable ReLU rows, rows outside the
+/// objective cone, a vacuous CROWN result) are structural and mean the requested
+/// work WAS completed, which is why
+/// [`GraphCrownIbpBoundsResult::all_requested_crown_targets_completed`] is the
+/// right question to ask rather than "were there any fallbacks".
+pub use ny_propagate::types::{
+    BoundsProvenance, CrownIbpFallbackEvent, CrownIbpFallbackReason, GraphCrownIbpBoundsResult,
+};

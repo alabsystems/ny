@@ -8,10 +8,10 @@
 # FAIL).
 #
 # Checks:
-#   a  Rust hygiene gate   cargo fmt --all -- --check, Cargo-owned source policy,
+#   a  Rust hygiene gate   targo fmt --all -- --check, Cargo-owned source policy,
 #                          ny-levers declarations/direct-literal ratchet, and
 #                          migration inventory (no Python interpreter), then
-#                          cargo clippy --locked --workspace --exclude ny-python
+#                          targo tippy --locked --workspace --exclude ny-python
 #                          --all-targets -- -D warnings, minus the crates in
 #                          CLIPPY_SKIPPED_CRATES (printed as SKIPPED + reason),
 #                          plus the shipped ny-cli `mip,cuda` feature tier
@@ -73,6 +73,38 @@
 #                            `cargo test <filter>` exits 0 when the filter
 #                            matches NOTHING — the same vacuous green that check
 #                            [i] refuses for absent benchmark data.
+#   k  ny-api suite          cargo test --locked -p ny-api --features cert
+#                            --all-targets (--all-targets EXCLUDES doctests, which
+#                            the `trust` toolchain cannot run) —
+#      (seconds)             the integration tests that were SILENTLY
+#                            SKIPPED. Every [[test]] target carries
+#                            required-features, and cargo skips an unmet test
+#                            target with NO warning and exit 0, so before
+#                            `default = ["cert"]` landed this crate ran 26 unit
+#                            tests, skipped all 8 integration binaries, and
+#                            reported success. --features is passed EXPLICITLY
+#                            so the lane does not depend on the default key
+#                            staying put. Carries a MINIMUM count and asserts
+#                            two cert-tier binaries BY NAME, so "the targets
+#                            built but the cert tier went dark" fails closed.
+#   l  activation-math       cargo test --locked -p ny-propagate --lib
+#      certified-bound pins  silu:: plus cargo test --locked
+#      (unmeasured)          -p ny-relaxation --all-targets. SiLU's certified
+#                            IBP lower bound is `next_down_f32` of SiLU
+#                            evaluated at a critical point found by NEWTON'S
+#                            METHOD IN f32 with a central-difference second
+#                            derivative (silu/math.rs). ONE f32 ULP of backoff
+#                            is the entire margin, so soundness rested on
+#                            Newton having converged and NOTHING asserted it.
+#                            The `newton_pin` modules pin it against an
+#                            mpmath-derived minimum (dps 60), so unlike the
+#                            assertions they replaced they cannot drift with
+#                            the code under test. Before this lane NO SiLU test
+#                            ran in the gate at all, and `ny-relaxation` — the
+#                            mirror crate that exists to detect drift against
+#                            ny-propagate — appeared ZERO times in this script.
+#                            Both slices carry a MINIMUM count and assert all
+#                            four pins BY ANCHORED NAME in BOTH crates.
 #
 # NOT in this gate (needs verification runs, minutes to hours):
 #   scripts/check_banked_rows.py --bin <release ny> — replays a per-category
@@ -81,17 +113,71 @@
 #   gate lands.
 #
 # Flags:
-#   --fast        skip the heavy suites and packaging (runs a, b, c, h only)
-#   --only <x>    run a single check by letter (a-j)
+#   --fast        run the bounded edit-loop lane (checks a-h; skips i-n)
+#   --only <x>    run a single check by letter (a-n)
 #   -h | --help   usage
 # Environment:
 #   NY_GATE_PYTHON  Python interpreter provisioned from requirements.txt
 #                   (default: ./.venv/bin/python or ./.venv/Scripts/python.exe
 #                   when present, else python3)
+#   NY_SKIP_CREDENTIAL_CHECK=1
+#                   skip the github.com credential precondition. It normally
+#                   costs 0.027s and no network when no token is set, and it
+#                   refuses when a token IS set and does not authenticate —
+#                   because every cargo lane then dies at dependency
+#                   resolution (crates/ny-mip pulls ay-milp from a private
+#                   repo) and reports VOID as FAIL. Skipping does not fix it.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+# Parse control-only arguments before resolving any gate prerequisite. Help is
+# repository documentation: it must remain available on a machine that has not
+# installed the pinned Trust frontend yet. Every executing mode continues into
+# the fail-closed frontend check below.
+usage() {
+  # Print the header block: every line from line 2 up to the first non-comment
+  # line. This follows the header as checks and flags are added.
+  awk 'NR >= 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+}
+
+FAST=0
+ONLY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fast) FAST=1 ;;
+    --only)
+      [ $# -ge 2 ] || {
+        echo "gate.sh: --only requires a check letter a-n" >&2
+        exit 2
+      }
+      shift
+      ONLY="$1"
+      ;;
+    --only=*) ONLY="${1#--only=}" ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "gate.sh: unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+if [ -n "$ONLY" ]; then
+  case "$ONLY" in
+    a|b|c|d|e|f|g|h|i|j|k|l|m|n) ;;
+    *)
+      echo "gate.sh: --only takes a single check letter a-n, got: '$ONLY'" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 # Prefer the repository virtualenv the README tells you to create. Defaulting
 # straight to `python3` meant checks [e] and [g] failed on any host whose system
 # interpreter lacks the requirements — including one with no `pip` or `ensurepip`
@@ -104,6 +190,19 @@ cd "$REPO_ROOT"
 # the gate works without every caller exporting NY_GATE_PYTHON — could never fire
 # under Git Bash/MSYS, and [e]/[g] stayed red on Windows with a correctly
 # provisioned .venv sitting in the repo root.
+# The `else python3` half of the documented default (see the Environment block
+# above) was never implemented: with no `.venv` and no exported
+# NY_GATE_PYTHON, this loop set NOTHING and the variable stayed unset. Under
+# `set -u` the three lanes that read it then died at their FIRST line —
+#
+#   scripts/gate.sh: line 348: NY_GATE_PYTHON: unbound variable
+#
+# — checks [e], [f] and [g], each failing in 0s with a message about a shell
+# variable rather than about Python. Worse than either alternative: it bypasses
+# the importable-check below, whose error names the actual remedy ("Use the
+# README virtualenv setup, install requirements.txt there"). Falling back to
+# `python3` restores the documented contract AND routes a genuinely
+# under-provisioned host into that message instead of a crash.
 if [ -z "${NY_GATE_PYTHON:-}" ]; then
   for candidate in "$REPO_ROOT/.venv/bin/python" "$REPO_ROOT/.venv/Scripts/python.exe"; do
     if [ -x "$candidate" ]; then
@@ -112,11 +211,12 @@ if [ -z "${NY_GATE_PYTHON:-}" ]; then
     fi
   done
 fi
+: "${NY_GATE_PYTHON:=python3}"
 
 # Crates excluded from the Clippy portion of the Rust hygiene gate (check a),
 # with reasons.
 # Probed 2026-07-20 under exactly:
-#   cargo clippy --locked --workspace --exclude ny-python --all-targets -- -D warnings
+#   targo tippy --locked --workspace --exclude ny-python --all-targets -- -D warnings
 # Re-probe with that command and prune this list as the drift is paid down;
 # every entry here is un-linted debt, not a permanent carve-out.
 # Empty since the 2026-07-20 env-wall migration completed: every crate's raw
@@ -126,6 +226,130 @@ fi
 # crate with a known, dated, deliberately-unfixed warning — never to hide
 # fresh drift.
 CLIPPY_SKIPPED_CRATES=()
+
+# ---------------------------------------------------------------------------
+# Rust frontend resolution — REQUIRED, never a silent fallback.
+#
+# on a toolchain whose sysroot ships
+# Trust-branded frontends ONLY: `targo-fmt` and `targo-tippy`. `cargo-fmt` and
+# `cargo-clippy` are deliberately NOT installed there — they survive as private
+# compat protocols, never as installed aliases. So `cargo fmt` and
+# `cargo clippy` cannot run in this repository at all:
+#
+#   error: 'cargo-fmt' is not installed for the custom toolchain 'trust'.
+#
+# Measured 2026-08-27: check [a] failed in 0s on its FIRST command for exactly
+# that reason, which meant the entire Rust hygiene lane — fmt, source policy,
+# the lever ratchet, and both Clippy sweeps — never executed. It was not
+# reporting drift; it was reporting that it could not look. Real fmt drift was
+# sitting behind it (crates/ny-api and others).
+#
+# Resolve the pinned compiler through rustup explicitly. Calling ambient
+# `rustc --print sysroot` is insufficient: `/opt/homebrew/bin` can precede the
+# rustup proxies on PATH, in which case the command silently names stock Rust
+# even though rust-toolchain.toml pins `trust`. That made every executing gate
+# mode fail before its first check on a correctly linked Trust host.
+NY_TOOLCHAIN_CHANNEL="$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"/ { print $2; exit }' rust-toolchain.toml)"
+NY_RUSTUP="${NY_RUSTUP:-}"
+if [ -z "$NY_RUSTUP" ]; then
+  NY_RUSTUP="$(command -v rustup 2>/dev/null || true)"
+fi
+if [ -z "$NY_RUSTUP" ]; then
+  for candidate in "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" "${CARGO_HOME:-$HOME/.cargo}/bin/rustup.exe"; do
+    if [ -x "$candidate" ]; then
+      NY_RUSTUP="$candidate"
+      break
+    fi
+  done
+fi
+NY_PINNED_RUSTC=""
+if [ -n "$NY_RUSTUP" ] && [ -x "$NY_RUSTUP" ] && [ -n "$NY_TOOLCHAIN_CHANNEL" ]; then
+  NY_PINNED_RUSTC="$("$NY_RUSTUP" which rustc --toolchain "$NY_TOOLCHAIN_CHANNEL" 2>/dev/null || true)"
+fi
+NY_RUST_SYSROOT=""
+if [ -n "$NY_PINNED_RUSTC" ] && [ -x "$NY_PINNED_RUSTC" ]; then
+  NY_RUST_SYSROOT="$("$NY_PINNED_RUSTC" --print sysroot 2>/dev/null || true)"
+fi
+TARGO=""
+CARGO=""
+if [ -n "$NY_RUST_SYSROOT" ]; then
+  for candidate in "$NY_RUST_SYSROOT/bin/targo" "$NY_RUST_SYSROOT/bin/targo.exe"; do
+    if [ -x "$candidate" ]; then
+      TARGO="$candidate"
+      break
+    fi
+  done
+  for candidate in "$NY_RUST_SYSROOT/bin/cargo" "$NY_RUST_SYSROOT/bin/cargo.exe"; do
+    if [ -x "$candidate" ]; then
+      CARGO="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$TARGO" ] || [ -z "$CARGO" ]; then
+  echo "gate.sh: cannot resolve the pinned Trust frontend." >&2
+  echo "  rust-toolchain.toml pins channel = \"${NY_TOOLCHAIN_CHANNEL:-<unparsed>}\"; rustup must resolve a sysroot with targo and cargo frontends." >&2
+  echo "  rustup: ${NY_RUSTUP:-<none>}" >&2
+  echo "  pinned rustc: ${NY_PINNED_RUSTC:-<none>}" >&2
+  echo "  resolved sysroot: ${NY_RUST_SYSROOT:-<none>}" >&2
+  echo "  refusing to fall back to stock cargo — it would lint a different toolchain." >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# GitHub credential precondition — REQUIRED, and deliberately NOT a lane.
+#
+# crates/ny-mip pulls `ay-milp` from a private GitHub repo, and the pinned rev
+# is not in the local cargo git db, so every cargo command in this workspace
+# needs a working github.com credential before it can resolve dependencies. An
+# invalid GITHUB_TOKEN/GH_TOKEN in the environment overrides the working gh
+# keyring credential and makes that fetch fail — measured 2026-08-28:
+# `git ls-remote` on that URL returns rc=128 "Invalid username or token" with
+# the token set, and rc=0 with it unset.
+#
+# On 2026-08-28 that cost a 41-MINUTE gate run which produced no test results
+# at all: cargo died at dependency resolution, so ZERO tests ran and every
+# assertion in every lane was VOID — while the scoreboard reported plain FAILs
+# that read like a broken tree.
+#
+# WHY HERE AND NOT AS LANE [l]: lanes are skippable by --fast and --only, and
+# this precondition governs every lane that shells out to cargo (a,b,c,d,f,h,
+# i,j,k). A skippable check cannot protect `--only j`. Placing it here also
+# preserves the ordering the two frontend tests in tests/test_gate_help.py
+# assert: it runs strictly AFTER the frontend refusal above, so
+# test_executing_gate_still_requires_the_trust_frontend still sees its own
+# message and exit 2.
+#
+# Cost when healthy: 0.025-0.027s over 3 runs and ZERO network — with no token
+# set the check returns on its fast path without probing. Only a token that IS
+# set is probed (0.356-0.479s failing, 0.624-0.910s succeeding; 8s watchdog).
+#
+# Exit 3 from the checker means "authenticates: no" and is mapped to gate.sh's
+# existing precondition exit code 2. Offline is a WARNING (exit 0) inside the
+# checker, so a developer with no network still runs everything that does not
+# need it.
+if [ "${NY_SKIP_CREDENTIAL_CHECK:-0}" != 1 ]; then
+  CREDENTIAL_CHECK="$REPO_ROOT/scripts/check_github_credential.sh"
+  # Fail CLOSED on a missing checker rather than silently proceeding. Without
+  # this, deleting the script turns the precondition into a no-op that still
+  # "passes": bash exits 127, which is not 3, so the refusal below never fires.
+  # That is the same shape as `cargo test <filter>` exiting 0 on a filter that
+  # matched nothing — a check that cannot run must not read as a check that
+  # passed.
+  if [ ! -r "$CREDENTIAL_CHECK" ]; then
+    echo "gate.sh: $CREDENTIAL_CHECK is missing or unreadable." >&2
+    echo "  It is a tracked file; its absence is repository drift, not a local choice." >&2
+    exit 2
+  fi
+  credential_rc=0
+  bash "$CREDENTIAL_CHECK" --context gate || credential_rc=$?
+  if [ "$credential_rc" -eq 3 ]; then
+    echo "gate.sh: refusing to run — the GitHub credential above cannot fetch ay-milp." >&2
+    echo "  Every cargo lane would die at dependency resolution and report VOID as FAIL." >&2
+    echo "  Set NY_SKIP_CREDENTIAL_CHECK=1 to run anyway (it will not help)." >&2
+    exit 2
+  fi
+fi
 
 # h is a pure config-vs-code coherence check that finishes in seconds, so it
 # belongs in --fast: the two gates that silently zeroed a banked category were
@@ -147,45 +371,6 @@ CLIPPY_SKIPPED_CRATES=()
 # unrunnable in an edit loop. Adding a cheap check here is not weakening the
 # full gate; it is putting the cheap half where it will actually be run.
 FAST_CHECKS="a b c d e f g h"
-
-usage() {
-  # Print the header block: every line from line 2 up to the first non-comment
-  # line. The hardcoded end line this replaced was already one short of the
-  # header and silently truncated the help text every time a check was added.
-  awk 'NR >= 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
-}
-
-FAST=0
-ONLY=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --fast) FAST=1 ;;
-    --only)
-      shift
-      ONLY="${1:-}"
-      ;;
-    --only=*) ONLY="${1#--only=}" ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "gate.sh: unknown argument: $1" >&2
-      usage >&2
-      exit 2
-      ;;
-  esac
-  shift
-done
-if [ -n "$ONLY" ]; then
-  case "$ONLY" in
-    a|b|c|d|e|f|g|h|i|j) ;;
-    *)
-      echo "gate.sh: --only takes a single check letter a-j, got: '$ONLY'" >&2
-      exit 2
-      ;;
-  esac
-fi
 
 LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ny-gate.XXXXXX")"
 trap 'rm -rf "$LOG_DIR"' EXIT
@@ -240,7 +425,10 @@ run_check() {
 # a) Rust formatting + Clippy drift gate
 # ---------------------------------------------------------------------------
 check_a() {
-  local args=(clippy --locked --workspace --exclude ny-python --all-targets)
+  # `tippy`, not `clippy`: the pinned Trust sysroot installs `targo-tippy` and
+  # keeps `cargo-clippy`/`clippy-driver` as private compat protocols that are
+  # never installed aliases, so a `clippy` subcommand does not resolve here.
+  local args=(tippy --locked --workspace --exclude ny-python --all-targets)
   local entry crate reason
   # ${arr[@]+...} guard: macOS bash 3.2 under `set -u` treats an EMPTY array
   # expansion as unbound (same idiom as the RESULTS loop below).
@@ -250,21 +438,21 @@ check_a() {
     echo "SKIPPED crate $crate: $reason"
     args+=(--exclude "$crate")
   done
-  echo "+ cargo fmt --all -- --check"
-  cargo fmt --all -- --check
+  echo "+ targo fmt --all -- --check"
+  "$TARGO" fmt --all -- --check
   echo "+ cargo test --locked -j 1 -p ny-test-utils --test source_policy"
-  cargo test --locked -j 1 -p ny-test-utils --test source_policy
+  "$CARGO" test --locked -j 1 -p ny-test-utils --test source_policy
   echo "+ cargo test --locked -j 1 -p ny-test-utils --test python_correctness_migration_manifest"
-  cargo test --locked -j 1 -p ny-test-utils --test python_correctness_migration_manifest
+  "$CARGO" test --locked -j 1 -p ny-test-utils --test python_correctness_migration_manifest
   echo "+ cargo test --locked -j 1 -p ny-levers"
-  cargo test --locked -j 1 -p ny-levers
-  echo "+ cargo ${args[*]} -- -D warnings"
-  cargo "${args[@]}" -- -D warnings
+  "$CARGO" test --locked -j 1 -p ny-levers
+  echo "+ targo ${args[*]} -- -D warnings"
+  "$TARGO" "${args[@]}" -- -D warnings
   # The VNN-COMP executable is built with this exact non-default feature pair.
   # Workspace Clippy alone does not enable either feature and therefore cannot
   # catch integration drift in the scored MIP/CUDA surface.
-  echo "+ cargo clippy --locked -p ny-cli --bin ny --features mip,cuda -- -D warnings"
-  cargo clippy --locked -p ny-cli --bin ny --features mip,cuda -- -D warnings
+  echo "+ targo tippy --locked -p ny-cli --bin ny --features mip,cuda -- -D warnings"
+  "$TARGO" tippy --locked -p ny-cli --bin ny --features mip,cuda -- -D warnings
 }
 
 # ---------------------------------------------------------------------------
@@ -272,7 +460,7 @@ check_a() {
 # ---------------------------------------------------------------------------
 check_b() {
   echo "+ cargo test --locked -p ny-cert --all-targets"
-  cargo test --locked -p ny-cert --all-targets
+  "$CARGO" test --locked -p ny-cert --all-targets
 }
 
 # ---------------------------------------------------------------------------
@@ -282,19 +470,19 @@ check_b() {
 # ---------------------------------------------------------------------------
 check_c() {
   echo "+ cargo test --locked -p ny-cli --bin ny vnncomp_submit"
-  cargo test --locked -p ny-cli --bin ny vnncomp_submit
+  "$CARGO" test --locked -p ny-cli --bin ny vnncomp_submit
   echo "+ cargo test --locked -p ny-cli --bin ny cert"
-  cargo test --locked -p ny-cli --bin ny cert
+  "$CARGO" test --locked -p ny-cli --bin ny cert
   echo "+ cargo test --locked -p ny-cli --bin ny alpha_zero_yield"
-  cargo test --locked -p ny-cli --bin ny alpha_zero_yield
+  "$CARGO" test --locked -p ny-cli --bin ny alpha_zero_yield
   echo "+ cargo test --locked -p ny-propagate --lib alpha_zero_yield"
-  cargo test --locked -p ny-propagate --lib alpha_zero_yield
+  "$CARGO" test --locked -p ny-propagate --lib alpha_zero_yield
   echo "+ cargo test --locked -p ny-cli --test measured_gate_delivery"
-  cargo test --locked -p ny-cli --test measured_gate_delivery
+  "$CARGO" test --locked -p ny-cli --test measured_gate_delivery
   echo "+ cargo test --locked -p ny-cli --test ay_pin_unity"
-  cargo test --locked -p ny-cli --test ay_pin_unity
+  "$CARGO" test --locked -p ny-cli --test ay_pin_unity
   echo "+ cargo test --locked -p ny-cli --test flight_lever_receipt"
-  cargo test --locked -p ny-cli --test flight_lever_receipt
+  "$CARGO" test --locked -p ny-cli --test flight_lever_receipt
 }
 
 # ---------------------------------------------------------------------------
@@ -302,12 +490,12 @@ check_c() {
 # ---------------------------------------------------------------------------
 check_d() {
   echo "+ cargo test --locked -p ny-propagate --lib collection"
-  cargo test --locked -p ny-propagate --lib collection
+  "$CARGO" test --locked -p ny-propagate --lib collection
   # The conv2d slice contains scoped tests for the process-global
   # NY_DENSE_BUDGET_MB knob. Run this slice serially so a deliberate
   # zero-budget scope cannot alter an unrelated test's allocation policy.
   echo "+ cargo test --locked -p ny-propagate --lib conv2d -- --test-threads=1"
-  cargo test --locked -p ny-propagate --lib conv2d -- --test-threads=1
+  "$CARGO" test --locked -p ny-propagate --lib conv2d -- --test-threads=1
 }
 
 # ---------------------------------------------------------------------------
@@ -344,13 +532,13 @@ check_e() {
 # ---------------------------------------------------------------------------
 check_f() {
   local target_dir bin
-  target_dir="$(cargo metadata --locked --format-version 1 --no-deps | "$NY_GATE_PYTHON" -c \
+  target_dir="$("$CARGO" metadata --locked --format-version 1 --no-deps | "$NY_GATE_PYTHON" -c \
     'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
   bin="$target_dir/debug/ny"
   if [ ! -x "$bin" ]; then
     echo "debug ny binary absent — building it"
     echo "+ cargo build --locked -p ny-cli --bin ny"
-    cargo build --locked -p ny-cli --bin ny
+    "$CARGO" build --locked -p ny-cli --bin ny
   else
     echo "using existing debug binary: $bin"
   fi
@@ -469,7 +657,7 @@ check_g() {
   (
     unset NY_GATE_PYTHON
     NY_TEST_PYTHON="$gate_python" \
-      cargo test --locked -p ny-test-utils --features python-tools --tests
+      "$CARGO" test --locked -p ny-test-utils --features python-tools --tests
   )
 }
 
@@ -478,7 +666,7 @@ check_g() {
 # ---------------------------------------------------------------------------
 check_h() {
   echo "+ cargo test --locked -p ny-cli --bin ny preset::backend_capability_tests"
-  cargo test --locked -p ny-cli --bin ny preset::backend_capability_tests
+  "$CARGO" test --locked -p ny-cli --bin ny preset::backend_capability_tests
 }
 
 # ---------------------------------------------------------------------------
@@ -495,7 +683,7 @@ check_h() {
 # ---------------------------------------------------------------------------
 check_i() {
   echo "+ cargo test --locked --release -p ny-cli --features external-vnncomp --bin ny preset::model_load_smoke_tests -- --nocapture"
-  cargo test --locked --release -p ny-cli --features external-vnncomp --bin ny preset::model_load_smoke_tests -- --nocapture
+  "$CARGO" test --locked --release -p ny-cli --features external-vnncomp --bin ny preset::model_load_smoke_tests -- --nocapture
 }
 
 # ---------------------------------------------------------------------------
@@ -524,9 +712,28 @@ check_i() {
 #    Each filter carries a MINIMUM test count. `cargo test <filter>` exits 0
 #    when the filter matches NOTHING, so a rename or a module move would
 #    otherwise leave this lane green while running zero oracles — the same
-#    vacuous green check [i] refuses for absent benchmark data. Counted
-#    2026-08-16 under default features: 54 / 16 / 102. Lower a floor only
-#    alongside the deletion that justifies it, never to clear a red.
+#    vacuous green check [i] refuses for absent benchmark data. Lower a floor
+#    only alongside the deletion that justifies it, never to clear a red.
+#
+#    OBSERVED COUNTS (the floors below are deliberately lower; these are what
+#    the tree actually has, so a reader can tell growth from breakage):
+#      2026-08-16, default features:  54 / 16 / 102
+#      2026-08-28, default features:  98 / 16 / 104   <- first execution of this
+#        lane on aarch64-unknown-linux-gnu. The enclosure slice nearly DOUBLED
+#        (54 -> 98) because oracles were added, which is the good direction; the
+#        floors 50 / 14 / 95 are still met with room. Recorded because a reader
+#        diffing 98 against a lone stale "54" would think something moved.
+#
+#    WHAT THIS LANE COST, since the header above says "~4 min": measured 2561 s
+#    end to end, of which ~2537 s was the COLD release build of the test binary
+#    (`-C lto -C codegen-units=1` over a ~187 MB rlib) and 24.1 s was the oracles
+#    themselves. Slices 2 and 3 are instant because they reuse slice 1's binary.
+#
+#    WHAT THE ORACLES REPORTED on that first run: ~45.2M sampled (class, point)
+#    enclosure checks, ZERO overshoots — the certified per-class lower bound
+#    never exceeded the true feasible margin in any adversarial regime the
+#    oracles construct. Every `worst_over` in a verdict-bearing mode was
+#    NEGATIVE, i.e. strictly inside the true margin.
 # ---------------------------------------------------------------------------
 run_propagate_oracle_slice() {
   local label="$1" floor="$2" filter="$3"
@@ -534,7 +741,7 @@ run_propagate_oracle_slice() {
   echo "+ cargo test --locked --release -p ny-propagate --lib $filter"
   # `if !` so the pipeline's failure is handled here instead of aborting the
   # check subshell: every slice reports, the way check_f's f1/f2/f3 do.
-  if ! cargo test --locked --release -p ny-propagate --lib "$filter" 2>&1 | tee "$slice_log"; then
+  if ! "$CARGO" test --locked --release -p ny-propagate --lib "$filter" 2>&1 | tee "$slice_log"; then
     echo "  FAIL  j-$label: cargo test failed for filter '$filter'"
     return 1
   fi
@@ -550,6 +757,19 @@ run_propagate_oracle_slice() {
 check_j() {
   local ok=0
   run_propagate_oracle_slice enclosure 50 margin_row::tests:: || ok=1
+  # The three floors above are on each FILTER'S TOTAL. `margin_row::tests::`
+  # matches 98 tests of which only ~13 are the dj/box enclosure oracles, so
+  # deleting an oracle could be masked by the ~85 siblings and the floor of 50
+  # would still be met. These two slices pin the oracle subsets DIRECTLY. They
+  # ADD a constraint — they do not replace or lower the floor of 50 above.
+  #
+  # Floors are MEASURED, not chosen: `-- --list` on 2026-08-28 reports exactly 3
+  # and 6. They are set AT the observed count rather than below it because these
+  # are the load-bearing oracles: any deletion must be a deliberate act that
+  # lowers the floor in the same commit, which is the same rule the header states
+  # for the totals.
+  run_propagate_oracle_slice enclosure-oracle-mods 3 margin_row::tests::enclosure_oracle_ || ok=1
+  run_propagate_oracle_slice enclosure-oracle-fns 6 margin_row::tests::oracle_ || ok=1
   run_propagate_oracle_slice wide-alpha-true 14 wide_alpha_true::tests:: || ok=1
   run_propagate_oracle_slice interm-refine 95 interm_refine:: || ok=1
   return "$ok"
@@ -559,6 +779,335 @@ MODE="full"
 [ "$FAST" -eq 1 ] && MODE="fast (--fast)"
 [ -n "$ONLY" ] && MODE="single check (--only $ONLY)"
 echo "ny drift gate — mode: $MODE — repo: $REPO_ROOT"
+
+# ---------------------------------------------------------------------------
+# k) ny-api suite — the integration tests that were SILENTLY SKIPPED
+# ---------------------------------------------------------------------------
+#    Every [[test]] target in crates/ny-api carries `required-features`, and
+#    cargo skips an unmet test target with NO warning and exit 0. Before
+#    `default = ["cert"]` landed, `cargo test -p ny-api` compiled the lib, ran
+#    26 unfeatured unit tests, skipped all 8 integration binaries (49 tests),
+#    and reported success — "matched nothing reads as pass", shipped as build
+#    configuration.
+#
+#    `--features cert` is passed EXPLICITLY so this lane does not depend on the
+#    default key staying put: if someone drops or narrows `default`, the lane
+#    keeps running the suite instead of silently going hollow again.
+#
+#    Counts RE-DERIVED on the merged tree 2026-08-27 (the pre-merge figures were
+#    stale: upstream added 4 test targets while this lane was being written).
+#    12 [[test]] targets, 76 #[test] fns under tests/; `cert` arms 65 of them.
+#    gpu_facade_contract's 11 need --features gpu and a real device.
+#
+#    The floor and the BY-NAME assertion exist for the same reason as lane [j]:
+#    a count alone cannot tell "the suite ran" from "only the 26 old unfeatured
+#    unit tests ran". Counted 2026-08-27. Lower a floor only alongside the
+#    deletion that justifies it, never to clear a red.
+check_k() {
+  # DISTINCT from run_check's own "$LOG_DIR/check-k.log": run_check tees this
+  # function's output to that exact path while it runs, so grepping it here
+  # races the outer tee's truncation and the by-name assertions read an empty
+  # or partial file. Lane [j] uses check-j-$label.log for the same reason.
+  local log="$LOG_DIR/check-k-api.log" floor=55 ran rc
+  # --all-targets mirrors lane [b] and is load-bearing, not cosmetic: it runs
+  # lib + integration targets but EXCLUDES doctests. Without it cargo exits 1 on
+  # `rustdoc is not installed for the custom toolchain 'trust'` even when every
+  # test passed, which would make this lane permanently red on this host for a
+  # reason that has nothing to do with ny-api.
+  echo "+ cargo test --locked -p ny-api --features cert --all-targets"
+  # "$CARGO", not bare `cargo`: gate.sh resolves $CARGO from the sysroot that
+  # rust-toolchain.toml pins (see :273-291). A bare `cargo` resolves from PATH
+  # and can be a DIFFERENT toolchain than every other lane runs against, which
+  # would make this lane's result incomparable with theirs.
+  "$CARGO" test --locked -p ny-api --features cert --all-targets 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+
+  # Branch on the ok/FAILED token, never on the count alone: `ok. 0 passed` is
+  # VOID (matched nothing) while `FAILED. 0 passed; N failed` is a real failure.
+  if grep -qE '^test result: FAILED' "$log"; then
+    echo "  FAIL  k: ny-api reported a real test failure"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "  FAIL  k: cargo test -p ny-api exited $rc"
+    return 1
+  fi
+
+  # Count INTEGRATION tests only. Summing every `ok. N passed` line made this
+  # floor HOLLOW: ny-api's lib carries 200 #[test] fns, so the lib block alone
+  # cleared a floor of 65 with every integration binary dark — precisely the
+  # condition this lane exists to detect. awk tracks which binary is reporting
+  # and ignores the `Running unittests src/lib.rs` block.
+  ran=$(awk '
+    /^[[:space:]]+Running unittests/ { in_int = 0; next }
+    /^[[:space:]]+Running tests\// { in_int = 1; next }
+    in_int && /^test result: ok\. [0-9]+ passed/ { for (i = 1; i <= NF; i++) if ($i == "ok.") { n += $(i+1); break } }
+    END { print n + 0 }
+  ' "$log")
+  # A zero count is VOID, not pass: it means no integration binary reported at
+  # all. Rejected explicitly rather than relying on the floor, so that lowering
+  # the floor some day cannot silently re-admit a hollow run.
+  if [ "$ran" -eq 0 ]; then
+    echo "  FAIL  k: ny-api ran ZERO integration tests — VOID, not a pass"
+    echo "        (the lib block is excluded from this count by design)"
+    return 1
+  fi
+  if [ "$ran" -lt "$floor" ]; then
+    echo "  FAIL  k: ny-api ran $ran tests, below the floor of $floor"
+    echo "        A count under the floor means test targets were SKIPPED for"
+    echo "        unmet required-features — the exact defect this lane guards."
+    return 1
+  fi
+
+  # BY NAME: one test from each feature tier, so "the targets built but the
+  # cert tier went dark" fails closed instead of passing on propagate alone.
+  local missing=0 t
+  for t in lipschitz_sound facade_expansion_contract; do
+    if ! grep -qE "^\s+Running tests/$t\.rs" "$log"; then
+      echo "  FAIL  k: test binary '$t' never ran (required-features unmet?)"
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || return 1
+
+  echo "  ok    k: ny-api ran $ran INTEGRATION tests (floor $floor), cert-tier binaries present"
+  echo "        NOTE: gpu_facade_contract (11 tests) needs --features gpu and a"
+  echo "              real device; it is NOT covered here. Known, named gap."
+}
+
+# ---------------------------------------------------------------------------
+# l) activation-math certified-bound pins (SiLU: ny-propagate + ny-relaxation)
+# ---------------------------------------------------------------------------
+#    `silu_critical_point` (crates/ny-propagate/src/layers/activations/silu/
+#    math.rs) finds SiLU's argmin by NEWTON'S METHOD IN f32, using a CENTRAL
+#    DIFFERENCE for the second derivative at eps = 1.0e-5_f32. `silu_min_max`
+#    then evaluates SiLU there and applies `next_down_f32` — ONE f32 ULP of
+#    backoff, the entire safety margin — to publish a CERTIFIED LOWER BOUND.
+#    The bound is therefore sound only if Newton converged, and nothing
+#    asserted that until the `newton_pin` modules landed. Those pins are
+#    zero-tolerance and compare against an mpmath-derived minimum (dps 60), so
+#    unlike the two assertions they replaced they cannot drift with the code
+#    they check.
+#
+#    Before this lane, NO SiLU test ran in the gate at all. Census of every
+#    `cargo test` in this file: [b] is -p ny-cert, [c] -p ny-cli, [d] is
+#    -p ny-propagate --lib filtered to `collection` and `conv2d`, [j] is
+#    -p ny-propagate --lib filtered to `margin_row::tests::`,
+#    `wide_alpha_true::tests::` and `interm_refine::`, [k] is -p ny-api. None
+#    of them reaches `silu::`. `ny-relaxation` appeared ZERO times in this
+#    script, so the mirror crate that exists precisely to detect drift against
+#    ny-propagate (tests/drift.rs) was itself never run. This lane closes both
+#    gaps, which is why it runs the whole mirror crate and not just its pins.
+#
+#    --all-targets on ny-relaxation for the same reason as [b] and [k]: it runs
+#    lib + tests/drift.rs + tests/soundness.rs but EXCLUDES doctests, which the
+#    pinned `trust` toolchain has no rustdoc to run. Without it this lane would
+#    be permanently red for a reason that has nothing to do with SiLU.
+#
+#    Debug, not --release: [d] already runs debug `-p ny-propagate --lib`
+#    slices inside --fast, so that binary is known to work on this host, and
+#    these pins are scalar arithmetic with no gemm on the path. The silu slice
+#    also contains one `#[cfg(debug_assertions)]` test, which a --release run
+#    would silently drop below the floor.
+#
+#    NOT in FAST_CHECKS: this lane's wall clock has never been measured — it
+#    was authored without box access. Move it into FAST_CHECKS once somebody
+#    has timed it, not before; an unmeasured cost is how --fast stops being
+#    fast.
+#
+#    The floors are STATIC counts, derived 2026-08-28 by enumerating `#[test]`
+#    in the sources rather than by observing a run:
+#      ny-propagate `silu::` — 27 existing (24 top-level in silu/tests.rs plus
+#        3 inside its single `proptest!` block; one of the 24 is the
+#        `#[cfg(debug_assertions)]` chord-precondition case) + 4 new pins = 31.
+#      ny-relaxation --all-targets — 10 lib unit tests (exp 3, log 3,
+#        softmax 2, rounding 1, safe_math 1) + drift.rs 11 + soundness.rs 11
+#        + 4 new pins = 36.
+#    The first execution of this lane is what confirms them. A floor that is
+#    too HIGH fails closed and its FAIL line prints the real number to correct
+#    it with; a floor is only ever LOWERED alongside the deletion that
+#    justifies it, never to clear a red.
+run_activation_pin_slice() {
+  local label="$1" floor="$2" slice_log="$3"
+  shift 3
+  local ran rc=0
+  echo "+ cargo $*"
+  # `if !` rather than a bare pipeline: run_check runs this inside
+  # `set -euo pipefail`, where a failing pipeline aborts the subshell before
+  # any of the diagnostics below can print. Lane [j] uses the same form.
+  if ! "$CARGO" "$@" 2>&1 | tee "$slice_log"; then
+    rc=1
+  fi
+
+  # Branch on the ok/FAILED token FIRST and never on the count alone:
+  # `test result: ok. 0 passed` is VOID (the selection matched nothing) while
+  # `test result: FAILED. 0 passed; N failed` is a real failure. A detector in
+  # this campaign inverted exactly this and filed a genuine red test as a
+  # tooling artifact.
+  if grep -qE '^test result: FAILED' "$slice_log"; then
+    echo "  FAIL  l-$label: a test in this slice actually FAILED"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "  FAIL  l-$label: cargo exited non-zero with no FAILED test result"
+    return 1
+  fi
+
+  # One awk rather than `grep -oE | grep -oE | awk`: that pipeline exits
+  # non-zero when nothing matches, and under `pipefail` the command
+  # substitution would abort the subshell before the floor message could
+  # print. awk sums across every binary --all-targets ran and always exits 0.
+  ran="$(awk '/^test result: ok\. [0-9]+ passed/ { n += $4 } END { print n + 0 }' "$slice_log")"
+  if [ "$ran" -lt "$floor" ]; then
+    echo "  FAIL  l-$label: ran $ran test(s), floor is $floor"
+    echo "        Under the floor means the filter or target selection no"
+    echo "        longer reaches these pins, so this lane proved NOTHING."
+    return 1
+  fi
+  echo "  ok    l-$label: $ran test(s) passed (floor $floor)"
+  return 0
+}
+
+check_l() {
+  # Own log paths, for lane [k]'s reason: run_check tees this function's output
+  # to "$LOG_DIR/check-l.log" WHILE it runs, so grepping that path here races
+  # the outer tee's truncation and the by-name assertions read a partial file.
+  local prop_log="$LOG_DIR/check-l-silu-propagate.log"
+  local relax_log="$LOG_DIR/check-l-silu-relaxation.log"
+  local ok=0
+
+  run_activation_pin_slice propagate 31 "$prop_log" \
+    test --locked -p ny-propagate --lib silu:: || ok=1
+  run_activation_pin_slice relaxation 36 "$relax_log" \
+    test --locked -p ny-relaxation --all-targets || ok=1
+
+  # BY NAME, ANCHORED on the full module path and on the trailing ` ... ok`.
+  # A bare `silu` substring also matches the silu_chord/silu_eval tests, which
+  # say nothing about the Newton premise, and an unanchored name is how "elu"
+  # matched "celu" earlier in this campaign. All four pins must have RUN and
+  # PASSED in BOTH crates: ny-relaxation mirrors ny-propagate's math, so a pin
+  # that exists in only one of them is itself the drift this asserts against.
+  local missing=0 t
+  for t in certified_minimum_never_exceeds_true_silu_minimum \
+    newton_lands_inside_the_certified_robustness_radius \
+    no_f32_lies_between_the_critical_point_and_the_true_argmin \
+    critical_point_is_the_nearest_f32_to_the_true_argmin; do
+    if ! grep -qE "^test layers::activations::silu::math::newton_pin::$t \.\.\. ok\$" \
+      "$prop_log"; then
+      echo "  FAIL  l: ny-propagate pin '$t' did not run and pass"
+      missing=1
+    fi
+    if ! grep -qE "^test silu::math::newton_pin::$t \.\.\. ok\$" "$relax_log"; then
+      echo "  FAIL  l: ny-relaxation mirror pin '$t' did not run and pass"
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || ok=1
+
+  if [ "$ok" -eq 0 ]; then
+    echo "  ok    l: all 4 certified-bound pins ran and passed in both crates"
+  fi
+  return "$ok"
+}
+
+# ---------------------------------------------------------------------------
+# m) ny-api GPU-facade tier — the 11 tests lane [k] can only NAME, not run
+# ---------------------------------------------------------------------------
+#    gpu_facade_contract.rs is gated `required-features = ["gpu"]`, and the
+#    crate default is ["cert"], so lane [k] cannot reach it. The default is
+#    correct and must not change: `gpu = ["propagate", "dep:ny-gpu",
+#    "ny-gpu/wgpu"]` would put a real ny-gpu + wgpu edge on every plain
+#    `cargo build -p ny-api`.
+#
+#    But the tests DO NOT need a device. The file's own header (lines 21-22)
+#    states it "runs identically on a host with no adapter"; every test names
+#    types and checks constructor signatures, and the live ladder is a
+#    SEPARATE #[ignore]d unit test in ny_api::gpu. So the gap lane [k] names is
+#    closable here at the cost of one extra compile, not a hardware
+#    requirement. Before this lane those 11 tests had never run in the gate.
+#
+#    Same discipline as [k]: branch on the ok/FAILED token before any count,
+#    count INTEGRATION binaries only (the lib block would swamp any floor),
+#    reject a zero count as VOID, assert the gpu binary BY NAME so "it built
+#    but the gpu tier went dark" fails closed, and use a distinct log filename
+#    because run_check tees to check-m.log while this function reads it.
+check_m() {
+  local log="$LOG_DIR/check-m-api-gpu.log" floor=11 ran rc
+  echo "+ cargo test --locked -p ny-api --features cert,gpu --all-targets"
+  # "$CARGO" for the same reason as lane [k]: the pinned sysroot frontend, not
+  # whatever `cargo` PATH happens to resolve.
+  "$CARGO" test --locked -p ny-api --features cert,gpu --all-targets 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+
+  if grep -qE '^test result: FAILED' "$log"; then
+    echo "  FAIL  m: ny-api reported a real test failure under cert,gpu"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "  FAIL  m: cargo test -p ny-api --features cert,gpu exited $rc"
+    return 1
+  fi
+
+  # gpu_facade_contract only. A total across binaries would let the other tiers
+  # cover a dark gpu binary, which is the exact failure this lane exists for.
+  ran=$(awk '
+    /^[[:space:]]+Running tests\/gpu_facade_contract\.rs/ { seen = 1; next }
+    seen && /^test result: ok\. [0-9]+ passed/ { for (i = 1; i <= NF; i++) if ($i == "ok.") { print $(i+1); exit } }
+  ' "$log")
+  ran=${ran:-0}
+
+  if [ "$ran" -eq 0 ]; then
+    echo "  FAIL  m: gpu_facade_contract ran ZERO tests — VOID, not a pass"
+    echo "        (either the binary never ran, or required-features went unmet)"
+    return 1
+  fi
+  if [ "$ran" -lt "$floor" ]; then
+    echo "  FAIL  m: gpu_facade_contract ran $ran tests, below the floor of $floor"
+    return 1
+  fi
+  echo "  ok    m: gpu_facade_contract ran $ran tests (floor $floor)"
+}
+
+# ---------------------------------------------------------------------------
+# n) score-at-risk drift — the yaml that prices a model-load refusal
+# ---------------------------------------------------------------------------
+#    configs/preset_score_at_risk.yaml told the model-load guard that vit_2023
+#    was worth 16.8 normalized points for SIXTEEN DAYS after a proof retraction
+#    took its bank to zero solved rows. Nothing noticed: the only consumer
+#    (crates/ny-cli/src/preset/model_load_smoke_tests.rs) asserts merely
+#    0.0 <= banked_normalized <= 100.0, which 16.8 satisfied throughout.
+#
+#    scripts/check_score_at_risk_drift.py closes that. Every check it runs is
+#    DENOMINATOR-FREE, so it needs no external_tools/vnncomp2025_results
+#    checkout (gitignored, absent here) — recomputing a member from the bank
+#    would need the winner denominators, but CHECKING these invariants does not:
+#      1. census anchored to the SCORER's own REGULAR/EXTENDED lists, not to the
+#         yaml's own rows — comparing the yaml against itself cannot detect an
+#         omission;
+#      2. each total equals the sum of its members, de-duplicated (the file
+#         carries 31 roots for 25 scored benchmarks because cifar100/safenlp
+#         appear under alternate years, so a naive sum over-counts by 136.0);
+#      3. any SCORED benchmark whose bank has zero sat/unsat rows must be priced
+#         0.0, since raw=0 forces normalized 0.0 under both branches of the
+#         scorer's meas_norm. This is the vit_2023 failure exactly, and it is
+#         verified to fire on that scenario alone with the totals made
+#         self-consistent.
+#    It exits 2 (VOID) rather than 0 when it cannot check — no bank files found,
+#    or a bank file with no recognisable verdict column.
+check_n() {
+  local log="$LOG_DIR/check-n-score-drift.log" rc
+  echo "+ python3 scripts/check_score_at_risk_drift.py"
+  "$NY_GATE_PYTHON" scripts/check_score_at_risk_drift.py 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  case "$rc" in
+    0) : ;;
+    2) echo "  FAIL  n: drift check could not run (VOID) — it verified NOTHING"; return 1 ;;
+    *) echo "  FAIL  n: score-at-risk drift detected (see above)"; return 1 ;;
+  esac
+  grep -q '^PASS:' "$log" || {
+    echo "  FAIL  n: exit 0 without a PASS line — treating as VOID"; return 1; }
+  echo "  ok    n: score-at-risk yaml agrees with the bank and the scorer's lists"
+}
 
 run_check a "Rust hygiene gate (fmt + source policy + lever ratchet + workspace/scored-tier Clippy)" check_a
 run_check b "ny-cert test suite (--all-targets)" check_b
@@ -570,6 +1119,10 @@ run_check g "Python package/version coherence" check_g
 run_check h "preset capability guard (declared device honoured or waived)" check_h
 run_check i "preset model-load smoke (every shipped preset's models load)" check_i
 run_check j "ny-propagate soundness oracles (RootEval.dj enclosure, wide-alpha-true, interm-refine)" check_j
+run_check k "ny-api suite (integration tests formerly skipped for unmet required-features)" check_k
+run_check l "activation-math certified-bound pins (ny-propagate silu + ny-relaxation mirror)" check_l
+run_check m "ny-api GPU-facade tier (11 tests lane [k] cannot reach)" check_m
+run_check n "score-at-risk drift (yaml vs bank vs scorer lists)" check_n
 
 echo ""
 echo "==================== GATE SCOREBOARD ===================="

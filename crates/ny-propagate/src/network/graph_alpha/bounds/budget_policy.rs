@@ -25,6 +25,44 @@ use super::target_backward::{
 };
 
 /// Minimum useful per-node time budget in seconds for DAG CROWN-IBP (#3499).
+///
+/// KNOWN PATHOLOGY ON SMALL GRAPHS — measured 2026-08-25, NOT fixed here.
+/// `compute_weighted_per_node_budget_secs` refuses a target when its weighted
+/// share falls below this floor, and the share is
+/// `remaining_secs * this_weight / remaining_weight_sum`. When the whole
+/// collection window is itself close to this floor, NO target can clear it: a
+/// share can only reach the floor if the floor is at most `remaining_secs / n`,
+/// so with `n` targets and a window of `~floor` seconds every one of them is
+/// refused before any work is attempted.
+///
+/// That is not hypothetical. On `lsnc_relu` quadrotor2d the collection window is
+/// 2.0-4.4 s and there are 10 targets, so shares come out at 0.1-1.9 s against
+/// this 2.0 s floor and ny reports
+/// `9/10 DEMANDED targets did not complete CROWN (PerNodeDeadlineExceeded=9)`.
+/// The targets are `dim=2` to `dim=8`; none of them needs 2 seconds, and none of
+/// them ever ran.
+///
+/// THE LABEL IS FIXED (#per-node-floor-label, 2026-08-25). `crown_tighten.rs`
+/// used to report this below-floor REFUSAL with the same
+/// `PerNodeDeadlineExceeded` reason it uses for a genuine deadline overrun, so
+/// the log read like a timeout and hid this cliff for weeks. The refusal now
+/// carries `CrownIbpFallbackReason::PerNodeBudgetBelowFloor` and its fallback
+/// event says "REFUSED before any backward step". Same TIME class, same
+/// completeness accounting, same bounds — only the claim is corrected. The
+/// quoted log line above is therefore HISTORICAL; at HEAD it reads
+/// `PerNodeBudgetBelowFloor=9`.
+///
+/// The 2.0 s value is calibrated against conv targets around
+/// `PRESET_CAP_REFERENCE_DIMS` (28,800) rows wide, where it is sensible.
+///
+/// `NY_PER_NODE_FLOOR_SECS=0.01` converts all 9 refusals into completions. The
+/// DEFAULT IS DELIBERATELY UNCHANGED: measured end to end, the repair halves the
+/// open branch-and-bound frontier on `lsnc_relu` but produces ZERO proofs, and
+/// six scored families run through this constant. The obviously-correct shape is
+/// a floor that can never refuse EVERY target (admit the highest-weight one
+/// regardless), but that must be measured across all six families before it
+/// ships. Evidence and the full attribution:
+/// `reports/measured-2026/lsnc_relu_artifacts/s1_per_node_floor/README.md`.
 pub(crate) const MIN_PER_NODE_BUDGET_SECS: f64 = 2.0;
 
 /// FLOOR for the global per-node time budget in seconds (#4413).
@@ -272,17 +310,12 @@ fn sanitize_budget_secs(override_secs: Option<f64>, default_secs: f64) -> f64 {
         .unwrap_or(default_secs)
 }
 
-/// Operator overrides for the per-node floor/cap.
+/// Legacy exact positive-seconds parser still used by the patches-budget seam.
 ///
-/// These exist so the cap can be MEASURED rather than argued about: the
-/// historical 12 s cap was never sweepable without editing source and
-/// rebuilding, which is why it went unexamined while
-/// `PerNodeDeadlineExceeded` fallbacks accumulated.
-/// A value set here is treated exactly like a preset-supplied one (including
-/// dim-aware scaling), and an unset/invalid value changes nothing.
-const PER_NODE_CAP_ENV: &str = "NY_PER_NODE_CAP_SECS";
-const PER_NODE_FLOOR_ENV: &str = "NY_PER_NODE_FLOOR_SECS";
-
+/// The per-node floor/cap now use their central declarations instead: absence
+/// preserves the typed preset, an admissible environment value overrides it,
+/// and a present rejected value deliberately suppresses it and restores the
+/// declaration/runtime policy.
 fn budget_secs_from_raw(raw: Option<&str>) -> Option<f64> {
     raw.and_then(|raw| raw.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
@@ -305,19 +338,63 @@ pub(super) struct ResolvedPerNodeTimeBudget {
 pub(super) fn resolve_per_node_time_budget(
     budget: &CrownIbpPerNodeTimeBudget,
 ) -> ResolvedPerNodeTimeBudget {
-    let floor_raw = std::env::var(PER_NODE_FLOOR_ENV).ok();
-    let cap_raw = std::env::var(PER_NODE_CAP_ENV).ok();
-    resolve_per_node_time_budget_from_raw(budget, floor_raw.as_deref(), cap_raw.as_deref())
+    let floor_override = governed_budget_secs(
+        &ny_levers::decls::crown_ibp_budget::PER_NODE_FLOOR_SECS,
+        budget.floor_secs,
+    );
+    let cap_override = governed_budget_secs(
+        &ny_levers::decls::crown_ibp_budget::PER_NODE_CAP_SECS,
+        budget.cap_secs,
+    );
+    resolved_per_node_time_budget(floor_override, cap_override)
 }
 
+fn governed_budget_secs(
+    decl: &'static ny_levers::LeverDecl,
+    configured: Option<f64>,
+) -> Option<f64> {
+    ny_levers::read_over_config(decl, configured.map(ny_levers::LeverValue::F64))
+        .ok()
+        .and_then(|resolved| resolved.value.as_f64())
+}
+
+#[cfg(test)]
 fn resolve_per_node_time_budget_from_raw(
     budget: &CrownIbpPerNodeTimeBudget,
     floor_raw: Option<&str>,
     cap_raw: Option<&str>,
 ) -> ResolvedPerNodeTimeBudget {
-    let floor_override = budget_secs_from_raw(floor_raw).or(budget.floor_secs);
-    let cap_override = budget_secs_from_raw(cap_raw)
-        .or_else(|| budget.cap_secs.filter(|v| v.is_finite() && *v > 0.0));
+    fn resolve(
+        decl: &'static ny_levers::LeverDecl,
+        raw: Option<&str>,
+        configured: Option<f64>,
+    ) -> Option<f64> {
+        ny_levers::read_over_config_with(
+            decl,
+            |_| raw.map(str::to_owned),
+            configured.map(ny_levers::LeverValue::F64),
+        )
+        .ok()
+        .and_then(|resolved| resolved.value.as_f64())
+    }
+
+    let floor_override = resolve(
+        &ny_levers::decls::crown_ibp_budget::PER_NODE_FLOOR_SECS,
+        floor_raw,
+        budget.floor_secs,
+    );
+    let cap_override = resolve(
+        &ny_levers::decls::crown_ibp_budget::PER_NODE_CAP_SECS,
+        cap_raw,
+        budget.cap_secs,
+    );
+    resolved_per_node_time_budget(floor_override, cap_override)
+}
+
+fn resolved_per_node_time_budget(
+    floor_override: Option<f64>,
+    cap_override: Option<f64>,
+) -> ResolvedPerNodeTimeBudget {
     ResolvedPerNodeTimeBudget {
         floor_secs: sanitize_budget_secs(floor_override, MIN_PER_NODE_BUDGET_SECS),
         cap_secs: sanitize_budget_secs(cap_override, ADAPTIVE_PER_NODE_CAP_FLOOR_SECS),
@@ -479,16 +556,20 @@ pub(in crate::network::graph_alpha) struct ObjectiveChunkSchedulingPlan {
 
 /// Admit M1 only on the execution driver's invariant fixed-wave route.
 ///
-/// A cut context or `NY_NO_CHUNK_WAVE_PAR=1` selects the sequential driver,
-/// whose adaptive widths are measured at runtime and cannot be predicted
-/// faithfully before execution. Those routes deliberately return `None` and
-/// retain raw-row scheduling. Worker count and the memory-derived wave cap are
-/// resolved by the same central helper execution uses.
+/// Production selects the sequential driver because concrete backward chunks
+/// do not yet carry complete per-worker memory receipts. The measurement-only
+/// spelling `NY_NO_CHUNK_WAVE_PAR=0` admits the old fixed-wave experiment.
+/// Sequential adaptive widths are measured at runtime and cannot be predicted
+/// faithfully before execution, so that route deliberately returns `None`
+/// and retains raw-row scheduling. Experimental worker count and the legacy
+/// row-derived wave cap are resolved by the same central helper execution uses.
 pub(in crate::network::graph_alpha) fn objective_chunk_scheduling_plan(
     target_rows: usize,
     execution: ObjectiveChunkRoutePlan,
     has_deadline: bool,
     has_cut_context: bool,
+    wave_parallel_enabled: bool,
+    adaptive_growth_enabled: bool,
 ) -> Option<ObjectiveChunkSchedulingPlan> {
     let chunk_rows = execution.effective_initial_rows;
     let chunk_ceiling = if execution.requested_rows > 0 {
@@ -502,6 +583,8 @@ pub(in crate::network::graph_alpha) fn objective_chunk_scheduling_plan(
         chunk_ceiling,
         has_deadline,
         has_cut_context,
+        wave_parallel_enabled,
+        adaptive_growth_enabled,
     ) {
         ObjectiveChunkDriverRoute::FixedWaves(fixed_waves) => Some(ObjectiveChunkSchedulingPlan {
             execution,
@@ -537,19 +620,28 @@ pub(in crate::network::graph_alpha) fn demanded_target_work_weight(
     }
 }
 
-/// Preserve the parent's cap-dimension input when M1 is dark.
+/// Preserve the parent's cap-dimension input when every weight-inflating
+/// mechanism is dark.
 ///
 /// Before M1 the scheduling weight doubled as the dimension passed to
 /// `dim_scaled_cap_secs`; sparse-row experiments therefore used their selected
 /// row count. Armed M1 must separate those axes so an inflated work proxy does
 /// not masquerade as node width, but dark execution keeps the parent's exact
 /// allocation semantics.
+///
+/// #target-cost-weight passes the SAME argument for the same reason, and it is
+/// load-bearing rather than cosmetic: prefix-cost weighting multiplies the
+/// scheduling weight by a factor of up to 1e4, and if that product were still
+/// read as a node WIDTH it would flow into `dim_scaled_cap_secs`, whose scaling
+/// is QUADRATIC in width — turning a scheduling-only correction into a silent
+/// 1e8x inflation of the per-node cap. Callers therefore pass
+/// `chunk_aware || prefix_cost_weighted`.
 pub(crate) fn weighted_budget_cap_dims(
     this_work_weight: f64,
     raw_node_dims: f64,
-    chunk_aware: bool,
+    separate_dims_from_weight: bool,
 ) -> f64 {
-    if chunk_aware {
+    if separate_dims_from_weight {
         raw_node_dims
     } else {
         this_work_weight
@@ -692,6 +784,190 @@ fn dim_scaled_cap_secs(cap_secs: f64, preset_cap_set: bool, node_dims: f64) -> f
 /// `this_work_weight` affects only the proportional scheduling share.
 /// `raw_node_dims` separately controls the dim-scaled preset cap, so an
 /// experimental work multiplier cannot pretend the node itself is wider.
+/// #target-cost-weight: hard ceiling on the prefix-cost multiplier spread.
+///
+/// Multipliers are normalised so the CHEAPEST admitted candidate keeps its
+/// historical row weight and every other candidate scales UP by its relative
+/// per-row prefix cost. A degenerate graph (one modelled weighted ancestor
+/// against a fifty-layer prefix) could otherwise produce a ratio large enough
+/// to drive every other candidate's share to zero in f64. 1e4 is far above the
+/// measured spread (cgan: 9.5x by rows, ~27x by secs/row) and exists only to
+/// keep the allocation non-degenerate.
+pub(crate) const PREFIX_COST_MULTIPLIER_MAX: f64 = 1.0e4;
+
+/// WHAT THIS IS NOT, and what comes next (#target-cost-weight).
+///
+/// This corrects the COST side of the allocation. It does not measure VALUE,
+/// and on cgan row 7 value is what the leave-one-out actually ranks: dropping
+/// the 4,608-row and 12,544-row generator targets costs EXACTLY 1.000x,
+/// dropping the 28,800 costs 1.52x, and dropping the 512-ROW discriminator
+/// target costs 1954x. Cost correction moves budget the right way HERE only
+/// because the highest-value target is also the deepest one, and depth is
+/// exactly what the row count underprices — a correlation, not an identity. A
+/// net whose expensive targets are worthless would not be helped by this.
+///
+/// The value estimator this wants is sensitivity x slack: one backward pass
+/// from the objective propagating ABSOLUTE coefficients, giving each node a
+/// `Σ|coef|` weight, multiplied by that node's current IBP width. That is the
+/// node's share of the output interval, i.e. what tightening it can possibly
+/// buy — and it costs ONE pass for the whole graph, not one per target. It is
+/// deliberately NOT built here: it is a new backward propagation over every op
+/// type in the bound path, and an unmeasured second mechanism in this file is
+/// worth less than a measured first one. The measurement that would decide it
+/// is the same leave-one-out above, run against the estimator's ranking.
+///
+/// #target-cost-weight: per-row prefix cost implied by a walk's MAC estimate.
+///
+/// `collector_walk_macs*` returns `2 · rows · Σ per_row(weighted prefix node)`
+/// — exactly the `rows x prefix_width` model that tracks measured collector
+/// cost to 1.5x where the row count alone is off by 9.5x. Dividing the row
+/// factor back out leaves the part of the cost that the row count DOES NOT
+/// see, which is precisely the correction the scheduler is missing.
+pub(crate) fn prefix_cost_per_row(macs: u128, rows: usize) -> Option<f64> {
+    if rows == 0 {
+        return None;
+    }
+    let per_row = macs as f64 / (2.0 * rows as f64);
+    (per_row.is_finite() && per_row > 0.0).then_some(per_row)
+}
+
+/// #target-cost-weight: turn per-target prefix costs into scheduling
+/// multipliers, or decline.
+///
+/// ALL-OR-NOTHING by design. `collector_walk_macs` fails open on every op it
+/// does not model (ConvTranspose was in that set until #cprime-convtranspose,
+/// and attention/MatMul still are), contributing ZERO to the sum. Mixing a
+/// priced candidate's true cost with an unpriced candidate's silent zero would
+/// not be a worse cost model, it would be an arbitrary one — the unpriced node
+/// would be starved for a reason unrelated to its cost. So a single admitted
+/// candidate that cannot be priced returns `None`, and the caller keeps
+/// today's row weights EXACTLY.
+///
+/// Normalised by the MINIMUM admitted cost so the cheapest-prefix candidate
+/// retains its historical weight and the correction is expressed purely as
+/// relative inflation. Only ratios reach the allocator, so the choice of
+/// normaliser cannot change any share; it keeps the magnitudes comparable to
+/// the row weights they replace, which is what makes an armed-vs-dark log
+/// diff readable.
+pub(crate) fn prefix_cost_multipliers(
+    costs: &[Option<f64>],
+    admitted: &[bool],
+) -> Option<Vec<f64>> {
+    if costs.len() != admitted.len() {
+        return None;
+    }
+    let mut min_cost = f64::INFINITY;
+    let mut any = false;
+    for (cost, &is_admitted) in costs.iter().zip(admitted.iter()) {
+        if !is_admitted {
+            continue;
+        }
+        let cost = (*cost)?;
+        if !cost.is_finite() || cost <= 0.0 {
+            return None;
+        }
+        min_cost = min_cost.min(cost);
+        any = true;
+    }
+    if !any || !min_cost.is_finite() || min_cost <= 0.0 {
+        return None;
+    }
+    Some(
+        costs
+            .iter()
+            .zip(admitted.iter())
+            .map(|(cost, &is_admitted)| {
+                if !is_admitted {
+                    return 1.0;
+                }
+                cost.map_or(1.0, |c| (c / min_cost).clamp(1.0, PREFIX_COST_MULTIPLIER_MAX))
+            })
+            .collect(),
+    )
+}
+
+/// #target-cost-weight: the per-candidate share ceiling, validated.
+///
+/// Outside `(0, 1)` there is nothing to cap — `>= 1.0` can never bind and
+/// `<= 0.0` would refuse every candidate — so both resolve to "no cap" rather
+/// than to a policy nobody asked for.
+pub(crate) fn resolve_max_target_share_frac(budget: &CrownIbpPerNodeTimeBudget) -> Option<f64> {
+    budget
+        .max_target_share_frac
+        .filter(|frac| frac.is_finite() && *frac > 0.0 && *frac < 1.0)
+}
+
+/// #target-cost-weight: whether prefix-cost weighting is armed for this run.
+pub(crate) fn prefix_cost_weighting_enabled(budget: &CrownIbpPerNodeTimeBudget) -> bool {
+    budget.prefix_cost_weighted
+}
+
+/// #target-cost-weight: clamp one candidate's share to its window fraction.
+///
+/// SKIPPED when this candidate carries the entire remaining weight — it is the
+/// last claimant, so capping it would strand the rest of the window for
+/// nobody. Sound in every case: the share only bounds how long a backward walk
+/// may run, and a walk that does not finish keeps the certified IBP fallback.
+fn cap_target_share_secs(
+    share: f64,
+    remaining_secs: f64,
+    this_work_weight: f64,
+    remaining_work_weight_sum: f64,
+    budget: &CrownIbpPerNodeTimeBudget,
+) -> f64 {
+    match resolve_max_target_share_frac(budget) {
+        Some(frac) if this_work_weight < remaining_work_weight_sum => {
+            share.min(remaining_secs * frac)
+        }
+        _ => share,
+    }
+}
+
+/// The same weighted share as [`compute_weighted_per_node_budget_secs`], but
+/// WITHOUT the floor gate — i.e. the number that was actually computed and then
+/// rejected.
+///
+/// Diagnostics only. The skip log used to print `remaining / candidates`, the
+/// EQUAL share, while the decision was made on the WEIGHTED share, so it emitted
+/// self-contradicting lines like "per-node budget 4.2s < 2.0s floor". That line
+/// sent a reader looking at the adaptive cap (which is clamped at 12 s and
+/// therefore almost never binds) instead of at this share against the 2 s floor.
+/// A diagnostic that names the wrong term costs more than no diagnostic.
+pub(crate) fn weighted_per_node_budget_secs_unfloored(
+    remaining_secs: f64,
+    remaining_work_weight_sum: f64,
+    this_work_weight: f64,
+    raw_node_dims: f64,
+    budget: &CrownIbpPerNodeTimeBudget,
+) -> Option<f64> {
+    if !remaining_secs.is_finite()
+        || remaining_secs <= 0.0
+        || !remaining_work_weight_sum.is_finite()
+        || remaining_work_weight_sum <= 0.0
+        || !this_work_weight.is_finite()
+        || this_work_weight <= 0.0
+        || !raw_node_dims.is_finite()
+        || raw_node_dims <= 0.0
+    {
+        return None;
+    }
+    let resolved = resolve_per_node_time_budget(budget);
+    let cap_secs = if resolved.cap_is_explicit {
+        dim_scaled_cap_secs(resolved.cap_secs, true, raw_node_dims)
+    } else {
+        adaptive_per_node_cap_secs(remaining_secs)
+    };
+    let share = remaining_secs * (this_work_weight / remaining_work_weight_sum);
+    let share = cap_target_share_secs(
+        share,
+        remaining_secs,
+        this_work_weight,
+        remaining_work_weight_sum,
+        budget,
+    );
+    Some(share.min(cap_secs))
+}
+
 pub(crate) fn compute_weighted_per_node_budget_secs(
     remaining_secs: f64,
     remaining_work_weight_sum: f64,
@@ -722,6 +998,13 @@ pub(crate) fn compute_weighted_per_node_budget_secs(
         adaptive_per_node_cap_secs(remaining_secs)
     };
     let share = remaining_secs * (this_work_weight / remaining_work_weight_sum);
+    let share = cap_target_share_secs(
+        share,
+        remaining_secs,
+        this_work_weight,
+        remaining_work_weight_sum,
+        budget,
+    );
     let capped = share.min(cap_secs);
     (capped >= resolved.floor_secs).then_some(capped)
 }
@@ -1102,9 +1385,7 @@ fn walk_record_admission_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         walk_record_admission_enabled_from_disabled(
-            ny_levers::read(&ny_levers::decls::collection::NO_WALK_RECORD_ADMISSION)
-                .value
-                .as_bool(),
+            crate::preset_gates::no_walk_record_admission_enabled(),
         )
     })
 }
@@ -1608,24 +1889,66 @@ pub(super) fn record_patches_budget_fallback(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The skip log prints the UNFLOORED weighted share; this pins that it is the
+    /// number the floor test actually rejected, so the line can never again read
+    /// "4.2s < 2.0s floor".
+    #[test]
+    fn the_unfloored_share_is_the_value_the_floor_rejected() {
+        let budget = CrownIbpPerNodeTimeBudget::default();
+        let floor = resolve_per_node_time_budget(&budget).floor_secs;
+
+        // Ten equal-weight candidates sharing 4 s: each share is 0.4 s, under the
+        // floor, so the floored call declines and the unfloored call reports 0.4 --
+        // NOT the equal share of remaining/candidates the old log printed.
+        let remaining = 4.0;
+        let floored = compute_weighted_per_node_budget_secs(remaining, 10.0, 1.0, 64.0, &budget);
+        let unfloored =
+            weighted_per_node_budget_secs_unfloored(remaining, 10.0, 1.0, 64.0, &budget);
+        assert!(floored.is_none(), "0.4s share must fail the {floor}s floor");
+        let reported = unfloored.expect("unfloored share is always computable here");
+        assert!(
+            (reported - 0.4).abs() < 1e-9,
+            "expected the weighted share 0.4, got {reported}"
+        );
+        assert!(
+            reported < floor,
+            "a logged skip must report a value BELOW the floor, got {reported} vs {floor}"
+        );
+
+        // Above the floor the two agree exactly, so the log cannot drift from the
+        // decision in the accepted case either.
+        let above = 200.0;
+        let f = compute_weighted_per_node_budget_secs(above, 10.0, 1.0, 64.0, &budget)
+            .expect("20s share clears the floor");
+        let u = weighted_per_node_budget_secs_unfloored(above, 10.0, 1.0, 64.0, &budget)
+            .expect("same inputs");
+        assert!(
+            (f - u).abs() < 1e-9,
+            "floored {f} and unfloored {u} must agree"
+        );
+    }
     use super::super::target_backward::{objective_chunk_route_plan, ObjectiveChunkFixedWavePlan};
     use super::{
         admitted_weighted_budget_secs, compute_global_per_node_budget_secs,
         compute_stacked_backward_budget_secs, compute_weighted_per_node_budget_secs,
         count_remaining_budget_candidates, crown_chunk_aware_budget_from_raw,
         demanded_target_work_weight, dim_cap_scale_from_raw, effective_per_node_time_budget,
-        objective_fixed_wave_work_weight, prefix_cost_admission_enabled_from_raw,
-        resolve_patches_tightening_budget_from_raw, resolve_per_node_time_budget_from_raw,
-        sum_remaining_budget_weights, weighted_budget_cap_dims, CrownIbpPerNodeTimeBudget,
-        ObjectiveChunkSchedulingPlan, PrefixCostAdmission, PrefixCostAdmissionModel,
-        WeightedBudgetAdmission, ADAPTIVE_PER_NODE_CAP_FLOOR_SECS, MIN_PER_NODE_BUDGET_SECS,
-        PRESET_CAP_REFERENCE_DIMS,
+        objective_chunk_scheduling_plan, objective_fixed_wave_work_weight,
+        prefix_cost_admission_enabled_from_raw, resolve_patches_tightening_budget_from_raw,
+        resolve_per_node_time_budget_from_raw, sum_remaining_budget_weights,
+        weighted_budget_cap_dims, CrownIbpPerNodeTimeBudget, ObjectiveChunkSchedulingPlan,
+        PrefixCostAdmission, PrefixCostAdmissionModel, WeightedBudgetAdmission,
+        ADAPTIVE_PER_NODE_CAP_FLOOR_SECS, MIN_PER_NODE_BUDGET_SECS, PRESET_CAP_REFERENCE_DIMS,
     };
     use std::time::Duration;
 
     const DEFAULT_BUDGET: CrownIbpPerNodeTimeBudget = CrownIbpPerNodeTimeBudget {
         floor_secs: None,
         cap_secs: None,
+    prefix_cost_weighted: false,
+        max_target_share_frac: None,
     };
 
     /// #cgan-stacked-backward: the stacked pass receives the SUM of its
@@ -1849,11 +2172,13 @@ mod tests {
         let preset = CrownIbpPerNodeTimeBudget {
             floor_secs: Some(1.25),
             cap_secs: Some(150.0),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         };
         assert_eq!(
             resolve_per_node_time_budget_from_raw(&preset, Some("invalid"), Some("-1")),
-            resolve_per_node_time_budget_from_raw(&preset, None, None),
-            "invalid env text must resolve to the preset, not create a distinct policy"
+            resolve_per_node_time_budget_from_raw(&DEFAULT_BUDGET, None, None),
+            "a present rejected environment override is a governed kill switch: it must suppress the typed preset and restore the declaration/runtime defaults"
         );
     }
 
@@ -2095,6 +2420,8 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         };
         // A single remaining candidate with a long deadline now gets the full
         // preset cap instead of the 12 s constant.
@@ -2117,6 +2444,8 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: Some(1.0),
             cap_secs: None,
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         };
         // 6/4 = 1.5 s share clears a 1.0 s floor (would be skipped at 2.0 s).
         assert_eq!(
@@ -2132,6 +2461,8 @@ mod tests {
             let budget = CrownIbpPerNodeTimeBudget {
                 floor_secs: bad,
                 cap_secs: bad,
+            prefix_cost_weighted: false,
+                max_target_share_frac: None,
             };
             assert_eq!(
                 effective_per_node_time_budget(&budget),
@@ -2154,6 +2485,8 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         };
         // The 61,504-dim imgSz64 generator target: ratio 2.1355..^2 = 4.56;
         // 150 * 4.56 = 684 s clamps to the 600 s ceiling. With 765 s remaining
@@ -2174,7 +2507,7 @@ mod tests {
             10_000.0, 130_000.0, 123_008.0, 123_008.0, &budget,
         )
         .expect("share above floor");
-        assert_eq!(saturated, super::DIM_SCALED_CAP_CEILING_SECS);
+        assert_eq!(saturated, DIM_SCALED_CAP_CEILING_SECS);
 
         // The reference-width node itself keeps the flat preset cap (ratio 1).
         assert_eq!(
@@ -2192,6 +2525,8 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(12.0),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         };
 
         let wide =
@@ -2256,6 +2591,8 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(700.0),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         };
         assert_eq!(
             compute_weighted_per_node_budget_secs(10_000.0, 100_000.0, 61_504.0, 61_504.0, &budget,),
@@ -2273,6 +2610,19 @@ mod tests {
             );
         }
         assert!(crown_chunk_aware_budget_from_raw(Some("1")));
+    }
+
+    #[test]
+    fn production_m1_does_not_model_unreceipted_parallel_waves() {
+        let execution = objective_chunk_route_plan(9_320, true, true);
+        assert!(
+            objective_chunk_scheduling_plan(28_800, execution, true, false, false, true).is_none(),
+            "production must retain raw-row scheduling for adaptive sequential execution"
+        );
+        assert!(
+            objective_chunk_scheduling_plan(28_800, execution, true, false, true, true).is_some(),
+            "the fixed-wave model must remain covered only under explicit experimental opt-in"
+        );
     }
 
     #[test]
@@ -2315,6 +2665,8 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         };
         let scheduling_weight = 9_000.0;
         let raw_node_dims = 61_504.0;
@@ -2418,6 +2770,8 @@ mod tests {
         let budget = CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         };
         let raw_dims = 28_800.0;
         let work_weight = objective_fixed_wave_work_weight(28_800, 4) as f64;
@@ -2444,7 +2798,7 @@ mod tests {
         // `input_dim = 0` isolates the per-row term this case is about; the
         // fixed input-scratch term gets its own coverage in
         // `test_auto_objective_chunk_rows_fits_full_admission_charge`.
-        let rows = super::auto_objective_chunk_rows(61_504, 0, budget);
+        let rows = auto_objective_chunk_rows(61_504, 0, budget);
         assert!(rows >= 1);
         assert!(2 * 4 * rows * 61_504 <= budget, "chunk pair exceeds budget");
         assert!(
@@ -2460,7 +2814,7 @@ mod tests {
         // full identity pair is 8 * 28800^2 = 6,635,520,000 bytes (~6.6 GB);
         // the auto chunk scales the pair down to fit the budget.
         let budget = 2usize * 1024 * 1024 * 1024;
-        let rows = super::auto_objective_chunk_rows(28_800, 0, budget);
+        let rows = auto_objective_chunk_rows(28_800, 0, budget);
         // 9_319, not the historical 9_320: the row cost now also carries the
         // bias pair and the endpoint buffers admission charges (`8*dim + 24`
         // per row, not `8*dim`). One row narrower is the whole point — the old
@@ -2650,14 +3004,14 @@ mod tests {
     #[test]
     fn test_auto_objective_chunk_rows_clamps_to_dim_and_floor() {
         // Under-budget target: clamp to dim (equivalent to a single pass).
-        assert_eq!(super::auto_objective_chunk_rows(16, 0, usize::MAX >> 1), 16);
+        assert_eq!(auto_objective_chunk_rows(16, 0, usize::MAX >> 1), 16);
         // Tiny budget: floor at 1 row so the chunked loop always progresses.
-        assert_eq!(super::auto_objective_chunk_rows(1_000_000, 0, 1), 1);
+        assert_eq!(auto_objective_chunk_rows(1_000_000, 0, 1), 1);
         // Degenerate dim.
-        assert_eq!(super::auto_objective_chunk_rows(0, 0, 1024), 1);
+        assert_eq!(auto_objective_chunk_rows(0, 0, 1024), 1);
         // Input scratch alone eats the whole budget: still floor at 1 row
         // rather than returning 0 and stalling the chunk loop.
-        assert_eq!(super::auto_objective_chunk_rows(64, 1_000_000, 1024), 1);
+        assert_eq!(auto_objective_chunk_rows(64, 1_000_000, 1024), 1);
     }
 
     /// REGRESSION (#cgan-bn11-chunk): the chunk size must fit the FULL charge
@@ -2679,7 +3033,7 @@ mod tests {
             (61_504, 12_288, 2 * 1024 * 1024 * 1024),
             (4096, 3072, 8 * 1024 * 1024),
         ] {
-            let rows = super::auto_objective_chunk_rows(dim, input_dim, budget);
+            let rows = auto_objective_chunk_rows(dim, input_dim, budget);
             assert!(rows >= 1, "dim={dim}: chunk loop must always progress");
             // Exactly the terms LinearConcretizationAdmission::new accumulates.
             let coefficient_pair = 2 * F32 * rows * dim;
@@ -3294,5 +3648,230 @@ mod walk_value_record_tests {
                 "{raw:?}"
             );
         }
+    }
+}
+
+/// #target-cost-weight: the corrected COST MODEL and the per-target share cap.
+///
+/// These are scheduling controls only. Nothing here can change what a bound IS;
+/// the collector-level proof of that lives in `crown_tighten.rs`'s
+/// `target_cost_weight_tests`, which re-runs a real collection under a starved
+/// schedule and shows every published box is either bit-identical or the
+/// unchanged certified IBP fallback.
+#[cfg(test)]
+mod target_cost_weight_policy_tests {
+    use super::{
+        compute_weighted_per_node_budget_secs, dim_scaled_cap_secs, prefix_cost_multipliers,
+        prefix_cost_per_row, resolve_max_target_share_frac, weighted_budget_cap_dims,
+        CrownIbpPerNodeTimeBudget, PREFIX_COST_MULTIPLIER_MAX,
+    };
+
+    const DARK: CrownIbpPerNodeTimeBudget = CrownIbpPerNodeTimeBudget {
+        floor_secs: None,
+        cap_secs: None,
+        prefix_cost_weighted: false,
+        max_target_share_frac: None,
+    };
+
+    /// `collector_walk_macs` returns `2 · rows · Σ per_row`, so dividing the row
+    /// factor back out must recover the prefix cost EXACTLY — that identity is
+    /// the whole justification for reusing the admission estimator as a
+    /// scheduling weight, and an off-by-2 here would silently rescale every
+    /// multiplier.
+    #[test]
+    fn prefix_cost_per_row_inverts_the_macs_identity() {
+        // 3 rows through a prefix costing 500 MACs per row.
+        let macs: u128 = 2 * 3 * 500;
+        assert_eq!(prefix_cost_per_row(macs, 3), Some(500.0));
+        // Zero rows is not a walk; it must not divide by zero.
+        assert_eq!(prefix_cost_per_row(macs, 0), None);
+        // A zero-MAC estimate (no modelled weighted ancestor) is not a cost.
+        assert_eq!(prefix_cost_per_row(0, 3), None);
+    }
+
+    /// ALL-OR-NOTHING. One admitted candidate the MAC estimator cannot price
+    /// must abandon the whole correction, because an unpriced candidate would
+    /// otherwise be scheduled against a cost of "1.0" that has no relation to
+    /// its real walk — starving it for a reason unconnected to cost. This is
+    /// the guard that keeps the change fail-open to today's policy on every
+    /// graph containing an op the estimator does not model.
+    #[test]
+    fn prefix_cost_multipliers_decline_when_any_admitted_target_is_unpriced() {
+        let costs = [Some(10.0), None, Some(40.0)];
+        let all_admitted = [true, true, true];
+        assert_eq!(prefix_cost_multipliers(&costs, &all_admitted), None);
+
+        // The SAME unpriced entry is harmless when it is not a candidate:
+        // non-candidates carry weight 0.0 and never receive a share.
+        let middle_not_admitted = [true, false, true];
+        assert_eq!(
+            prefix_cost_multipliers(&costs, &middle_not_admitted),
+            Some(vec![1.0, 1.0, 4.0]),
+        );
+    }
+
+    /// Normalisation is by the MINIMUM admitted cost, so the cheapest-prefix
+    /// candidate keeps its historical row weight and every correction is a
+    /// pure relative inflation. Only ratios reach the allocator.
+    #[test]
+    fn prefix_cost_multipliers_normalise_to_the_cheapest_admitted_target() {
+        let costs = [Some(64.0), Some(1088.0), Some(2112.0)];
+        let admitted = [true, true, true];
+        let multipliers =
+            prefix_cost_multipliers(&costs, &admitted).expect("every target priced");
+        assert_eq!(multipliers, vec![1.0, 17.0, 33.0]);
+    }
+
+    /// A degenerate spread must not drive every other candidate's f64 share to
+    /// zero, and a non-finite or non-positive cost is not a cost at all.
+    #[test]
+    fn prefix_cost_multipliers_clamp_and_reject_degenerate_costs() {
+        let costs = [Some(1.0), Some(1.0e12)];
+        let admitted = [true, true];
+        let multipliers = prefix_cost_multipliers(&costs, &admitted).expect("priced");
+        assert_eq!(multipliers[1], PREFIX_COST_MULTIPLIER_MAX);
+
+        assert_eq!(
+            prefix_cost_multipliers(&[Some(f64::NAN), Some(1.0)], &admitted),
+            None
+        );
+        assert_eq!(
+            prefix_cost_multipliers(&[Some(-1.0), Some(1.0)], &admitted),
+            None
+        );
+        // Nothing admitted: there is no denominator, so there is no correction.
+        assert_eq!(
+            prefix_cost_multipliers(&[Some(1.0), Some(2.0)], &[false, false]),
+            None
+        );
+        // Mismatched lengths are a wiring bug, not a policy: decline.
+        assert_eq!(prefix_cost_multipliers(&[Some(1.0)], &admitted), None);
+    }
+
+    /// Only a fraction strictly inside `(0, 1)` is a cap. `>= 1.0` can never
+    /// bind and `<= 0.0` would refuse every candidate, so both resolve to "no
+    /// cap" rather than to a policy nobody requested.
+    #[test]
+    fn max_target_share_frac_admits_only_a_binding_fraction() {
+        let armed = CrownIbpPerNodeTimeBudget {
+            max_target_share_frac: Some(0.25),
+            ..DARK
+        };
+        assert_eq!(resolve_max_target_share_frac(&armed), Some(0.25));
+        for bad in [0.0, -0.1, 1.0, 2.0, f64::NAN, f64::INFINITY] {
+            let budget = CrownIbpPerNodeTimeBudget {
+                max_target_share_frac: Some(bad),
+                ..DARK
+            };
+            assert_eq!(
+                resolve_max_target_share_frac(&budget),
+                None,
+                "{bad} is not a binding share cap"
+            );
+        }
+        assert_eq!(resolve_max_target_share_frac(&DARK), None);
+    }
+
+    /// The cap binds a candidate that shares the window, and is DELIBERATELY
+    /// skipped for the last claimant — capping the only remaining candidate
+    /// would strand the rest of the collection window for nobody.
+    #[test]
+    fn share_cap_binds_a_sharing_candidate_and_spares_the_last_claimant() {
+        // An EXPLICIT, deliberately unreachable per-node cap. Without one the
+        // ADAPTIVE cap (25% of the remaining window, clamped 12..=600 s) is
+        // itself 100 s here and swallows the whole experiment — the first
+        // version of this test measured that instead of the share cap and read
+        // as a failure of the lever. `dim_scaled_cap_secs` leaves 1e4 untouched
+        // at these widths whether or not the dim-scale gate is on, so the arms
+        // differ ONLY in `max_target_share_frac`.
+        let base = CrownIbpPerNodeTimeBudget {
+            cap_secs: Some(10_000.0),
+            ..DARK
+        };
+        let capped = CrownIbpPerNodeTimeBudget {
+            max_target_share_frac: Some(0.25),
+            ..base
+        };
+        // 400 s window, this target holds 90% of the remaining weight.
+        let uncapped_share = compute_weighted_per_node_budget_secs(400.0, 100.0, 90.0, 90.0, &base)
+            .expect("dark share");
+        assert!(
+            (uncapped_share - 360.0).abs() < 1e-9,
+            "dark policy hands one node 90% of the window: {uncapped_share}"
+        );
+        let capped_share =
+            compute_weighted_per_node_budget_secs(400.0, 100.0, 90.0, 90.0, &capped)
+                .expect("capped share");
+        assert!(
+            (capped_share - 100.0).abs() < 1e-9,
+            "the cap must clamp it to 25% of the window: {capped_share}"
+        );
+
+        // Sole remaining claimant (weight == remaining sum): NOT capped.
+        let last = compute_weighted_per_node_budget_secs(400.0, 90.0, 90.0, 90.0, &capped)
+            .expect("last claimant share");
+        assert!(
+            (last - 400.0).abs() < 1e-9,
+            "the last claimant keeps the whole window, uncapped: {last}"
+        );
+    }
+
+    /// #target-cost-weight relies on this: an inflated scheduling weight must
+    /// never be re-read as a node WIDTH, because `dim_scaled_cap_secs` is
+    /// QUADRATIC in that argument. A 33x multiplier read as width would inflate
+    /// the per-node cap ~1089x.
+    #[test]
+    fn cap_dims_separate_from_an_inflated_weight() {
+        assert_eq!(weighted_budget_cap_dims(33_000.0, 1_000.0, true), 1_000.0);
+        // Dark: the parent's legacy behaviour, weight doubles as width.
+        assert_eq!(weighted_budget_cap_dims(33_000.0, 1_000.0, false), 33_000.0);
+    }
+
+    /// The consequence, priced. `dim_scaled_cap_secs` scales QUADRATICALLY in
+    /// its width argument, so feeding it a 33x-inflated scheduling weight
+    /// instead of the node's real width would demand a ~1089x cap. The ONLY
+    /// thing standing between the mis-wiring and an unbounded per-node cap is
+    /// `DIM_SCALED_CAP_CEILING_SECS` — which still lets one node take 600 s of
+    /// a 405 s collection window instead of its 150 s preset cap. That is why
+    /// the crown_tighten call site passes `chunk_aware || prefix_cost_weighted`
+    /// and not `chunk_aware` alone.
+    #[test]
+    fn an_inflated_weight_read_as_width_would_explode_the_dim_scaled_cap() {
+        // The environment lock only, with no `"NY_..."` literal: adding one
+        // would move `source_frontier.rs`'s exact literal manifest, which this
+        // change has no business touching. `NY_DIM_CAP_SCALE=0` in the ambient
+        // environment would make this test fail LOUDLY rather than pass
+        // vacuously, which is the acceptable direction.
+        let _env_lock = ny_test_utils::env::lock_env();
+
+        // A cgan-scale node: 28,800 real rows, repriced 33x by prefix cost.
+        let real_width = 28_800.0_f64;
+        let inflated_weight = real_width * 33.0;
+        let preset_cap = 150.0;
+
+        let correct = dim_scaled_cap_secs(
+            preset_cap,
+            true,
+            weighted_budget_cap_dims(inflated_weight, real_width, true),
+        );
+        let wrong = dim_scaled_cap_secs(
+            preset_cap,
+            true,
+            weighted_budget_cap_dims(inflated_weight, real_width, false),
+        );
+        assert!(
+            (correct - preset_cap).abs() < 1e-9,
+            "at the reference width the preset cap is unscaled: {correct}"
+        );
+        assert!(
+            (wrong - super::DIM_SCALED_CAP_CEILING_SECS).abs() < 1e-9,
+            "the mis-wired argument demands 1089x the preset cap and is only \
+             stopped by the ceiling: got {wrong}"
+        );
+        assert!(
+            wrong > correct * 3.0,
+            "even clamped, the mis-wiring quadruples one node's cap \
+             ({wrong} vs {correct})"
+        );
     }
 }

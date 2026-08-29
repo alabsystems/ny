@@ -2,55 +2,70 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-//! SoA (structure-of-arrays) multi-domain GEMM batching for linear CROWN
+//! SoA (structure-of-arrays) multi-domain batching for the linear CROWN
 //! backward — the Linear arm of the #lsnc-batched-bwd input-split fast lane
 //! (design-doc slice S3, `docs/LSNC_BATCH_TENSOR_DESIGN.md`).
 //!
-//! # Relationship to [`propagate_linear_batched_with_engine`]
+//! # Relationship to the reference Linear arm: DELEGATION, not transcription
 //!
-//! [`super::crown_batched_multi_domain::propagate_linear_batched_with_engine`]
-//! is the scalar reference: it consumes per-domain `LinearBounds`, issues ONE
-//! stacked f32 engine GEMM per position over the active domains, then runs the
-//! per-domain certified-error machinery (`aw_f64_with_abssum` S-recompute,
-//! incoming-error propagation, f64 bias accumulation, directed finalize,
-//! non-finite row degrade) SERIALLY on the driver thread.
+//! The reference batched backward's Linear arm
+//! (`backward_core::dispatch_node_backward`) calls
+//! [`LinearLayer::propagate_linear_pollable_cpu`] once per active domain — the
+//! certified f64 `A·W` contraction, published with a `γ_n^{f64}·S`
+//! coefficient-error certificate.
 //!
-//! This SoA twin is a faithful transcription that
-//! 1. reads the pending coefficient planes directly from contiguous
-//!    `[B, R, W]` batch tensors (no per-domain `LinearBounds` allocation),
-//! 2. issues the IDENTICAL stacked engine GEMM calls (same stacked row
-//!    contents, same `m/k/n`, same engine → identical f32 bits), and
-//! 3. runs the per-domain certified-error block in COARSE rayon chunks over
-//!    the domain axis. Every per-domain step is domain-independent and calls
-//!    the SAME shared leaves (`aw_f64_with_abssum`, `mat_mul`,
-//!    `accumulate_bias_f64`, `finalize_bias_directed`, `is_crown_coeff_safe`,
-//!    `next_up_f32`) with the same inputs in the same per-domain order, so the
-//!    result is BIT-IDENTICAL per domain to the reference.
+//! This lane CALLS THAT SAME FUNCTION, per domain, in the same domain order.
+//! It owns only the SoA plumbing: reading each domain's pending coefficient
+//! block out of the contiguous `[B, R, W]` batch tensors, dispatching the
+//! shared kernel over coarse rayon chunks on the domain axis, and writing the
+//! results back into flat output planes. **No arithmetic lives in this file.**
+//! Bit-identity with the reference is therefore true by construction rather
+//! than by review.
 //!
-//! A [`NestedFaerParGuard`] is held inside each worker so the faer f64
-//! products (`aw_f64_with_abssum`, the `err_in·|W|` `mat_mul`) run under the
-//! SAME faer parallelism policy as the reference's driver-thread calls
-//! (`current_par()` would otherwise force `Par::Seq` inside a rayon worker).
-//! At the lsnc-lane matrix sizes faer never splits these products, so the
-//! blocking — and hence the f64 bits — is identical either way; the guard
-//! makes the equality hold by construction for larger shapes too. Parity is
-//! pinned by `test_linear_backward_soa_matches_reference` below and the
-//! full-pipeline gate test in `tests_soundness.rs`.
+//! # Why (the defect this shape exists to prevent)
+//!
+//! This module used to be a hand-written *transcription* of
+//! [`super::crown_batched_multi_domain::propagate_linear_batched_with_engine`]:
+//! a stacked f32 engine GEMM published with a `γ_n^{f32}·S` certificate. When
+//! `backward_core.rs`'s Linear arm moved onto the certified f64 contraction
+//! (removing a deadline-presence arithmetic split), the transcription did not
+//! move with it, and `propagate_linear_batched_with_engine` was left with zero
+//! production callers — this lane became a faithful copy of nothing.
+//!
+//! The observable consequence was that the fast lane published bounds
+//! differing from its own reference by up to 8 ULP on
+//! `test_input_split_batched_bwd_full_pipeline_bit_identical_lsnc_s3`. The
+//! divergence was always in the LOOSER direction (`γ_n^{f32}` is ~2^29 wider
+//! than `γ_n^{f64}`, and that term dominates the point-coefficient wobble for
+//! every contraction width `n >= 2`), so no proof was ever unsound — but the
+//! lane's "strictly a performance transform, never a bound change" contract
+//! was false, and the certificate it published was ~2^29 looser than the one
+//! the reference could justify.
+//!
+//! A copy can drift; a call cannot. Do NOT reintroduce a private arithmetic
+//! path here — if the Linear stacking is ever worth restoring for throughput,
+//! it belongs in the shared kernel where BOTH lanes get it.
+//!
+//! A [`NestedFaerParGuard`] is held inside each worker so the shared kernel's
+//! faer f64 products run under the SAME faer parallelism policy as the
+//! reference's driver-thread calls (`current_par()` would otherwise force
+//! `Par::Seq` inside a rayon worker). The pollable-CPU contraction is
+//! documented row-count- and par-policy-independent (see
+//! `crown_single::aw_f64_with_abssum_pollable_cpu_with_chunk_macs`), so the
+//! guard makes the equality hold by construction rather than by matrix size.
+//!
+//! Parity is pinned by `test_linear_backward_soa_matches_reference` below
+//! (against the very same per-domain reference call) and by the full-pipeline
+//! gate test in `tests_soundness.rs`.
 
-use faer::Mat;
 use ndarray::{Array1, Array2};
-use ny_core::{is_crown_coeff_safe, GemmEngine, NyError, Result};
+use ny_core::{GemmEngine, NyError, Result};
 use rayon::prelude::*;
-use tracing::debug;
 
-use super::bias::{
-    accumulate_bias_f64, add_coeff_err_bias_product_up, add_f64_down, add_f64_up, f32_to_f64_exact,
-    finalize_bias_directed, publish_error_up_normal, BiasBlockParams,
-};
-use super::crown_single::{aw_f64_with_abssum, gamma_n_f32, incoming_error_product};
 use super::layout::resolve_backward_layout;
 use super::LinearLayer;
 use crate::faer_parallelism::NestedFaerParGuard;
+use crate::LinearBounds;
 
 /// Borrowed SoA view of the per-node pending linear bounds for a batch of
 /// domains. Planes are domain-major row-major: domain `d`'s coefficient block
@@ -94,9 +109,20 @@ pub(crate) struct SoaLinearBackwardOutput {
     pub upper_a_err: Vec<f32>,
 }
 
-/// SoA twin of [`propagate_linear_batched_with_engine`] — see module docs for
-/// the bit-parity argument. `min_chunk` is the minimum number of domains per
-/// rayon task (coarse chunking; NO per-domain fan-out).
+/// The Linear arm of the #lsnc-batched-bwd SoA fast lane.
+///
+/// Delegates EVERY domain to the shared reference kernel
+/// [`LinearLayer::propagate_linear_pollable_cpu`] — the same call the
+/// reference loop (`backward_core::dispatch_node_backward`) makes — so the
+/// published coefficients, biases and certified-error planes are bit-identical
+/// to the reference by construction. See the module docs for why this is a
+/// call and not a copy.
+///
+/// `min_chunk` is the minimum number of domains per rayon task (coarse
+/// chunking; NO per-domain fan-out). The fast lane only ever runs without a
+/// deadline (`batched_bwd::try_backward_soa` declines on any finite one), so
+/// `None` is passed through as the kernel's deadline — matching the reference,
+/// which is handed the same `None`.
 pub(crate) fn propagate_linear_batched_soa(
     layer: &LinearLayer,
     input: &SoaLinearBackwardInput<'_>,
@@ -112,339 +138,138 @@ pub(crate) fn propagate_linear_batched_soa(
     debug_assert!(input.lower_a_err.is_some() || input.lower_err_present.iter().all(|&p| !p));
     debug_assert!(input.upper_a_err.is_some() || input.upper_err_present.iter().all(|&p| !p));
 
-    let active_domains: Vec<usize> = (0..n_domains).filter(|&d| input.active[d]).collect();
-
     let weight_rows = layer.weight.nrows();
     let in_features = layer.weight.ncols();
     let layout = resolve_backward_layout(num_outputs, bounds_inputs, weight_rows, in_features)?;
-    let weight_slice = layer
-        .weight
-        .as_slice()
-        .ok_or_else(|| NyError::InvalidSpec("Linear weight is not contiguous".to_string()))?;
-    let n_active = active_domains.len();
-    let total_stacked_rows = n_active * num_outputs;
     let out_cols = layout.total_in_features;
-
-    let mut out_lower_a = vec![0.0f32; n_domains * num_outputs * out_cols];
-    let mut out_upper_a = vec![0.0f32; n_domains * num_outputs * out_cols];
-    let mut out_lower_b = vec![0.0f32; n_domains * num_outputs];
-    let mut out_upper_b = vec![0.0f32; n_domains * num_outputs];
-    let mut out_lower_err = vec![0.0f32; n_domains * num_outputs * out_cols];
-    let mut out_upper_err = vec![0.0f32; n_domains * num_outputs * out_cols];
-    if n_active == 0 {
-        return Ok(SoaLinearBackwardOutput {
-            rows: num_outputs,
-            cols: out_cols,
-            active: input.active.to_vec(),
-            lower_a: out_lower_a,
-            upper_a: out_upper_a,
-            lower_b: out_lower_b,
-            upper_b: out_upper_b,
-            lower_a_err: out_lower_err,
-            upper_a_err: out_upper_err,
-        });
-    }
-
-    // Certified-error machinery (#vnncomp-aw-soundness) — identical to the
-    // reference: contraction width = layout.out_features, f32 growth factor.
-    let gamma = gamma_n_f32(layout.out_features);
-    let weight_faer = layer.weight_faer();
-    let w_abs = Mat::<f32>::from_fn(layout.out_features, in_features, |k, j| {
-        weight_faer[(k, j)].abs()
-    });
-
-    // Phase 1 (driver thread): the stacked f32 engine GEMMs, one pair per
-    // position — IDENTICAL stacked contents and call shapes to the reference
-    // (active domains in domain-index order, `num_outputs` rows each).
-    let mut gemm_lower: Vec<Vec<f32>> = Vec::with_capacity(layout.num_positions);
-    let mut gemm_upper: Vec<Vec<f32>> = Vec::with_capacity(layout.num_positions);
-    for pos in 0..layout.num_positions {
-        let in_start = pos * layout.out_features;
-        let mut stacked_lower = vec![0.0f32; total_stacked_rows * layout.out_features];
-        let mut stacked_upper = vec![0.0f32; total_stacked_rows * layout.out_features];
-        for (k, &d) in active_domains.iter().enumerate() {
-            let row_offset = k * num_outputs;
-            let base = d * num_outputs * bounds_inputs;
-            for i in 0..num_outputs {
-                let src = base + i * bounds_inputs + in_start;
-                let dst = (row_offset + i) * layout.out_features;
-                stacked_lower[dst..dst + layout.out_features]
-                    .copy_from_slice(&input.lower_a[src..src + layout.out_features]);
-                stacked_upper[dst..dst + layout.out_features]
-                    .copy_from_slice(&input.upper_a[src..src + layout.out_features]);
-            }
-        }
-        gemm_lower.push(engine.gemm_f32(
-            total_stacked_rows,
-            layout.out_features,
-            in_features,
-            &stacked_lower,
-            weight_slice,
-        )?);
-        gemm_upper.push(engine.gemm_f32(
-            total_stacked_rows,
-            layout.out_features,
-            in_features,
-            &stacked_upper,
-            weight_slice,
-        )?);
-    }
-
-    // Phase 2: per-domain certified-error block, coarse-chunked over domains.
-    // Safe disjoint parallelism: the output planes are chunked per domain and
-    // zipped, so each worker owns exactly its domain's regions.
     let coeff_len = num_outputs * out_cols;
-    let in_coeff_len = num_outputs * bounds_inputs;
 
-    // Stacked-row index of each domain in the active-only GEMM (None =
-    // inactive), matching the reference's active-list enumeration order.
-    let k_of: Vec<Option<usize>> = {
-        let mut k_of = vec![None; n_domains];
-        for (k, &d) in active_domains.iter().enumerate() {
-            k_of[d] = Some(k);
-        }
-        k_of
-    };
-
-    out_lower_a
-        .par_chunks_mut(coeff_len)
-        .zip(out_upper_a.par_chunks_mut(coeff_len))
-        .zip(out_lower_b.par_chunks_mut(num_outputs))
-        .zip(out_upper_b.par_chunks_mut(num_outputs))
-        .zip(out_lower_err.par_chunks_mut(coeff_len))
-        .zip(out_upper_err.par_chunks_mut(coeff_len))
-        .enumerate()
-        .with_min_len(min_chunk.max(1))
-        .for_each(
-            |(
-                d,
-                (
-                    ((((res_lower_a, res_upper_a), res_lower_b), res_upper_b), res_lower_err),
-                    res_upper_err,
-                ),
-            )| {
-                let Some(k) = k_of[d] else { return };
-                // Match the reference's faer parallelism policy (driver thread):
-                // without this, `current_par()` inside a rayon worker forces
-                // Par::Seq — same bits at lsnc sizes, but the guard makes the
-                // policy equal by construction. See module docs.
-                let _faer_par = NestedFaerParGuard::new();
-
-                let in_base = d * in_coeff_len;
-                let in_lower_a = &input.lower_a[in_base..in_base + in_coeff_len];
-                let in_upper_a = &input.upper_a[in_base..in_base + in_coeff_len];
-                let in_lower_err = input.lower_err_present[d].then(|| {
-                    &input.lower_a_err.expect("flagged err plane")[in_base..in_base + in_coeff_len]
-                });
-                let in_upper_err = input.upper_err_present[d].then(|| {
-                    &input.upper_a_err.expect("flagged err plane")[in_base..in_base + in_coeff_len]
-                });
-
-                let row_offset = k * num_outputs;
-                let mut bias_lower_acc = vec![0.0f64; num_outputs];
-                let mut bias_upper_acc = vec![0.0f64; num_outputs];
-                let mut lower_nonfinite = vec![false; num_outputs];
-                let mut upper_nonfinite = vec![false; num_outputs];
-
-                for pos in 0..layout.num_positions {
-                    let in_start = pos * layout.out_features;
-                    let out_start = pos * in_features;
-
-                    // SOUND certified-error base (#vnncomp-aw-soundness):
-                    // re-accumulate S = |A|·|W| in f64 for THIS domain/position
-                    // block — identical to the reference (same Mat contents, same
-                    // shared `aw_f64_with_abssum`).
-                    let a_lower_faer =
-                        Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, j| {
-                            in_lower_a[i * bounds_inputs + in_start + j]
-                        });
-                    let a_upper_faer =
-                        Mat::<f32>::from_fn(num_outputs, layout.out_features, |i, j| {
-                            in_upper_a[i * bounds_inputs + in_start + j]
-                        });
-                    let (lower_reference, lower_s) = aw_f64_with_abssum(&a_lower_faer, weight_faer);
-                    let (upper_reference, upper_s) = aw_f64_with_abssum(&a_upper_faer, weight_faer);
-
-                    // Propagated incoming error: P[i,j] = Σ_k err_in[i,in_start+k]·|W[k,j]|.
-                    let propagate_error = |error: &[f32]| {
-                        let block =
-                            Array2::from_shape_fn((num_outputs, layout.out_features), |(i, kk)| {
-                                error[i * bounds_inputs + in_start + kk]
-                            });
-                        match incoming_error_product(&block, 0, layout.out_features, &w_abs, None) {
-                            Ok(product) => product,
-                            Err(_) => Array2::from_elem((num_outputs, in_features), f32::INFINITY),
-                        }
-                    };
-                    let prop_lower = in_lower_err.map(propagate_error);
-                    let prop_upper = in_upper_err.map(propagate_error);
-
-                    let g_lower = &gemm_lower[pos];
-                    let g_upper = &gemm_upper[pos];
-                    for i in 0..num_outputs {
-                        let src_row = row_offset + i;
-                        for j in 0..in_features {
-                            let lower = g_lower[src_row * in_features + j];
-                            let upper = g_upper[src_row * in_features + j];
-                            let lower_gap =
-                                (f32_to_f64_exact(lower) - lower_reference[[i, j]]).abs();
-                            let upper_gap =
-                                (f32_to_f64_exact(upper) - upper_reference[[i, j]]).abs();
-                            let l_prop = prop_lower
-                                .as_ref()
-                                .map_or(0.0, |p| f32_to_f64_exact(p[(i, j)]));
-                            let u_prop = prop_upper
-                                .as_ref()
-                                .map_or(0.0, |p| f32_to_f64_exact(p[(i, j)]));
-                            let l_err = publish_error_up_normal(
-                                lower_gap + gamma * lower_s[[i, j]] + l_prop,
-                            );
-                            let u_err = publish_error_up_normal(
-                                upper_gap + gamma * upper_s[[i, j]] + u_prop,
-                            );
-                            // A stored coefficient is sound iff BOTH the
-                            // coefficient and its certified error stay finite/in-
-                            // range; otherwise the row degrades to ±inf bias.
-                            if is_crown_coeff_safe(lower) && l_err.is_finite() {
-                                res_lower_a[i * out_cols + out_start + j] = lower;
-                                res_lower_err[i * out_cols + out_start + j] = l_err;
-                            } else {
-                                lower_nonfinite[i] = true;
-                            }
-                            if is_crown_coeff_safe(upper) && u_err.is_finite() {
-                                res_upper_a[i * out_cols + out_start + j] = upper;
-                                res_upper_err[i * out_cols + out_start + j] = u_err;
-                            } else {
-                                upper_nonfinite[i] = true;
-                            }
-                        }
-                    }
-
-                    if let Some(ref bias) = layer.bias {
-                        let block = BiasBlockParams {
-                            num_outputs,
-                            out_features: layout.out_features,
-                            col_offset: in_start,
-                        };
-                        accumulate_bias_f64(
-                            &mut (bias_lower_acc.as_mut_slice(), bias_upper_acc.as_mut_slice()),
-                            |i, j| in_lower_a[i * bounds_inputs + j],
-                            |i, j| in_upper_a[i * bounds_inputs + j],
-                            bias,
-                            &block,
-                        );
-                    }
-                }
-
-                // Fold the propagated incoming error into the BIAS
-                // (#vnncomp-aw-soundness): Σ_j err_in[i,j]·|bias[j]|, folded
-                // OUTWARD in f64 BEFORE the directed cast — identical to the
-                // reference's post-position loop.
-                if let Some(ref bias) = layer.bias {
-                    if let Some(le) = in_lower_err {
-                        for i in 0..num_outputs {
-                            let mut e = 0.0f64;
-                            for j in 0..bias.len() {
-                                e = add_coeff_err_bias_product_up(
-                                    e,
-                                    le[i * bounds_inputs + j],
-                                    bias[j],
-                                );
-                            }
-                            bias_lower_acc[i] = add_f64_down(bias_lower_acc[i], -e);
-                        }
-                    }
-                    if let Some(ue) = in_upper_err {
-                        for i in 0..num_outputs {
-                            let mut e = 0.0f64;
-                            for j in 0..bias.len() {
-                                e = add_coeff_err_bias_product_up(
-                                    e,
-                                    ue[i * bounds_inputs + j],
-                                    bias[j],
-                                );
-                            }
-                            bias_upper_acc[i] = add_f64_up(bias_upper_acc[i], e);
-                        }
-                    }
-                }
-
-                let bias_base = d * num_outputs;
-                if layer.bias.is_some() {
-                    let lower_acc = Array1::from(bias_lower_acc);
-                    let upper_acc = Array1::from(bias_upper_acc);
-                    let old_lower_b = Array1::from_iter(
-                        input.lower_b[bias_base..bias_base + num_outputs]
-                            .iter()
-                            .copied(),
-                    );
-                    let old_upper_b = Array1::from_iter(
-                        input.upper_b[bias_base..bias_base + num_outputs]
-                            .iter()
-                            .copied(),
-                    );
-                    let (lb, ub) =
-                        finalize_bias_directed(&lower_acc, &upper_acc, &old_lower_b, &old_upper_b);
-                    for i in 0..num_outputs {
-                        res_lower_b[i] = lb[i];
-                        res_upper_b[i] = ub[i];
-                    }
-                } else {
-                    res_lower_b.copy_from_slice(&input.lower_b[bias_base..bias_base + num_outputs]);
-                    res_upper_b.copy_from_slice(&input.upper_b[bias_base..bias_base + num_outputs]);
-                }
-
-                // Non-finite row degrade: zero coefficients AND their certified
-                // error (no double-count), ±inf bias — identical to the reference.
-                let lower_affected = lower_nonfinite.iter().filter(|&&row| row).count();
-                let upper_affected = upper_nonfinite.iter().filter(|&&row| row).count();
-                if lower_affected > 0 || upper_affected > 0 {
-                    debug!(
-                    "Linear CROWN backward (SoA multi-domain GEMM, domain {}): overflow/magnitude \
-                     in {}/{} lower rows, {}/{} upper rows — falling back to ±inf bias (#1932)",
-                    d, lower_affected, num_outputs, upper_affected, num_outputs
-                );
-                    for i in 0..num_outputs {
-                        if lower_nonfinite[i] {
-                            for j in 0..out_cols {
-                                res_lower_a[i * out_cols + j] = 0.0;
-                                res_lower_err[i * out_cols + j] = 0.0;
-                            }
-                            res_lower_b[i] = f32::NEG_INFINITY;
-                        }
-                        if upper_nonfinite[i] {
-                            for j in 0..out_cols {
-                                res_upper_a[i * out_cols + j] = 0.0;
-                                res_upper_err[i * out_cols + j] = 0.0;
-                            }
-                            res_upper_b[i] = f32::INFINITY;
-                        }
-                    }
-                }
-            },
-        );
-
-    Ok(SoaLinearBackwardOutput {
+    let mut out = SoaLinearBackwardOutput {
         rows: num_outputs,
         cols: out_cols,
         active: input.active.to_vec(),
-        lower_a: out_lower_a,
-        upper_a: out_upper_a,
-        lower_b: out_lower_b,
-        upper_b: out_upper_b,
-        lower_a_err: out_lower_err,
-        upper_a_err: out_upper_err,
+        lower_a: vec![0.0f32; n_domains * coeff_len],
+        upper_a: vec![0.0f32; n_domains * coeff_len],
+        lower_b: vec![0.0f32; n_domains * num_outputs],
+        upper_b: vec![0.0f32; n_domains * num_outputs],
+        lower_a_err: vec![0.0f32; n_domains * coeff_len],
+        upper_a_err: vec![0.0f32; n_domains * coeff_len],
+    };
+    if !input.active.iter().any(|&active| active) {
+        return Ok(out);
+    }
+
+    // Phase 1 — run the SHARED per-domain reference kernel, coarse-chunked over
+    // the domain axis. Domains are independent (each reads only its own pending
+    // block and produces only its own result), so chunking changes scheduling
+    // and nothing else.
+    let per_domain: Vec<Option<Result<LinearBounds>>> = (0..n_domains)
+        .into_par_iter()
+        .with_min_len(min_chunk.max(1))
+        .map(|d| {
+            if !input.active[d] {
+                return None;
+            }
+            // Match the reference's faer parallelism policy (driver thread).
+            let _faer_par = NestedFaerParGuard::new();
+            Some(
+                domain_pending_bounds(input, d, num_outputs, bounds_inputs).and_then(|bounds| {
+                    layer
+                        .propagate_linear_pollable_cpu(&bounds, Some(engine), None)
+                        .map(std::borrow::Cow::into_owned)
+                }),
+            )
+        })
+        .collect();
+
+    // Phase 2 — scatter into the flat output planes (pure copy, no arithmetic).
+    for (d, slot) in per_domain.into_iter().enumerate() {
+        let Some(result) = slot else { continue };
+        let bounds = result?;
+        if bounds.lower_a().dim() != (num_outputs, out_cols) {
+            return Err(NyError::ShapeMismatch {
+                expected: vec![num_outputs, out_cols],
+                got: bounds.lower_a().shape().to_vec(),
+            });
+        }
+        let coeff = d * coeff_len..(d + 1) * coeff_len;
+        let bias = d * num_outputs..(d + 1) * num_outputs;
+        copy_from(&mut out.lower_a[coeff.clone()], bounds.lower_a().iter());
+        copy_from(&mut out.upper_a[coeff.clone()], bounds.upper_a().iter());
+        copy_from(&mut out.lower_b[bias.clone()], bounds.lower_b().iter());
+        copy_from(&mut out.upper_b[bias], bounds.upper_b().iter());
+        // `None` on a certified-error plane is the EXACT marker (error 0), which
+        // is exactly what the freshly zeroed output plane already holds, so the
+        // absent case needs no write. `BatchSlot::from_linear_out` records
+        // "present" for every active domain, matching the reference Linear arm,
+        // which attaches error unconditionally (`propagates_coeff_err`, I-D5).
+        if let Some(err) = bounds.lower_a_err() {
+            copy_from(&mut out.lower_a_err[coeff.clone()], err.iter());
+        }
+        if let Some(err) = bounds.upper_a_err() {
+            copy_from(&mut out.upper_a_err[coeff], err.iter());
+        }
+    }
+
+    Ok(out)
+}
+
+fn copy_from<'a>(dst: &mut [f32], src: impl Iterator<Item = &'a f32>) {
+    for (slot, &value) in dst.iter_mut().zip(src) {
+        *slot = value;
+    }
+}
+
+/// Materialize domain `d`'s pending [`LinearBounds`] from the SoA planes.
+///
+/// Struct-literal construction (not `LinearBounds::new`) because the fast lane
+/// must hand the shared kernel EXACTLY what the reference loop hands it: the
+/// reference reads these objects straight out of `IndexedPendingLinearBounds`
+/// with no revalidation, and `new`'s NaN/Inf rejection would turn a row that
+/// the kernel degrades in place (zeroed coefficients + ±inf bias, #1932/#2681)
+/// into a hard error — a behaviour difference, i.e. the very class of drift
+/// this module was rebuilt to make impossible.
+fn domain_pending_bounds(
+    input: &SoaLinearBackwardInput<'_>,
+    d: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<LinearBounds> {
+    let rc = rows * cols;
+    let base = d * rc;
+    let bias_base = d * rows;
+    let coeff = |plane: &[f32]| -> Result<Array2<f32>> {
+        Array2::from_shape_vec((rows, cols), plane[base..base + rc].to_vec()).map_err(|err| {
+            NyError::InvalidSpec(format!("SoA Linear pending block for domain {d}: {err}"))
+        })
+    };
+    let bias = |plane: &[f32]| Array1::from(plane[bias_base..bias_base + rows].to_vec());
+    let err = |plane: Option<&[f32]>, present: bool| -> Result<Option<Array2<f32>>> {
+        if !present {
+            return Ok(None);
+        }
+        let plane = plane.ok_or_else(|| {
+            NyError::InvalidSpec(format!(
+                "SoA Linear certified-error plane flagged present but absent (domain {d})"
+            ))
+        })?;
+        coeff(plane).map(Some)
+    };
+    Ok(LinearBounds {
+        lower_a: coeff(input.lower_a)?,
+        lower_b: bias(input.lower_b),
+        upper_a: coeff(input.upper_a)?,
+        upper_b: bias(input.upper_b),
+        lower_a_err: err(input.lower_a_err, input.lower_err_present[d])?,
+        upper_a_err: err(input.upper_a_err, input.upper_err_present[d])?,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use ndarray::Array2;
-
-    use super::super::crown_batched_multi_domain::propagate_linear_batched_with_engine;
-    use super::*;
-    use crate::LinearBounds;
     use ny_core::NaiveCpuGemmEngine;
+
+    use super::*;
 
     /// Deterministic LCG f32 stream with occasional zeros / huge / tiny values.
     fn lcg_stream(seed: u64) -> impl FnMut() -> f32 {
@@ -464,10 +289,23 @@ mod tests {
     }
 
     /// The SoA Linear backward must be BIT-IDENTICAL (coefficients, biases,
-    /// AND certified-error matrices) to the per-domain reference
-    /// `propagate_linear_batched_with_engine` across: bias / no-bias layers,
-    /// err-present / err-absent domains, partial active masks, and huge
-    /// coefficients driving the non-finite row degrade. #lsnc-batched-bwd.
+    /// AND certified-error matrices) to THE REFERENCE THE FAST LANE ACTUALLY
+    /// MIRRORS — `LinearLayer::propagate_linear_pollable_cpu`, the call
+    /// `backward_core::dispatch_node_backward`'s Linear arm makes — across:
+    /// bias / no-bias layers, err-present / err-absent domains, partial active
+    /// masks, and huge coefficients driving the non-finite row degrade.
+    /// #lsnc-batched-bwd.
+    ///
+    /// This test used to compare against
+    /// `crown_batched_multi_domain::propagate_linear_batched_with_engine` (a
+    /// stacked f32 engine GEMM with a `γ_n^{f32}·S` certificate). It stayed
+    /// GREEN through the entire window in which the fast lane published bounds
+    /// up to 8 ULP away from what the batched backward's own Linear arm
+    /// published, because that arm had moved to the certified f64 contraction
+    /// and this comparand had not — it had zero production callers left. The
+    /// comparand is now the live reference, so this test cannot pass while the
+    /// lane and its reference disagree. Do not point it back at a function
+    /// nothing calls.
     #[ntest::timeout(60000)]
     #[test]
     fn test_linear_backward_soa_matches_reference() {
@@ -511,12 +349,22 @@ mod tests {
                 per_domain.push(Some(bounds));
             }
 
-            // Reference: active-only slice through the per-domain kernel.
+            // Reference: the shared per-domain kernel, called exactly as the
+            // reference batched backward calls it (active domains in ascending
+            // domain order, no deadline).
             let active_refs: Vec<&LinearBounds> =
                 per_domain.iter().filter_map(|b| b.as_ref()).collect();
             let engine = NaiveCpuGemmEngine;
-            let reference = propagate_linear_batched_with_engine(&layer, &active_refs, &engine)
-                .expect("reference backward");
+            let reference: Vec<LinearBounds> = active_refs
+                .iter()
+                .copied()
+                .map(|bounds| {
+                    layer
+                        .propagate_linear_pollable_cpu(bounds, Some(&engine), None)
+                        .expect("reference backward")
+                        .into_owned()
+                })
+                .collect();
 
             // SoA: pack the same fixture into flat planes.
             let coeff_len = rows * cols;

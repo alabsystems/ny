@@ -143,9 +143,16 @@ fn snake_candidates(
     edge_samples: usize,
 ) -> Vec<f64> {
     let mut xs = vec![l, u, l.midpoint(u)];
+    // For a < 0 the phase 2*a*x DECREASES over [l, u], so the admissible-k
+    // range is [phase(u), phase(l)]; take min/max so the boundary-k probes
+    // point INTO the range for either sign of `a`.
+    let (phase_lo, phase_hi) = {
+        let (p, q) = (2.0 * a * l, 2.0 * a * u);
+        (p.min(q), p.max(q))
+    };
     let push_branch = |base: f64, xs: &mut Vec<f64>| {
-        let kl = ((2.0 * a * l - base) / TWO_PI).ceil();
-        let ku = ((2.0 * a * u - base) / TWO_PI).floor();
+        let kl = ((phase_lo - base) / TWO_PI).ceil();
+        let ku = ((phase_hi - base) / TWO_PI).floor();
         if !kl.is_finite() || !ku.is_finite() {
             return;
         }
@@ -167,9 +174,13 @@ fn snake_candidates(
         }
     }
     // sin(a x) = 0 (oscillation minimum) and sin^2(a x) = 1 (maximum).
+    let (ax_lo, ax_hi) = {
+        let (p, q) = (a * l, a * u);
+        (p.min(q), p.max(q))
+    };
     for base in [0.0f64, std::f64::consts::FRAC_PI_2] {
-        let kl = ((a * l - base) / std::f64::consts::PI).ceil();
-        let ku = ((a * u - base) / std::f64::consts::PI).floor();
+        let kl = ((ax_lo - base) / std::f64::consts::PI).ceil();
+        let ku = ((ax_hi - base) / std::f64::consts::PI).floor();
         if kl.is_finite() && ku.is_finite() {
             for d in 0..3i64 {
                 for k in [kl + d as f64, ku - d as f64] {
@@ -185,7 +196,7 @@ fn snake_candidates(
     for i in 0..=grid_samples {
         xs.push(l + (u - l) * (i as f64) / (grid_samples as f64));
     }
-    let win = (4.0 * std::f64::consts::PI / a).min(u - l);
+    let win = (4.0 * std::f64::consts::PI / a.abs()).min(u - l);
     if win.is_finite() && win > 0.0 {
         for i in 0..=edge_samples {
             let t = (i as f64) / (edge_samples as f64);
@@ -219,7 +230,10 @@ fn audit_snake_one(
     let slopes = [f64::from(r.lower_slope), f64::from(r.upper_slope)];
     let xs = snake_candidates(l64, u64, a64, &slopes, grid_samples, edge_samples);
     // Slack: f64 evaluation error of the oracle plus the line evaluation.
-    let scale = l64.abs().max(u64.abs()).max(1.0 / a64).max(1.0);
+    // `1/|a|`, not `1/a`: the oscillation amplitude is a magnitude, and for
+    // a < 0 the signed quotient would drop out of the `max`, silently
+    // tightening the slack below the positive mirror's.
+    let scale = l64.abs().max(u64.abs()).max(1.0 / a64.abs()).max(1.0);
     let slack = 64.0 * f64::EPSILON * scale;
     let mut best: Option<Violation> = None;
     let mut local = Vec::new();
@@ -398,7 +412,12 @@ fn report(name: &str, mut vs: Vec<Violation>) -> usize {
 #[test]
 fn audit_snake() {
     let profile = AuditProfile::from_environment();
-    let exhaustive_alphas = [
+    // Both signs on purpose: negative alpha is a certified regime (the point
+    // reflection in `snake_linear_relaxation`), and a corpus that only ever
+    // probes `a > 0` cannot catch a broken transfer. The production Kokoro
+    // value -0.026045702 is pinned in both profiles.
+    let kokoro_negative_alpha = f32::from_bits(0xbcd5_5dcc);
+    let positive_exhaustive_alphas = [
         1e-9,
         5e-9,
         9.9e-9,
@@ -424,12 +443,25 @@ fn audit_snake() {
         1e30,
         3.4e38,
     ];
-    let bounded_alphas = [1e-9, 9.9e-9, 1e-8, 1.0000001e-8, 0.1, 1.0, 10.0, 1e8];
+    let positive_bounded_alphas = [1e-9, 9.9e-9, 1e-8, 1.0000001e-8, 0.1, 1.0, 10.0, 1e8];
+    let with_negations = |positives: &[f32]| -> Vec<f32> {
+        let mut all = positives.to_vec();
+        all.extend(positives.iter().map(|a| -a));
+        all.push(kokoro_negative_alpha);
+        all.push(-kokoro_negative_alpha);
+        all
+    };
+    let exhaustive_alphas = with_negations(&positive_exhaustive_alphas);
+    let bounded_alphas = with_negations(&positive_bounded_alphas);
     let alphas: &[f32] = if profile.is_exhaustive() {
         &exhaustive_alphas
     } else {
         &bounded_alphas
     };
+    assert!(
+        alphas.iter().any(|a| *a > 0.0) && alphas.iter().any(|a| *a < 0.0),
+        "snake audit corpus must probe both alpha signs"
+    );
     let grid = if profile.is_exhaustive() {
         f32_grid()
     } else {
@@ -484,7 +516,12 @@ fn audit_snake() {
         audit_snake_one(l, u, a, grid_samples, edge_samples, &mut out);
     }
     for _ in 0..any_random_cases {
-        let a = rng.f32_any().abs().max(1e-12);
+        // Both signs (no `.abs()`): the sign carries the reflection transfer
+        // under audit. Keep the 1e-12 magnitude floor, sign-preserving; the
+        // `signum()` maps a raw ±0.0 to ±1.0, so the floored value is never
+        // zero.
+        let raw = rng.f32_any();
+        let a = raw.signum() * raw.abs().max(1e-12);
         let (mut l, mut u) = (rng.f32_any(), rng.f32_any());
         if l > u {
             std::mem::swap(&mut l, &mut u);
@@ -514,7 +551,10 @@ fn audit_snake_infinite() {
     // with a non-finite endpoint.
     let mut out = Vec::new();
     let mut cases = 0usize;
-    for &a in &[1e-7f32, 0.1, 1.0, 10.0, 1e6] {
+    for &a in &[
+        1e-7f32, 0.1, 1.0, 10.0, 1e6, // positive
+        -1e-7, -0.1, -1.0, -10.0, -1e6, // negative: the reflected arm
+    ] {
         for &b in &[-1e6f32, -1.0, 0.0, 1.0, 1e6] {
             for (l, u) in [(f32::NEG_INFINITY, b), (b, f32::INFINITY)] {
                 cases += 1;
@@ -530,7 +570,7 @@ fn audit_snake_infinite() {
             }
         }
     }
-    assert_eq!(cases, 50, "infinite-arm audit corpus changed unexpectedly");
+    assert_eq!(cases, 100, "infinite-arm audit corpus changed unexpectedly");
     let n = report("snake_infinite_relaxation", out);
     assert_eq!(n, 0, "snake infinite-arm envelope violations found");
 }

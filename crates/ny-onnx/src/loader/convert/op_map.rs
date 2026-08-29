@@ -12,6 +12,40 @@ use tracing::debug;
 /// `Ok((LayerType::Unknown, false))` for known shape/constant/utility ops that
 /// are safe to trace through, and `Err(UnsupportedOp)` for truly unknown ops
 /// that should not be silently dropped. (#2931)
+///
+/// # NOT IN THIS TABLE: the vendor-domain family
+///
+/// This map is only ever consulted for a node in the STANDARD domain
+/// (`""` / `"ai.onnx"`). `convert_node_to_layer` runs the custom-op registry
+/// first and then refuses any non-standard domain outright ("Custom op missing
+/// registration"), so a vendor-domain node either belongs to its registered
+/// `CustomOpHandler` — which builds its own `LayerSpec` — or never gets here.
+///
+/// It therefore used to LIE about coverage. Arms for `ArgSort`, `Snake`,
+/// `RoPE` / `RotaryPositionEmbedding`, `AdaIN` /
+/// `AdaptiveInstanceNorm` / `AdaptiveInstanceNormalization`, and
+/// `SimplifiedLayerNormalization` were unreachable in both directions:
+///
+/// * in the standard domain, `parse::schema_preflight::validate_standard_schemas`
+///   refuses every one of those op types BY NAME ("is not a registered
+///   main-domain operator; use an explicitly imported and registered vendor
+///   domain") before conversion ever runs — none of them is a main-domain ONNX
+///   operator;
+/// * in a vendor domain, the registry / missing-registration gate above
+///   short-circuits first.
+///
+/// The arms are deleted rather than wired, because wiring them would mean
+/// admitting a standard-domain op type that ONNX does not define — exactly the
+/// "same-named lookalike" substitution `is_standard_domain` exists to prevent.
+/// `LayerType::ArgSort` / `Snake` / `RoPE` / `AdaIN` remain reachable through a
+/// registered `CustomOpHandler` and through the trace bridge, which is where
+/// those operators legitimately come from. `RMSNormalization` KEPT its arm:
+/// it is a real main-domain operator (opset 23) and is not in the preflight's
+/// refusal list, so it is genuinely reachable; only its legacy experimental
+/// spelling `SimplifiedLayerNormalization` was dead.
+///
+/// `op_map_refusals_are_not_shadowed_by_the_schema_preflight` below pins that
+/// analysis so the table cannot silently regrow a dead arm.
 pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerType, bool)> {
     match op_type {
         // Basic layers
@@ -50,7 +84,6 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
         "ThresholdedRelu" => Ok((LayerType::ThresholdedRelu, true)),
         "Shrink" => Ok((LayerType::Shrink, true)),
         "Softsign" => Ok((LayerType::Softsign, true)),
-        "Snake" => Ok((LayerType::Snake, true)),
         "Floor" => Ok((LayerType::Floor, true)),
         "Ceil" => Ok((LayerType::Ceil, true)),
         "Round" => Ok((LayerType::Round, true)),
@@ -60,25 +93,21 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
         "Cos" => Ok((LayerType::Cos, true)),
         "Tan" => Ok((LayerType::Tan, true)),
         "Atan" => Ok((LayerType::Arctan, true)),
-        // Positional encoding
-        "RoPE" | "RotaryPositionEmbedding" => Ok((LayerType::RoPE, true)),
         // Normalization (fused ops)
         "LayerNormalization" => Ok((LayerType::LayerNorm, true)),
-        // SimplifiedLayerNormalization is the legacy experimental ONNX RMSNorm
-        // spelling; RMSNormalization is the standard main-domain op since
-        // opset 23. Their exact supported schemas are checked by convert.rs.
-        "SimplifiedLayerNormalization" | "RMSNormalization" => Ok((LayerType::RMSNorm, true)),
+        // RMSNormalization is the standard main-domain op since opset 23; its
+        // exact supported schema is checked by `validate_direct_normalization_schema`
+        // in convert.rs before this table is consulted.
+        //
+        // The legacy experimental spelling `SimplifiedLayerNormalization` is
+        // deliberately NOT here — see the "NOT IN THIS TABLE" note below.
+        "RMSNormalization" => Ok((LayerType::RMSNorm, true)),
         // InstanceNormalization: per-channel normalization (ONNX opset 1+).
         // Used in style transfer and audio models (avoice K2/K3/K4).
         "InstanceNormalization" => Ok((LayerType::InstanceNorm, true)),
         // GroupNormalization: per-group normalization (ONNX opset 21+).
         // Used in Demucs DConv sub-layers (dilated Conv1d + GroupNorm + GELU).
         "GroupNormalization" => Ok((LayerType::GroupNorm, true)),
-        // AdaIN: Adaptive Instance Normalization (custom op in style-based models).
-        // Used in avoice K3/K4. Not a standard ONNX op.
-        "AdaIN" | "AdaptiveInstanceNorm" | "AdaptiveInstanceNormalization" => {
-            Ok((LayerType::AdaIN, true))
-        }
         "BatchNormalization" => Ok((LayerType::BatchNorm, true)),
         // Pooling
         "AveragePool" => Ok((LayerType::AveragePool, true)),
@@ -199,12 +228,12 @@ pub(super) fn op_type_to_layer_type(op_type: &str, name: &str) -> Result<(LayerT
         // ReduceMax/ReduceMin: supported with fixed_max_index CROWN assumption
         "ReduceMax" => Ok((LayerType::ReduceMax, true)),
         "ReduceMin" => Ok((LayerType::ReduceMin, true)),
-        // Selection ops: ArgMax/ArgMin/ArgSort/TopK. Piecewise-constant index
-        // outputs; sound integer-index intervals (exact when argmax/min provably
-        // unique over the input box). Detection heads (cctsdb_yolo) use ArgMax.
+        // Selection ops: ArgMax/ArgMin/TopK. Piecewise-constant index outputs;
+        // sound integer-index intervals (exact when argmax/min provably unique
+        // over the input box). Detection heads (cctsdb_yolo) use ArgMax.
+        // `ArgSort` is NOT a main-domain ONNX operator — see the note below.
         "ArgMax" => Ok((LayerType::Argmax, true)),
         "ArgMin" => Ok((LayerType::ArgMin, true)),
-        "ArgSort" => Ok((LayerType::ArgSort, true)),
         "TopK" => Ok((LayerType::Topk, true)),
         // Only Casts whose drop is an EXACT identity reach this arm: a FLOAT32
         // target, or a BOOL target on a provably {0,1}-valued operand.
@@ -285,6 +314,65 @@ mod tests {
         let (ty, include) = op_type_to_layer_type("ScatterND", "scatter_0").unwrap();
         assert_eq!(ty, LayerType::ScatterND);
         assert!(include);
+    }
+
+    /// The vendor-domain family must NOT be in this table.
+    ///
+    /// Every one of these op types is refused by name in
+    /// `parse::schema_preflight::validate_standard_schemas` when it appears in
+    /// the standard domain, and is short-circuited by the custom-op registry /
+    /// missing-registration gate when it appears in a vendor domain. An arm
+    /// here is therefore unreachable and makes the map overstate its coverage.
+    /// Pinned as an error so a re-added arm fails loudly instead of quietly
+    /// lying.
+    #[test]
+    fn vendor_domain_op_types_are_not_claimed_by_the_standard_map() {
+        for op_type in [
+            "ArgSort",
+            "Snake",
+            "RoPE",
+            "RotaryPositionEmbedding",
+            "AdaIN",
+            "AdaptiveInstanceNorm",
+            "AdaptiveInstanceNormalization",
+            "SimplifiedLayerNormalization",
+        ] {
+            assert!(
+                matches!(
+                    op_type_to_layer_type(op_type, "vendor"),
+                    Err(NyError::UnsupportedOp(_))
+                ),
+                "'{op_type}' is not a main-domain ONNX operator; the standard op map must not \
+                 claim it (it reaches ny through a registered CustomOpHandler or the trace bridge)"
+            );
+        }
+    }
+
+    /// `RMSNormalization` is the counterpart the deletion above must NOT touch:
+    /// a genuine main-domain operator (opset 23) that is absent from the
+    /// preflight's refusal list and therefore genuinely reachable here.
+    #[test]
+    fn standard_rms_normalization_keeps_its_reachable_arm() {
+        let (ty, include) = op_type_to_layer_type("RMSNormalization", "rms_0").unwrap();
+        assert_eq!(ty, LayerType::RMSNorm);
+        assert!(include);
+    }
+
+    /// `Trilu`, `ScatterElements` and the deprecated `Scatter` are handled by
+    /// their own canonicalizers BEFORE this table is consulted, so reaching
+    /// this arm at all means the canonicalizer declined a node it owns. Keep
+    /// the fail-closed answer.
+    #[test]
+    fn canonicalized_ops_still_fail_closed_in_the_generic_table() {
+        for op_type in ["Trilu", "ScatterElements", "Scatter"] {
+            assert!(
+                matches!(
+                    op_type_to_layer_type(op_type, "live"),
+                    Err(NyError::UnsupportedOp(_))
+                ),
+                "{op_type} is canonicalized upstream; the generic table must not admit it"
+            );
+        }
     }
 
     #[test]

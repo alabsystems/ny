@@ -1,0 +1,141 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+#
+# cgan2026 CANARY: #target-cost-weight — value-weighted intermediate-target budget
+#
+# IDENTICAL to configs/vnncomp26/cgan2026.yaml except for the two `bab` keys at
+# the end of the `bab:` block. This is the ARMED arm of the A/B; the production
+# file is the control. Do NOT promote this file; promote the two keys into
+# cgan2026.yaml once the measurement supports it.
+#
+# THE DEFECT: the CROWN-IBP collector weights each candidate target's slice of
+# the collection window by its objective-ROW COUNT. Measured on cgan row 7:
+# BatchNorm_11 (28,800 rows) takes 217 s of a 405 s window (54%) and the
+# generator as a whole takes 86%, while Conv_19 gets 7.7 s and Conv_22 gets
+# 3.9 s — 2.9% combined. Leave-one-out at the root says value runs the OTHER
+# WAY: dropping the 4,608-row and 12,544-row targets costs EXACTLY 1.000x,
+# dropping the 28,800 costs 1.52x, and dropping the 512-ROW target costs 1954x.
+#
+# `crown_ibp_prefix_cost_weighted` replaces the row count with the MAC cost of
+# the walk each target will actually run (`rows x prefix`) — the same estimator
+# the walk-admission gate already trusts. Measured secs/row across those targets
+# spans 27x; `rows x prefix` tracks true cost to 1.5x where `rows` alone is off
+# by 9.5x. Because the deep narrow targets carry the LONGEST prefixes, correcting
+# the cost model moves budget toward exactly the targets leave-one-out says carry
+# the value.
+#
+# `crown_ibp_max_target_share_frac` additionally forbids any single non-final
+# target from taking more than 35% of the remaining window, so one wide node
+# cannot eat half the collection however it is priced.
+#
+# SOUND AT ANY VALUE: both keys move only the per-node DEADLINE. A target that
+# still completes publishes a bit-identical box; a target that does not keeps
+# its certified IBP fallback. Pinned by `target_cost_weight_tests` in
+# crown_tighten.rs.
+#
+# Benchmark characteristics:
+# - Conditional-GAN robustness with resampled 2026 properties. All eight model
+#   names are byte-identical after decompression to cgan_2023's 2025 models, so
+#   model-cost scheduling measurements transfer; solve rates do not. Seven are
+#   tracked as .onnx.gz; setup materializes the small-transformer eighth model.
+# - Architecture: Gemm -> Reshape -> ConvTranspose+BN+ReLU (gen) ->
+#   Conv+ReLU+BN (disc) -> Gemm. Low-dim latent input, disjunctive output.
+# - IMPORTANT: the name `cgan2026` has NO `_20NN` suffix, so the year-stripping
+#   preset fallback does NOT map it to `cgan` — this explicit preset is REQUIRED
+#   (without it cgan2026 silently runs on auto defaults with no tuning).
+# - No audited cgan2026 solve-rate projection is retained. Do not transfer the
+#   2025 result counts to these resampled properties.
+
+general:
+  # cgan2026 is a regular-track category, so the selected competition manifest
+  # is VNN-LIB 1.0. The 1.0/2.0 instance-list blobs currently match, but retain
+  # the voted version explicitly rather than relying on that incidental parity.
+  root_path: ../../benchmarks/vnncomp2026/benchmarks/cgan2026/1.0
+  csv_name: instances.csv
+  # Mirrors production cgan_2023.yaml #cgan-abc-parity (2026-08-26): the
+  # BaB-child-backward conv representation. See production for the measurement.
+  conv_mode: matrix
+  device: wgpu
+
+solver:
+  # Mirrors production: plain CROWN child bounds - the load-bearing key of
+  # the 2026-08-26 conversion factorial. See production cgan_2023.yaml.
+  bound_prop_method: crown
+
+model:
+  batch_norm_folding: preserve_raw
+  require_authored_float32_initializers: true
+  cgan_forward_alpha_surrogate: false
+
+attack:
+  pgd_order: before
+  pgd_restarts: 200
+
+bab:
+  batch_size: 64
+  # Byte-identical 2025 models need the same deadline-safe bound retention.
+  cgan_reclaim: true
+  # Same model-cost ceiling as cgan_2023. A missed CROWN walk falls back to its
+  # sound IBP enclosure, so this controls time/tightness rather than authority.
+  crown_ibp_per_node_cap_secs: 150
+  # #target-cost-weight (see the banner above). Both are scheduling-only.
+  crown_ibp_prefix_cost_weighted: true
+  crown_ibp_max_target_share_frac: 0.35
+  phase_budget:
+    # Attack caps are schedule-only: every SAT witness is still independently
+    # validated, while an undiscovered witness falls through to proof search.
+    disjunctive_pgd_fraction: 0.10
+    disjunctive_pgd_max_secs: 5
+    attack_extension_fraction: 0.0
+    # The byte-identical models use the same fast cached forward-linear map.
+    # These fractions remain generous ceilings rather than reserved spend.
+    initial_bounds_fraction: 0.45
+    disjunctive_precheck_fraction: 0.85
+    # Spend the remaining official budget on the proof tree after upfront PGD.
+    post_bab_pgd_fraction: 0.0
+    # Match the measured cgan_2023 policy for the independent wrapper lane.
+    vnncomp_post_bab_attack: false
+  branching:
+    method: input
+    candidates: 5
+    reduceop: max
+    input_split:
+      # Mirrors production #cgan-abc-parity: sb selection threshold and the
+      # periodic SAT-only probe (0 ENABLES; -1 disables).
+      sb_coeff_thresh: 1.0e-2
+      adv_check: 0
+      # Keep the eager best-first route; the reordered warm-parallel schedule
+      # has not yet closed an official-budget cGAN row.
+      reorder_bab: true
+      # One warm step bounds per-domain refinement cost on the identical model.
+      alpha_iteration: 1
+      lr_alpha: 0.05
+      # Both certified accelerators fail closed to their established scalar
+      # paths on unsupported shapes or metadata.
+      ibp_enhancement: true
+      stacked_rebound: true
+  clip:
+    relaxed: true
+    relaxed_iterations: 20
+    # Mirrors production: the sound exact-domain input clip (abc's
+    # clip_input_domain). See production cgan_2023.yaml for the contract.
+    input_split_fresh_domain_clip: true
+  alpha_crown:
+    lr_alpha: 0.2
+    iterations: 100
+    # These models are byte-identical to the audited 2025 cGAN models. Reuse
+    # the same certified root-only complete cascade; property resampling does
+    # not affect its structural eligibility or soundness, and child domains
+    # still clear the policy before taking the cheap forward-linear route.
+    cgan_complete_crown_ibp_root: true
+    # Aggregate scheduling-only ceiling shared with the byte-identical 2025
+    # models; expiry retains the previous certified reference map.
+    reference_refresh_max_secs: 12
+    # The identical 2025/2026 models share the measured endgame cliff: after
+    # forward-linear deadline refusal, select certified plain IBP directly.
+    forward_linear_deadline_fallback_to_ibp: true
+  beta_crown:
+    lr_alpha: 0.1
+    lr_beta: 0.15
+    iterations: 25

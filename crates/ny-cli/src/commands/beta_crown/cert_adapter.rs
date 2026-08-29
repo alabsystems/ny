@@ -488,6 +488,23 @@ pub(super) fn maybe_emit_certificate(
                 return;
             }
         };
+        // BRIDGE: ny-cert's bounded `Json` carries no serde impls by design;
+        // re-parse its canonical rendering for this serde_json payload.
+        let entailment_json: serde_json::Value =
+            match serde_json::from_str(&entailment_json.to_string()) {
+                Ok(v) => v,
+                Err(e) => {
+                    info!("cert: skipped (entailment JSON bridge: {e})");
+                    return;
+                }
+            };
+        let farkas_json: serde_json::Value = match serde_json::from_str(&farkas_json.to_string()) {
+            Ok(v) => v,
+            Err(e) => {
+                info!("cert: skipped (farkas JSON bridge: {e})");
+                return;
+            }
+        };
 
         let lower_bound = match certified.lower_bound.checked_parts() {
             Ok((num, den)) => format!("{num}/{den}"),

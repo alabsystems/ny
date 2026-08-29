@@ -1058,14 +1058,21 @@ impl GraphNetwork {
         // would be faster and is a valid later optimization; the sound forward is
         // used here only so the pre-activations/masks match the certified path.
         // #attack-fast-kernels (NY_ATTACK_POINT_FAST_KERNELS=1, default OFF =>
-        // byte-identical). A finite deadline forces every Conv2d off im2col+GEMM
-        // onto the per-MAC pollable scalar contraction and makes conv2d/bound.rs:308
-        // discard the engine, which costs ~91x here: this call measures 8.5 s/step
-        // on CIFAR100_resnet_large against the ~93 ms/step this crate's own
-        // `point_vjp_batched_resnet.rs:9-12` records for the same call on the same
-        // model family. At 8.5 s/step the upfront falsification lane completes ZERO
-        // gradient steps in its 4 s slice, and raising that slice is separately
-        // refuted (it costs 15 wall-hugger proofs to win 9 counterexamples).
+        // byte-identical). HISTORICAL MOTIVE, now largely paid down in the
+        // kernel: a finite deadline used to force every Conv2d onto a per-MAC
+        // pollable scalar contraction, which cost ~91x here — this call measured
+        // 8.5 s/step on CIFAR100_resnet_large against the ~93 ms/step this
+        // crate's own `point_vjp_batched_resnet.rs:9-12` records for the same
+        // call on the same model family, i.e. ZERO gradient steps in the upfront
+        // lane's 4 s slice (and raising that slice is separately refuted: it
+        // costs 15 wall-hugger proofs to win 9 counterexamples).
+        //
+        // #pollable-conv-ibp replaced that scalar kernel with a blocked,
+        // tap-hoisted, byte-identical twin (`conv2d/ops_ibp_blocked.rs`), so the
+        // Conv2d share of the gap is gone. What is left under a finite layer
+        // deadline is ConvTranspose2d's per-MAC directed-f64 arm and the
+        // engine-discarding `propagate_ibp_with_engine_and_deadline`. RE-MEASURE
+        // this gate before spending anything on it: its headline number is stale.
         //
         // The gate keeps the LOOP deadline and drops only the LAYER deadline, so the
         // enclosure is unchanged (the two conv routes are documented as

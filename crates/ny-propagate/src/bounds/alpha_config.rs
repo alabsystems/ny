@@ -611,6 +611,27 @@ pub struct AlphaCrownConfig {
     /// the complete cascade needed by the cGAN root certificate.
     #[serde(default)]
     pub cgan_complete_crown_ibp_root: bool,
+    /// Row ceiling for demanded CROWN targets inside the complete cGAN root
+    /// cascade (`#cgan-narrow-target-budget`).
+    ///
+    /// `None` (default) keeps the historical all-demanded candidate set. When
+    /// set, a demanded pre-activation target whose objective-row count exceeds
+    /// this ceiling is DECLINED as a tightening candidate and retains the
+    /// certified forward-linear baseline the cascade was seeded with.
+    ///
+    /// This is a SCHEDULING policy, not a bound algorithm. Declining a target
+    /// can only leave it at an enclosure the collector already holds, so the
+    /// published map stays shrink-only with respect to that baseline and proof
+    /// authority is unchanged in either direction.
+    ///
+    /// Motivation: on the official cGAN rows the collection budget is split in
+    /// proportion to objective-row count, so the wide generator targets (up to
+    /// 28,800 and 61,504 rows) draw ~86% of it. Those targets are already
+    /// within 1.02-1.13x of the sampled-exact width under the forward-linear
+    /// seed, while the narrow discriminator targets they starve are where the
+    /// root over-approximation is actually manufactured.
+    #[serde(default)]
+    pub cgan_narrow_target_max_rows: Option<usize>,
     /// Sparse alpha optimization: only optimize the top K% most influential alphas.
     ///
     /// After the first iteration, alphas are ranked by gradient magnitude and only
@@ -963,6 +984,10 @@ impl Default for AlphaCrownConfig {
             // Complete cGAN root collection is separately default-dark until
             // its production-shaped official-row A/B passes.
             cgan_complete_crown_ibp_root: false,
+            // Narrow-target collection ceiling is default-dark: it changes
+            // which targets the cascade spends its budget on, so it stays off
+            // until a sealed official-budget row measures it.
+            cgan_narrow_target_max_rows: None,
             // Sparse optimization: focus on top 30% most influential alphas.
             // Reduces SPSA variance when perturbing fewer coordinates.
             sparse_ratio: 0.3,

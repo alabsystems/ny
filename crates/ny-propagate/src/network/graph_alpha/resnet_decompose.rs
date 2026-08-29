@@ -715,7 +715,7 @@ fn extract_node_layer_bn(
     out: &mut Vec<GpuCrownLayer>,
     allow_bn: bool,
     pending_bn_werr: &mut Option<Vec<f32>>,
-) -> Option<()> {
+) -> Option<bool> {
     use crate::network::core::{apply_bn_werr_to_host_relu, try_extract_batch_norm_conv1x1};
     if let Layer::BatchNorm(bn) = layer {
         if !allow_bn || pending_bn_werr.is_some() {
@@ -724,7 +724,7 @@ fn extract_node_layer_bn(
         let (conv, werr) = try_extract_batch_norm_conv1x1(bn, pre_activation)?;
         out.push(conv);
         *pending_bn_werr = Some(werr);
-        return Some(());
+        return Some(true);
     }
     if pending_bn_werr.is_some() {
         // The BN's producer must be its host ReLU. Clear `pending` ONLY after the
@@ -737,9 +737,10 @@ fn extract_node_layer_bn(
         extract_node_layer(node_name, layer, pre_activation, alpha_state, out)?;
         apply_bn_werr_to_host_relu(out.last_mut()?, pending_bn_werr.as_ref()?)?;
         *pending_bn_werr = None;
-        return Some(());
+        return Some(false);
     }
-    extract_node_layer(node_name, layer, pre_activation, alpha_state, out)
+    extract_node_layer(node_name, layer, pre_activation, alpha_state, out)?;
+    Some(false)
 }
 
 /// Walk a pure unary chain backward from `branch_start` until reaching `z`,
@@ -956,6 +957,7 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments<
     let mut names = Vec::new();
     let mut frontier_abs = Vec::new();
     let mut stopped_at: Option<String> = None;
+    let mut bn_layers_extracted = 0usize;
     extract_gpu_resnet_segments_collect(
         graph,
         input,
@@ -970,6 +972,7 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments<
         false,
         false,
         &mut stopped_at,
+        &mut bn_layers_extracted,
     )
 }
 
@@ -1008,7 +1011,7 @@ pub(crate) fn extract_gpu_resnet_segments_with_relu_names<
     Vec<Vec<f32>>,
     Vec<Vec<f32>>,
 )> {
-    let (segments, names, frontier_abs, node_abs, stopped_at) =
+    let (segments, names, frontier_abs, node_abs, stopped_at, _bn_layers_extracted) =
         extract_gpu_segments_with_relu_names_ext(
             graph,
             input,
@@ -1049,7 +1052,8 @@ pub(crate) fn extract_gpu_segments_with_relu_names_ext<
     // conv (discharge folded into the feeding ReLU). Root-joint lane only.
     allow_bn: bool,
     // #root-joint-frozen-stop: allow the walk to terminate at the deepest
-    // frozen-bounded node M it cannot walk past (5th tuple slot names M).
+    // frozen-bounded node M it cannot walk past (5th tuple slot names M;
+    // the 6th authenticates how many BN nodes the accepted walk extracted).
     frozen_stop: bool,
 ) -> Option<(
     Vec<GpuResnetSegment>,
@@ -1057,10 +1061,12 @@ pub(crate) fn extract_gpu_segments_with_relu_names_ext<
     Vec<Vec<f32>>,
     Vec<Vec<f32>>,
     Option<String>,
+    usize,
 )> {
     let mut names = Vec::new();
     let mut frontier_abs = Vec::new();
     let mut stopped_at: Option<String> = None;
+    let mut bn_layers_extracted = 0usize;
     let segments = extract_gpu_resnet_segments_collect(
         graph,
         input,
@@ -1075,6 +1081,7 @@ pub(crate) fn extract_gpu_segments_with_relu_names_ext<
         allow_bn,
         frozen_stop,
         &mut stopped_at,
+        &mut bn_layers_extracted,
     )?;
     // Per-ReLU PRE-activation abs-max bounds in FOLD order (same order as `names`). The
     // ReLU's pre-activation is its INPUT node's bounds — resolved exactly as the
@@ -1104,7 +1111,14 @@ pub(crate) fn extract_gpu_segments_with_relu_names_ext<
             s
         );
     }
-    Some((segments, names, frontier_abs, node_abs, stopped_at))
+    Some((
+        segments,
+        names,
+        frontier_abs,
+        node_abs,
+        stopped_at,
+        bn_layers_extracted,
+    ))
 }
 
 /// Per-ReLU PRE-activation abs-max bound (`max(|pre_l|,|pre_u|)` per dim) for each ReLU in
@@ -1205,6 +1219,8 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
     frozen_stop: bool,
     // OUT: Some(M) iff the walk stopped at frozen node M (frozen_stop only).
     stopped_at: &mut Option<String>,
+    // OUT: number of BatchNorm nodes represented by the accepted extraction.
+    bn_layers_extracted: &mut usize,
 ) -> Option<Vec<GpuResnetSegment>> {
     // #extract-skeleton x #image-node-crown fail-closed seam: the BUILD recorder
     // documents the LEGACY walk only. The gated new semantics (BN-as-1x1-conv,
@@ -1299,7 +1315,7 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                         break 'step false;
                     };
                     let before = chain.len();
-                    if extract_node_layer_bn(
+                    let Some(extracted_bn) = extract_node_layer_bn(
                         &current,
                         &node.layer,
                         pre,
@@ -1307,11 +1323,12 @@ pub(in crate::network::graph_alpha) fn extract_gpu_resnet_segments_collect<
                         &mut chain,
                         allow_bn,
                         &mut pending_bn_werr,
-                    )
-                    .is_none()
-                    {
+                    ) else {
                         step_reason = "extract_step_layer_unsupported";
                         break 'step false;
+                    };
+                    if extracted_bn {
+                        *bn_layers_extracted += 1;
                     }
                     if let Some(r) = rec.as_deref_mut() {
                         r.record_resolved(&input_name, pre);
@@ -1556,7 +1573,9 @@ pub(crate) fn try_resnet_gpu_suffix<V1: Borrow<BoundedTensor>, V2: Borrow<Bounde
     // that unpollable host preparation; the dedicated private single/bounded-
     // row experiments remain separate APIs and are not production proof
     // authority for this route.
-    // #gpu-suffix-expiry set-mate: default-off, byte-identical unarmed.
+    // #gpu-suffix-expiry set-mate: decided by `PATCHES_FINITE_EXPIRY`, which
+    // SHIPS ARMED (`DefaultSpec::Bool(true)`) — refusal is by EXPIRY in every
+    // scored run; `NY_PATCHES_FINITE_EXPIRY=0` restores the presence refusal.
     if let Some(limit) = deadline {
         if Instant::now() >= limit {
             return Err(NyError::DeadlineExceeded(
@@ -2881,16 +2900,18 @@ mod tests {
         g.set_output("l2");
         let input = input_box();
         let bounds = g.collect_node_bounds(&input).expect("node bounds");
-        let (segs, names, frontier, node_abs, _stop) = extract_gpu_segments_with_relu_names_ext(
-            &g, &input, "l2", &bounds, &bounds, None, true, false, false,
-        )
-        .expect("pure chain must decompose with allow_pure_chain");
+        let (segs, names, frontier, node_abs, _stop, bn_layers_extracted) =
+            extract_gpu_segments_with_relu_names_ext(
+                &g, &input, "l2", &bounds, &bounds, None, true, false, false,
+            )
+            .expect("pure chain must decompose with allow_pure_chain");
         assert_eq!(segs.len(), 1, "one Chain segment");
         assert!(matches!(segs[0], GpuResnetSegment::Chain(_)));
         assert_eq!(chain_len(&segs[0]), 3, "Chain=[l2, relu1, l1]");
         assert_eq!(names, vec!["relu1".to_string()], "fold-order ReLU names");
         assert_eq!(frontier.len(), 1, "one frontier entry per segment");
         assert_eq!(node_abs.len(), 1, "one node_abs entry per ReLU");
+        assert_eq!(bn_layers_extracted, 0);
         // The false-flag ext call must match the resnet-only entry byte-identically.
         assert!(
             extract_gpu_segments_with_relu_names_ext(

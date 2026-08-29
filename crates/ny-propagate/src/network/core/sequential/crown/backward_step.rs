@@ -525,6 +525,14 @@ fn check_crown_backward_deadline(
 /// dispatch_backward_layer returns Unsupported for ReLU because graph-CROWN
 /// needs alpha/beta state that varies per call site. Sequential CROWN uses
 /// the simpler propagate_crown_backward trait path.
+/// Sub-shares of the activation walk bucket: the elementwise backward
+/// dispatch vs the eager coefficient-error fold (#budget-log companion,
+/// printed on `[walk-share]`).
+pub(crate) static ACT_BWD_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static ACT_FOLD_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn crown_backward_relu(
     layer: &Layer,
     linear_bounds: &mut LinearBounds,
@@ -559,14 +567,25 @@ fn crown_backward_relu(
             ),
         }));
     }
-    match layer.propagate_crown_backward(linear_bounds, Some(pre_activation)) {
+    let bwd_t = Instant::now();
+    let backward = layer.propagate_crown_backward(linear_bounds, Some(pre_activation));
+    ACT_BWD_NANOS.fetch_add(
+        u64::try_from(bwd_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    match backward {
         Ok(mut next) => {
             check_crown_backward_deadline(deadline, layer_idx, layer, "after ReLU dispatch")?;
             // Eager per-row discharge of the carried coefficient error over the
             // pre-activation cut (#cgan-conv-err-compose, see
             // LinearBounds::fold_coeff_err_over_box_eager). Rows with a
             // non-finite penalty keep carrying (prior behavior).
+            let fold_t = Instant::now();
             next.fold_coeff_err_over_box_eager(pre_activation);
+            ACT_FOLD_NANOS.fetch_add(
+                u64::try_from(fold_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             check_crown_backward_deadline(
                 deadline,
                 layer_idx,

@@ -63,14 +63,64 @@ def _v3_lever_state() -> dict[str, object]:
     return {
         "status": "resolved",
         "receipt": {
-            "schema": "ny-levers/receipt/v2",
+            "schema": "ny-levers/receipt/v3",
             "lever_count": len(levers),
             "env_present": 1,
             "env_accepted": 1,
             "env_rejected": 0,
+            "env_ignored": 0,
             "levers": levers,
         },
     }
+
+
+def test_lever_receipt_v3_ignored_evidence_and_v2_compatibility() -> None:
+    ambient = {"NY_PHASE_TELEMETRY": "1"}
+    current = _v3_lever_state()
+    assert qualify._valid_v3_lever_state(
+        current, require_resolved=True, ambient_env=ambient
+    )
+
+    legacy = json.loads(json.dumps(current))
+    legacy["receipt"]["schema"] = "ny-levers/receipt/v2"
+    del legacy["receipt"]["env_ignored"]
+    assert qualify._valid_v3_lever_state(
+        legacy, require_resolved=True, ambient_env=ambient
+    )
+
+    ignored = json.loads(json.dumps(current))
+    entry = ignored["receipt"]["levers"][0]
+    entry["name"] = "NY_UPFRONT_ATTACK"
+    entry["value"] = False
+    entry["ignored_raw"] = "true"
+    entry["env_utf8"] = True
+    ignored["receipt"]["env_present"] = 2
+    ignored["receipt"]["env_ignored"] = 1
+    ignored_ambient = {**ambient, "NY_UPFRONT_ATTACK": "true"}
+    assert qualify._valid_v3_lever_state(
+        ignored, require_resolved=True, ambient_env=ignored_ambient
+    )
+
+    malformed = []
+    bad = json.loads(json.dumps(ignored))
+    bad["receipt"]["env_ignored"] = 0
+    malformed.append((bad, ignored_ambient))
+    malformed.append((ignored, ambient))
+    malformed.append((ignored, {**ignored_ambient, "NY_UPFRONT_ATTACK": "false"}))
+    bad = json.loads(json.dumps(ignored))
+    del bad["receipt"]["levers"][0]["env_utf8"]
+    malformed.append((bad, ignored_ambient))
+    bad = json.loads(json.dumps(ignored))
+    bad["receipt"]["levers"][0]["rejected_raw"] = "true"
+    malformed.append((bad, ignored_ambient))
+    bad = json.loads(json.dumps(ignored))
+    bad["receipt"]["schema"] = "ny-levers/receipt/v2"
+    del bad["receipt"]["env_ignored"]
+    malformed.append((bad, ignored_ambient))
+    for bad_state, bad_ambient in malformed:
+        assert not qualify._valid_v3_lever_state(
+            bad_state, require_resolved=True, ambient_env=bad_ambient
+        )
 
 
 def _targets() -> list[qualify.Target]:
@@ -815,7 +865,7 @@ def test_flight_authentication_rejects_malformed_v3_lever_state(
         receipt["levers"] = []
         receipt["lever_count"] = 0
     elif malformation == "extra_entry_field":
-        receipt["levers"][0]["unexpected"] = "not in receipt/v2"
+        receipt["levers"][0]["unexpected"] = "not in receipt/v3"
     elif malformation == "env_source_missing_ambient":
         del payload["ambient_env"]["NY_PHASE_TELEMETRY"]
     elif malformation == "config_with_env_evidence":

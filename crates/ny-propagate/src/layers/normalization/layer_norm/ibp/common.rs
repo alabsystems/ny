@@ -56,6 +56,18 @@ pub(super) struct IbpShapeContext {
     pub norm_size: usize,
 }
 
+/// Classification of a structurally valid LayerNorm IBP input.
+pub(super) enum ValidatedIbpInput {
+    /// All bounds finite: proceed with interval arithmetic.
+    Finite(IbpShapeContext),
+    /// Bounds contain ±inf (but no NaN): a legitimately saturated upstream box
+    /// (deep-stack IBP overflow — outward-rounded Linear IBP under
+    /// production-scale weights overflows f32). Not an error: the caller must
+    /// substitute the conservative fallback enclosure, which is sound for
+    /// every finite real input regardless of magnitude.
+    Saturated,
+}
+
 /// Validate input for LayerNorm IBP and extract shape context.
 ///
 /// Consolidates the validation checks previously repeated inline in
@@ -63,7 +75,7 @@ pub(super) struct IbpShapeContext {
 pub(super) fn validate_ibp_input(
     layer: &LayerNormLayer,
     input: &BoundedTensor,
-) -> Result<IbpShapeContext> {
+) -> Result<ValidatedIbpInput> {
     let shape = input.shape();
     let ndim = shape.len();
 
@@ -93,12 +105,14 @@ pub(super) fn validate_ibp_input(
     }
 
     // Category B per domain validation policy (designs/2026-02-07-domain-validation-policy.md):
-    // Reject non-finite input bounds. NaN/Inf inputs cause 0/0 or inf/inf in
-    // normalization arithmetic. Consistent with the CROWN path.
-    if input.lower().iter().any(|x| !x.is_finite()) || input.upper().iter().any(|x| !x.is_finite())
-    {
+    // NaN input bounds fail closed — NaN carries no bound information and would
+    // silently poison the normalization arithmetic (0/0, inf/inf). ±Inf
+    // endpoints are handled separately below: they are the conservative-bounds
+    // convention for "unbounded in that direction" and must saturate, not
+    // error (consistent with the CROWN path's constant-bounds fallback, #3259).
+    if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
         return Err(NyError::NumericalInstability(
-            "LayerNorm IBP: non-finite input bounds".to_string(),
+            "LayerNorm IBP: NaN input bounds".to_string(),
         ));
     }
 
@@ -122,7 +136,19 @@ pub(super) fn validate_ibp_input(
         });
     }
 
-    Ok(IbpShapeContext { ndim, norm_size })
+    // Deep-stack IBP overflow saturation: an input box with infinite endpoints
+    // is sound (it over-approximates the true range) and must produce a sound
+    // conservative output, not abort the whole verification pass.
+    if input.lower().iter().any(|x| x.is_infinite())
+        || input.upper().iter().any(|x| x.is_infinite())
+    {
+        return Ok(ValidatedIbpInput::Saturated);
+    }
+
+    Ok(ValidatedIbpInput::Finite(IbpShapeContext {
+        ndim,
+        norm_size,
+    }))
 }
 
 impl LayerNormLayer {
@@ -179,11 +205,11 @@ impl LayerNormLayer {
 
             if g >= 0.0 {
                 // #3344: directed rounding on fallback
-                per_dim_lower[i] = next_down_f32(b + g * z_lower);
-                per_dim_upper[i] = next_up_f32(b + g * z_upper);
+                per_dim_lower[i] = affine_fallback_down(b, g, z_lower);
+                per_dim_upper[i] = affine_fallback_up(b, g, z_upper);
             } else {
-                per_dim_lower[i] = next_down_f32(b + g * z_upper);
-                per_dim_upper[i] = next_up_f32(b + g * z_lower);
+                per_dim_lower[i] = affine_fallback_down(b, g, z_upper);
+                per_dim_upper[i] = affine_fallback_up(b, g, z_lower);
             }
         }
 
@@ -201,4 +227,30 @@ impl LayerNormLayer {
         // strategy (#3030, #3060).
         BoundedTensor::new_repaired(out_lower, out_upper, RepairStrategy::Conservative)
     }
+}
+
+/// `beta + gamma * z` rounded OUTWARD (`_up` / `_down`), computed in f64.
+///
+/// SOUNDNESS-CRITICAL — do not inline this back into f32. `f32 * f32` is
+/// EXACT in f64 (24 + 24 = 48 <= 53 mantissa bits), so the only rounding here
+/// is the f64 addition (<= 0.5 ulp of the TRUE sum) plus the final f32 cast,
+/// and the single directed f32 step dominates both.
+///
+/// Computing it in f32 is UNSOUND whenever `beta` cancels the product: the
+/// product's round-to-nearest error lives at the PRODUCT's magnitude while the
+/// one-ULP outward step lands at the (possibly hundreds of ULPs smaller) SUM's
+/// magnitude, so the step cannot cover it and the "bound" excludes reachable
+/// outputs. Found by adversarial review 2026-08-26; repro (InstanceNorm1d,
+/// T = 4, gamma = 1.1550927, beta = -2.0006793, eps = 1e-5): the f32 form
+/// returns an upper bound of 1e-45 while x = [1e5, 0, 0, 0] evaluates to
+/// 1.7408787e-8.
+#[inline]
+fn affine_fallback_up(beta: f32, gamma: f32, z: f32) -> f32 {
+    next_up_f32((f64::from(beta) + f64::from(gamma) * f64::from(z)) as f32)
+}
+
+/// Downward-rounded mirror of [`affine_fallback_up`]; same f64 rationale.
+#[inline]
+fn affine_fallback_down(beta: f32, gamma: f32, z: f32) -> f32 {
+    next_down_f32((f64::from(beta) + f64::from(gamma) * f64::from(z)) as f32)
 }

@@ -811,6 +811,7 @@ impl BetaCrownVerifier {
                 beta_state,
                 targets,
                 conjunctive,
+                false, // relu_split_route: test wrapper
                 &seed_caches,
                 false,
             )?;
@@ -828,6 +829,7 @@ impl BetaCrownVerifier {
         beta_state: &mut GraphBetaState,
         targets: &MultiObjectiveTargets<'_>,
         conjunctive: bool,
+        relu_split_route: bool,
         seed_caches: &[Option<&CachedLinearBounds>],
         capture_caches: bool,
     ) -> Result<MultiObjectiveWarmStartResult> {
@@ -841,6 +843,7 @@ impl BetaCrownVerifier {
             beta_state,
             targets,
             conjunctive,
+            relu_split_route,
             seed_caches,
             capture_caches,
             baseline_first,
@@ -866,6 +869,7 @@ impl BetaCrownVerifier {
         beta_state: &mut GraphBetaState,
         targets: &MultiObjectiveTargets<'_>,
         conjunctive: bool,
+        relu_split_route: bool,
         seed_caches: &[Option<&CachedLinearBounds>],
         capture_caches: bool,
         cuda_beta_spsa_frontier: MoCudaBetaSpsaFrontier,
@@ -881,6 +885,7 @@ impl BetaCrownVerifier {
             beta_state,
             targets,
             conjunctive,
+            relu_split_route,
             seed_caches,
             capture_caches,
             baseline_first,
@@ -916,6 +921,7 @@ impl BetaCrownVerifier {
             beta_state,
             targets,
             conjunctive,
+            false, // relu_split_route: baseline-policy helper, not the relu-split child eval
             seed_caches,
             capture_caches,
             baseline_first,
@@ -947,6 +953,7 @@ impl BetaCrownVerifier {
             beta_state,
             targets,
             conjunctive,
+            false, // relu_split_route: baseline-policy helper, not the relu-split child eval
             seed_caches,
             capture_caches,
             MoBetaBaselineFirstPolicy::forced_deadline_after_first_completed_iteration(),
@@ -965,6 +972,13 @@ impl BetaCrownVerifier {
         beta_state: &mut GraphBetaState,
         targets: &MultiObjectiveTargets<'_>,
         conjunctive: bool,
+        // EXPLICIT route marker (#alpha-step v3 narrow gate): true ONLY for
+        // the relu-split disjunctive per-child evals (batched_multi). The
+        // delta-form alpha treatment (split_refresh + neutralized deltas +
+        // alpha-only SPSA rounds) activates on this marker, never inferred
+        // from history shape — input-split lanes share this optimizer and
+        // their parity pins assert stored-alpha behavior.
+        relu_split_route: bool,
         seed_caches: &[Option<&CachedLinearBounds>],
         capture_caches: bool,
         baseline_first: MoBetaBaselineFirstPolicy,
@@ -1140,6 +1154,41 @@ impl BetaCrownVerifier {
         // that stronger result rather than replacing it with inherited IBP.
         let mut retain_completed_best = false;
 
+        // #alpha-step (2026-08-24): within-eval per-domain alpha, stepped
+        // JOINTLY with beta by the same SPSA slope. The MO lanes never
+        // stepped alpha (stale inherited values measurably lose to the plain
+        // current-box heuristic — see the stale-alpha receipts in the
+        // REGRESSION doc). alpha_local persists across iterations of THIS
+        // eval only; the published result is whatever bounds the (correct)
+        // best-margin keeper banked, sound for any alpha in [0,1].
+        // STRUCTURAL activation, default-on, no knobs (#alpha-split-refresh
+        // + decoupled #alpha-step): domains WITH split constraints get their
+        // relaxation slopes re-derived from their own clamped boxes
+        // (split_refresh) and stepped in decoupled α-only rounds; the root
+        // (no splits) keeps its optimized α untouched. This is the
+        // generalized per-domain α treatment (abCROWN re-optimizes α per
+        // domain as a matter of course), activated by domain structure.
+        let domain_has_splits = relu_split_route && !context.history.constraints.is_empty();
+        let mut alpha_local: Option<crate::beta_crown::state::GraphDomainAlphaState> =
+            if domain_has_splits {
+                context.alpha_state.map(|a| {
+                    let mut local = a.clone();
+                    local.split_refresh = true;
+                    // Delta-form neutralization: stored values become deltas
+                    // around the current-box heuristic; 0.5 = zero offset.
+                    for map in [&mut local.neurons, &mut local.upper_neurons] {
+                        for node in map.values_mut() {
+                            for n in node.values_mut() {
+                                n.set_alpha(0.5);
+                            }
+                        }
+                    }
+                    local
+                })
+            } else {
+                None
+            };
+
         for iter in 0..self.config.beta_iterations {
             // Deadline check (#3109): bail early if the verification timeout budget
             // is exhausted BETWEEN iterations. Return the current best bounds
@@ -1174,11 +1223,18 @@ impl BetaCrownVerifier {
             // break and return it via the post-loop deadline short-circuit below.
             // Returning that earlier (valid) spec-guided CROWN bound is sound — we
             // only stop optimizing sooner and yield to BaB/timeout gracefully.
+            let iter_context = {
+                let mut c = *context;
+                if let Some(a) = alpha_local.as_ref() {
+                    c.alpha_state = Some(a);
+                }
+                c
+            };
             let (output, node_bounds, intermediate) = match self
                 .propagate_crown_with_graph_beta_and_spec_matrix_storing_intermediates(
                     graph,
                     input,
-                    context,
+                    &iter_context,
                     beta_state,
                     &spec_matrix,
                 ) {
@@ -1251,14 +1307,164 @@ impl BetaCrownVerifier {
                 periodic_snapshots.push(beta_state.clone());
             }
 
-            // Compute analytical gradients for the critical objective
-            let max_grad = beta_state.compute_analytical_gradients_multi_objective_spec_rows(
-                &intermediate,
-                &obj_bounds,
-                targets.thresholds,
-                targets.verified_mask,
-                conjunctive,
-            );
+            // Gradient computation (#beta-spsa, 2026-08-22). The analytical
+            // spec-row gradient is PROVEN wrong: it reads the backward
+            // A-matrix COEFFICIENT of the split neuron where the bound's real
+            // beta-dependence needs the neuron's pre-activation VALUE at the
+            // concretization corner (see graph_beta/gradients.rs and the
+            // beta-plumb receipts in the REGRESSION doc — hand-set beta
+            // improves real domains while the analytical direction pins beta
+            // at 0 forever). Until the corrected analytical form (x* +
+            // pre-activation linear rows) lands, use a MEASURED two-sided
+            // SPSA estimate through the very same spec-guided pass: the
+            // direction is correct by construction, and the (already correct)
+            // best-margin keeper downstream banks any gain. Deterministic
+            // Rademacher directions (xorshift on the iteration index) keep
+            // runs reproducible. Soundness: unconditional — gradients only
+            // choose the next beta CANDIDATE; every candidate's bound is a
+            // valid enclosure, and acceptance re-evaluates through the sound
+            // pass. Kill switch NY_MO_BETA_SPSA=0 restores the analytical
+            // gradient byte-for-byte.
+            let use_spsa = {
+                static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ON.get_or_init(crate::preset_gates::mo_beta_spsa_enabled)
+            };
+            let mut spsa_grad: Option<f32> = None;
+            if use_spsa && !beta_state.entries.is_empty() {
+                const SPSA_DELTA: f32 = 0.1;
+                let mut seed: u32 = 0x9E37_79B9u32 ^ (iter as u32).wrapping_mul(0x85EB_CA6B);
+                let dirs: Vec<f32> = beta_state
+                    .entries
+                    .iter()
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        if seed & 1 == 0 {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    })
+                    .collect();
+                // #alpha-step v2, DECOUPLED rounds: when alpha stepping is
+                // armed, odd iterations perturb ONLY alpha and even ones ONLY
+                // beta, so each family's two-point slope is clean (the joint
+                // v1 slope was alpha-noise-dominated and regressed the probe
+                // row — receipts in the REGRESSION doc).
+                // Delta-form (#alpha-step v3): reader composes heuristic +
+                // stored delta on the relu_split_route only. The α-only SPSA
+                // rounds are PARKED: measured 2026-08-26 on the probe row,
+                // alternating rounds cost half the β iterations and moved the
+                // 60s frontier -10.18 → -11.42 (α gains did not cover the β
+                // loss at iterations=15). Machinery + delta reader stay —
+                // iteration 0 is byte-equal to the receipted refresh
+                // baseline; a cheaper α schedule (every 4th iter, or a
+                // dedicated α budget) is the scoped follow-up.
+                // Sparse schedule: α every 4th iteration (β keeps 12/15) —
+                // the alternating schedule's measured regression came from
+                // the 50% β-iteration cost, not from α stepping itself.
+                let alpha_round = alpha_local.is_some() && iter % 4 == 3;
+                let mut plus = beta_state.clone();
+                let mut minus = beta_state.clone();
+                if !alpha_round {
+                    for ((p, m), d) in plus
+                        .entries
+                        .iter_mut()
+                        .zip(minus.entries.iter_mut())
+                        .zip(dirs.iter())
+                    {
+                        p.value = (p.value + SPSA_DELTA * d).max(0.0);
+                        m.value = (m.value - SPSA_DELTA * d).max(0.0);
+                    }
+                }
+                // Joint alpha perturbation (#alpha-step): same Rademacher
+                // stream continues into the alpha entries, so one shared
+                // slope drives both parameter families.
+                const ALPHA_DELTA: f32 = 0.05;
+                const ALPHA_LR: f32 = 0.05;
+                let mut alpha_dirs: Vec<(String, usize, f32)> = Vec::new();
+                let (alpha_plus, alpha_minus) = if let (true, Some(base)) =
+                    (alpha_round, alpha_local.as_ref())
+                {
+                    let mut ap = base.clone();
+                    let mut am = base.clone();
+                    for (node, neurons) in base.neurons.iter() {
+                        for &idx in neurons.keys() {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            let d = if seed & 1 == 0 { 1.0f32 } else { -1.0f32 };
+                            alpha_dirs.push((node.clone(), idx, d));
+                            if let Some(n) = ap.neurons.get_mut(node).and_then(|m| m.get_mut(&idx))
+                            {
+                                n.set_alpha((n.alpha() + ALPHA_DELTA * d).clamp(0.0, 1.0));
+                            }
+                            if let Some(n) = am.neurons.get_mut(node).and_then(|m| m.get_mut(&idx))
+                            {
+                                n.set_alpha((n.alpha() - ALPHA_DELTA * d).clamp(0.0, 1.0));
+                            }
+                        }
+                    }
+                    (Some(ap), Some(am))
+                } else {
+                    (None, None)
+                };
+                let eval =
+                    |state: &_, alpha: Option<&crate::beta_crown::state::GraphDomainAlphaState>| {
+                        let mut c = *context;
+                        if let Some(a) = alpha.or(alpha_local.as_ref()) {
+                            c.alpha_state = Some(a);
+                        }
+                        self.propagate_crown_with_graph_beta_and_spec_matrix_storing_intermediates(
+                            graph,
+                            input,
+                            &c,
+                            state,
+                            &spec_matrix,
+                        )
+                        .ok()
+                        .map(|(o, _, _)| compute_margin(&spec_bounds_to_vec(&o)))
+                    };
+                if let (Some(m_plus), Some(m_minus)) = (
+                    eval(&plus, alpha_plus.as_ref()),
+                    eval(&minus, alpha_minus.as_ref()),
+                ) {
+                    let mut max_g = 0.0f32;
+                    if alpha_round {
+                        if let Some(base) = alpha_local.as_mut() {
+                            let alpha_slope = (m_plus - m_minus) / (2.0 * ALPHA_DELTA);
+                            max_g = alpha_slope.abs();
+                            for (node, idx, d) in alpha_dirs.iter() {
+                                if let Some(n) =
+                                    base.neurons.get_mut(node).and_then(|m| m.get_mut(idx))
+                                {
+                                    n.set_alpha(
+                                        (n.alpha() + ALPHA_LR * alpha_slope * d).clamp(0.0, 1.0),
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        let slope = (m_plus - m_minus) / (2.0 * SPSA_DELTA);
+                        for (entry, d) in beta_state.entries.iter_mut().zip(dirs.iter()) {
+                            entry.grad = slope * d;
+                            max_g = max_g.max(entry.grad.abs());
+                        }
+                    }
+                    spsa_grad = Some(max_g);
+                }
+            }
+            let max_grad = match spsa_grad {
+                Some(g) => g,
+                None => beta_state.compute_analytical_gradients_multi_objective_spec_rows(
+                    &intermediate,
+                    &obj_bounds,
+                    targets.thresholds,
+                    targets.verified_mask,
+                    conjunctive,
+                ),
+            };
 
             // Adam gradient step
             let t = iter + 1;

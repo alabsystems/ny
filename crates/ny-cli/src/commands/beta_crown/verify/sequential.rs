@@ -212,17 +212,21 @@ pub(super) fn verify_sequential_relational(
         // which implies min_x max_j m_j(x) > 0, the max-diff success criterion —
         // so reserving budget for the per-constraint fallback cannot recover
         // anything the max-diff BaB misses. Give the max-diff BaB the full
-        // remaining wall-clock instead. This is what acasxu prop_2 needs: its
+        // remaining wall-clock instead. Thread that exact absolute authority
+        // rather than rebasing `remaining()` at engine entry: the latter moves
+        // the deadline later and breaks strict timeout attribution. This is
+        // what acasxu prop_2 needs: its
         // verifying conjunct varies across the input box, so per-constraint
         // decomposition is provably useless there (each conjunct individually
         // falsifiable — PGD found Y_1-Y_0 = -3.7e-4 < 0 on 1_5), while the 0.4
         // sub-budget starved the one engine that can decide it (26400 domains
         // at timeout under the old split). The default-dark SafeNLP
         // shared-prefix treatment is the narrow exception: it supplies an
-        // absolute deadline below so this prefix yields to its reserved MIP
-        // slice. Gate-off and unrelated same-LHS categories retain the full
-        // historical wall clock. Ordinary multi-row conjunctions are routed to
-        // graph any-row verification before reaching this fallback.
+        // earlier absolute deadline below so this prefix yields to its reserved
+        // MIP slice. Gate-off and unrelated same-LHS categories retain the full
+        // historical wall clock via the exact overall deadline. Ordinary
+        // multi-row conjunctions are routed to graph any-row verification
+        // before reaching this fallback.
         let reduction_applies = normalize_same_lhs_reduction(vnnlib).is_some();
         let reduced_timeout = if reduction_applies {
             ledger
@@ -250,7 +254,7 @@ pub(super) fn verify_sequential_relational(
             pgd_restarts,
             pgd_steps,
             pgd_deadline,
-            ledger.safenlp_shared_prefix_bab_deadline(),
+            reduced_verification_deadline(ledger, reduction_applies),
             gemm_engine,
             json,
         )?;
@@ -334,6 +338,24 @@ pub(super) fn verify_sequential_relational(
         json,
         ledger.bab_deadline(),
     )
+}
+
+/// Preserve one absolute authority for the reduced same-LHS engine call.
+///
+/// The default ACAS route owns the parent ledger's full wall clock. The
+/// SafeNLP shared-prefix treatment is the sole earlier authority and therefore
+/// takes precedence when armed. Non-reduced calls preserve their historical
+/// treatment-only behavior.
+fn reduced_verification_deadline(
+    ledger: &PhaseBudgetLedger,
+    reduction_applies: bool,
+) -> Option<std::time::Instant> {
+    let treatment_deadline = ledger.safenlp_shared_prefix_bab_deadline();
+    if reduction_applies {
+        treatment_deadline.or_else(|| ledger.overall_deadline())
+    } else {
+        treatment_deadline
+    }
 }
 
 /// Try reduced verification for common targeted-robustness properties.
@@ -603,6 +625,36 @@ mod tests {
     use ndarray::{arr1, arr2};
     use ny_onnx::vnnlib::parse_vnnlib;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn same_lhs_deadline_preserves_exact_overall_authority_and_treatment_precedence() {
+        let exact_overall = Instant::now() + Duration::from_secs(100);
+        let policy = ny_propagate::PhaseBudgetConfig {
+            post_bab_pgd_fraction: 0.10,
+            ..Default::default()
+        };
+        let ordinary = PhaseBudgetLedger::from_deadline(Some(exact_overall), policy.clone())
+            .with_mip_escalation_allowed(false);
+        assert_eq!(
+            reduced_verification_deadline(&ordinary, true),
+            Some(exact_overall),
+            "same-LHS ACAS must receive the parent's exact overall Instant"
+        );
+        assert_eq!(reduced_verification_deadline(&ordinary, false), None);
+
+        let treatment = PhaseBudgetLedger::from_deadline(Some(exact_overall), policy)
+            .with_mip_reservation(true)
+            .with_safenlp_shared_prefix_budget_repair(true);
+        assert_eq!(
+            reduced_verification_deadline(&treatment, true),
+            treatment.safenlp_shared_prefix_bab_deadline(),
+            "the explicitly armed shared-prefix handoff remains the earlier authority"
+        );
+        assert!(
+            reduced_verification_deadline(&treatment, true) < Some(exact_overall),
+            "the treatment deadline must precede the overall wall"
+        );
+    }
 
     /// The same-LHS reduction is the SafeNLP shared prefix before exact MIP.
     /// Its verifier must honor the caller's phase deadline even though its

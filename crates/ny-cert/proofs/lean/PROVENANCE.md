@@ -10,7 +10,7 @@ The local Lake package is `nyproof`, its library is `NyProof`, and Clean's
 
 ```text
 repository: https://github.com/alabsystems/clean.git
-revision:   a119ed0cfdafcb3eca4904253fdc51283e2ff0f8
+revision:   9a9b16e44b9233d0c387839ea205a22fb77ac4bb
 subDir:     crown-proofs/lean
 ```
 
@@ -117,8 +117,14 @@ manifest and build the overlay:
 lake update
 lake exe cache get
 lake build NyProof
+lake build NyProof.AxiomAudit
 lake env lean NyProof/AxiomAudit.lean > AXIOM_AUDIT.txt
 ```
+
+`NyProof` deliberately excludes the diagnostic `AxiomAudit` module, so a fresh
+checkout must build `NyProof.AxiomAudit` before invoking Lean on that file
+directly. Relying on a stale dependency `.olean` makes the audit
+machine-dependent and can fail before any axiom is checked.
 
 The committed `AXIOM_AUDIT.txt` is historical captured output from the same
 theorem set. Regenerate it after changing the Clean pin or any overlay proof;

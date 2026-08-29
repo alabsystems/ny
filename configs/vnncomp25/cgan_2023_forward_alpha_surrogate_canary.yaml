@@ -23,6 +23,14 @@
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
   csv_name: instances.csv
+  # Mirrors production cgan_2023.yaml #cgan-abc-parity (2026-08-26): the
+  # BaB-child-backward conv representation. See production for the measurement.
+  conv_mode: matrix
+
+solver:
+  # Mirrors production: plain CROWN child bounds - the load-bearing key of
+  # the 2026-08-26 conversion factorial. See production cgan_2023.yaml.
+  bound_prop_method: crown
 
 model:
   # cGAN is a measured rewrite class: the historical f32 ConvTranspose/Gemm
@@ -43,6 +51,7 @@ attack:
 
 bab:
   batch_size: 64
+  cgan_reclaim: true
   # Per-node CROWN-IBP time-budget cap (#4413 lever chain, #cgan-bn11-budget):
   # BatchNormalization_11 (28,800 dims) is memory-feasible via the auto-chunked
   # CROWN backward (#cgan-bn11-chunk), but the default 12 s equal-share cap /
@@ -136,6 +145,10 @@ bab:
     candidates: 5
     reduceop: max
     input_split:
+      # Mirrors production #cgan-abc-parity: sb selection threshold and the
+      # periodic SAT-only probe (0 ENABLES; -1 disables).
+      sb_coeff_thresh: 1.0e-2
+      adv_check: 0
       # Reordered input-split BaB (bound -> filter -> split -> clip) with the
       # batched rebound lane: 64 domains per pop instead of 1, measured 3.4x
       # domain throughput on cGAN_imgSz32_nCh_1 (5.8 -> 19.5 domains/s).
@@ -147,7 +160,7 @@ bab:
       # manifest, exact artifact identities, input hashes, or retained logs.
       # Keep reorder OFF until the engaged route reproduces on the current,
       # remote-aligned artifact under the fail-closed measurement wrapper.
-      reorder_bab: false
+      reorder_bab: true
       alpha_iteration: 1
       lr_alpha: 0.05
       # Batched IBP prescreen before the CROWN rebound for child domains.
@@ -167,6 +180,9 @@ bab:
   clip:
     relaxed: true
     relaxed_iterations: 20
+    # Mirrors production: the sound exact-domain input clip (abc's
+    # clip_input_domain). See production cgan_2023.yaml for the contract.
+    input_split_fresh_domain_clip: true
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100

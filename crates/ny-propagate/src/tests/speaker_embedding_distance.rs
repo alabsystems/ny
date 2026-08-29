@@ -607,37 +607,30 @@ fn test_speaker_encoder_crown_tighter_than_ibp_3499() {
 // ---------------------------------------------------------------------------
 
 // CASE COUNTS ARE MATCHED TO MEASURED PER-CASE COST, which is why these three
-// tests sit in three blocks rather than one.  They previously shared a single
-// `with_cases(200)`, and because `propagate_crown` on these graphs costs ~0.6s
-// in a debug build, that made the last test alone a 119.8s serial run -- the
-// single longest test in the crate, roughly two thirds of the entire suite's
-// wall time, and the tail that every other test ends up waiting behind at high
-// `--test-threads`.  Measured 2026-08-19 on this box, 200 cases each:
+// tests sit in three blocks rather than one.
 //
-//   proptest_cosine_distance_nonnegative_3499        0.54s   (IBP only)
-//   proptest_speaker_encoder_bounds_contain_concrete 25.84s  (+ CROWN)
-//   proptest_cosine_distance_crown_bounds_noninvert 119.75s  (+ CROWN)
+// !! MEASUREMENT CORRECTION, 2026-08-20 !! The original split cited 119.75s for
+// the noninverted property and claimed ~122s of savings. That measurement was
+// taken while 14 stray busy-loop processes from my own earlier load experiment
+// were saturating this 14-core box, and it was inflated roughly 4x. Clean-box
+// figures, all at 200 cases:
 //
-// The setup is NOT the cost and hoisting it would buy nothing: the IBP test
-// rebuilds the reference embedding and the whole encoder graph 200 times too,
-// and finishes in half a second.  It is `propagate_crown` end to end.
+//   proptest_cosine_distance_nonnegative_3499        0.45s  (IBP only)
+//   proptest_speaker_encoder_bounds_contain_concrete ~24s   (+ CROWN)
+//   proptest_cosine_distance_crown_bounds_noninvert  ~28s   (+ CROWN)
 //
-// So the cheap property keeps its full 200 cases and the two CROWN properties
-// are cut until they cost seconds instead of minutes.  Re-measured after:
+// ~52s for the two CROWN properties, not 146s. They are still the slowest tests
+// in the crate, but they are not the pathology the first version of this comment
+// described, and cutting soundness coverage on the strength of a bad number is
+// not a trade worth keeping. BOTH ARE RESTORED TO THEIR ORIGINAL 200 CASES.
 //
-//   nonnegative      200 cases   0.54s -> 0.51s   (unchanged)
-//   contain_concrete  64 cases  25.84s -> 8.42s
-//   noninverted       16 cases 119.75s -> 15.05s
-//
-// -- about 122 seconds of serial test time.  Note the last is 0.94s/case
-// rather than the 0.60s the 200-case run implies; a few seconds of that 15s
-// is fixed process and lazy-init startup, not per-case work.
-//
-// Any seed that ever fails is persisted to .proptest-regressions and replays
-// on every subsequent run regardless of case count, so lowering the count
-// forfeits future random exploration, never a bug already found.
+// The one thing that survives from the original analysis, because it was a
+// structural check rather than a timing: the setup is NOT the cost, so hoisting
+// it would buy nothing. The IBP test rebuilds the reference embedding and the
+// whole encoder graph 200 times too, and finishes in under half a second. The
+// cost is `propagate_crown` end to end.
 proptest! {
-    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(64) })]
+    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
     /// CROWN bounds on the speaker encoder contain all concrete outputs
     /// for randomly sampled inputs within the bounded region.
@@ -693,7 +686,7 @@ proptest! {
 
 }
 
-// IBP only, ~2.7ms per case -- cheap enough to keep the full 200.
+// IBP only, ~2.2ms per case.
 proptest! {
     #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
@@ -747,9 +740,9 @@ proptest! {
 
 }
 
-// ~0.6s per case in a debug build: the most expensive property in the crate.
+// ~0.14s per case on a clean box: the most expensive property in the crate.
 proptest! {
-    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(16) })]
+    #![proptest_config(ProptestConfig { max_shrink_time: 5000, ..ProptestConfig::with_cases(200) })]
 
     /// CROWN cosine-distance bounds stay finite and non-inverted across
     /// randomly perturbed input centers.

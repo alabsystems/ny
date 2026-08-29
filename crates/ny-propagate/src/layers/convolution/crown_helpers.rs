@@ -14,6 +14,13 @@ use tracing::{debug, warn};
 /// collection dump lever).
 pub(crate) static CONV_BIAS_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Sub-shares of [`CONV_ERR_NANOS`]: the row scans (`row_max` /
+/// `error_row_max` / `row_l1`) vs the publication loop, so `[err-split]` can
+/// attribute the err-matrix share instead of guessing.
+pub(crate) static CONV_ERR_SCAN_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CONV_ERR_PUB_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static CONV_ERR_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -306,6 +313,28 @@ pub(crate) fn add_f32_bias_up_no_subnormal(lhs: f32, rhs: f32) -> f32 {
 /// above it.
 #[inline]
 fn publish_error_up(value: f64) -> f32 {
+    // Fast lane for the dominant case (positive, binary32-normal, finite,
+    // strictly below the f32::MAX rounding boundary): in the monotone
+    // positive bit encoding, `f64_to_f32_up_no_subnormal` is `nearest`
+    // (+1 ulp when RN rounded below `value`), and the publication step is one
+    // more ulp — so the composition is `bits + 1 + (nearest < value)`,
+    // replacing a ~14-branch serial cascade measured as the bulk of the
+    // err-matrix publication share. `publish_error_up_matches_reference`
+    // pins bit-equality against the composed form across the boundary zoo.
+    // NaN fails the `>=` gate; ±inf, zeros, subnormals, negatives, and the
+    // MAX boundary all fall through to the reference cascade.
+    let nearest = value as f32;
+    if value >= f64::from(f32::MIN_POSITIVE) && nearest < f32::MAX {
+        let bump = 1 + u32::from(f64::from(nearest) < value);
+        return f32::from_bits(nearest.to_bits() + bump);
+    }
+    next_up_f32(f64_to_f32_up_no_subnormal(value))
+}
+
+/// The original branch-cascade composition, kept verbatim as the reference
+/// oracle for [`publish_error_up`]'s fast lane.
+#[cfg(test)]
+fn publish_error_up_reference(value: f64) -> f32 {
     next_up_f32(f64_to_f32_up_no_subnormal(value))
 }
 
@@ -682,52 +711,118 @@ where
     let mut new_lower_b = Array1::<f32>::zeros(rows);
     let mut new_upper_b = Array1::<f32>::zeros(rows);
     let mut work_since_poll = 0usize;
+    // Row-slice fast lane (#conv-fill-hoist): identical fold order (the
+    // directed-rounded accumulators are order-dependent and stay sequential,
+    // element for element), with the per-element 2D bounds-checked index and
+    // the per-element poll call hoisted — contiguous rows iterate slice
+    // segments and offer the poll once per channel segment with the same
+    // accounted totals (the publication pass set this precedent). Strided
+    // views keep the legacy per-element body.
+    let lower_a_flat = lower_a.to_slice();
+    let upper_a_flat = upper_a.to_slice();
+    let lower_err_flat = lower_a_err.as_ref().map(|e| e.to_slice());
+    let upper_err_flat = upper_a_err.as_ref().map(|e| e.to_slice());
+    let fast = lower_a_flat.is_some()
+        && upper_a_flat.is_some()
+        && lower_err_flat.map_or(true, |e| e.is_some())
+        && upper_err_flat.map_or(true, |e| e.is_some());
     for row in 0..rows {
         let mut lower = f32_to_f64_exact(lower_b[row]);
         let mut upper = f32_to_f64_exact(upper_b[row]);
         let mut lower_penalty = 0.0_f64;
         let mut upper_penalty = 0.0_f64;
 
-        for c in 0..out_c {
-            // Keep the zero-bias fast path bounded too: it skips all spatial
-            // loops below but may still traverse a large rows×channels grid.
-            poll_crown_host_work(&mut work_since_poll, poll)?;
-            let bias_value = f32_to_f64_exact(bias[c]);
-            let bias_abs = bias_value.abs();
-            let start = c * spatial_size;
-            let end = start + spatial_size;
+        if fast {
+            let la_row = &lower_a_flat.expect("checked")[row * mid_dim..(row + 1) * mid_dim];
+            let ua_row = &upper_a_flat.expect("checked")[row * mid_dim..(row + 1) * mid_dim];
+            let le_row =
+                lower_err_flat.map(|e| &e.expect("checked")[row * mid_dim..(row + 1) * mid_dim]);
+            let ue_row =
+                upper_err_flat.map(|e| &e.expect("checked")[row * mid_dim..(row + 1) * mid_dim]);
+            for c in 0..out_c {
+                poll_crown_host_work(&mut work_since_poll, poll)?;
+                let bias_value = f32_to_f64_exact(bias[c]);
+                let bias_abs = bias_value.abs();
+                let start = c * spatial_size;
+                let end = start + spatial_size;
 
-            if bias_value != 0.0 {
-                for col in start..end {
-                    let lower_term = f32_to_f64_exact(lower_a[[row, col]]) * bias_value;
-                    let upper_term = f32_to_f64_exact(upper_a[[row, col]]) * bias_value;
-                    lower = add_f64_down(lower, lower_term);
-                    upper = add_f64_up(upper, upper_term);
-                    poll_crown_host_work(&mut work_since_poll, poll)?;
+                if bias_value != 0.0 {
+                    for (&la, &ua) in la_row[start..end].iter().zip(&ua_row[start..end]) {
+                        let lower_term = f32_to_f64_exact(la) * bias_value;
+                        let upper_term = f32_to_f64_exact(ua) * bias_value;
+                        lower = add_f64_down(lower, lower_term);
+                        upper = add_f64_up(upper, upper_term);
+                    }
+                    poll_crown_host_block(&mut work_since_poll, end - start, poll)?;
+                }
+
+                if bias_abs != 0.0 {
+                    if let Some(le_row) = le_row {
+                        for &entry in &le_row[start..end] {
+                            let value = nonnegative_f32_error_or_infinity(entry);
+                            if !value.is_finite() {
+                                lower_penalty = f64::INFINITY;
+                                break;
+                            }
+                            lower_penalty = add_f64_up(lower_penalty, value * bias_abs);
+                        }
+                        poll_crown_host_block(&mut work_since_poll, end - start, poll)?;
+                    }
+                    if let Some(ue_row) = ue_row {
+                        for &entry in &ue_row[start..end] {
+                            let value = nonnegative_f32_error_or_infinity(entry);
+                            if !value.is_finite() {
+                                upper_penalty = f64::INFINITY;
+                                break;
+                            }
+                            upper_penalty = add_f64_up(upper_penalty, value * bias_abs);
+                        }
+                        poll_crown_host_block(&mut work_since_poll, end - start, poll)?;
+                    }
                 }
             }
+        } else {
+            for c in 0..out_c {
+                // Keep the zero-bias fast path bounded too: it skips all spatial
+                // loops below but may still traverse a large rows×channels grid.
+                poll_crown_host_work(&mut work_since_poll, poll)?;
+                let bias_value = f32_to_f64_exact(bias[c]);
+                let bias_abs = bias_value.abs();
+                let start = c * spatial_size;
+                let end = start + spatial_size;
 
-            if bias_abs != 0.0 {
-                if let Some(err) = lower_a_err.as_ref() {
+                if bias_value != 0.0 {
                     for col in start..end {
-                        let value = nonnegative_f32_error_or_infinity(err[[row, col]]);
-                        if !value.is_finite() {
-                            lower_penalty = f64::INFINITY;
-                            break;
-                        }
-                        lower_penalty = add_f64_up(lower_penalty, value * bias_abs);
+                        let lower_term = f32_to_f64_exact(lower_a[[row, col]]) * bias_value;
+                        let upper_term = f32_to_f64_exact(upper_a[[row, col]]) * bias_value;
+                        lower = add_f64_down(lower, lower_term);
+                        upper = add_f64_up(upper, upper_term);
                         poll_crown_host_work(&mut work_since_poll, poll)?;
                     }
                 }
-                if let Some(err) = upper_a_err.as_ref() {
-                    for col in start..end {
-                        let value = nonnegative_f32_error_or_infinity(err[[row, col]]);
-                        if !value.is_finite() {
-                            upper_penalty = f64::INFINITY;
-                            break;
+
+                if bias_abs != 0.0 {
+                    if let Some(err) = lower_a_err.as_ref() {
+                        for col in start..end {
+                            let value = nonnegative_f32_error_or_infinity(err[[row, col]]);
+                            if !value.is_finite() {
+                                lower_penalty = f64::INFINITY;
+                                break;
+                            }
+                            lower_penalty = add_f64_up(lower_penalty, value * bias_abs);
+                            poll_crown_host_work(&mut work_since_poll, poll)?;
                         }
-                        upper_penalty = add_f64_up(upper_penalty, value * bias_abs);
-                        poll_crown_host_work(&mut work_since_poll, poll)?;
+                    }
+                    if let Some(err) = upper_a_err.as_ref() {
+                        for col in start..end {
+                            let value = nonnegative_f32_error_or_infinity(err[[row, col]]);
+                            if !value.is_finite() {
+                                upper_penalty = f64::INFINITY;
+                                break;
+                            }
+                            upper_penalty = add_f64_up(upper_penalty, value * bias_abs);
+                            poll_crown_host_work(&mut work_since_poll, poll)?;
+                        }
                     }
                 }
             }
@@ -1024,17 +1119,51 @@ where
             let mut m = 0.0f64;
             let ncols = a.ncols();
             let row = a.row(i);
+            // Contiguous rows iterate the slice directly (#conv-fill-hoist):
+            // same elements, same order, same block boundaries and polls —
+            // minus the per-element strided-view index. Strided rows keep the
+            // indexed body.
+            let row_slice = row.to_slice();
             let mut k0 = 0usize;
             while k0 < ncols {
                 let k1 = k0 + crown_host_poll_block_len(*work_since_poll, ncols - k0);
-                for k in k0..k1 {
-                    let entry = row[k];
-                    let v = f32_to_f64_exact(entry).abs();
-                    if !v.is_finite() {
+                if let Some(slice) = row_slice {
+                    // Two branch-free passes over the cached block instead of a
+                    // per-element early exit (which forces scalar code): the
+                    // badness pass returns INFINITY iff the abandoned loop would
+                    // have (first bad element lives in the first bad block, and
+                    // blocks are visited in order), and the f32 max fold equals
+                    // the f64 fold because f32->f64 widening is exact and
+                    // monotone and the block is non-finite-free here. The
+                    // badness fold uses `|=` (no short circuit) so LLVM can
+                    // vectorize the reduction; `any()`'s early exit kept it
+                    // scalar.
+                    let blk = &slice[k0..k1];
+                    let mut bad = false;
+                    for &entry in blk {
+                        bad |= !entry.is_finite();
+                    }
+                    if bad {
                         return Ok(f64::INFINITY);
                     }
+                    let mut block_max = 0.0f32;
+                    for &entry in blk {
+                        block_max = block_max.max(entry.abs());
+                    }
+                    let v = f32_to_f64_exact(block_max);
                     if v > m {
                         m = v;
+                    }
+                } else {
+                    for k in k0..k1 {
+                        let entry = row[k];
+                        let v = f32_to_f64_exact(entry).abs();
+                        if !v.is_finite() {
+                            return Ok(f64::INFINITY);
+                        }
+                        if v > m {
+                            m = v;
+                        }
                     }
                 }
                 poll_crown_host_block(work_since_poll, k1 - k0, poll)?;
@@ -1078,17 +1207,57 @@ where
             let mut m = 0.0f64;
             let ncols = a.ncols();
             let row = a.row(i);
+            // Same slice/strided split as `row_max` above.
+            let row_slice = row.to_slice();
             let mut k0 = 0usize;
             while k0 < ncols {
                 let k1 = k0 + crown_host_poll_block_len(*work_since_poll, ncols - k0);
-                for k in k0..k1 {
-                    let entry = row[k];
-                    let value = nonnegative_f32_error_or_infinity(entry);
-                    if !value.is_finite() {
+                if let Some(slice) = row_slice {
+                    // Same block-pass structure as `row_max`; the bad-entry
+                    // test is the sanitizer's own predicate inlined as integer
+                    // ops (an entry is bad iff `nonnegative_f32_error_or_infinity`
+                    // maps it to INFINITY: exponent all-ones, or negative with
+                    // nonzero magnitude), folded with `|=` so the reduction
+                    // vectorizes. `error_row_max_badness_matches_sanitizer`
+                    // pins the predicates together. Surviving entries satisfy
+                    // value == exact widening of the raw f32 (>= -0.0), so the
+                    // f32 max fold + one widening is the identical fold.
+                    let blk = &slice[k0..k1];
+                    let mut bad = false;
+                    // `needless_bitwise_bool` is allowed here for the reason the
+                    // comment above already gives: the non-short-circuiting `|`
+                    // and `&` are what let this reduction vectorize. Both
+                    // operands are pure integer comparisons on a value already
+                    // in a register, so `||`/`&&` would buy no work-skipping and
+                    // would cost a branch per entry in the innermost loop of the
+                    // error-row scan.
+                    #[allow(clippy::needless_bitwise_bool)]
+                    for &entry in blk {
+                        let bits = entry.to_bits();
+                        let magnitude = bits & 0x7fff_ffff;
+                        bad |= (magnitude >= 0x7f80_0000) | ((bits >> 31 != 0) & (magnitude != 0));
+                    }
+                    if bad {
                         return Ok(f64::INFINITY);
                     }
+                    let mut block_max = 0.0f32;
+                    for &entry in blk {
+                        block_max = block_max.max(entry);
+                    }
+                    let value = f32_to_f64_exact(block_max);
                     if value > m {
                         m = value;
+                    }
+                } else {
+                    for k in k0..k1 {
+                        let entry = row[k];
+                        let value = nonnegative_f32_error_or_infinity(entry);
+                        if !value.is_finite() {
+                            return Ok(f64::INFINITY);
+                        }
+                        if value > m {
+                            m = value;
+                        }
                     }
                 }
                 poll_crown_host_block(work_since_poll, k1 - k0, poll)?;
@@ -1117,96 +1286,241 @@ where
             _ => kernel_l1,
         }
     };
-    for i in 0..nrows {
-        let row_in_max = row_max(in_a, i, &mut work_since_poll, poll)?;
-        // Only needed when the f32 certificate is live; skip the extra pass
-        // otherwise so the always-on f64 path costs nothing new.
-        let row_in_l1 = if recompute_ok {
-            0.0
-        } else {
-            row_l1(in_a, i, &mut work_since_poll, poll)?
+    // Publication fast lane (#conv-fill-hoist). Byte-identical arithmetic:
+    // `gamma * row_in_max * kl1` associates as `(gamma * row_in_max) * kl1`,
+    // so hoisting `g = gamma * row_in_max` per row changes nothing;
+    // `combine_downgrade_only_f64(h, INFINITY)` returns `h` verbatim for every
+    // `h` (the `measured_accum_err = None` case this lane requires); the final
+    // sum keeps the legacy `((cast + s) + prop)` shape via identical source
+    // order. What the lane removes is the three 2D bounds-checked indexings
+    // per output cell (`c[[i,p]]`, `stored[[i,p]]`, `err[[i,p]]`) — measured
+    // at 10.75 s of the biasfield collection (REGRESSION doc, 2026-08-20).
+    // Poll cadence is unchanged: one offer per output row, same budget.
+    let kl1_cols: Option<&[f64]> = kernel_l1_per_col.filter(|v| v.len() == ncols);
+    let ftz_flat = 4.0 * (n_contraction as f64) * 2f64.powi(-126);
+    let fast_done = 'fast: {
+        if measured_accum_err.is_some() {
+            break 'fast false;
+        }
+        let Some(stored_flat) = stored.as_slice() else {
+            break 'fast false;
         };
-        let row_err_max = match in_err {
-            Some(error) => error_row_max(error, i, &mut work_since_poll, poll)?,
-            None => 0.0,
+        let c_live = coeff_f64.filter(|_| recompute_ok);
+        let c_flat = match c_live {
+            Some(c) => match c.as_slice() {
+                Some(flat) => Some(flat),
+                None => break 'fast false,
+            },
+            None => None,
         };
-        for p in 0..ncols {
-            let kl1 = col_l1(p);
-            // #f32-cert-underflow-floor: `gamma * row_max * kernel_L1` is Higham
-            // Thm 3.1, which ASSUMES NO UNDERFLOW. In the subnormal range each
-            // rounding contributes an ABSOLUTE eta that no RELATIVE factor can
-            // cover, so the relative term alone is NOT a bound there.
-            //
-            // Adversarial review (2026-07-29) built an exact-rational
-            // counterexample on the `coeff_f64 = None` branch: out_c=4, 3x3
-            // kernel with all-subnormal weights, n_contraction=36 gives a
-            // certified `gamma*S = 1.69e-46` against a measured true error of
-            // `4.25e-45` -- a 25x violation, i.e. the certified interval did NOT
-            // contain the true coefficient.
-            //
-            // This repo's own f32-sound primitive already charges the term:
-            // `crown_single.rs`'s `aw_f32_sound_bound` uses
-            // `gamma*s + ftz + daz`, with `ftz = 4*k*2^-126`. Charge the same
-            // underflow floor here. It is a pure WIDENING (added, never
-            // subtracted) and it is ~1.7e-36 at k=36, dwarfing the 4.25e-45 the
-            // counterexample needed.
-            //
-            // NOTE this branch is DEAD today -- `conv_should_f64_recompute`
-            // returns `true` unconditionally, so `recompute_ok` holds and
-            // `gamma` is the f64 factor, for which the f64 `cast_err` term
-            // already captures storage rounding exactly. This charge exists so
-            // that making that function consult `n_contraction` (the change that
-            // would let a 576-row Conv_25 walk finish inside its time budget)
-            // does not silently enable an under-charged certificate.
-            let (ftz, daz) = if recompute_ok {
-                (0.0, 0.0)
-            } else {
-                (
-                    4.0 * (n_contraction as f64) * 2f64.powi(-126),
-                    // DAZ operand-flush floor, mirroring
-                    // `crown_single.rs::daz_operand_flush_floor`:
-                    // `(rowL1(A) + colL1(W)) * FLT_MIN`. Covers a backend that
-                    // flushes subnormal OPERANDS to zero, which the relative
-                    // Higham factor also cannot see.
-                    (row_in_l1 + kl1) * f64::from(f32::MIN_POSITIVE),
-                )
-            };
-            // A-priori Higham accumulation charge, and the S2 seam that may
-            // only ever lower it. `measured_accum_err = None` (every call site
-            // today) makes `combine_downgrade_only_f64` return `higham_accum`
-            // itself, so `s` is bit-identical to the pre-S2 expression.
-            let higham_accum = gamma * row_in_max * kl1;
-            let measured_accum = measured_accum_err.map_or(f64::INFINITY, |m| {
-                nonnegative_f32_error_or_infinity(m[[i, p]])
-            });
-            let s =
-                ny_core::eft::combine_downgrade_only_f64(higham_accum, measured_accum) + ftz + daz;
-            let prop_row = if prop_exact.is_some() {
+        let pe_flat = match prop_exact {
+            Some(pe) => match pe.as_slice() {
+                Some(flat) => Some(flat),
+                None => break 'fast false,
+            },
+            None => None,
+        };
+        let Some(err_flat) = err.as_slice_mut() else {
+            break 'fast false;
+        };
+        // Per-call sanitized kl1 table: same per-column result the per-element
+        // match produced, computed once instead of nrows times.
+        let kl1_table: Vec<f64> = match kl1_cols {
+            Some(v) => v
+                .iter()
+                .map(|&x| {
+                    if x.is_finite() && x >= 0.0 {
+                        x.min(kernel_l1)
+                    } else {
+                        kernel_l1
+                    }
+                })
+                .collect(),
+            None => vec![kernel_l1; ncols],
+        };
+        for i in 0..nrows {
+            let scan_t = std::time::Instant::now();
+            let row_in_max = row_max(in_a, i, &mut work_since_poll, poll)?;
+            let row_in_l1 = if recompute_ok {
                 0.0
             } else {
-                row_err_max * kl1
+                row_l1(in_a, i, &mut work_since_poll, poll)?
             };
-            let cast = coeff_f64.filter(|_| recompute_ok).map_or(0.0, |c| {
-                (c[[i, p]] - f32_to_f64_exact(stored[[i, p]])).abs()
-            });
-            let prop = match prop_exact {
-                Some(pe) => {
-                    let value = nonnegative_f32_error_or_infinity(pe[[i, p]]);
-                    if value.is_finite() {
-                        value * prop_inflate
-                    } else {
-                        f64::INFINITY
+            let row_err_max = match in_err {
+                Some(error) => error_row_max(error, i, &mut work_since_poll, poll)?,
+                None => 0.0,
+            };
+            CONV_ERR_SCAN_NANOS.fetch_add(
+                u64::try_from(scan_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let pub_t = std::time::Instant::now();
+            let g = gamma * row_in_max;
+            let stored_row = &stored_flat[i * ncols..(i + 1) * ncols];
+            let c_row = c_flat.map(|flat| &flat[i * ncols..(i + 1) * ncols]);
+            let pe_row = pe_flat.map(|flat| &flat[i * ncols..(i + 1) * ncols]);
+            let err_row = &mut err_flat[i * ncols..(i + 1) * ncols];
+            // Specialized inner loops for the live configuration
+            // (`recompute_ok` + f64 coefficients, `prop_exact` present or
+            // absent): the per-element `Option` matches and the per-element
+            // kl1 sanitization (hoisted into `kl1_table` once per call) kept
+            // the loop scalar and branchy. Identical arithmetic — `s =
+            // g·kl1 + 0.0 + 0.0` collapses exactly to `g·kl1` because every
+            // factor is non-negative (no -0.0 source). The generic loop below
+            // remains for every other configuration.
+            match (c_row, pe_row, recompute_ok) {
+                (Some(c), Some(pe), true) => {
+                    for p in 0..ncols {
+                        let kl1 = kl1_table[p];
+                        let s = g * kl1;
+                        let cast = (c[p] - f32_to_f64_exact(stored_row[p])).abs();
+                        let value = nonnegative_f32_error_or_infinity(pe[p]);
+                        let prop = if value.is_finite() {
+                            value * prop_inflate
+                        } else {
+                            f64::INFINITY
+                        };
+                        err_row[p] = publish_error_up(cast + s + prop);
                     }
                 }
-                None => prop_row,
-            };
-            err[[i, p]] = publish_error_up(cast + s + prop);
+                (Some(c), None, true) => {
+                    for p in 0..ncols {
+                        let kl1 = kl1_table[p];
+                        let s = g * kl1;
+                        let cast = (c[p] - f32_to_f64_exact(stored_row[p])).abs();
+                        let prop = row_err_max * kl1;
+                        err_row[p] = publish_error_up(cast + s + prop);
+                    }
+                }
+                (c_row, pe_row, _) => {
+                    for p in 0..ncols {
+                        let kl1 = kl1_table[p];
+                        let (ftz, daz) = if recompute_ok {
+                            (0.0, 0.0)
+                        } else {
+                            (ftz_flat, (row_in_l1 + kl1) * f64::from(f32::MIN_POSITIVE))
+                        };
+                        let s = g * kl1 + ftz + daz;
+                        let cast = match c_row {
+                            Some(c) => (c[p] - f32_to_f64_exact(stored_row[p])).abs(),
+                            None => 0.0,
+                        };
+                        let prop = match pe_row {
+                            Some(pe) => {
+                                let value = nonnegative_f32_error_or_infinity(pe[p]);
+                                if value.is_finite() {
+                                    value * prop_inflate
+                                } else {
+                                    f64::INFINITY
+                                }
+                            }
+                            None => row_err_max * kl1,
+                        };
+                        err_row[p] = publish_error_up(cast + s + prop);
+                    }
+                }
+            }
+            CONV_ERR_PUB_NANOS.fetch_add(
+                u64::try_from(pub_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            poll_crown_host_block(&mut work_since_poll, ncols, poll)?;
         }
-        // One offer per output ROW rather than per output element. The per-row
-        // budget is the row width, so the accounting is the same total; what
-        // goes away is an opaque `?`-returning call in the innermost loop of the
-        // publication pass.
-        poll_crown_host_block(&mut work_since_poll, ncols, poll)?;
+        true
+    };
+    if !fast_done {
+        for i in 0..nrows {
+            let row_in_max = row_max(in_a, i, &mut work_since_poll, poll)?;
+            // Only needed when the f32 certificate is live; skip the extra pass
+            // otherwise so the always-on f64 path costs nothing new.
+            let row_in_l1 = if recompute_ok {
+                0.0
+            } else {
+                row_l1(in_a, i, &mut work_since_poll, poll)?
+            };
+            let row_err_max = match in_err {
+                Some(error) => error_row_max(error, i, &mut work_since_poll, poll)?,
+                None => 0.0,
+            };
+            for p in 0..ncols {
+                let kl1 = col_l1(p);
+                // #f32-cert-underflow-floor: `gamma * row_max * kernel_L1` is Higham
+                // Thm 3.1, which ASSUMES NO UNDERFLOW. In the subnormal range each
+                // rounding contributes an ABSOLUTE eta that no RELATIVE factor can
+                // cover, so the relative term alone is NOT a bound there.
+                //
+                // Adversarial review (2026-07-29) built an exact-rational
+                // counterexample on the `coeff_f64 = None` branch: out_c=4, 3x3
+                // kernel with all-subnormal weights, n_contraction=36 gives a
+                // certified `gamma*S = 1.69e-46` against a measured true error of
+                // `4.25e-45` -- a 25x violation, i.e. the certified interval did NOT
+                // contain the true coefficient.
+                //
+                // This repo's own f32-sound primitive already charges the term:
+                // `crown_single.rs`'s `aw_f32_sound_bound` uses
+                // `gamma*s + ftz + daz`, with `ftz = 4*k*2^-126`. Charge the same
+                // underflow floor here. It is a pure WIDENING (added, never
+                // subtracted) and it is ~1.7e-36 at k=36, dwarfing the 4.25e-45 the
+                // counterexample needed.
+                //
+                // NOTE this branch is DEAD today -- `conv_should_f64_recompute`
+                // returns `true` unconditionally, so `recompute_ok` holds and
+                // `gamma` is the f64 factor, for which the f64 `cast_err` term
+                // already captures storage rounding exactly. This charge exists so
+                // that making that function consult `n_contraction` (the change that
+                // would let a 576-row Conv_25 walk finish inside its time budget)
+                // does not silently enable an under-charged certificate.
+                let (ftz, daz) = if recompute_ok {
+                    (0.0, 0.0)
+                } else {
+                    (
+                        4.0 * (n_contraction as f64) * 2f64.powi(-126),
+                        // DAZ operand-flush floor, mirroring
+                        // `crown_single.rs::daz_operand_flush_floor`:
+                        // `(rowL1(A) + colL1(W)) * FLT_MIN`. Covers a backend that
+                        // flushes subnormal OPERANDS to zero, which the relative
+                        // Higham factor also cannot see.
+                        (row_in_l1 + kl1) * f64::from(f32::MIN_POSITIVE),
+                    )
+                };
+                // A-priori Higham accumulation charge, and the S2 seam that may
+                // only ever lower it. `measured_accum_err = None` (every call site
+                // today) makes `combine_downgrade_only_f64` return `higham_accum`
+                // itself, so `s` is bit-identical to the pre-S2 expression.
+                let higham_accum = gamma * row_in_max * kl1;
+                let measured_accum = measured_accum_err.map_or(f64::INFINITY, |m| {
+                    nonnegative_f32_error_or_infinity(m[[i, p]])
+                });
+                let s = ny_core::eft::combine_downgrade_only_f64(higham_accum, measured_accum)
+                    + ftz
+                    + daz;
+                let prop_row = if prop_exact.is_some() {
+                    0.0
+                } else {
+                    row_err_max * kl1
+                };
+                let cast = coeff_f64.filter(|_| recompute_ok).map_or(0.0, |c| {
+                    (c[[i, p]] - f32_to_f64_exact(stored[[i, p]])).abs()
+                });
+                let prop = match prop_exact {
+                    Some(pe) => {
+                        let value = nonnegative_f32_error_or_infinity(pe[[i, p]]);
+                        if value.is_finite() {
+                            value * prop_inflate
+                        } else {
+                            f64::INFINITY
+                        }
+                    }
+                    None => prop_row,
+                };
+                err[[i, p]] = publish_error_up(cast + s + prop);
+            }
+            // One offer per output ROW rather than per output element. The per-row
+            // budget is the row width, so the accounting is the same total; what
+            // goes away is an opaque `?`-returning call in the innermost loop of the
+            // publication pass.
+            poll_crown_host_block(&mut work_since_poll, ncols, poll)?;
+        }
     }
     poll()?;
     Ok(err)
@@ -1220,6 +1534,176 @@ pub(crate) use conv_coeff_err_matrix_with_poll as batched_conv_coeff_err_with_po
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// #conv-fill-hoist pin: the slice fast lane and the legacy indexed lane
+    /// publish BIT-IDENTICAL certificates. The legacy lane is forced by
+    /// column-major (Fortran-layout) inputs, whose `as_slice()` is `None`;
+    /// logical content is identical, so any difference is a fast-lane bug.
+    /// Exercises both `recompute_ok` configurations, `prop_exact` present and
+    /// absent, a per-column L1 table with invalid entries (negative, NaN —
+    /// which must fall back to the global `kernel_l1`), a negative stored
+    /// coefficient, and a subnormal.
+    #[test]
+    fn coeff_err_fast_lane_matches_legacy_bitwise() {
+        use ndarray::ShapeBuilder;
+        let nrows = 5usize;
+        let ncols = 7usize;
+        let in_cols = 11usize;
+        let fill_a = |i: usize, k: usize| -> f32 {
+            ((i * 31 + k * 17) as f32).mul_add(0.37, -91.0) * 1.001f32.powi(k as i32)
+        };
+        let fill_stored = |i: usize, p: usize| -> f32 {
+            let v = ((i * 13 + p * 7) as f32).mul_add(-0.11, 3.5);
+            if (i, p) == (2, 3) {
+                1.0e-39
+            } else {
+                v
+            }
+        };
+        let fill_err = |i: usize, k: usize| ((i + k) as f32) * 1.5e-6;
+        let fill_pe = |i: usize, p: usize| ((i * 3 + p) as f32) * 2.0e-7;
+        let std_from = |r: usize, c: usize, f: &dyn Fn(usize, usize) -> f32| {
+            Array2::from_shape_fn((r, c), |(i, j)| f(i, j))
+        };
+        let fortran_from = |r: usize, c: usize, f: &dyn Fn(usize, usize) -> f32| {
+            Array2::from_shape_fn((r, c).f(), |(i, j)| f(i, j))
+        };
+        let kernel_l1 = 2.75f64;
+        let kl1_cols: Vec<f64> = (0..ncols)
+            .map(|p| match p {
+                1 => -0.5,     // invalid: negative → global kernel_l1
+                4 => f64::NAN, // invalid: NaN → global kernel_l1
+                5 => 9.0,      // valid but above global → min() clamps
+                _ => 0.25 + p as f64 * 0.5,
+            })
+            .collect();
+        for recompute in [true, false] {
+            for use_pe in [true, false] {
+                let in_a_s = std_from(nrows, in_cols, &fill_a);
+                let in_a_f = fortran_from(nrows, in_cols, &fill_a);
+                let stored_s = std_from(nrows, ncols, &fill_stored);
+                let stored_f = fortran_from(nrows, ncols, &fill_stored);
+                let in_err_s = std_from(nrows, in_cols, &fill_err);
+                let in_err_f = fortran_from(nrows, in_cols, &fill_err);
+                let pe_s = std_from(nrows, ncols, &fill_pe);
+                let pe_f = fortran_from(nrows, ncols, &fill_pe);
+                let coeff = if recompute {
+                    Some(Array2::from_shape_fn((nrows, ncols), |(i, p)| {
+                        f64::from(fill_stored(i, p)) + 1.0e-7 * ((i + 2 * p) as f64 - 3.0)
+                    }))
+                } else {
+                    None
+                };
+                let run = |a: &Array2<f32>,
+                           e: &Array2<f32>,
+                           st: &Array2<f32>,
+                           pe: &Array2<f32>|
+                 -> Array2<f32> {
+                    conv_coeff_err_matrix_downgraded_with_poll(
+                        a,
+                        Some(e),
+                        st,
+                        coeff.as_ref(),
+                        kernel_l1,
+                        in_cols,
+                        use_pe.then_some(pe),
+                        Some(&kl1_cols),
+                        None,
+                        &mut || Ok(()),
+                    )
+                    .expect("infallible poll")
+                };
+                let fast = run(&in_a_s, &in_err_s, &stored_s, &pe_s);
+                let legacy = run(&in_a_f, &in_err_f, &stored_f, &pe_f);
+                for ((i, p), lhs) in fast.indexed_iter() {
+                    assert_eq!(
+                        lhs.to_bits(),
+                        legacy[[i, p]].to_bits(),
+                        "certificate divergence at ({i},{p}) recompute={recompute} use_pe={use_pe}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fast bit-arithmetic lane in `publish_error_up` must be
+    /// bit-identical to the composed reference cascade everywhere: sampled
+    /// across the f64 space via f32 bit patterns widened with perturbations,
+    /// plus the full boundary zoo.
+    #[test]
+    fn publish_error_up_matches_reference() {
+        let check = |value: f64| {
+            assert_eq!(
+                publish_error_up(value).to_bits(),
+                publish_error_up_reference(value).to_bits(),
+                "value={value:e} bits={:#018x}",
+                value.to_bits()
+            );
+        };
+        for bits in (0u32..=u32::MAX).step_by(9_973) {
+            let base = f64::from(f32::from_bits(bits));
+            for perturb in [1.0, 1.0 + 1e-9, 1.0 - 1e-9, 0.5, 2.0] {
+                check(base * perturb);
+            }
+        }
+        for special in [
+            0.0,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::from(f32::MIN_POSITIVE),
+            f64::from(f32::MIN_POSITIVE) * 0.999_999,
+            f64::from(f32::MIN_POSITIVE) * 1.000_001,
+            f64::from(f32::MAX),
+            f64::from(f32::MAX) * 0.999_999,
+            f64::from(f32::MAX) * 1.000_001,
+            f64::from(f32::MAX) + 1.0,
+            1e-300,
+            -1e-300,
+            f64::MIN_POSITIVE,
+            5e-324,
+            -5e-324,
+            f64::from(next_up_f32(f32::MAX / 2.0)),
+            -1.0,
+            -f64::from(f32::MIN_POSITIVE),
+        ] {
+            check(special);
+        }
+    }
+
+    /// The inlined badness predicate in `error_row_max`'s block fold must
+    /// match the canonical sanitizer exactly: bad iff
+    /// `nonnegative_f32_error_or_infinity` maps the entry to INFINITY.
+    /// Sampled across the whole f32 bit space plus the boundary specials.
+    #[test]
+    fn error_row_max_badness_matches_sanitizer() {
+        let check = |bits: u32| {
+            let value = f32::from_bits(bits);
+            let magnitude = bits & 0x7fff_ffff;
+            let inlined = (magnitude >= 0x7f80_0000) || (bits >> 31 != 0) && (magnitude != 0);
+            let canonical = !nonnegative_f32_error_or_infinity(value).is_finite();
+            assert_eq!(inlined, canonical, "bits={bits:#010x} value={value}");
+        };
+        for bits in (0u32..=u32::MAX).step_by(2_477) {
+            check(bits);
+        }
+        for special in [
+            0x0000_0000, // +0
+            0x8000_0000, // -0
+            0x0000_0001, // smallest subnormal
+            0x8000_0001, // -smallest subnormal
+            0x7f7f_ffff, // f32::MAX
+            0x7f80_0000, // +inf
+            0xff80_0000, // -inf
+            0x7f80_0001, // sNaN
+            0x7fc0_0000, // qNaN
+            0xffc0_0000, // -qNaN
+            0x7f7f_fffe,
+        ] {
+            check(special);
+        }
+    }
 
     #[test]
     fn higham_error_publication_steps_past_binary32_boundary() {

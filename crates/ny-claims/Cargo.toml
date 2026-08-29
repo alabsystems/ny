@@ -1,0 +1,40 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ny-claims"
+description = "Executable empirical claims: a claim is a record with an extractor, an engagement witness, and a sensitivity set, re-checkable against the artifacts it was derived from."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# A LEAF crate on purpose. `ny claims verify` must be runnable in a pre-commit
+# hook and in CI without linking the verifier, because a check that costs a
+# 10-minute release build is a check nobody runs — and an unrun check is
+# exactly the documentation this crate exists to replace.
+#
+# No `regex`: an extractor is EVIDENCE, and an unbounded pattern language is
+# not auditable. The op set in `extract.rs` is closed, typed and tested.
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# Fast path for iteration and for hooks: identical code to `ny claims`, but it
+# builds in seconds instead of relinking a 133 MB verifier.
+[[bin]]
+name = "ny-claims"
+path = "src/bin/ny_claims.rs"

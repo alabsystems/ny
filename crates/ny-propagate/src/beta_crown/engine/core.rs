@@ -15,7 +15,10 @@ use tracing::{info, instrument};
 use crate::beta_crown::bab_cuts::CutPool;
 use crate::beta_crown::config::BetaCrownConfig;
 use crate::beta_crown::domain::BabDomain;
-use crate::beta_crown::result::{BabVerificationStatus, BetaCrownResult};
+use crate::beta_crown::result::{
+    note_global_timeout_engine_invocation, record_global_timeout_deadline_source,
+    BabVerificationStatus, BetaCrownResult,
+};
 use crate::{GraphNetwork, Network};
 
 use super::cut_gate::CutGateState;
@@ -275,6 +278,8 @@ impl BetaCrownVerifier {
         // All-None (every preset that doesn't set the knobs) is byte-identical
         // to the historical constants.
         configured.set_crown_ibp_per_node_time_budget(self.config.crown_ibp_per_node_time_budget());
+        configured.set_chunk_wave_parallel_enabled(self.config.chunk_wave_parallel_enabled);
+        configured.set_frozen_levers(self.config.frozen_levers.clone());
         configured.set_forward_linear_deadline_fallback_to_ibp(
             self.config
                 .alpha_config
@@ -361,6 +366,7 @@ impl BetaCrownVerifier {
         deadline: Option<Instant>,
     ) -> Result<BetaCrownResult> {
         self.config.validate()?;
+        note_global_timeout_engine_invocation();
         // Disable the L2/Cauchy–Schwarz lever for the entire beta-CROWN verify
         // scope. beta-CROWN re-runs IBP forward bound collection per domain (root
         // bounds, child clips, input-split prescreen — some on rayon workers via
@@ -372,7 +378,7 @@ impl BetaCrownVerifier {
         // Env-gated throughput probe (#38 acasxu prop_2). Prints domains/s at each
         // BaB loop exit so A/B runs can report explored-domain counts + rate
         // without a tracing subscriber. No effect unless NY_ACASXU_PROF is set.
-        let prof = std::env::var("NY_ACASXU_PROF").is_ok();
+        let prof = ny_levers::read_raw(&ny_levers::decls::bab_diagnostics::ACASXU_PROF).is_some();
         let prof_report = |tag: &str,
                            explored: usize,
                            verified: usize,
@@ -386,16 +392,15 @@ impl BetaCrownVerifier {
                     );
             }
         };
-        let effective_total = match deadline {
-            Some(dl) => dl.saturating_duration_since(start_time),
-            None => self.config.timeout,
+        let crown_deadline = match deadline {
+            Some(deadline) => Some(deadline),
+            None => Some(start_time.checked_add(self.config.timeout).ok_or_else(|| {
+                NyError::InvalidConfig(format!(
+                    "effective timeout {:?} is too large for the platform monotonic clock",
+                    self.config.timeout
+                ))
+            })?),
         };
-        let crown_deadline = Some(start_time.checked_add(effective_total).ok_or_else(|| {
-            NyError::InvalidConfig(format!(
-                "effective timeout {:?} is too large for the platform monotonic clock",
-                effective_total
-            ))
-        })?);
         let mut cut_gate = CutGateState::new(&self.config);
         let mut state = BabLoopState::new(self.config.enable_cuts);
         // Conflict-clause learning (win-plan arc C, v1): per-run store, gated
@@ -452,6 +457,11 @@ impl BetaCrownVerifier {
         let pgd_fallback = |result| {
             self.try_pgd_attack_with_deadline(network, input, threshold, result, pgd_deadline)
         };
+        let bab_deadline = start_time.checked_add(bab_timeout).ok_or_else(|| {
+            NyError::InvalidConfig(
+                "BaB timeout is too large for the platform monotonic clock".to_string(),
+            )
+        })?;
 
         // BaB queue MEMORY cap (#bab-queue-oom). Each `BabDomain` on the heap carries
         // per-layer intermediate bounds for the whole network; on conv-heavy nets
@@ -481,6 +491,62 @@ impl BetaCrownVerifier {
 
         let mut queue: BinaryHeap<BabDomain> = BinaryHeap::new();
         let mut root = self.build_root_domain(initial_layer_bounds, &initial_bounds, input)?;
+        // SEED THE ROOT (#bab-warm-start). `BabDomain::root` carries an EMPTY
+        // α state and EMPTY intermediate bounds, so every depth-1 child (a)
+        // warm-started from nothing, re-deriving the u>-l heuristic, and (b)
+        // fell into the full-recompute fallback in `create_child_domain`
+        // (parent intermediates empty). One joint-α optimization at the root
+        // (empty history: no β, pure α) populates both: children inherit an
+        // OPTIMIZED α trajectory and take the frozen-prefix transfer path
+        // from the first split on. Measured motivation: with the monotone
+        // floor's counter, 100% of children regressed below their parent's
+        // bound (clamp 1942/1942 on `mnist_fc 256x4`) — the cold-started
+        // per-child optimizer could not even reproduce the root bound.
+        // SOUNDNESS: the joint optimizer's root bound and the initial-phase
+        // bound both enclose the same region, so `max` is sound; α seeding
+        // affects only the optimizer's starting point.
+        if self.config.use_alpha_crown
+            && !matches!(
+                self.config.branching_heuristic,
+                crate::beta_crown::branching::BranchingHeuristic::InputSplit
+            )
+        {
+            let root_history = crate::beta_crown::SplitHistory::new();
+            let mut root_alpha =
+                crate::beta_crown::state::DomainAlphaState::from_layer_bounds_and_constraints(
+                    network,
+                    &root.layer_bounds,
+                    &root_history,
+                );
+            if !root_alpha.is_empty() {
+                let mut root_beta = crate::beta_crown::state::BetaState::empty();
+                let (root_joint_bounds, root_intermediate) = self.optimize_joint_bounds(
+                    network,
+                    input,
+                    &root_history,
+                    &root.layer_bounds,
+                    &mut root_beta,
+                    &mut root_alpha,
+                    &mut cut_pool,
+                    engine,
+                )?;
+                let joint_lower = {
+                    use super::tensor_ext::BoundedTensorExt as _;
+                    root_joint_bounds.lower_scalar()
+                };
+                if prof {
+                    eprintln!(
+                        "[NY_ACASXU_PROF] root-seed: joint_lower={joint_lower:.4} initial_lower={:.4}",
+                        root.lower_bound
+                    );
+                }
+                if joint_lower.is_finite() {
+                    root.lower_bound = root.lower_bound.max(joint_lower);
+                }
+                root.domain_alpha_state = root_alpha;
+                root.intermediate_bounds = root_intermediate;
+            }
+        }
         root.priority = self
             .config
             .violation_priority(root.lower_bound, root.upper_bound)?;
@@ -495,12 +561,16 @@ impl BetaCrownVerifier {
                 let since = prof_last.elapsed().as_secs_f64();
                 if since >= 2.0 {
                     eprintln!(
-                        "[NY_ACASXU_PROF] tick: iters={prof_iters} explored={} verified={} queue={} depth={} elapsed={:.1}s",
+                        "[NY_ACASXU_PROF] tick: iters={prof_iters} explored={} verified={} queue={} depth={} elapsed={:.1}s clamp={}/{}",
                         state.domains_explored,
                         state.domains_verified,
                         queue.len(),
                         state.max_depth,
-                        start_time.elapsed().as_secs_f64()
+                        start_time.elapsed().as_secs_f64(),
+                        super::domain::child::MONOTONE_CLAMP_FIRED
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        super::domain::child::CHILDREN_CREATED
+                            .load(std::sync::atomic::Ordering::Relaxed),
                     );
                     prof_last = Instant::now();
                 }
@@ -526,7 +596,8 @@ impl BetaCrownVerifier {
                     state.max_depth,
                     state.domains_clause_pruned,
                 );
-                return pgd_fallback(BetaCrownResult {
+                record_global_timeout_deadline_source(Some(bab_deadline));
+                let result = pgd_fallback(BetaCrownResult {
                     result: BabVerificationStatus::Timeout,
                     domains_explored: state.domains_explored,
                     time_elapsed: start_time.elapsed(),
@@ -534,7 +605,8 @@ impl BetaCrownVerifier {
                     output_bounds: None,
                     cuts_generated: cut_pool.total_generated,
                     domains_verified: state.domains_verified,
-                });
+                })?;
+                return Ok(result);
             }
 
             if state.domains_explored >= self.config.max_domains {

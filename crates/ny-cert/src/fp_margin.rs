@@ -77,23 +77,33 @@ use num_bigint::BigInt;
 use crate::crown_deep::{DeepCrownError, DeepReluProblem};
 use crate::rational::{Rat, RatError};
 
+/// Largest input dimension a network may declare for margin computation.
+///
+/// The per-input error vector is sized from the parsed network's input box, so
+/// nothing in the program text bounds it — the allocation checker refutes it
+/// with a counterexample at 2^26. Note the binding ceiling here is the BYTE one,
+/// not the element one: `Rat` is a 4-byte arena handle, so 256 MiB is reached at
+/// 2^26 inputs rather than 2^28, and a cap chosen against the element ceiling
+/// would not have discharged this.
+///
+/// 2^20 is the domain answer with wide margin: ImageNet is 150,528 inputs,
+/// CIFAR-10 is 3,072, MNIST 784, ACAS-Xu 5. A network claiming 2^20 or more
+/// inputs is a corrupt or adversarial file, not a verification target. Shares
+/// the value of [`crate::branch`]'s cell cap and `exact`'s dimension cap so the
+/// crate has one size doctrine.
+const MAX_INPUT_DIM: usize = 1_048_576;
+
 /// Errors that can arise while computing a deployed-FP error margin.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FpMarginError {
     /// The network failed validation or exact interval propagation.
-    #[error(transparent)]
-    Network(#[from] DeepCrownError),
+    Network(DeepCrownError),
     /// Exact arithmetic failure.
-    #[error(transparent)]
-    Rat(#[from] RatError),
+    Rat(RatError),
     /// An affine layer has so many inputs that `(n+1)·2⁻²⁴ ≥ 1`, outside the
     /// `γ_k` model's domain (`k·u < 1`). Fail-closed; unreachable for any
     /// realistic network (needs width ≥ 2²⁴ − 1).
-    #[error(
-        "affine layer with {width} inputs is too wide for the f32 error model \
-         (needs ({width}+1)·2^-24 < 1)"
-    )]
     WidthTooLarge {
         /// Number of inputs of the offending affine row.
         width: usize,
@@ -101,17 +111,67 @@ pub enum FpMarginError {
     /// A purported deployed weight or bias is not exactly representable as a
     /// finite f32, so there is no authenticated deployed parameter to compare
     /// with the ideal rational semantics.
-    #[error("deployed parameter {value} is not the exact value of a finite f32")]
     NonF32Parameter {
         /// Canonical rational spelling of the rejected parameter.
         value: String,
     },
     /// A conservative magnitude envelope can reach beyond finite f32 range.
-    #[error("deployed affine row may overflow f32 (magnitude envelope {magnitude})")]
     OverflowRisk {
         /// Canonical rational spelling of the conservative envelope.
         magnitude: String,
     },
+}
+
+// Hand-written replacements for the former `thiserror::Error` derive: the
+// proc-macro dependency is removed so the bignum stack can be verified rather
+// than assumed. Every message is byte-identical to the derived one, and the
+// two former `#[error(transparent)]` variants keep transparent semantics —
+// Display forwards to the inner error and `source()` forwards to the INNER
+// error's source (the wrapper stays invisible in the chain).
+impl core::fmt::Display for FpMarginError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Network(source) => core::fmt::Display::fmt(source, f),
+            Self::Rat(source) => core::fmt::Display::fmt(source, f),
+            Self::WidthTooLarge { width } => write!(
+                f,
+                "affine layer with {width} inputs is too wide for the f32 error model \
+                 (needs ({width}+1)·2^-24 < 1)"
+            ),
+            Self::NonF32Parameter { value } => write!(
+                f,
+                "deployed parameter {value} is not the exact value of a finite f32"
+            ),
+            Self::OverflowRisk { magnitude } => write!(
+                f,
+                "deployed affine row may overflow f32 (magnitude envelope {magnitude})"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for FpMarginError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Network(source) => core::error::Error::source(source),
+            Self::Rat(source) => core::error::Error::source(source),
+            Self::WidthTooLarge { .. }
+            | Self::NonF32Parameter { .. }
+            | Self::OverflowRisk { .. } => None,
+        }
+    }
+}
+
+impl From<DeepCrownError> for FpMarginError {
+    fn from(source: DeepCrownError) -> Self {
+        Self::Network(source)
+    }
+}
+
+impl From<RatError> for FpMarginError {
+    fn from(source: RatError) -> Self {
+        Self::Rat(source)
+    }
 }
 
 /// Result alias for this module.
@@ -238,7 +298,16 @@ pub fn deployed_fp_margin(problem: &DeepReluProblem) -> FpMarginResult<FpMargin>
         let (la, ha) = (lo.abs(), hi.abs());
         mags.push(if la >= ha { la } else { ha });
     }
-    let mut errs: Vec<Rat> = vec![Rat::ZERO; mags.len()];
+    // Dominating size cap (fail-closed) on the SAME operand the bulk fill below
+    // consumes. `mags` was built by a push loop, which carries no allocation
+    // obligation, so this is where the input dimension first becomes visible to
+    // the checker. Bind it once and guard the binding: guarding `mags.len()` while
+    // the allocation reads a separate re-evaluation would leave the two unlinked.
+    let dim = mags.len();
+    if dim >= MAX_INPUT_DIM {
+        return Err(FpMarginError::WidthTooLarge { width: dim });
+    }
+    let mut errs: Vec<Rat> = vec![Rat::ZERO; dim];
 
     let mut activation_errors: Vec<Vec<Rat>> = Vec::new();
     for ((w, b), z_hi) in problem

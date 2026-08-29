@@ -4,13 +4,13 @@
 
 //! Certified Cut-CROWN resident-lane cut-fold REGISTRY (shared seam).
 //!
-//! The fold ENTRY + its global registry + the dark gate live here in `ny-core`
+//! The fold ENTRY + its global registry live here in `ny-core`
 //! so that BOTH the writer (`ny-propagate`, which drives the resident GPU
 //! backward but — to avoid a dependency cycle — depends on `ny-gpu` only as a
 //! dev-dependency) and the reader (`ny-gpu`'s sound resident CROWN backward) can
 //! reach the same registry through their shared `ny-core` dependency. `ny-gpu`
-//! re-exports these symbols from `ny_gpu::wgpu_device` for the experiment
-//! harnesses (`NY_CUT_FOLD_RESIDENT`), so existing call sites are unchanged.
+//! re-exports these symbols from `ny_gpu::wgpu_device` for historical research
+//! harnesses, so existing registry call sites are unchanged.
 //!
 //! A registered fold contributes, to the LOWER objective at the target ReLU:
 //!   * `coeffs`     — `+Σλ·cc_i` on the ReLU-OUTPUT frontier (pre-transform);
@@ -42,31 +42,19 @@ pub struct ResidentCutFold {
     /// transform (the `+β·a_i` channel the legacy C2 fold lacked; realizes the
     /// §2.2 pre-activation term on the resident lane). Empty ⇒ the fold site
     /// runs the single-part backward exactly as the legacy C2 path (no sub-
-    /// split), so `NY_CUT_FOLD_RESIDENT` behaviour is untouched.
+    /// split), so legacy single-part backward behaviour is untouched.
     pub pre_coeffs: Vec<(u32, f32)>,
     /// When true, every coefficient/bias add rounds OUTWARD and widens the
     /// certified `lower_err`/`lower_b_err` (production soundness — the
     /// proposed `NY_MULTINEURON_STEM` stem lever). `false` = the legacy
-    /// experiment-grade
-    /// plain-f32 add (byte-identical to today's `NY_CUT_FOLD_RESIDENT` path).
+    /// experiment-grade plain-f32 add (byte-identical to the retired research
+    /// path).
     pub sound_round: bool,
 }
 
 fn registry() -> &'static RwLock<Option<ResidentCutFold>> {
     static REGISTRY: OnceLock<RwLock<Option<ResidentCutFold>>> = OnceLock::new();
     REGISTRY.get_or_init(|| RwLock::new(None))
-}
-
-/// The dark gate: resident cut folding is active only under the legacy research
-/// harness `NY_CUT_FOLD_RESIDENT=1`. Neither proposed production environment
-/// request (`NY_MULTINEURON_STEM` nor `NY_MN_HEAD_RESIDENT`) grants authority.
-/// The research gate unset ⇒ `active_resident_cut_fold()` is `None` ⇒ the fold
-/// site is never entered ⇒ byte-identical to today.
-pub fn resident_cut_fold_enabled() -> bool {
-    matches!(
-        std::env::var("NY_CUT_FOLD_RESIDENT").ok().as_deref(),
-        Some("1")
-    )
 }
 
 /// Proof authority for consuming a resident cut fold.
@@ -115,10 +103,10 @@ pub fn clear_resident_cut_fold() {
 
 /// The active proof-path fold.
 ///
-/// Currently always `None`: environment and registry state are research inputs,
-/// not proof authority.
+/// Currently always `None`: public registry state is a research input, not
+/// proof authority.
 pub fn active_resident_cut_fold() -> Option<ResidentCutFold> {
-    if !resident_cut_fold_proof_authority_enabled() || !resident_cut_fold_enabled() {
+    if !resident_cut_fold_proof_authority_enabled() {
         return None;
     }
     registry().read().ok()?.clone()
@@ -133,7 +121,6 @@ mod tests {
         // Serialized env scope (clippy env wall); pre-test state restored on
         // exit.
         ny_test_utils::env::with_env_edits(|env| {
-            env.remove("NY_CUT_FOLD_RESIDENT");
             env.remove("NY_MULTINEURON_STEM");
             env.remove("NY_MN_HEAD_RESIDENT");
             set_resident_cut_fold(ResidentCutFold {
@@ -142,13 +129,9 @@ mod tests {
                 pre_coeffs: vec![(2, 0.75)],
                 sound_round: true,
             });
-            // Default (research gate unset) ⇒ inert even with an entry registered.
+            // Public registry state is inert even with an entry registered.
             assert!(active_resident_cut_fold().is_none());
 
-            // The legacy environment request is observable to research
-            // harnesses, but cannot arm the proof-path reader.
-            env.set("NY_CUT_FOLD_RESIDENT", "1");
-            assert!(resident_cut_fold_enabled());
             assert!(!resident_cut_fold_proof_authority_enabled());
             assert!(active_resident_cut_fold().is_none());
 
@@ -162,7 +145,6 @@ mod tests {
             assert_eq!(fold.bias_shift, -1.25);
             assert_eq!(fold.pre_coeffs, vec![(2, 0.75)]);
             assert!(fold.sound_round);
-            env.remove("NY_CUT_FOLD_RESIDENT");
 
             // The proposed stem gate is authority-quarantined too.
             env.set("NY_MULTINEURON_STEM", "1");
@@ -190,7 +172,6 @@ mod tests {
             assert!(active_resident_cut_fold().is_none());
 
             clear_resident_cut_fold();
-            env.set("NY_CUT_FOLD_RESIDENT", "1");
             assert!(active_resident_cut_fold().is_none());
         });
     }

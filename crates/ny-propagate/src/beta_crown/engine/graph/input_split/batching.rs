@@ -547,6 +547,7 @@ pub(super) fn bound_deferred_domains_batch_with_metrics(
                 crown_backward_layers,
                 ibp_enhancement: config.input_split_ibp_enhancement,
                 stacked_rebound: config.input_split_stacked_rebound,
+                nested_deadline: config.input_split_nested_deadline,
             })?;
         batched_timing = Some(batched_bounds.rebound_timing.clone());
 
@@ -656,6 +657,9 @@ pub(super) fn bound_deferred_domains_batch_with_metrics(
                 crown_backward_layers,
                 config,
             )
+            // Anchors are consumed only by the eager-lane f64-tail hook; the
+            // deferred overlay drops them (no per-domain retention cost).
+            .map(|(bounds, linear, refined_alpha, _anchors)| (bounds, linear, refined_alpha))
         },
     );
     for (domain_idx, warm_result) in warm_results {
@@ -809,6 +813,7 @@ where
                 crown_backward_layers,
                 ibp_enhancement: config.input_split_ibp_enhancement,
                 stacked_rebound: config.input_split_stacked_rebound,
+                nested_deadline: config.input_split_nested_deadline,
             })?;
         batched_timing = Some(batched_bounds.rebound_timing.clone());
 
@@ -910,7 +915,8 @@ where
                 crown_backward_layers,
                 config,
             )
-            .and_then(|(bounds, linear, refined_alpha)| {
+            // `_anchors` dropped: only the eager-lane f64-tail hook keeps them.
+            .and_then(|(bounds, linear, refined_alpha, _anchors)| {
                 Ok((
                     extract_obj_bounds(&bounds, num_specs)?,
                     linear,
@@ -1035,6 +1041,7 @@ pub(super) fn bound_deferred_disjunctive_domains_batch(
     config: &BetaCrownConfig,
     metrics_sink: Option<&dyn GraphDomainBatchMetricsSink>,
     batch_index: usize,
+    f64_tail_budget: Option<&super::f64_tail::F64TailRunBudget>,
 ) -> Result<DenseSpecReboundTiming> {
     // #relational-bab lever 1 (config-gated, default OFF => byte-identical):
     // the collection-verify shortcut applies only when the rebound would use
@@ -1095,6 +1102,8 @@ pub(super) fn bound_deferred_disjunctive_domains_batch(
         mul_binary_alphas,
         engine,
         deadline,
+        config,
+        f64_tail_budget,
     );
     Ok(timing)
 }

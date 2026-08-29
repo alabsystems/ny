@@ -60,6 +60,10 @@ pub mod wgpu_device;
 /// GPU-side constraint buffer manager for batched Clip-and-Verify.
 #[cfg(feature = "wgpu")]
 pub use constraint_buffers::GpuConstraintBuffers;
+/// #margin-row-gpu-eft: dedicated-device executor for the margin-row certified
+/// GPU backward lane (`ny_core::MarginRowLaneGpu` implementation).
+#[cfg(feature = "wgpu")]
+pub use wgpu_device::margin_row_lane::MarginRowLaneDevice;
 /// #batched-bab wide-lane publication counter (observability; see the fn doc).
 #[cfg(feature = "wgpu")]
 pub use wgpu_device::wide_resnet_batched_taken_count;

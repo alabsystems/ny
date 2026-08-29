@@ -10,8 +10,10 @@
 //! - Element-wise nonlinear (`ReciprocalLayer`)
 //! - Conditional (`WhereLayer`)
 //! - Index-producing (`NonZeroLayer`)
+//! - Certified additive widening (`EpsilonExpandLayer`)
 
 pub(crate) mod compare;
+mod epsilon_expand;
 mod nonzero;
 mod piecewise_constant;
 mod qdq_perturbation;
@@ -20,6 +22,7 @@ mod skip_merge;
 mod where_layer;
 
 pub use compare::{CompareLayer, CompareOp};
+pub use epsilon_expand::EpsilonExpandLayer;
 pub use nonzero::NonZeroLayer;
 pub use piecewise_constant::{CeilLayer, FloorLayer, RoundLayer, SignLayer, TruncLayer};
 pub use qdq_perturbation::QdqPerturbationLayer;

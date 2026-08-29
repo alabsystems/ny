@@ -21,9 +21,26 @@ external-carcara = []
 external-lean = []
 
 [dependencies]
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-thiserror.workspace = true
+# NO PROC-MACRO DEPENDENCIES. Evidence-grade verification enforces a
+# no-proc-macro TCB boundary (an in-process proc macro shares rustc's argv,
+# memory, stderr, and artifact filesystem, and can forge the TRUSTJSON proof
+# transport), so a proc macro anywhere in this graph makes the whole bignum
+# stack unverifiable-and-assumed rather than verified. Three dependencies were
+# therefore removed and hand-expanded in-crate:
+#   * `thiserror` (pulls `thiserror-impl`)  -> hand-written Display/Error/From.
+#   * serde's `derive` feature (pulls `serde_derive`) -> hand-written
+#     `lake-manifest.json` decoding in `cite_check`'s test module.
+#   * `serde_json` (and with it `serde`/`serde_core`) -> the in-crate `json`
+#     module.
+#
+# NO SIMD SUBSTRING SEARCHER IN THE TRUSTED BASE. `serde_json` pulls `memchr`,
+# whose hand-vectorized `unsafe` pointer arithmetic accounted for ~78% of every
+# proof obligation and ~97% of every failure in the dependency-verification run
+# (1195 of 1231 FAILED), and `itoa`/`zmij` for number formatting. That whole
+# edge existed to parse three repo-hygiene manifests; `crates/ny-cert/src/json.rs`
+# replaces it with a byte-compatible reader/writer written to this crate's
+# provability discipline (no indexing, no unwrap, no unsafe, explicit depth
+# budget). Certificates are EMITTED by ny-cert and never parsed by it.
 num-bigint.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true

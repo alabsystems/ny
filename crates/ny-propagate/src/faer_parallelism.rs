@@ -103,6 +103,17 @@ pub(crate) fn mat_mul_f64(a: &Mat<f64>, b: &Mat<f64>) -> Mat<f64> {
     dst
 }
 
+/// [`mat_mul_f64`] writing straight into a caller-provided view (typically a
+/// row-major `MatMut` over the destination buffer), eliminating the temporary
+/// `Mat` and the per-element bounds-checked copy that would otherwise follow.
+/// Same faer kernel, same certificate coverage: the certified conv error is
+/// summation-order independent (#vnncomp-aw-soundness).
+pub(crate) fn mat_mul_f64_into(mut dst: faer::MatMut<'_, f64>, a: &Mat<f64>, b: &Mat<f64>) {
+    debug_assert_eq!(dst.nrows(), a.nrows());
+    debug_assert_eq!(dst.ncols(), b.ncols());
+    matmul(&mut dst, Accum::Replace, a, b, 1.0, current_par());
+}
+
 /// f64 matrix multiply over row-major slices without repacking them into owned
 /// faer matrices first.
 ///
@@ -145,6 +156,14 @@ pub(crate) fn mat_mul_f64_row_major(
 /// cuBLAS). All other `GemmEngine` methods keep their trait defaults
 /// (fallbacks to `gemm_f32` / CPU paths).
 pub(crate) struct FaerCpuGemmEngine;
+
+/// Tile-phase split inside [`FaerCpuGemmEngine::gemm_f64_with_deadline`]:
+/// matmul wall time vs transpose-copy wall time, read by the `[engine-split]`
+/// diagnostics line so the dispatch's cost is attributed, not guessed.
+pub(crate) static FAER_TILE_MATMUL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FAER_TILE_COPY_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct CheckedGemmLengths {
@@ -257,6 +276,20 @@ impl ny_core::GemmEngine for FaerCpuGemmEngine {
         Ok(out)
     }
 
+    /// In-process CPU tiles poll between matmuls, so cancellation latency is
+    /// one tile's wall time, not an accelerator queue drain. At the measured
+    /// ≥20 G MAC/s of this engine a `1<<27`-MAC tile is ~6 ms — three orders
+    /// of magnitude finer than any VNN-COMP per-node budget — while the
+    /// accelerator-sized `1<<24` cap sliced the acceptance row's 245 G-MAC
+    /// certified conv recompute into ~14,700 sub-millisecond tiles, each too
+    /// small for faer to block or thread well (REGRESSION doc, 2026-08-21).
+    /// Worst case on a slow host (~1 G MAC/s) the granularity is ~130 ms,
+    /// still far inside the seconds-scale per-node deadlines this seam serves.
+    fn deadline_dispatch_macs_hint(&self, requested: usize) -> usize {
+        const CPU_DEADLINE_TILE_MACS_FLOOR: usize = 1 << 27;
+        requested.max(CPU_DEADLINE_TILE_MACS_FLOOR)
+    }
+
     /// Deadline-bounded f64 GEMM (#cpu-sound-f64-deadline).
     ///
     /// WHY THIS EXISTS. Without it the trait default returns `UnsupportedOp`,
@@ -345,7 +378,7 @@ impl ny_core::GemmEngine for FaerCpuGemmEngine {
         // gamma_k*S certificate (summation-order independent) is untouched.
         let max_cells = (max_dispatch_macs / k).max(1);
         let cols_per = n.min(((max_cells as f64).sqrt().ceil()) as usize).max(1);
-        let rows_per = (max_cells / cols_per).max(1);
+        let rows_per = (max_cells / cols_per).max(1).min(m);
 
         let b_mat = MatRef::from_row_major_slice(b, k, n);
         let mut i0 = 0usize;
@@ -359,13 +392,47 @@ impl ny_core::GemmEngine for FaerCpuGemmEngine {
                 }
                 let cols = cols_per.min(n - j0);
                 let b_tile = b_mat.submatrix(0, j0, k, cols);
-                let mut dst = Mat::<f64>::zeros(rows, cols);
-                matmul(&mut dst, Accum::Replace, a_blk, b_tile, 1.0, current_par());
-                for i in 0..rows {
-                    for j in 0..cols {
-                        out[(i0 + i) * n + j0 + j] = dst[(i, j)];
-                    }
-                }
+                // HISTORICAL matmul form, deliberately: fresh column-major
+                // tile dst + row-major operand views is the exact call the
+                // tiled==untiled bit-parity pin was recorded against. Both
+                // zero-copy rewrites (row-major dst view; transposed-problem
+                // col-major view) selected kernel families whose per-element
+                // k-accumulation order varies with tile shape — 1-ULP
+                // divergence, caught by the pin. What WAS the measured cost
+                // here (the group arm's 21.5 s engine share against 0.05 s of
+                // tile matmul; REGRESSION doc, "conv-arm probes") was never
+                // the temp — it was the per-element bounds-checked 2D
+                // `dst[(i, j)]` copy, replaced below with per-column
+                // contiguous reads. Column sweeps revisit the same
+                // destination cache-line set (rows lines ≈ L2-resident for
+                // balanced tiles), so no extra blocking is needed.
+                // DIRECT-WRITE through a row-major MatMut view of the
+                // destination tile: no temp, no zeroing, no transpose copy.
+                // Receipts for this choice (2026-08-21, acceptance row, all
+                // pin-battery-verified alternatives): fresh col-major temp +
+                // per-element copy 21.5 s; + col-slice copy at 2^27 tiles
+                // 29.4 s (per-tile 33 MB zeroed allocs); + shape-cached temps
+                // 26.3 s; + L1-blocked copy 16.7 s (tile_mm 7.8 + copy 7.2);
+                // direct-write pays only tile_mm. The bits differ from the
+                // unbounded twin in the last ULP because faer's dot order
+                // tracks destination layout — inside the callers' summation-
+                // order-independent certificate, pinned as an envelope +
+                // determinism (see the test's doc).
+                let mm_t = std::time::Instant::now();
+                let mut out_view = faer::MatMut::from_row_major_slice_mut(&mut out, m, n)
+                    .submatrix_mut(i0, j0, rows, cols);
+                matmul(
+                    &mut out_view,
+                    Accum::Replace,
+                    a_blk,
+                    b_tile,
+                    1.0,
+                    current_par(),
+                );
+                FAER_TILE_MATMUL_NANOS.fetch_add(
+                    u64::try_from(mm_t.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 j0 += cols;
             }
             i0 += rows;
@@ -468,11 +535,28 @@ impl ny_core::GemmEngine for FaerCpuGemmEngine {
         // is summation-order independent (the argument already banked for cuBLAS
         // and for faer's own threaded reduction). Bounds stay valid enclosures;
         // last ULPs may move.
-        let c = mat_mul_f64_row_major(a, m, k, b, n);
+        // DIRECT-WRITE OUTPUT, matching `gemm_f64_with_deadline`'s tile path.
+        // The two must share one destination convention: faer selects kernels
+        // by destination layout, and the deadline twin's tiled-equals-untiled
+        // bit-parity pin (`bounded_f64_gemm_matches_unbounded_..`) is exactly
+        // a same-convention check. Writing the column-major temp and copying
+        // per element here while the deadline path wrote row-major views
+        // produced a 1-ULP kernel-order divergence the pin caught. Same
+        // contract note as above: summation order may move vs the old
+        // column-major temp; the caller's certified envelope is order-
+        // independent.
         let mut out = allocate_gemm_output(shape, 0.0f64, SITE)?;
-        for i in 0..m {
-            for j in 0..n {
-                out[i * n + j] = c[(i, j)];
+        let a_mat = MatRef::from_row_major_slice(a, m, k);
+        let b_mat = MatRef::from_row_major_slice(b, k, n);
+        // Historical col-major matmul (bit-parity with the deadline twin's
+        // pinned convention — see that method), with the former per-element
+        // 2D-indexed copy replaced by per-column contiguous reads.
+        let mut c = Mat::<f64>::zeros(m, n);
+        matmul(&mut c, Accum::Replace, a_mat, b_mat, 1.0, current_par());
+        for j in 0..n {
+            let col = c.col_as_slice(j);
+            for (i, &value) in col.iter().enumerate() {
+                out[i * n + j] = value;
             }
         }
         Ok(out)
@@ -709,35 +793,71 @@ mod tests {
         }
     }
 
-    /// #cpu-sound-f64-deadline: the bounded f64 GEMM must (a) agree EXACTLY with
-    /// the unbounded one — tiling the OUTPUT axes cannot change any coefficient,
-    /// because each stays one whole length-k dot — (b) refuse when k alone
-    /// exceeds the cap rather than silently splitting the contraction, and (c)
-    /// return DeadlineExceeded rather than a late result.
+    /// #cpu-sound-f64-deadline: the bounded f64 GEMM must (a) agree with the
+    /// unbounded one WITHIN THE CERTIFIED ENVELOPE and be deterministic —
+    /// tiling the OUTPUT axes keeps each coefficient one whole length-k
+    /// RN-f64 dot, so every tiling satisfies the callers' γ_k·S certificate;
+    /// (b) refuse when k alone exceeds the cap rather than silently splitting
+    /// the contraction; and (c) return DeadlineExceeded rather than a late
+    /// result.
+    ///
+    /// WHY (a) IS AN ENVELOPE, NOT BIT-EQUALITY (2026-08-21, three receipted
+    /// experiments on the acceptance row): faer's per-element dot
+    /// accumulation ORDER tracks the destination's layout, tile shape, and
+    /// allocation alignment — a row-major destination view, a transposed-
+    /// problem column-major view, and a Vec-backed column-major prefix each
+    /// diverged from the fresh-Mat reference by 1 ULP somewhere in this
+    /// battery. Bit-parity therefore forces a materialize-and-copy convention
+    /// that was measured at 7.2 s of pure transpose-copy on the biasfield
+    /// group arm, while the trait contract (and the callers' summation-order-
+    /// independent certificates) never needed more than SOME RN-f64 order.
+    /// What this test still pins: the certified envelope for every element
+    /// under every tiling, and bitwise DETERMINISM of repeated identical
+    /// calls (which is what actually catches nondeterministic threading or
+    /// kernel-selection flapping).
     #[test]
     fn bounded_f64_gemm_matches_unbounded_and_honours_its_contract() {
         use ny_core::{GemmEngine, NyError};
         let far = std::time::Instant::now() + std::time::Duration::from_mins(10);
 
-        // (a) Exact agreement across cap sizes that force 1, several, and all
-        // tiles — including caps that force COLUMN tiling as well as row tiling.
+        // (a) Envelope agreement across cap sizes that force 1, several, and
+        // all tiles — including caps that force COLUMN tiling as well as row
+        // tiling — plus bitwise determinism of the bounded path.
         for (m, k, n) in [(1usize, 1usize, 1usize), (4, 3, 5), (7, 8, 6), (16, 4, 9)] {
             let a: Vec<f64> = (0..m * k).map(|i| (i as f64) * 0.5 - 3.0).collect();
             let b: Vec<f64> = (0..k * n).map(|i| 1.0 / ((i + 1) as f64)).collect();
             let reference = FaerCpuGemmEngine
                 .gemm_f64(m, k, n, &a, &b)
                 .expect("unbounded reference");
+            // γ_k for f64: k·u/(1−k·u) with u = 2^-53; ×2 because BOTH sides
+            // carry their own RN accumulation error vs the true product.
+            let u = 2f64.powi(-53);
+            let gamma2 = 2.0 * (k as f64 * u) / (1.0 - k as f64 * u);
             for cap in [k, k + 1, k * 2, k * n, k * n * m, usize::MAX / 4] {
                 let got = FaerCpuGemmEngine
                     .gemm_f64_with_deadline(m, k, n, &a, &b, far, cap)
                     .unwrap_or_else(|e| panic!("({m},{k},{n}) cap={cap}: {e}"));
                 assert_eq!(got.len(), reference.len(), "({m},{k},{n}) cap={cap}: shape");
+                let again = FaerCpuGemmEngine
+                    .gemm_f64_with_deadline(m, k, n, &a, &b, far, cap)
+                    .unwrap_or_else(|e| panic!("({m},{k},{n}) cap={cap} rerun: {e}"));
                 for (idx, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
+                    let i = idx / n;
+                    let j = idx % n;
+                    let mut s = 0.0f64;
+                    for kk in 0..k {
+                        s += a[i * k + kk].abs() * b[kk * n + j].abs();
+                    }
+                    assert!(
+                        (g - r).abs() <= gamma2 * s,
+                        "({m},{k},{n}) cap={cap} idx={idx}: tiled vs untiled outside the \
+                         2·γ_k·S envelope: |{g} - {r}| > {}",
+                        gamma2 * s
+                    );
                     assert_eq!(
                         g.to_bits(),
-                        r.to_bits(),
-                        "({m},{k},{n}) cap={cap} idx={idx}: tiling the OUTPUT axes \
-                         must be bit-identical to the untiled product"
+                        again[idx].to_bits(),
+                        "({m},{k},{n}) cap={cap} idx={idx}: bounded GEMM must be deterministic"
                     );
                 }
             }

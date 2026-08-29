@@ -57,6 +57,12 @@ pub mod exact;
 pub mod fp_margin;
 pub mod generate;
 pub mod invprop_cert;
+// In-crate JSON. Replaces `serde_json` (and with it `memchr`'s hand-vectorized
+// `unsafe` SIMD substring search, plus `itoa`/`zmij`) in the trusted base: the
+// dependency-verification run charged ~78% of all obligations and ~97% of all
+// failures to that one edge. Byte-compatible with `serde_json` 1.0.150 and
+// written to the crate's provability discipline — see the module docs.
+pub mod json;
 pub mod proof_carrying;
 pub mod rational;
 pub mod sbar;

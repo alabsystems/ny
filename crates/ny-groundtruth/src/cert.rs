@@ -366,6 +366,14 @@ pub fn certify_dominance_with(
         .map_err(|e| DominanceCertError::Construction(format!("entailment JSON: {e}")))?;
     let farkas = farkas_to_json(&certified.farkas)
         .map_err(|e| DominanceCertError::Construction(format!("farkas JSON: {e}")))?;
+    // BRIDGE: ny-cert now emits its own bounded `Json` (no serde impls by
+    // design); this payload is still assembled with `serde_json::json!`, so
+    // re-parse the canonical rendering. Removable once this file migrates to
+    // `ny_cert::Json` end-to-end.
+    let entailment: serde_json::Value = serde_json::from_str(&entailment.to_string())
+        .map_err(|e| DominanceCertError::Construction(format!("entailment JSON bridge: {e}")))?;
+    let farkas: serde_json::Value = serde_json::from_str(&farkas.to_string())
+        .map_err(|e| DominanceCertError::Construction(format!("farkas JSON bridge: {e}")))?;
     let squares_json = folded
         .squares
         .iter()

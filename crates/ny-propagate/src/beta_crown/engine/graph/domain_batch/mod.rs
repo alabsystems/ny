@@ -93,6 +93,12 @@ pub(in crate::beta_crown::engine::graph) struct DenseSpecBatchRequest<'a> {
     /// #cgan-batched-stack: domain-stacked conv/BN backward + per-domain IBP
     /// refresh in the batched dense-spec kernel (preset-gated, default false).
     pub(in crate::beta_crown::engine::graph) stacked_rebound: bool,
+    /// #dist-shift-5291: typed nested-deadline authority from
+    /// `BetaCrownConfig::input_split_nested_deadline` (`None` = keep, the
+    /// shipped default). Resolved against `NY_INPUT_SPLIT_NESTED_DEADLINE`
+    /// at the single chokepoint in `input_split/shared_specs.rs`; the env
+    /// lever overrides this field in both directions.
+    pub(in crate::beta_crown::engine::graph) nested_deadline: Option<bool>,
 }
 
 /// Shared entry points for graph domain-batch execution.
@@ -151,6 +157,7 @@ impl GraphDomainBatchExecutor {
             request.crown_backward_layers,
             request.ibp_enhancement,
             request.stacked_rebound,
+            request.nested_deadline,
         )
     }
 }

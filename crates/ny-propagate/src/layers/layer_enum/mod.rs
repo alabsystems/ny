@@ -50,11 +50,14 @@ use super::binary_ops::MulBinaryLayer;
 use super::binary_ops::SubLayer;
 use super::convolution::Conv1dLayer;
 use super::convolution::Conv2dLayer;
+use super::convolution::Conv3dLayer;
 use super::convolution::ConvTranspose1dLayer;
 use super::convolution::ConvTranspose2dLayer;
+use super::interval_const::IntervalConstLayer;
 use super::linear::LinearLayer;
 use super::misc::CeilLayer;
 use super::misc::CompareLayer;
+use super::misc::EpsilonExpandLayer;
 use super::misc::FloorLayer;
 use super::misc::NonZeroLayer;
 use super::misc::QdqPerturbationLayer;
@@ -254,8 +257,27 @@ pub(crate) use for_each_patches_capable_activation;
 #[derive(Debug, Clone)]
 pub enum Layer {
     Linear(LinearLayer),
+    /// Affine layer whose frozen constant is a rigorous ENCLOSURE rather than a
+    /// point (see `layers::interval_const`). A SEPARATE variant on purpose: an
+    /// interval that some propagation path silently reads as its midpoint is
+    /// indistinguishable in its output from the unsound point fold this carrier
+    /// exists to avoid, so every site must either be taught the interval or
+    /// fail closed, and the compiler is what enforces the choice.
+    IntervalConst(IntervalConstLayer),
     Conv1d(Conv1dLayer),
     Conv2d(Conv2dLayer),
+    /// Volumetric convolution over `(C, D, H, W)` / `(N, C, D, H, W)`.
+    ///
+    /// IBP ONLY, and deliberately so: its interval forward is the certified
+    /// directed-binary64 enclosure, while its CROWN backward FAILS CLOSED with
+    /// `UnsupportedOp` because no certified rank-3-spatial transposed
+    /// convolution exists yet. That is why `Conv3d` appears in NEITHER
+    /// [`Layer::propagates_coeff_err`] nor [`Layer::supports_batched_crown`]
+    /// nor the batched-CROWN dispatch: a driver that met it there would have to
+    /// either drop a certified coefficient error or publish a relation this
+    /// layer cannot certify. Refusing degrades the node to IBP, which is always
+    /// sound.
+    Conv3d(Conv3dLayer),
     ConvTranspose1d(ConvTranspose1dLayer),
     ConvTranspose2d(ConvTranspose2dLayer),
     /// Average pooling over spatial dimensions
@@ -440,6 +462,9 @@ pub enum Layer {
     OpaqueSkip(OpaqueSkipLayer),
     /// Unary: sound QDQ fake-quantization relaxation y in x +/- epsilon
     QdqPerturbation(QdqPerturbationLayer),
+    /// Unary: certified additive widening y = x + e with e in +/- epsilon
+    /// (per-element Minkowski enclosure; no quantization semantics)
+    EpsilonExpand(EpsilonExpandLayer),
 }
 
 #[cfg(test)]

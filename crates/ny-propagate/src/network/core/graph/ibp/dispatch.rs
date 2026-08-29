@@ -476,10 +476,26 @@ where
 /// plain IBP, so intersecting avoids a regression while still capturing the
 /// up/gate correlation gains wherever the zonotope wins.
 ///
-/// `intersection_per_element` widens to the union on the numerically-degenerate
-/// disjoint/NaN cases (still sound); a `None` (shape mismatch — not expected
-/// for two views of one node) keeps the zonotope result, matching the prior
+/// `intersection_per_element` widens to the union ONLY on the disjoint branch
+/// (`max(l) > min(u)` at some element — numerically degenerate for two views of
+/// one node, and still sound because the union contains both operands). It
+/// returns `None` on exactly two causes: a shape mismatch (not expected for two
+/// views of one node) **or** a NaN in any endpoint of either operand
+/// (`ny_tensor::BoundedTensor::intersection_per_element`, #2640 — NaN is
+/// rejected, never absorbed). On `None` we keep `zono`, matching the prior
 /// unconditional-zonotope behavior.
+///
+/// **NaN is therefore NOT handled here** — do not read the union fallback as
+/// covering it. Keeping `zono` is sound (it is independently an enclosure of the
+/// node), but a NaN-carrying `zono` is published from this function verbatim,
+/// and a NaN-carrying `ibp` is silently dropped rather than merged. Both cases
+/// are caught by the per-node [`check_nan_firewall`] that every caller runs on
+/// this function's result later in the same loop iteration:
+/// `graph_alpha/bounds/ibp.rs:303`/`:317` (over `node_ibp_step`'s output),
+/// `network/graph_ibp.rs:1145`/`:1153`, `ibp/block_wise.rs:434`,
+/// `ibp/detailed.rs:207`. That firewall is load-bearing, not redundant: removing
+/// it, or reusing this function on a path that lacks one, would publish NaN
+/// bounds. See `ibp.rs:495-496` for the sibling statement of the same contract.
 pub(crate) fn intersect_zonotope_ibp(zono: BoundedTensor, ibp: BoundedTensor) -> BoundedTensor {
     match zono.intersection_per_element(&ibp) {
         Some((tightened, _disjoint)) => tightened,
@@ -489,7 +505,10 @@ pub(crate) fn intersect_zonotope_ibp(zono: BoundedTensor, ibp: BoundedTensor) ->
 
 /// Pollable counterpart to [`intersect_zonotope_ibp`].
 ///
-/// A poll error prevents publication of a partially constructed intersection.
+/// The `None`/NaN contract is identical to the ordinary function — see its docs;
+/// NaN is *not* union-widened here either, and the downstream firewall is the
+/// thing that catches it. A poll error prevents publication of a partially
+/// constructed intersection.
 pub(crate) fn intersect_zonotope_ibp_with_poll<F>(
     zono: BoundedTensor,
     ibp: BoundedTensor,
@@ -501,5 +520,93 @@ where
     match zono.intersection_per_element_with_poll(&ibp, poll)? {
         Some((tightened, _disjoint)) => Ok(tightened),
         None => Ok(zono),
+    }
+}
+
+/// Pins the documented contract of [`intersect_zonotope_ibp`] (#orphans-lies-6).
+///
+/// The doc comment above these functions used to claim that
+/// `intersection_per_element` "widens to the union on the numerically-degenerate
+/// disjoint/NaN cases". That is false for NaN: NaN returns `None` and the caller
+/// keeps `zono` unmerged. These tests exist so the comment cannot drift back —
+/// they assert the *actual* three behaviours (tighten / union-on-disjoint /
+/// keep-zono-on-NaN) rather than restating prose.
+#[cfg(test)]
+mod intersect_zonotope_ibp_tests {
+    use super::{intersect_zonotope_ibp, intersect_zonotope_ibp_with_poll};
+    use ndarray::{ArrayD, IxDyn};
+    use ny_tensor::BoundedTensor;
+
+    /// `BoundedTensor::new` rejects NaN outright, so the NaN cases must be built
+    /// with the shape-only constructor — exactly as a corrupted upstream node's
+    /// bounds reach this merge in production.
+    fn bt(lower: &[f32], upper: &[f32]) -> BoundedTensor {
+        let shape = IxDyn(&[lower.len()]);
+        BoundedTensor::new_unchecked(
+            ArrayD::from_shape_vec(shape.clone(), lower.to_vec()).expect("lower"),
+            ArrayD::from_shape_vec(shape, upper.to_vec()).expect("upper"),
+        )
+        .expect("bounds")
+    }
+
+    /// Overlapping intervals intersect: max of lowers, min of uppers.
+    #[test]
+    fn overlapping_elements_intersect_to_the_tighter_box() {
+        let merged =
+            intersect_zonotope_ibp(bt(&[-2.0, 0.0], &[2.0, 5.0]), bt(&[-1.0, 1.0], &[3.0, 4.0]));
+        assert_eq!(merged.lower().as_slice().expect("lower"), &[-1.0, 1.0]);
+        assert_eq!(merged.upper().as_slice().expect("upper"), &[2.0, 4.0]);
+    }
+
+    /// The union fallback fires on the DISJOINT branch only — this is the case
+    /// the doc comment describes, and it is genuinely sound (the union contains
+    /// both operands, so it still encloses the node's reachable set).
+    #[test]
+    fn disjoint_elements_widen_to_the_union_not_to_an_empty_interval() {
+        let merged = intersect_zonotope_ibp(bt(&[0.0], &[1.0]), bt(&[5.0], &[6.0]));
+        assert_eq!(merged.lower().as_slice().expect("lower"), &[0.0]);
+        assert_eq!(merged.upper().as_slice().expect("upper"), &[6.0]);
+    }
+
+    /// NaN is NOT union-widened: `intersection_per_element` returns `None` and
+    /// `intersect_zonotope_ibp` republishes `zono` verbatim. A NaN in the IBP
+    /// operand therefore *discards* the merge entirely — the finite IBP bound is
+    /// not consulted — and a NaN in the zonotope operand is passed straight
+    /// through to the caller's `check_nan_firewall`.
+    #[test]
+    fn nan_in_either_operand_keeps_the_zonotope_operand_unmerged() {
+        // NaN in the IBP operand: the tighter finite IBP bound is dropped.
+        let merged = intersect_zonotope_ibp(bt(&[-9.0], &[9.0]), bt(&[f32::NAN], &[0.5]));
+        assert_eq!(merged.lower().as_slice().expect("lower"), &[-9.0]);
+        assert_eq!(merged.upper().as_slice().expect("upper"), &[9.0]);
+
+        // NaN in the zonotope operand: it survives the merge and must be caught
+        // downstream by check_nan_firewall, not here.
+        let merged = intersect_zonotope_ibp(bt(&[f32::NAN], &[1.0]), bt(&[-1.0], &[1.0]));
+        assert!(merged.lower().iter().any(|v| v.is_nan()));
+    }
+
+    /// Shape mismatch is the other `None` cause; it also keeps `zono`.
+    #[test]
+    fn shape_mismatch_keeps_the_zonotope_operand() {
+        let merged = intersect_zonotope_ibp(bt(&[-1.0, -1.0], &[1.0, 1.0]), bt(&[0.0], &[0.5]));
+        assert_eq!(merged.lower().as_slice().expect("lower"), &[-1.0, -1.0]);
+        assert_eq!(merged.upper().as_slice().expect("upper"), &[1.0, 1.0]);
+    }
+
+    /// The pollable twin agrees element-for-element on all three branches.
+    #[test]
+    fn pollable_twin_matches_the_ordinary_function() {
+        for (zono, ibp) in [
+            (bt(&[-2.0, 0.0], &[2.0, 5.0]), bt(&[-1.0, 1.0], &[3.0, 4.0])),
+            (bt(&[0.0], &[1.0]), bt(&[5.0], &[6.0])),
+            (bt(&[-9.0], &[9.0]), bt(&[f32::NAN], &[0.5])),
+        ] {
+            let expected = intersect_zonotope_ibp(zono.clone(), ibp.clone());
+            let actual =
+                intersect_zonotope_ibp_with_poll(zono, ibp, || Ok(())).expect("pollable merge");
+            assert_eq!(actual.lower(), expected.lower());
+            assert_eq!(actual.upper(), expected.upper());
+        }
     }
 }

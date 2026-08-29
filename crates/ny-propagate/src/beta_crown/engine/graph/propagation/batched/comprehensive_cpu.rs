@@ -86,10 +86,15 @@ pub(crate) struct ComprehensiveCpuReport {
 
 /// Governed exact-one opt-in through the workspace lever chokepoint. The
 /// shipped arm is dark.
+///
+/// DELIVERY SEAM (#lever-reachability): `NY_ROOT_CPU_PARALLEL_INTERM_CROWN`
+/// still wins in BOTH directions where present; absent, the typed
+/// `bab.root_cpu_parallel_interm_crown` key decides. The phase REPLACES the
+/// dense-head tightener rather than adding to it, so it changes which
+/// intermediate bounds are published — and until the key existed it could not
+/// be selected on a scored run at all.
 pub(crate) fn comprehensive_cpu_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::collection::ROOT_CPU_PARALLEL_INTERM_CROWN)
-        .value
-        .as_bool()
+    crate::preset_gates::root_cpu_parallel_interm_crown_enabled()
 }
 
 #[inline]
@@ -1158,19 +1163,35 @@ mod tests {
             0
         );
 
-        // The same ordinary, unguarded Linear backward retains its historical
-        // global admission attempt. This also proves the zero-call assertion
-        // above is sensitive to an accidental lookup.
-        assert!(backward_input_relative_bounds_at_node(
-            &graph,
-            "linear",
-            &frozen,
-            &input,
-            &crate::faer_parallelism::FaerCpuGemmEngine,
-            Some(deadline),
-            None,
+        // SENSITIVITY CONTROL. The assertion above is only worth anything if
+        // SOMETHING in this process still reaches the process-global f64
+        // accessor; otherwise "zero attempts" is what a dead counter reads.
+        //
+        // The control used to be `backward_input_relative_bounds_at_node`,
+        // which routed to the batched Linear backward. That arm now runs the
+        // pollable CPU contraction with `allow_global_f64_engine = false`
+        // (crown_single.rs `propagate_linear_pollable_cpu`) and therefore never
+        // consults the global slot — so the control went silent and this test
+        // became a pair of assertions that could not fail. It is now pinned to
+        // the ordinary unbounded Linear backward, which still admits the global
+        // engine above `SOUND_F64_GEMM_MIN_MACS` (1<<24). The stacked
+        // lower-over-upper product here is 2*256 x 256 x 256 = 33.5 M MACs,
+        // comfortably over that floor. If a future change moves THIS entry off
+        // the global seam too, this assertion must be re-pointed again — never
+        // deleted, or the zero-attempt claim above goes back to being vacuous.
+        let seed = crate::LinearBounds::new(
+            Array2::<f32>::eye(dim),
+            Array1::<f32>::zeros(dim),
+            Array2::<f32>::eye(dim),
+            Array1::<f32>::zeros(dim),
         )
-        .is_some());
+        .expect("identity seed");
+        let control_layer =
+            LinearLayer::new(Array2::<f32>::eye(dim), Some(Array1::<f32>::zeros(dim)))
+                .expect("control layer");
+        assert!(control_layer
+            .propagate_linear_with_engine(&seed, None)
+            .is_ok());
         assert!(crate::sound_f64_gemm::global_accessor_attempts() > before_all);
     }
 

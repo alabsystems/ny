@@ -52,8 +52,12 @@ use std::time::Instant;
 
 use super::attack_stall::AttackStallPolicy;
 use super::graph_pgd::{
-    best_clause_bottleneck_margin, best_disjunctive_target, emit_graph_pgd_status,
-    ranked_disjunctive_targets, GraphDisjunctiveAttackOutcome, GraphPgdTarget,
+    best_clause_bottleneck_margin, best_disjunctive_target, constraint_target,
+    emit_graph_pgd_status, ranked_disjunctive_targets, GraphDisjunctiveAttackOutcome,
+    GraphPgdTarget,
+};
+use super::graph_pgd_exact_vjp_evidence::{
+    ExactVjpExecution, ExactVjpInactiveReason as Inactive, ExactVjpOutcome as EvidenceOutcome,
 };
 use super::graph_pgd_init::{
     evaluate_graph, initialize_graph_point, sample_center_point, sample_uniform_point, SimpleRng,
@@ -65,15 +69,6 @@ pub(super) enum DisjVjpBatchedOutcome {
     Completed,
     /// The batched lane is unavailable — run the sequential loop instead.
     FallbackToSequential,
-}
-
-/// Parallel restart width (shared knob with the conjunctive driver).
-fn vjp_batch_width() -> usize {
-    std::env::var("NY_PGD_VJP_K")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(32)
 }
 
 /// Batched exact-VJP best-disjunct attack. Mutates `outcome` in place
@@ -97,24 +92,49 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
 ) -> Result<DisjVjpBatchedOutcome> {
     use DisjVjpBatchedOutcome::{Completed, FallbackToSequential};
 
+    let evidence = ExactVjpExecution::disjunctive(
+        pgd_config.exact_vjp,
+        pgd_config.num_restarts.max(1),
+        pgd_config.num_steps,
+    );
     // A deferred/zero slice must not pay the potentially large exact-VJP plan
     // construction cost before discovering that no attack time exists.
     if exact_vjp_slice_expired(pgd_config.deadline, Instant::now()) {
         outcome.hit_deadline = true;
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::DeadlineBeforeStart);
         return Ok(Completed);
     }
-    if std::env::var("NY_PGD_VJP_BATCH").ok().as_deref() == Some("0") {
-        return Ok(FallbackToSequential);
-    }
     let Some(gpu) = gemm_engine.and_then(|e| e.as_gpu_crown_backward()) else {
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::GpuUnavailable);
         return Ok(FallbackToSequential);
     };
+    if !clauses
+        .iter()
+        .flatten()
+        .any(|constraint| constraint_target(constraint).is_some())
+    {
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::EmptyObjective);
+        return Ok(FallbackToSequential);
+    }
     // The wide plan builds ONCE per attack (Arc-shared weights); `None` means
     // the graph is outside both the pure-chain AND the chain+residual resnet
     // fragments (#batched-vjp-resnet) → sequential loop.
     let Some(plan) = PointVjpWavePlan::build(graph, input) else {
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::UnsupportedPlan);
         return Ok(FallbackToSequential);
     };
+    // Prove the disabled treatment had a live counterfactual route without
+    // issuing an attack forward or a GPU VJP. Plan construction is deterministic
+    // and may consume the remaining slice, hence the second deadline check.
+    if exact_vjp_slice_expired(pgd_config.deadline, Instant::now()) {
+        outcome.hit_deadline = true;
+        evidence.finish(EvidenceOutcome::NotStarted, Inactive::DeadlineBeforeStart);
+        return Ok(Completed);
+    }
+    if !pgd_config.exact_vjp.batch_enabled {
+        evidence.finish(EvidenceOutcome::BatchDisabled, Inactive::BatchDisabled);
+        return Ok(FallbackToSequential);
+    }
 
     let satisfied = |output: &ArrayD<f32>| {
         clauses
@@ -129,7 +149,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     let mut stall_monitor = stall.monitor(attack_start, pgd_config.deadline);
     let deadline_hit = || pgd_config.deadline.is_some_and(|d| Instant::now() >= d);
     let total_restarts = pgd_config.num_restarts.max(1);
-    let width = vjp_batch_width();
+    let width = pgd_config.exact_vjp.disjunctive_batch_width();
     // Restart-index seed offset: same continuation convention as the
     // sequential loop (`seed = 42 + k` ⇒ start the sequence at index k), so
     // the adaptive attack extension continues instead of replaying. Default
@@ -143,6 +163,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
     // (closest-to-violation first). Even restart indices walk this ranking
     // from clean init; odd indices are dynamic random-init lanes.
     let clean_point = sample_center_point(input);
+    evidence.mark_work_started();
     let ranked: Vec<GraphPgdTarget> = {
         let clean_out = evaluate_graph(graph, &clean_point, gemm_engine)?;
         if let Some(m) = best_clause_bottleneck_margin(&clean_out, clauses) {
@@ -162,6 +183,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
         if satisfied(&clean_out) {
             // The clean image itself violates the property.
             outcome.candidate = Some(clean_point);
+            evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
             return Ok(Completed);
         }
         ranked_disjunctive_targets(&clean_out, clauses)
@@ -215,6 +237,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
             });
         }
         outcome.restarts_started += k;
+        evidence.start_wave(restart_base, k, 0);
         let mut states: Vec<PgdStepState> = (0..k)
             .map(|_| {
                 PgdStepState::from_config(
@@ -240,6 +263,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                         outcome.best_margin
                     );
                 }
+                evidence.finish(EvidenceOutcome::Deadline, Inactive::None);
                 return Ok(Completed);
             }
 
@@ -253,6 +277,10 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                     if diag {
                         eprintln!("[pgd-vjp-disj] forward failed ({e}); sequential fallback");
                     }
+                    evidence.finish(
+                        EvidenceOutcome::FallbackSequential,
+                        Inactive::ForwardFailure,
+                    );
                     return Ok(FallbackToSequential);
                 }
             };
@@ -288,6 +316,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                                 format_args!("wave {restart_base} step {step} lane {kk}"),
                                 stall_monitor.best_margin(),
                             );
+                            evidence.finish(EvidenceOutcome::Stalled, Inactive::None);
                             return Ok(Completed);
                         }
                     }
@@ -318,6 +347,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                             );
                         }
                         outcome.candidate = Some(xs[kk].clone());
+                        evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
                         return Ok(Completed);
                     }
                     if diag {
@@ -335,6 +365,10 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                     .map(|t| t.to_spec_row(plan.output_dim()))
                 else {
                     // No modeled constraint in any clause — nothing to ascend.
+                    evidence.finish(
+                        EvidenceOutcome::FallbackSequential,
+                        Inactive::NoAttackTarget,
+                    );
                     return Ok(FallbackToSequential);
                 };
                 spec_rows.extend(row.row(0).iter().copied());
@@ -348,12 +382,18 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                     if diag {
                         eprintln!("[pgd-vjp-disj] wide VJP failed ({e}); sequential fallback");
                     }
+                    evidence.finish(EvidenceOutcome::FallbackSequential, Inactive::VjpFailure);
                     return Ok(FallbackToSequential);
                 }
             };
             if grads.len() != k {
+                evidence.finish(
+                    EvidenceOutcome::FallbackSequential,
+                    Inactive::GradientCountMismatch,
+                );
                 return Ok(FallbackToSequential);
             }
+            evidence.successful_vjp(false);
             // #batched-vjp-resnet gradient cross-check (`NY_PGD_VJP_CHECK=1`,
             // diagnostics only): on the FIRST step, compare lane 0's wide-pass
             // gradient against the sequential exact point-Jacobian
@@ -454,6 +494,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                                 format_args!("wave {restart_base} final check"),
                                 stall_monitor.best_margin(),
                             );
+                            evidence.finish(EvidenceOutcome::Stalled, Inactive::None);
                             return Ok(Completed);
                         }
                     }
@@ -474,6 +515,7 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                             );
                         }
                         outcome.candidate = Some(xs[kk].clone());
+                        evidence.finish(EvidenceOutcome::Candidate, Inactive::None);
                         return Ok(Completed);
                     }
                 }
@@ -508,6 +550,14 @@ pub(super) fn try_graph_disjunctive_pgd_vjp_batched(
                 "budget exhausted"
             }
         ),
+    );
+    evidence.finish(
+        if outcome.hit_deadline {
+            EvidenceOutcome::Deadline
+        } else {
+            EvidenceOutcome::Exhausted
+        },
+        Inactive::None,
     );
     Ok(Completed)
 }

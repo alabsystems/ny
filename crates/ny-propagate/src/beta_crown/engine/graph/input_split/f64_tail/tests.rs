@@ -18,6 +18,13 @@ use crate::layers::{Layer, LinearLayer, SigmoidLayer};
 use crate::network::graph_crown_f64_tail::{f64_tail_verify, force_f64_tail, F64TailOutcome};
 use crate::{GraphNetwork, GraphNode};
 
+/// Default (dark) config for hook-level tests: the env/force gate decides.
+fn tail_test_config() -> &'static crate::beta_crown::config::BetaCrownConfig {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<crate::beta_crown::config::BetaCrownConfig> = OnceLock::new();
+    CFG.get_or_init(Default::default)
+}
+
 /// The gate is a process-global atomic; serialize every test that forces it.
 static GATE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -183,6 +190,8 @@ fn gate_off_is_byte_identical_and_gate_on_verifies() {
         None,
         None,
         None,
+        tail_test_config(),
+        None,
     );
     assert_eq!(
         domains_off[0].obj_bounds[0].0.to_bits(),
@@ -211,6 +220,7 @@ fn gate_off_is_byte_identical_and_gate_on_verifies() {
             None,
             None,
             deadline,
+            tail_test_config(),
         ),
         "gate off: last chance must decline without work"
     );
@@ -226,6 +236,8 @@ fn gate_off_is_byte_identical_and_gate_on_verifies() {
         &clause_sizes,
         None,
         None,
+        None,
+        tail_test_config(),
         None,
     );
     assert!(
@@ -253,6 +265,7 @@ fn gate_off_is_byte_identical_and_gate_on_verifies() {
             None,
             None,
             deadline,
+            tail_test_config(),
         ),
         "gate on: last chance must certify the fp-blocked domain"
     );
@@ -283,6 +296,8 @@ fn out_of_band_domain_is_not_escalated() {
         None,
         None,
         None,
+        tail_test_config(),
+        None,
     );
     force_f64_tail(None);
     assert_eq!(
@@ -291,6 +306,126 @@ fn out_of_band_domain_is_not_escalated() {
         "out-of-band domain must not be touched"
     );
     assert_eq!(domains[0].priority.to_bits(), priority.to_bits());
+}
+
+/// #cgan-dark-tail FIX-1: BOTH f64 seams compose the typed per-child cap.
+///
+/// The defect the cap closes is that these seams receive the ABSOLUTE BaB
+/// ceiling, so one escalation is entitled to the whole remaining budget. The
+/// two claims that matter here are:
+///
+/// * a GENEROUS cap changes NOTHING — the measured escalation mean is 0.1235 s
+///   over 363 escalations, so any cap in seconds is a ceiling on pathology,
+///   not a schedule, and the fp-blocked fixture must still certify;
+/// * an ALREADY-SPENT cap DECLINES, byte-identically. This is the TEETH: a
+///   seam that ignored the cap would run the 300 s ceiling it was handed and
+///   certify the fixture, changing the bits. `f64_tail_verify` fail-closes on
+///   an expired deadline at its ENTRY gate, before any work, and the cap is
+///   composed microseconds earlier (settings resolution, candidate selection,
+///   the support census, rayon spawn), so the decline is deterministic rather
+///   than a race on a 1 ns slice.
+#[test]
+fn both_f64_seams_compose_the_typed_per_child_cap() {
+    let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _gate_reset = GateOverrideReset;
+    let (graph, input, spec, threshold, f32_lower) = fp_blocked_fixture();
+    let thresholds = [threshold];
+    let clause_sizes = [1usize];
+    let obj_bounds = vec![(f32_lower, f32::INFINITY)];
+    let priority = disjunctive_domain_priority(&obj_bounds, &thresholds, &clause_sizes);
+
+    fn capped_config(secs: f64) -> crate::beta_crown::config::BetaCrownConfig {
+        crate::beta_crown::config::BetaCrownConfig {
+            input_split_child_bound_max_secs: Some(secs),
+            ..Default::default()
+        }
+    }
+
+    force_f64_tail(Some(true));
+
+    // --- Generous cap: verdict identical to the uncapped arm. ---
+    let generous = capped_config(30.0);
+    let mut domains = vec![make_domain(&input, obj_bounds.clone(), priority)];
+    f64_tail_escalate_batch(
+        &mut domains,
+        &graph,
+        &spec,
+        &thresholds,
+        &clause_sizes,
+        None,
+        None,
+        Some(Instant::now() + Duration::from_mins(5)),
+        &generous,
+        None,
+    );
+    assert!(
+        disjunctive_domain_verified(&domains[0].obj_bounds, &thresholds, &clause_sizes),
+        "a 30 s cap must not cost the batch seam its certified verdict"
+    );
+    let domain = make_domain(&input, obj_bounds.clone(), priority);
+    assert!(
+        f64_tail_last_chance(
+            &graph,
+            &domain,
+            &spec,
+            &thresholds,
+            &clause_sizes,
+            None,
+            None,
+            Instant::now() + Duration::from_mins(5),
+            &generous,
+        ),
+        "a 30 s cap must not cost the last-chance seam its certified verdict"
+    );
+
+    // --- Already-spent cap under a FAR ceiling: both seams must decline. ---
+    // 1 ns is the smallest representable positive cap; the ceiling handed in
+    // is 300 s away, so only a seam that actually composes the cap declines.
+    let spent = capped_config(1e-9);
+    let mut domains = vec![make_domain(&input, obj_bounds.clone(), priority)];
+    f64_tail_escalate_batch(
+        &mut domains,
+        &graph,
+        &spec,
+        &thresholds,
+        &clause_sizes,
+        None,
+        None,
+        Some(Instant::now() + Duration::from_mins(5)),
+        &spent,
+        None,
+    );
+    assert_eq!(
+        domains[0].obj_bounds[0].0.to_bits(),
+        obj_bounds[0].0.to_bits(),
+        "a spent per-child cap must leave the batch seam's domain byte-identical \
+         — a changed lower bound means the seam ran on the 300 s CEILING, i.e. \
+         the cap never reached it"
+    );
+    assert_eq!(
+        domains[0].obj_bounds[0].1.to_bits(),
+        obj_bounds[0].1.to_bits(),
+        "no seam may move an UPPER bound"
+    );
+    assert_eq!(domains[0].priority.to_bits(), priority.to_bits());
+    let domain = make_domain(&input, obj_bounds, priority);
+    assert!(
+        !f64_tail_last_chance(
+            &graph,
+            &domain,
+            &spec,
+            &thresholds,
+            &clause_sizes,
+            None,
+            None,
+            Instant::now() + Duration::from_mins(5),
+            &spent,
+        ),
+        "a spent per-child cap must make the last-chance seam decline — \
+         certifying here means it ran on the 300 s ceiling"
+    );
+
+    force_f64_tail(None);
 }
 
 #[test]
@@ -330,6 +465,8 @@ fn unsupported_net_declines_and_leaves_domain_untouched() {
         None,
         None,
         None,
+        tail_test_config(),
+        None,
     );
     let last = f64_tail_last_chance(
         &graph,
@@ -340,6 +477,7 @@ fn unsupported_net_declines_and_leaves_domain_untouched() {
         None,
         None,
         Instant::now() + Duration::from_secs(5),
+        tail_test_config(),
     );
     force_f64_tail(None);
 
@@ -388,6 +526,8 @@ fn mul_binary_alphas_are_threaded_through() {
         &clause_sizes,
         Some(&alphas),
         None,
+        None,
+        tail_test_config(),
         None,
     );
     force_f64_tail(None);
@@ -463,6 +603,8 @@ fn alpha_gate_off_is_byte_identical() {
         Some(&alphas),
         None,
         None,
+        tail_test_config(),
+        None,
     );
     assert_eq!(
         domains[0].obj_bounds[0].0.to_bits(),
@@ -480,6 +622,7 @@ fn alpha_gate_off_is_byte_identical() {
             Some(&alphas),
             None,
             Instant::now() + Duration::from_secs(5),
+            tail_test_config(),
         ),
         "both gates off: last chance must decline without work"
     );
@@ -539,6 +682,8 @@ fn alpha_tail_micro_bab_closes_relaxation_gap() {
         Some(&alphas),
         None,
         None,
+        tail_test_config(),
+        None,
     );
     force_f64_tail(None);
     force_alpha_tail(None);
@@ -583,6 +728,8 @@ fn alpha_tail_micro_bab_fails_closed_when_any_child_cannot_verify() {
         Some(&alphas),
         None,
         None,
+        tail_test_config(),
+        None,
     );
     force_f64_tail(None);
     force_alpha_tail(None);
@@ -626,6 +773,8 @@ fn alpha_tail_alone_arms_the_seam_for_fp_blocked_domains() {
         None,
         None,
         None,
+        tail_test_config(),
+        None,
     );
     assert!(
         disjunctive_domain_verified(&domains[0].obj_bounds, &thresholds, &clause_sizes),
@@ -642,6 +791,7 @@ fn alpha_tail_alone_arms_the_seam_for_fp_blocked_domains() {
         None,
         None,
         Instant::now() + Duration::from_secs(30),
+        tail_test_config(),
     ));
     force_f64_tail(None);
     force_alpha_tail(None);
@@ -687,6 +837,8 @@ fn alpha_tail_declines_unsupported_net_and_leaves_domain_untouched() {
         None,
         None,
         None,
+        tail_test_config(),
+        None,
     );
     let last = f64_tail_last_chance(
         &graph,
@@ -697,6 +849,7 @@ fn alpha_tail_declines_unsupported_net_and_leaves_domain_untouched() {
         None,
         None,
         Instant::now() + Duration::from_secs(5),
+        tail_test_config(),
     );
     force_f64_tail(None);
     force_alpha_tail(None);
@@ -708,4 +861,237 @@ fn alpha_tail_declines_unsupported_net_and_leaves_domain_untouched() {
         "declined alpha escalation must leave the domain byte-identical"
     );
     assert_eq!(domains[0].priority.to_bits(), priority.to_bits());
+}
+
+// ---------------------------------------------------------------------------
+// #cgan-f64-tail design-B additions: config chokepoint (B5/FIX B5), the
+// survivor-polish hook (B4), anchor-identity teeth (FIX B4), shared cap.
+// ---------------------------------------------------------------------------
+
+/// FIX B5: the resolution layering at the config chokepoint — env override in
+/// both directions over the typed key, dark default beneath both.
+#[test]
+fn resolve_settings_layers_env_over_config_over_default() {
+    let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _reset = GateOverrideReset;
+
+    // Dark default: no env, no config.
+    force_f64_tail(None);
+    if crate::network::graph_crown_f64_tail::f64_tail_env_state().is_none() {
+        let cfg = crate::beta_crown::config::BetaCrownConfig::default();
+        let s = resolve_f64_tail_settings(&cfg);
+        assert!(!s.enabled);
+        assert_eq!(s.source, "default");
+        if crate::network::graph_crown_f64_tail::f64_tail_band_env().is_none() {
+            assert_eq!(s.band, 5e-3);
+        }
+        assert_eq!(s.max_escalations, 0);
+
+        // Typed key arms without env (the ship shape).
+        let cfg = crate::beta_crown::config::BetaCrownConfig {
+            input_split_f64_tail_enabled: Some(true),
+            input_split_f64_tail_band: Some(5e-4),
+            input_split_f64_tail_max_escalations: Some(8),
+            ..Default::default()
+        };
+        let s = resolve_f64_tail_settings(&cfg);
+        assert!(s.enabled);
+        assert_eq!(s.source, "config");
+        if crate::network::graph_crown_f64_tail::f64_tail_band_env().is_none() {
+            assert_eq!(s.band, 5e-4);
+        }
+        assert_eq!(s.max_escalations, 8);
+    }
+
+    // Env force-off overrides a config-armed preset (kill switch).
+    force_f64_tail(Some(false));
+    let cfg = crate::beta_crown::config::BetaCrownConfig {
+        input_split_f64_tail_enabled: Some(true),
+        ..Default::default()
+    };
+    let s = resolve_f64_tail_settings(&cfg);
+    assert!(!s.enabled);
+    assert_eq!(s.source, "env");
+
+    // Env force-on overrides a config-dark preset (diagnostics).
+    force_f64_tail(Some(true));
+    let cfg = crate::beta_crown::config::BetaCrownConfig::default();
+    let s = resolve_f64_tail_settings(&cfg);
+    assert!(s.enabled);
+    assert_eq!(s.source, "env");
+}
+
+fn hook_settings(band: f32, max_escalations: usize) -> F64TailSettings {
+    F64TailSettings {
+        enabled: true,
+        band,
+        max_escalations,
+        source: "test",
+    }
+}
+
+/// B4: the survivor-polish hook verifies the fp-blocked fixture through the
+/// EXISTING merge funnel, and the shared cap gates it (second escalation is
+/// refused with bounds byte-identical).
+#[test]
+fn hook_escalates_fp_blocked_domain_and_respects_cap() {
+    let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _reset = GateOverrideReset;
+    force_f64_tail(Some(true));
+
+    let (graph, input, spec, threshold, f32_lower) = fp_blocked_fixture();
+    let node_bounds =
+        crate::network::collect_intermediate_bounds(&graph, &input, None, None).expect("anchors");
+    let anchors = F64TailAnchors::bundle_for(&input, node_bounds);
+    let thresholds = [threshold];
+    let clause_sizes = [1usize];
+    let budget = F64TailRunBudget::new();
+    let hook = F64TailHook::new(
+        &graph,
+        &spec,
+        &thresholds,
+        &clause_sizes,
+        None,
+        None,
+        None,
+        hook_settings(5e-3, 1),
+        &budget,
+    );
+
+    let mut obj_bounds = vec![(f32_lower, 1.0_f32)];
+    let gap = f32_lower - threshold; // negative, inside the band
+    assert!(hook.escalate_merge(&anchors, &mut obj_bounds, gap));
+    assert!(
+        disjunctive_domain_verified(&obj_bounds, &thresholds, &clause_sizes),
+        "merged rows must pass the UNCHANGED f32 verdict funnel"
+    );
+    assert!(obj_bounds[0].0 > threshold);
+    assert_eq!(budget.used(), 1);
+
+    // Cap exhausted: refused, bounds byte-identical.
+    let mut second = vec![(f32_lower, 1.0_f32)];
+    assert!(!hook.escalate_merge(&anchors, &mut second, gap));
+    assert_eq!(second[0].0.to_bits(), f32_lower.to_bits());
+    assert_eq!(budget.used(), 1);
+}
+
+/// Out-of-band gaps never escalate (no budget charge, bounds untouched).
+#[test]
+fn hook_skips_out_of_band_gap() {
+    let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _reset = GateOverrideReset;
+    force_f64_tail(Some(true));
+
+    let (graph, input, spec, threshold, f32_lower) = fp_blocked_fixture();
+    let node_bounds =
+        crate::network::collect_intermediate_bounds(&graph, &input, None, None).expect("anchors");
+    let anchors = F64TailAnchors::bundle_for(&input, node_bounds);
+    let thresholds = [threshold];
+    let clause_sizes = [1usize];
+    let budget = F64TailRunBudget::new();
+    let hook = F64TailHook::new(
+        &graph,
+        &spec,
+        &thresholds,
+        &clause_sizes,
+        None,
+        None,
+        None,
+        hook_settings(5e-4, 0),
+        &budget,
+    );
+    let mut obj_bounds = vec![(f32_lower, 1.0_f32)];
+    assert!(!hook.escalate_merge(&anchors, &mut obj_bounds, -1.0));
+    assert_eq!(budget.used(), 0);
+    assert_eq!(obj_bounds[0].0.to_bits(), f32_lower.to_bits());
+}
+
+/// FIX B4 teeth: the escalation runs on the box the anchors were BUNDLED for,
+/// not on whatever narrower box the caller currently holds. Anchors bundled
+/// for the FULL box cannot verify (its true min sits below the threshold), so
+/// the hook must decline even though a narrower sub-box would have verified —
+/// cross-box anchor reuse is unrepresentable through this API.
+#[test]
+fn hook_anchors_bundle_pins_the_escalated_box() {
+    let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _reset = GateOverrideReset;
+    force_f64_tail(Some(true));
+
+    // Identity net: y = x. Wide box [-1, 1] has min -1; the narrow child
+    // [0.5, 1.0] has min 0.5. Threshold 0.4 verifies ONLY the narrow box.
+    let mut graph = GraphNetwork::new();
+    graph.add_node(GraphNode::from_input(
+        "id",
+        Layer::Linear(LinearLayer::new(arr2(&[[1.0_f32]]), None).expect("id")),
+    ));
+    graph.set_output("id");
+    let wide = bt(&[-1.0], &[1.0]);
+    let node_bounds =
+        crate::network::collect_intermediate_bounds(&graph, &wide, None, None).expect("anchors");
+    let anchors = F64TailAnchors::bundle_for(&wide, node_bounds);
+    let spec = arr2(&[[1.0_f32]]);
+    let thresholds = [0.4_f32];
+    let clause_sizes = [1usize];
+    let budget = F64TailRunBudget::new();
+    let hook = F64TailHook::new(
+        &graph,
+        &spec,
+        &thresholds,
+        &clause_sizes,
+        None,
+        None,
+        None,
+        hook_settings(1.0, 0),
+        &budget,
+    );
+    // The caller "believes" it holds the narrow child (gap -0.001, in band),
+    // but the bundled anchors carry the WIDE box: the certified pass must
+    // evaluate the wide box and decline.
+    let mut obj_bounds = vec![(0.399_f32, 1.0_f32)];
+    assert!(
+        !hook.escalate_merge(&anchors, &mut obj_bounds, -0.001),
+        "escalation must run on the bundled (wide) box and fail to verify"
+    );
+    assert_eq!(obj_bounds[0].0.to_bits(), 0.399_f32.to_bits());
+}
+
+/// FIX B5: the shared budget gates the BATCH seam too — with a cap of 1 and
+/// two in-band fp-blocked domains, exactly one escalates.
+#[test]
+fn batch_seam_shares_the_escalation_cap() {
+    let _guard = GATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _reset = GateOverrideReset;
+    force_f64_tail(Some(true));
+
+    let (graph, input, spec, threshold, f32_lower) = fp_blocked_fixture();
+    let thresholds = [threshold];
+    let clause_sizes = [1usize];
+    let priority = f32_lower - threshold;
+    let mut domains = vec![
+        make_domain(&input, vec![(f32_lower, 1.0)], priority),
+        make_domain(&input, vec![(f32_lower, 1.0)], priority),
+    ];
+    let cfg = crate::beta_crown::config::BetaCrownConfig {
+        input_split_f64_tail_max_escalations: Some(1),
+        ..Default::default()
+    };
+    let budget = F64TailRunBudget::new();
+    f64_tail_escalate_batch(
+        &mut domains,
+        &graph,
+        &spec,
+        &thresholds,
+        &clause_sizes,
+        None,
+        None,
+        None,
+        &cfg,
+        Some(&budget),
+    );
+    assert_eq!(budget.used(), 1, "cap 1 must admit exactly one escalation");
+    let verified: usize = domains
+        .iter()
+        .filter(|d| disjunctive_domain_verified(&d.obj_bounds, &thresholds, &clause_sizes))
+        .count();
+    assert_eq!(verified, 1, "exactly the capped escalation may verify");
 }

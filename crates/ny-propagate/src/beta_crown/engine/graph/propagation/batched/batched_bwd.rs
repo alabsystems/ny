@@ -30,15 +30,21 @@
 //! `generic_backward_domain` in `backward_core.rs`, exactly the bodies the
 //! reference loop runs), (b) a shared per-element primitive
 //! (`GraphNetwork::safe_add_elem`, `indexed_pending::merge_bias_elem`,
-//! `indexed_pending::merged_err_elem`), or (c) the SoA Linear kernel
-//! (`crown_batched_soa.rs`), a transcription of the reference multi-domain
-//! Linear backward that issues the IDENTICAL stacked engine GEMMs and runs
-//! the identical per-domain certified-error block. The batch dimension never
-//! reassociates any reduction: per-row f64 bias folds keep their `i = 0..n`
-//! order inside the shared kernels, and the `aw_f64_with_abssum` / `γ_n·S`
-//! certified-error accounting produces identical per-row results (workers
-//! hold a `NestedFaerParGuard` so faer sees the same parallelism policy as
-//! the reference's driver-thread calls).
+//! `indexed_pending::merged_err_elem`), or (c) the SoA Linear arm
+//! (`crown_batched_soa.rs`), which CALLS the same
+//! `LinearLayer::propagate_linear_pollable_cpu` the reference Linear arm
+//! calls, per domain, in the same domain order — it owns SoA plumbing only,
+//! no arithmetic. The batch dimension never reassociates any reduction:
+//! per-row f64 bias folds keep their `i = 0..n` order inside the shared
+//! kernels, and the certified-error accounting produces identical per-row
+//! results (workers hold a `NestedFaerParGuard` so faer sees the same
+//! parallelism policy as the reference's driver-thread calls).
+//!
+//! (c) was a hand-written TRANSCRIPTION of a different reference until
+//! 2026-08-25. When `backward_core.rs`'s Linear arm moved onto the certified
+//! f64 contraction, the copy stayed on the stacked f32 engine GEMM and this
+//! "BIT-IDENTICAL" claim quietly became false by up to 8 ULP — conservatively,
+//! but falsely. Every arm here is now a call, not a copy; keep it that way.
 //!
 //! # Fail-closed decline discipline (pattern: `propagate_linear_multi_domain_relu`)
 //!

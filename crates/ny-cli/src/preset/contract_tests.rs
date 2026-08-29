@@ -74,13 +74,6 @@ const ACCEPTED_DEBT: &[(&str, &str)] = &[
          diversified-restart half of diversed_GAMA_PGD IS honoured. Attack-direction only.",
     ),
     (
-        "bab.clip.interm_domain",
-        "SEQUENTIAL engine only — the graph engine honours it. Sequential \
-         IntermediateLinearBounds are layer-output-relative and lack certified \
-         input-relative provenance, so the tightening is SKIPPED and bounds stay looser \
-         (ny_propagate::sequential_clip_interm_domain_supported).",
-    ),
-    (
         "bab.pruning_in_iteration",
         "declared on AlphaCrownConfig, read by nothing; running without in-iteration \
          pruning is more work and never a looser bound.",
@@ -237,12 +230,11 @@ fn no_shipped_preset_hits_an_unargued_verdict_affecting_mismatch() {
 fn design_s3_findings_still_reproduce_at_head() {
     let observed = observed_debt();
 
+    // `bab.clip.interm_domain` left this list 2026-08-21: the sequential
+    // engine's provenance-preserving conversion landed with all three flip
+    // gates (see `ny_propagate` clip.rs), so the field is honoured everywhere.
     for (field, preset) in [
         ("attack.pgd_order", "configs/vnncomp25/relusplitter.yaml"),
-        (
-            "bab.clip.interm_domain",
-            "configs/vnncomp25/relusplitter.yaml",
-        ),
         ("attack.pgd_order", "configs/vnncomp25/soundnessbench.yaml"),
     ] {
         let presets = observed.get(field).unwrap_or_else(|| {

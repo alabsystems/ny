@@ -31,6 +31,106 @@ pub struct LeverSet {
 }
 
 impl LeverSet {
+    /// Canonical SHA-256 identity of this exact frozen resolution record.
+    ///
+    /// The encoding is independent of JSON number formatting and registry
+    /// insertion order. Names/text are length-prefixed bytes; integer and
+    /// floating values use fixed-width little-endian encodings (floats retain
+    /// their exact IEEE bits); sources, lower-layer answers, rejected/ignored
+    /// raw input, and UTF-8 presence are all represented. Consequently two
+    /// sets compare equal only when their complete in-memory authority is
+    /// equal.
+    ///
+    /// This is an internal cache identity, not a digest promised by the
+    /// flight-v3 schema: v3 intentionally omits lower-layer metadata. A future
+    /// receipt schema must publish those fields before external tooling can
+    /// reconstruct this fingerprint.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        fn bytes(hasher: &mut Sha256, value: &[u8]) {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+
+        fn optional_text(hasher: &mut Sha256, value: Option<&str>) {
+            match value {
+                Some(value) => {
+                    hasher.update([1]);
+                    bytes(hasher, value.as_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        }
+
+        fn source(hasher: &mut Sha256, value: Source) {
+            let tag: u8 = match value {
+                Source::Default => 0,
+                Source::Config => 1,
+                Source::LegacyEnv => 2,
+                Source::LegacyEnvRejected => 3,
+            };
+            hasher.update([tag]);
+        }
+
+        fn lever_value(hasher: &mut Sha256, value: &LeverValue) {
+            match value {
+                LeverValue::Unset => hasher.update([0]),
+                LeverValue::Bool(value) => hasher.update([1, u8::from(*value)]),
+                LeverValue::U64(value) => {
+                    hasher.update([2]);
+                    hasher.update(value.to_le_bytes());
+                }
+                LeverValue::F64(value) => {
+                    hasher.update([3]);
+                    hasher.update(value.to_bits().to_le_bytes());
+                }
+                LeverValue::Secs(value) => {
+                    hasher.update([4]);
+                    hasher.update(value.to_bits().to_le_bytes());
+                }
+                LeverValue::Text(value) => {
+                    hasher.update([5]);
+                    bytes(hasher, value.as_bytes());
+                }
+            }
+        }
+
+        let mut ordered: Vec<&Resolved> = self.entries.iter().collect();
+        ordered.sort_unstable_by_key(|entry| entry.decl.name);
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"ny.levers.set-resolution.v1\0");
+        hasher.update((ordered.len() as u64).to_le_bytes());
+        for entry in ordered {
+            bytes(&mut hasher, entry.decl.name.as_bytes());
+            lever_value(&mut hasher, &entry.value);
+            source(&mut hasher, entry.source);
+            lever_value(&mut hasher, &entry.lower_value);
+            source(&mut hasher, entry.lower_source);
+            optional_text(&mut hasher, entry.rejected_raw.as_deref());
+            optional_text(&mut hasher, entry.ignored_raw.as_deref());
+            hasher.update([match entry.env_utf8 {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            }]);
+        }
+        hasher.finalize().into()
+    }
+
+    /// Lowercase hexadecimal form used by cache diagnostics and tests.
+    pub fn fingerprint_hex(&self) -> String {
+        use std::fmt::Write as _;
+
+        self.fingerprint()
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                write!(out, "{byte:02x}").expect("writing to String is infallible");
+                out
+            })
+    }
+
     /// Resolve every declared lever against the process environment, once.
     ///
     /// After this returns, the process environment is irrelevant to this set:
@@ -68,9 +168,11 @@ impl LeverSet {
     /// `raw` is authoritative: this function never consults the process
     /// environment. `config` supplies an optional typed preset/run-context
     /// value for each declaration and is called once per declaration. A
-    /// present valid legacy environment value wins over config. A present
-    /// invalid value suppresses config and resolves to the declaration
-    /// default as [`Source::LegacyEnvRejected`].
+    /// present valid legacy environment value wins over config. For ordinary
+    /// kinds, a present invalid value suppresses config and resolves to the
+    /// declaration default as [`Source::LegacyEnvRejected`]. Override-style
+    /// kinds instead record the invalid raw value as ignored and retain the
+    /// config/default layer they were designed to override.
     ///
     /// # Errors
     ///
@@ -157,9 +259,9 @@ impl LeverSet {
     /// It proves frozen raw inputs and any projected typed config; runtime
     /// consumption becomes authoritative incrementally as readers migrate to
     /// this same set.
-    /// `rejected_raw` appears only when the environment supplied a value the
-    /// parser refused — a typo that silently did nothing is a first-class
-    /// finding here, not a silence.
+    /// `rejected_raw` appears when invalid input suppresses config;
+    /// `ignored_raw` appears when an override-style parser deliberately leaves
+    /// config/default authoritative. Both make a typo first-class evidence.
     pub fn receipt(&self) -> serde_json::Value {
         let levers: Vec<serde_json::Value> = self
             .entries
@@ -196,6 +298,12 @@ impl LeverSet {
                         serde_json::Value::String(raw.clone()),
                     );
                 }
+                if let Some(raw) = &e.ignored_raw {
+                    obj.insert(
+                        "ignored_raw".to_owned(),
+                        serde_json::Value::String(raw.clone()),
+                    );
+                }
                 serde_json::Value::Object(obj)
             })
             .collect();
@@ -210,14 +318,20 @@ impl LeverSet {
             .iter()
             .filter(|entry| entry.source == Source::LegacyEnvRejected)
             .count();
-        let env_present = env_accepted + env_rejected;
+        let env_ignored = self
+            .entries
+            .iter()
+            .filter(|entry| entry.ignored_raw.is_some())
+            .count();
+        let env_present = env_accepted + env_rejected + env_ignored;
 
         serde_json::json!({
-            "schema": "ny-levers/receipt/v2",
+            "schema": "ny-levers/receipt/v3",
             "lever_count": levers.len(),
             "env_present": env_present,
             "env_accepted": env_accepted,
             "env_rejected": env_rejected,
+            "env_ignored": env_ignored,
             "levers": levers,
         })
     }
@@ -243,6 +357,19 @@ mod tests {
             bucket: Bucket::Debug,
             moat: MoatRisk::None,
             doc: "set unit-test fixture",
+            provenance: Provenance::Unmeasured { why_ok: "test" },
+            owner: Scope { package: "ny-levers", subsystem: "selftest" },
+            readers: &[],
+        };
+
+        /// Exact override fixture whose absence remains contextual.
+        pub OVERRIDE_GATE = LeverDecl {
+            name: "NY_LEVERS_SET_SELFTEST_OVERRIDE_GATE",
+            kind: LeverKind::BoolOverride,
+            default: DefaultSpec::Unset,
+            bucket: Bucket::Auto,
+            moat: MoatRisk::Low,
+            doc: "set unit-test override fixture",
             provenance: Provenance::Unmeasured { why_ok: "test" },
             owner: Scope { package: "ny-levers", subsystem: "selftest" },
             readers: &[],
@@ -283,7 +410,7 @@ mod tests {
     #[test]
     fn freeze_is_total_over_the_registry() {
         let set = LeverSet::freeze_with(&registry(), |_| None);
-        assert_eq!(set.len(), 3, "every declaration gets an entry, read or not");
+        assert_eq!(set.len(), 4, "every declaration gets an entry, read or not");
         assert!(!set.is_empty());
         assert_eq!(set.source(&GATE), Source::Default);
     }
@@ -320,20 +447,24 @@ mod tests {
                 Some("0.25".to_owned())
             } else if name == "NY_LEVERS_SET_SELFTEST_PRESENCE" {
                 None
+            } else if name == "NY_LEVERS_SET_SELFTEST_OVERRIDE_GATE" {
+                Some("true".to_owned())
             } else {
                 Some("ture".to_owned())
             }
         });
         let receipt = set.receipt();
 
-        assert_eq!(receipt["schema"], "ny-levers/receipt/v2");
-        assert_eq!(receipt["lever_count"], 3);
-        assert_eq!(receipt["env_present"], 2);
+        assert_eq!(receipt["schema"], "ny-levers/receipt/v3");
+        assert_eq!(set.fingerprint_hex().len(), 64);
+        assert_eq!(receipt["lever_count"], 4);
+        assert_eq!(receipt["env_present"], 3);
         assert_eq!(receipt["env_accepted"], 1);
         assert_eq!(receipt["env_rejected"], 1);
+        assert_eq!(receipt["env_ignored"], 1);
 
         let levers = receipt["levers"].as_array().expect("levers array");
-        assert_eq!(levers.len(), 3);
+        assert_eq!(levers.len(), 4);
 
         let frac = levers
             .iter()
@@ -356,6 +487,65 @@ mod tests {
             "a typo that silently did nothing must be visible in the receipt"
         );
         assert_eq!(gate["provenance"], "unmeasured");
+        assert!(
+            gate.get("lower_value").is_none() && gate.get("lower_source").is_none(),
+            "lower-layer metadata is internal until a receipt schema version publishes it"
+        );
+
+        let override_gate = levers
+            .iter()
+            .find(|l| l["name"] == "NY_LEVERS_SET_SELFTEST_OVERRIDE_GATE")
+            .expect("override gate present");
+        assert_eq!(override_gate["value"], serde_json::Value::Null);
+        assert_eq!(override_gate["source"], "default");
+        assert_eq!(override_gate["ignored_raw"], "true");
+        assert!(override_gate.get("rejected_raw").is_none());
+    }
+
+    #[test]
+    fn fingerprint_is_order_independent_and_changes_with_each_resolution() {
+        let baseline = LeverSet::freeze_with(&registry(), |_| None);
+        assert_eq!(
+            baseline.fingerprint_hex(),
+            "5a96430567b961ff54522646fca83304217fff22bcb5cfad9d05bb50bfcbed35",
+            "canonical encoding changes require an explicit fingerprint schema bump"
+        );
+        let mut reversed = baseline.clone();
+        reversed.entries.reverse();
+        assert_eq!(
+            baseline.fingerprint(),
+            reversed.fingerprint(),
+            "registry assembly order is not authority"
+        );
+
+        for (name, raw) in [
+            (GATE.name, "1"),
+            (OVERRIDE_GATE.name, "0"),
+            (FRAC.name, "0.25"),
+            (PRESENCE.name, "present"),
+        ] {
+            let changed = LeverSet::freeze_with(&registry(), |candidate| {
+                (candidate == name).then(|| raw.to_owned())
+            });
+            assert_ne!(
+                baseline.fingerprint(),
+                changed.fingerprint(),
+                "changing {name} must change frozen authority identity"
+            );
+        }
+
+        let rejected_a = LeverSet::freeze_with(&registry(), |name| {
+            (name == GATE.name).then(|| "true".to_owned())
+        });
+        let rejected_b = LeverSet::freeze_with(&registry(), |name| {
+            (name == GATE.name).then(|| "false".to_owned())
+        });
+        assert_eq!(rejected_a.get(&GATE), rejected_b.get(&GATE));
+        assert_ne!(
+            rejected_a.fingerprint(),
+            rejected_b.fingerprint(),
+            "distinct rejected authority bytes remain replay-visible"
+        );
     }
 
     #[test]
@@ -448,6 +638,7 @@ mod tests {
             vec![
                 FRAC.name.to_owned(),
                 GATE.name.to_owned(),
+                OVERRIDE_GATE.name.to_owned(),
                 PRESENCE.name.to_owned(),
             ],
             "capture calls the lookup exactly once per registered name, in registry order"
@@ -477,18 +668,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_utf8_numeric_is_rejected_but_non_utf8_text_presence_is_accepted() {
+    fn non_utf8_input_is_rejected_accepted_or_ignored_by_kind() {
         use std::os::unix::ffi::OsStringExt;
 
         let non_utf8 = OsString::from_vec(vec![b'x', 0xff]);
         let raw = RawLeverInputs::capture_with(&registry(), |name| {
             matches!(
                 name,
-                "NY_LEVERS_SET_SELFTEST_FRAC" | "NY_LEVERS_SET_SELFTEST_PRESENCE"
+                "NY_LEVERS_SET_SELFTEST_FRAC"
+                    | "NY_LEVERS_SET_SELFTEST_OVERRIDE_GATE"
+                    | "NY_LEVERS_SET_SELFTEST_PRESENCE"
             )
             .then(|| non_utf8.clone())
         });
-        assert_eq!(raw.len(), 3);
+        assert_eq!(raw.len(), 4);
         assert!(!raw.is_empty());
         assert!(raw
             .get(&PRESENCE)
@@ -497,7 +690,13 @@ mod tests {
             .is_none());
 
         let set = LeverSet::resolve_layered(&registry(), &raw, |decl| {
-            (decl.name == FRAC.name).then_some(LeverValue::F64(0.25))
+            if decl.name == FRAC.name {
+                Some(LeverValue::F64(0.25))
+            } else if decl.name == OVERRIDE_GATE.name {
+                Some(LeverValue::Bool(true))
+            } else {
+                None
+            }
         })
         .expect("fixture config is admissible");
 
@@ -512,16 +711,27 @@ mod tests {
         assert_eq!(presence.env_utf8, Some(false));
         assert!(matches!(presence.value, LeverValue::Text(_)));
 
+        let override_gate = set
+            .resolved(&OVERRIDE_GATE)
+            .expect("override gate registered");
+        assert_eq!(override_gate.value, LeverValue::Bool(true));
+        assert_eq!(override_gate.source, Source::Config);
+        assert_eq!(override_gate.env_utf8, Some(false));
+        assert!(override_gate.rejected_raw.is_none());
+        assert!(override_gate.ignored_raw.is_some());
+
         let receipt = set.receipt();
-        assert_eq!(receipt["env_present"], 2);
+        assert_eq!(receipt["env_present"], 3);
         assert_eq!(receipt["env_accepted"], 1);
         assert_eq!(receipt["env_rejected"], 1);
+        assert_eq!(receipt["env_ignored"], 1);
         assert_eq!(
             receipt["env_present"].as_u64(),
             receipt["env_accepted"]
                 .as_u64()
                 .zip(receipt["env_rejected"].as_u64())
-                .map(|(accepted, rejected)| accepted + rejected)
+                .zip(receipt["env_ignored"].as_u64())
+                .map(|((accepted, rejected), ignored)| accepted + rejected + ignored)
         );
     }
 

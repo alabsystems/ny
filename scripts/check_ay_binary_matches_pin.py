@@ -37,6 +37,16 @@ Usage:
     python3 scripts/check_ay_binary_matches_pin.py --json
     python3 scripts/check_ay_binary_matches_pin.py --warn-only   # always exit 0
 
+A binary that is simply ABSENT (no `$NY_AY`, no `ay` on `$PATH`) is a skip, not
+a failure: the in-process lane is the production default and AyProc is
+debug/bootstrap plus the mip-diff gate. But `$NY_AY` SET AND NOT A FILE is a
+FAILURE, never a skip. It used to fall into the same "absent" bucket and exit 0,
+which is a vacuous pass in exactly the situation this gate exists for: the
+rebuild recipe below puts the pinned binary under `/tmp`, so a stale `$NY_AY`
+survives in a shell rc or a sweep script long after the path is gone, the gate
+reports "AyProc lane unavailable" and passes, and the operator cites a mip-diff
+result on the strength of it.
+
 To fix a mismatch, build the binary from the pinned rev and point $NY_AY at it:
 
     git -C <ay-repo> worktree add --detach /tmp/ay-pinned <REV>
@@ -66,7 +76,13 @@ SHA_IN_VERSION = re.compile(r"\b([0-9a-f]{40})\b")
 
 
 def resolve_ay_binary() -> str | None:
-    """Resolve the binary the AyProc lane would run: $NY_AY, else `ay` on PATH."""
+    """Resolve the binary the AyProc lane would run: $NY_AY, else `ay` on PATH.
+
+    Mirrors `ny-mip/src/ay/run.rs::ay_command()` exactly -- two steps, no rustup
+    `trust` toolchain fallback. The gt/cnf routes DO have that third step, but
+    AyProc does not, and a gate that checked a binary the lane would never run
+    would be checking the wrong thing.
+    """
     explicit = os.environ.get("NY_AY")
     if explicit:
         return explicit if Path(explicit).is_file() else None
@@ -110,15 +126,27 @@ def main() -> int:
     args = ap.parse_args()
 
     pinned = pinned_ay_rev()
+    requested = os.environ.get("NY_AY") or None
     binary = resolve_ay_binary()
     sha, version = (None, "") if binary is None else binary_sha(binary)
 
     if pinned is None:
         status, detail = "error", "no ay-milp git pin found in the workspace"
+    elif binary is None and requested is not None:
+        # $NY_AY was NAMED and does not resolve to a file. Never a skip: the
+        # AyProc lane would fail to launch, and silently exiting 0 here is the
+        # vacuous pass this gate exists to prevent.
+        status, detail = (
+            "error",
+            f"$NY_AY={requested!r} is not a file; the AyProc lane cannot launch it",
+        )
     elif binary is None:
         # Not fatal on its own: the in-process lane is the production default,
         # and AyProc is debug/bootstrap plus the mip-diff gate.
-        status, detail = "absent", "no ay binary on $NY_AY or $PATH; AyProc lane unavailable"
+        status, detail = (
+            "absent",
+            "$NY_AY unset and no `ay` on $PATH; AyProc lane unavailable",
+        )
     elif sha is None:
         status, detail = "unknown", f"could not parse a build sha from: {version!r}"
     elif sha == pinned:
@@ -133,6 +161,7 @@ def main() -> int:
                     "status": status,
                     "detail": detail,
                     "pinned_rev": pinned,
+                    "ny_ay_requested": requested,
                     "binary": binary,
                     "binary_sha": sha,
                     "binary_version": version,

@@ -265,6 +265,158 @@ proptest! {
             CROWN_TOLERANCE,
         )?;
     }
+
+    // =========================================================================
+    // Snake CROWN backward soundness — NEGATIVE alpha (point reflection)
+    // =========================================================================
+    // For a < 0, snake_a(x) = -snake_{|a|}(-x) exactly; the relaxation is the
+    // reflected positive-alpha envelope (roles swapped, intercepts negated).
+    // These are the direct obligations on the reflected path.
+
+    /// Negative default frequency a = -1.0: the reflected chord path.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn soundness_snake_crown_negative_default(center in -10.0f32..10.0, width in 0.0f32..10.0) {
+        let l = center - width / 2.0;
+        let u = center + width / 2.0;
+        prop_assume!(l <= u);
+
+        let snake_layer = SnakeLayer::new(-1.0).expect("negative alpha is a valid Snake");
+        let identity = LinearBounds::identity(1);
+        let pre_activation = BoundedTensor::new(
+            arr1(&[l]).into_dyn(),
+            arr1(&[u]).into_dyn(),
+        ).expect("test: valid Snake");
+
+        let result = snake_layer
+            .propagate_linear_with_bounds(&identity, &pre_activation)
+            .expect("test: valid Snake");
+
+        assert_crown_backward_sound(
+            l, u,
+            |x| snake_eval_f32(x, -1.0),
+            &result,
+            "Snake(a=-1.0)",
+            CROWN_TOLERANCE,
+        )?;
+    }
+
+    /// Random negative frequency: random a in [-20, -0.1], random intervals.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn soundness_snake_crown_random_negative_freq(
+        center in -10.0f32..10.0,
+        width in 0.0f32..8.0,
+        a in -20.0f32..-0.1,
+    ) {
+        let l = center - width / 2.0;
+        let u = center + width / 2.0;
+        prop_assume!(l <= u);
+
+        let snake_layer = SnakeLayer::new(a).expect("negative alpha is a valid Snake");
+        let identity = LinearBounds::identity(1);
+        let pre_activation = BoundedTensor::new(
+            arr1(&[l]).into_dyn(),
+            arr1(&[u]).into_dyn(),
+        ).expect("test: valid Snake");
+
+        let result = snake_layer
+            .propagate_linear_with_bounds(&identity, &pre_activation)
+            .expect("test: valid Snake");
+
+        assert_crown_backward_sound(
+            l, u,
+            |x| snake_eval_f32(x, a),
+            &result,
+            &format!("Snake(a={a})"),
+            CROWN_TOLERANCE,
+        )?;
+    }
+
+    /// Negative alpha with mixed-sign incoming coefficients: exercises the
+    /// sign-switching branches of CROWN backward over the reflected envelope.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn soundness_snake_crown_negative_alpha_negative_coeffs(
+        l0 in -8.0f32..8.0,
+        d0 in 0.0f32..5.0,
+        l1 in -8.0f32..8.0,
+        d1 in 0.0f32..5.0,
+        c0 in -5.0f32..5.0,
+        c1 in -5.0f32..5.0,
+    ) {
+        let u0 = (l0 + d0).min(8.0);
+        let u1 = (l1 + d1).min(8.0);
+
+        prop_assume!(c0.abs() > 0.01 || c1.abs() > 0.01);
+        prop_assume!(c0 < -0.01 || c1 < -0.01);
+
+        let incoming = LinearBounds::new(
+            Array2::from_shape_vec((1, 2), vec![c0, c1]).expect("test: valid Snake"),
+            Array1::zeros(1),
+            Array2::from_shape_vec((1, 2), vec![c0, c1]).expect("test: valid Snake"),
+            Array1::zeros(1),
+        ).expect("test: valid Snake");
+
+        let snake_layer = SnakeLayer::new(-1.0).expect("negative alpha is a valid Snake");
+        assert_crown_negative_coeff_sound(
+            [l0, l1],
+            [u0, u1],
+            &incoming,
+            |bounds, pre| snake_layer.propagate_linear_with_bounds(bounds, pre),
+            |x| snake_eval_f32(x, -1.0),
+            "Snake(a=-1.0)",
+            CROWN_TOLERANCE,
+        )?;
+    }
+
+    /// Per-channel MIXED-sign alpha through the #4117 stride mapping: the
+    /// Kokoro checkpoint mixes signs within one alpha tensor, so the CROWN
+    /// per-channel path must select the reflected envelope per ELEMENT.
+    #[ntest::timeout(60000)]
+    #[test]
+    fn soundness_snake_crown_mixed_sign_per_channel(
+        l0 in -6.0f32..6.0,
+        d0 in 0.0f32..4.0,
+        l1 in -6.0f32..6.0,
+        d1 in 0.0f32..4.0,
+        a_pos in 0.1f32..5.0,
+        a_neg in -5.0f32..-0.1,
+    ) {
+        let u0 = l0 + d0;
+        let u1 = l1 + d1;
+
+        let snake_layer = SnakeLayer::per_channel(Array1::from_vec(vec![a_pos, a_neg]))
+            .expect("mixed-sign alpha is a valid Snake");
+        let identity = LinearBounds::identity(2);
+        let pre_activation = BoundedTensor::new(
+            arr1(&[l0, l1]).into_dyn(),
+            arr1(&[u0, u1]).into_dyn(),
+        ).expect("test: valid bounds");
+
+        let result = snake_layer
+            .propagate_linear_with_bounds(&identity, &pre_activation)
+            .expect("test: valid Snake");
+
+        for (dim, (l, u, a)) in [(l0, u0, a_pos), (l1, u1, a_neg)].into_iter().enumerate() {
+            for k in 0..=50 {
+                let x = l + (u - l) * (k as f32) / 50.0;
+                let y = snake_eval_f32(x, a);
+                let lb = result.lower_a[[dim, dim]] * x + result.lower_b[dim];
+                let ub = result.upper_a[[dim, dim]] * x + result.upper_b[dim];
+                prop_assert!(
+                    lb <= y + CROWN_TOLERANCE,
+                    "mixed-sign dim {} (a={}): lower {} > eval {} at x={}",
+                    dim, a, lb, y, x
+                );
+                prop_assert!(
+                    ub >= y - CROWN_TOLERANCE,
+                    "mixed-sign dim {} (a={}): upper {} < eval {} at x={}",
+                    dim, a, ub, y, x
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -430,6 +582,39 @@ proptest! {
         prop_assume!(l <= u);
 
         let snake_layer = SnakeLayer::new(a).expect("test: valid Snake");
+        let input = BoundedTensor::new(
+            arr1(&[l]).into_dyn(),
+            arr1(&[u]).into_dyn(),
+        ).unwrap();
+
+        let output = snake_layer.propagate_ibp(&input).unwrap();
+
+        for x in sample_points(l, u, 20) {
+            let y = snake_eval_f32(x, a);
+            prop_assert!(
+                output.lower()[[0]] - FP_TOLERANCE <= y
+                    && y <= output.upper()[[0]] + FP_TOLERANCE,
+                "Snake(a={}) IBP soundness violation: f({})={} not in [{}, {}]",
+                a, x, y, output.lower()[[0]], output.upper()[[0]]
+            );
+        }
+    }
+
+    /// IBP soundness for Snake with random NEGATIVE frequency. Monotonicity
+    /// (f' = 1 + sin(2ax) >= 0) is sign-independent, so IBP stays exact with
+    /// the unchanged formula — this pins that no sign branch crept in.
+    #[ntest::timeout(10000)]
+    #[test]
+    fn soundness_snake_ibp_random_negative_freq(
+        a in -20.0f32..-0.1,
+        center in -10.0f32..10.0,
+        width in 0.0f32..10.0
+    ) {
+        let l = center - width / 2.0;
+        let u = center + width / 2.0;
+        prop_assume!(l <= u);
+
+        let snake_layer = SnakeLayer::new(a).expect("negative alpha is a valid Snake");
         let input = BoundedTensor::new(
             arr1(&[l]).into_dyn(),
             arr1(&[u]).into_dyn(),

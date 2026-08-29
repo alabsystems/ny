@@ -32,11 +32,11 @@ pub enum ShapeInferencePolicy {
 /// the child dying is then observed as an ordinary inference failure and
 /// degrades to the same graceful no-inferred-shapes fallback as any other
 /// shape-inference error.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShapeInferBackend {
-    /// Run ORT shape inference in this process (default; no configuration
-    /// needed, identical to historical behavior).
-    #[default]
+    /// Run ORT shape inference in this process (the default wherever the
+    /// engine reports failure rather than aborting; identical to historical
+    /// behavior).
     InProcess,
     /// Run ORT shape inference in a child process: spawn `exe __shape-infer`,
     /// stream the model bytes over stdin, and read the inferred shape table
@@ -50,6 +50,36 @@ pub enum ShapeInferBackend {
         /// `std::env::current_exe()` of the `ny` CLI).
         exe: PathBuf,
     },
+}
+
+/// The default backend depends on WHICH ENGINE this build links, because the
+/// two engines fail differently.
+///
+/// The C++ runtime reports a model it cannot handle as an error, which the
+/// in-process worker thread turns into an ordinary inference failure — so
+/// in-process is both cheaper and sufficient there, and stays the default.
+///
+/// tract can instead panic across the C ABI while translating a graph, and a
+/// panic in a function that cannot unwind ABORTS: no Rust boundary in this
+/// process can contain it. That is not hypothetical — it is what ACASXU does,
+/// measured across the 2021 through 2026 VNN-COMP suites, and ACASXU is the
+/// most-run benchmark family there is. A child process is the only boundary
+/// that holds, and this module's whole purpose is to turn such a death into an
+/// ordinary inference error that loaders degrade from gracefully. So on a
+/// tract build the containment is the default rather than something a caller
+/// must know to ask for: a verifier that aborts on the canonical benchmark is
+/// worse than one that reports it could not infer shapes.
+///
+/// `current_exe` failing leaves nothing to spawn, so that falls back to
+/// in-process rather than pretending containment exists.
+impl Default for ShapeInferBackend {
+    fn default() -> Self {
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        if let Ok(exe) = std::env::current_exe() {
+            return Self::Subprocess { exe };
+        }
+        Self::InProcess
+    }
 }
 
 /// ONNX conversion-time optimization flags.

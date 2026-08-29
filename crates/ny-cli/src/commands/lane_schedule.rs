@@ -85,10 +85,14 @@ use ny_core::phase_yield::{DeclineReason, PhaseYield};
 ///
 /// Exact `"1"` arms it, exact `"0"` disarms it, every other byte sequence is a
 /// recorded rejection falling back to the declaration's `false`. Fails CLOSED.
+///
+/// DELIVERY SEAM (#lever-reachability, 2026-08-23): `NY_LANE_VALUE_SCHEDULER`
+/// still wins in both directions; absent, the typed
+/// `attack.lane_value_scheduler` key decides. Scheduling only — see the
+/// module's Soundness note: no scheduled lane has a verdict-bearing return
+/// type, so this can only change which counterexamples are found in time.
 pub(crate) fn lane_value_scheduler_armed() -> bool {
-    ny_levers::read(&ny_levers::decls::dark_probes::LANE_VALUE_SCHEDULER)
-        .value
-        .as_bool()
+    crate::preset_gates::lane_value_scheduler_armed()
 }
 
 /// The arming rule as a pure predicate over one raw environment string.

@@ -27,7 +27,7 @@ use super::types::{LayerNormLayer, LayerNormMode};
 use crate::layers::common::BoundPropagation;
 use crate::LinearBounds;
 
-use common::validate_ibp_input;
+use common::{validate_ibp_input, ValidatedIbpInput};
 
 impl LayerNormLayer {
     /// Build the per-slice L2 (Euclidean-ball) annotation for Standard LayerNorm.
@@ -107,7 +107,22 @@ impl LayerNormLayer {
 impl BoundPropagation for LayerNormLayer {
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
-        let ctx = validate_ibp_input(self, input)?;
+        let ctx = match validate_ibp_input(self, input)? {
+            ValidatedIbpInput::Finite(ctx) => ctx,
+            // Deep-stack IBP overflow saturation: an upstream box that
+            // legitimately overflowed f32 to ±inf (e.g. the PLBert Linear chain
+            // under production weights) must yield a sound conservative result,
+            // not abort verification. The fallback enclosure is sound for every
+            // finite real input — Standard mode's |z_i| ≤ sqrt(n-1) clamp holds
+            // regardless of input magnitude, MeanOnly yields [-inf, +inf] — and
+            // matches the existing internal-overflow route (`has_nonfinite_mean`
+            // → `fallback_output_bounds`, #3030/#3060). Skipping the L2 lever
+            // annotation here only forgoes tightening (sound). NaN input still
+            // fails closed inside `validate_ibp_input`.
+            ValidatedIbpInput::Saturated => {
+                return self.fallback_output_bounds(input.shape());
+            }
+        };
 
         if self.mode == LayerNormMode::MeanOnly {
             return mean_only::propagate_interval(self, input, &ctx);

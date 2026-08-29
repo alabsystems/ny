@@ -376,7 +376,33 @@ pub(crate) fn merge_pruned_cached_las(
         .copied()
         .zip(active_cached_las)
     {
-        merged_cached_las[idx] = cache.map(Arc::new);
+        // PER-NODE UNION, not replacement (#la-union-merge, 2026-08-23).
+        // A warm-started pass's capture contains ONLY nodes at-or-upstream
+        // of its seed (dispatch.rs takes and skips everything downstream),
+        // and a capture-less pass returns None. Wholesale replacement
+        // therefore EVICTED every ancestor entry downstream of the newest
+        // seed — so the next split at a downstream node missed the warm
+        // start and collapsed to a from-scratch backward at frozen inherited
+        // alpha (measured: depth-2 raw -13.7 vs its parent's -8.2 on
+        // `mnist_fc 256x4`, the non-monotone bounce in the REGRESSION doc).
+        // Union keeps inherited entries at unvisited nodes; fresh entries
+        // win on collision. SOUNDNESS: identical to the existing root-seed
+        // argument — a cached suffix captured under an ANCESTOR's (looser)
+        // boxes is a valid CROWN composition for every descendant (subset
+        // region), exactly as the root's no-constraint capture already seeds
+        // depth-1 children today.
+        merged_cached_las[idx] = match (merged_cached_las[idx].take(), cache) {
+            (Some(inherited), Some(fresh)) => {
+                let mut union = (*inherited).clone();
+                union.lower_a.extend(fresh.lower_a);
+                union.upper_a.extend(fresh.upper_a);
+                union.lower_b.extend(fresh.lower_b);
+                union.upper_b.extend(fresh.upper_b);
+                Some(Arc::new(union))
+            }
+            (inherited, None) => inherited,
+            (None, fresh) => fresh.map(Arc::new),
+        };
     }
     merged_cached_las
 }

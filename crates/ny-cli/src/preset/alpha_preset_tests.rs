@@ -841,7 +841,7 @@ fn no_shipped_preset_arms_root_alpha_margin_without_a_current_positive_ab() {
 
 /// #envelope-grad DELIVERY. The rule is measured to move the root census where
 /// every other alpha lever left it bit-identical, so it has to reach a SCORED
-/// run — and `vnncomp_scripts/run_instance.sh` exports exactly one `NY_*`, so an
+/// run — and `vnncomp_scripts/run_instance.sh` exports no `NY_*`, so an
 /// env-only lever never can. This pins the preset path that does.
 #[test]
 fn apply_preset_maps_alpha_envelope_grad_into_alpha_config() {

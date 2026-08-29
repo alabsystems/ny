@@ -36,12 +36,32 @@ const AUDITED_OPERATORS: &[&str] = &[
     "Range",
 ];
 
+/// The set of INT64 values `validate_structural_schemas` PROVED are exact
+/// static shape control.
+///
+/// This is authentication evidence, not permission. Its only consumer is
+/// `validate_arithmetic_float32_data_path`, which uses it to choose between
+/// refusing a node outright and DEFERRING that refusal to the post-folding
+/// ratchet. A value in here has been shown to have an all-static cone rooted
+/// only in initializers, `Constant` and `Shape`; a runtime-rooted chain never
+/// enters, which is what keeps cctsdb_yolo refused.
+#[derive(Debug, Default)]
+pub(super) struct StructuralAuthentication {
+    values: HashSet<String>,
+}
+
+impl StructuralAuthentication {
+    pub(super) fn contains(&self, value: &str) -> bool {
+        self.values.contains(value)
+    }
+}
+
 pub(super) fn validate_structural_schemas(
     graph: &GraphProto,
     opset_imports: &HashMap<String, i64>,
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
-) -> Result<()> {
+) -> Result<StructuralAuthentication> {
     let standard_opset = opset_imports
         .get("")
         .copied()
@@ -73,8 +93,11 @@ pub(super) fn validate_structural_schemas(
             _ => unreachable!("operator filtered above"),
         }
     }
-    validate_int64_structural_control_paths(graph, &mut dtypes, literals, exemptions)?;
-    Ok(())
+    let authenticated =
+        validate_int64_structural_control_paths(graph, &mut dtypes, literals, exemptions)?;
+    Ok(StructuralAuthentication {
+        values: authenticated,
+    })
 }
 
 /// Test-only: validate and immediately discharge any literal-cone deferral.
@@ -88,7 +111,8 @@ pub(super) fn validate_structural_schemas_unfolded(
 ) -> Result<()> {
     let literals = LiteralCone::new(graph);
     let mut exemptions = LiteralExemptions::default();
-    validate_structural_schemas(graph, opset_imports, &literals, &mut exemptions)?;
+    let _authenticated =
+        validate_structural_schemas(graph, opset_imports, &literals, &mut exemptions)?;
     exemptions.require_all_folded(&crate::WeightStore::new())
 }
 
@@ -1350,7 +1374,7 @@ fn validate_int64_structural_control_paths<'graph>(
     dtypes: &mut RawDtypeResolver<'graph>,
     literals: &LiteralCone,
     exemptions: &mut LiteralExemptions,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
     let mut audit = Int64ControlPathAudit::new(graph, dtypes, literals, exemptions);
 
     // Seed every authored INT64 constant, not just the outputs of the
@@ -1398,7 +1422,7 @@ fn validate_int64_structural_control_paths<'graph>(
             }
         }
     }
-    Ok(())
+    Ok(audit.authenticated)
 }
 
 fn structural_data_input_indices(node: &NodeProto) -> Vec<usize> {
@@ -1419,6 +1443,8 @@ struct Int64ControlPathAudit<'graph, 'dtype, 'cone> {
     initializers: HashSet<&'graph str>,
     producers: HashMap<&'graph str, Vec<usize>>,
     graph_outputs: HashSet<&'graph str>,
+    /// Values this pass PROVED are exact static shape control.
+    authenticated: HashSet<String>,
 }
 
 impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
@@ -1454,11 +1480,13 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
             initializers,
             producers,
             graph_outputs,
+            authenticated: HashSet::new(),
         }
     }
 
     fn require_static_source(&mut self, value: &str, active: &mut HashSet<String>) -> Result<()> {
         if self.initializers.contains(value) {
+            self.authenticated.insert(value.to_string());
             return Ok(());
         }
         if !active.insert(value.to_string()) {
@@ -1496,6 +1524,18 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
                 | "Slice"
                 | "Concat"
                 | "Range" => self.require_all_inputs_static(&producer, active),
+                // #cgan-int64-shape-arithmetic: elementwise integer arithmetic
+                // over an already-static cone is still exact shape control —
+                // `Div_59 = Gather(Shape(input.47), Const) / Const`. Safety is
+                // carried by the RECURSION, not by this operator list: every
+                // input must itself authenticate, and the recursion bottoms out
+                // only at an initializer, `Constant` or `Shape`. A chain rooted
+                // in a runtime value therefore still meets an unlisted producer
+                // and is refused exactly as before — cctsdb_yolo's comparison
+                // cone continues to fail, which its own waiver asserts.
+                "Add" | "Sub" | "Mul" | "Div" => {
+                    self.require_all_inputs_static(&producer, active)
+                }
                 _ => Err(NyError::UnsupportedOp(format!(
                     "raw ONNX INT64 structural value '{value}' is produced by '{}' ({}), which is not an exact static shape-control producer",
                     producer.name, producer.op_type
@@ -1503,6 +1543,14 @@ impl<'graph, 'dtype, 'cone> Int64ControlPathAudit<'graph, 'dtype, 'cone> {
             }
         })();
         active.remove(value);
+        if result.is_ok() {
+            // Record what this pass PROVED static. `validate_arithmetic_float32
+            // _data_path` consults it so a node carrying such a value defers
+            // its FLOAT32 refusal to the post-folding ratchet instead of
+            // refusing outright; `literal_cone` cannot answer for these because
+            // it deliberately excludes `Shape`.
+            self.authenticated.insert(value.to_string());
+        }
         result
     }
 
@@ -1606,7 +1654,10 @@ fn is_int64_control_input(op_type: &str, input_index: usize) -> bool {
         ) | ("Slice", 1..=4)
             | ("ConstantOfShape", 0)
             | ("Range", 0..=2)
-            | ("Gather" | "GatherElements" | "GatherND" | "ScatterND", 1)
+            | (
+                "Gather" | "GatherElements" | "GatherND" | "ScatterND" | "ScatterElements",
+                1
+            )
             | ("Trilu", 1)
             | ("Pad", 1 | 3)
             | ("Resize", 3)
@@ -1620,6 +1671,10 @@ fn is_int64_layout_chain_input(node: &NodeProto, input_index: usize) -> bool {
         "Shape" | "Identity" | "Transpose" | "Squeeze" | "Unsqueeze" | "Slice" | "Reshape"
         | "Expand" => input_index == 0,
         "Concat" => true,
+        // Both operands of a static integer arithmetic node carry the chain;
+        // neither is a data edge in ny's FLOAT sense
+        // (#cgan-int64-shape-arithmetic).
+        "Add" | "Sub" | "Mul" | "Div" => true,
         "Gather" => input_index == 0,
         "Cast" => input_index == 0 && cast_target_dtype(node) == Some(INT64),
         _ => false,

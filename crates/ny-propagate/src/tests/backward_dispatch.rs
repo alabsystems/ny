@@ -198,9 +198,13 @@ fn dispatch_opaque_skip_multi_input_returns_nary() {
         BackwardDispatchResult::Nary {
             bounds: entries, ..
         } => {
-            assert_eq!(entries.len(), 3, "Expected 3 entries for 3 inputs");
+            assert_eq!(
+                entries.onnx_slots().len(),
+                3,
+                "Expected 3 entries for 3 inputs"
+            );
             assert!(
-                entries.iter().all(|e| e.is_some()),
+                entries.onnx_slots().iter().all(|e| e.is_some()),
                 "All entries should be Some"
             );
         }

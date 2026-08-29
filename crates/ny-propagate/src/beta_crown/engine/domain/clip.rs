@@ -49,7 +49,21 @@ use super::super::BetaCrownVerifier;
 /// the moat forbids.
 #[inline]
 const fn sequential_clip_interm_has_input_relative_provenance() -> bool {
-    false
+    // ALL THREE GATES LANDED (#clip-provenance, sealed 2026-08-21):
+    //   (a) differential enclosure — `converted_clip_never_cuts_off_a_reachable_activation`;
+    //   (b) teeth — `enclosure_check_catches_a_one_ulp_too_tight_conversion` +
+    //       the frame-slip variant in `clip_provenance`;
+    //   (c) MEASURED moat sweep — full official relusplitter 220 at official
+    //       budgets against the official consensus ground truth (172 rows,
+    //       20 sat / 152 unsat, zero inter-verifier contradictions): ny
+    //       produced ZERO GT contradictions, every solved row GT-backed,
+    //       solved 44/220 (same as the skip baseline; error 0). Receipts in
+    //       docs/REGRESSION_FC_UNSAT_LOST_2026-08-14.md ("clip-provenance
+    //       gate (c)").
+    // The conversion feeding this predicate re-derives certified
+    // input-relative rows by backward composition and never reads the
+    // layer-output-relative rows (see `super::clip_provenance`).
+    true
 }
 
 /// Can the SEQUENTIAL engine actually honour `enable_clip_interm_domain`?
@@ -462,11 +476,15 @@ mod tests {
     /// so they follow automatically but their allow-list entries must be deleted.
     #[test]
     fn sequential_clip_interm_domain_stays_quarantined() {
+        // All three gates are landed (see the predicate's doc for the sealed
+        // receipts, including the gate-(c) moat sweep of 2026-08-21). The
+        // test keeps its name as the historical anchor; its assertion now
+        // pins the LANDED state so an accidental re-quarantine (which would
+        // silently loosen sequential bounds again) is caught loudly.
         assert!(
-            !sequential_clip_interm_domain_supported(),
-            "sequential clip_interm_domain must stay quarantined until the \
-             provenance-preserving backward conversion exists; see this test's docs \
-             for the three gates required to flip it",
+            sequential_clip_interm_domain_supported(),
+            "sequential clip_interm_domain was un-quarantined with all three gates \
+             landed (2026-08-21); re-quarantining requires new receipts",
         );
     }
 

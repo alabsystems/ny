@@ -19,9 +19,23 @@
 //!   [`BoundedTensor::new_allow_infinite`].
 //! - Pass the resulting bounds into ny verification APIs.
 //!
-//! ny may execute internal IBP/CROWN phases on GPU, but those device
-//! details stay internal. The stable exchange type at the public boundary
-//! remains [`BoundedTensor`].
+//! This boundary itself never touches a device, and no default-feature build
+//! of ny-api can: without the optional `gpu` feature, `ny-gpu` is not in this
+//! crate's dependency graph at all, so no facade call can reach one. A caller
+//! supplies acceleration explicitly — by injecting an engine
+//! (`Verifier::new_with_engine` / `Session::with_engine` take an
+//! [`ny_core::GemmEngine`]), by claiming the process-global seams in
+//! ny-propagate (`sound_f64_gemm::set_sound_f64_gemm_factory`,
+//! `sound_gpu_gate::set_sound_gpu_crown_factory`), or, with the `gpu` feature,
+//! through the `ny_api::gpu` module, which hands ny a typed verdict request and
+//! lets it qualify or refuse the device by live measurement. See
+//! `ny_api::engines::init_process_engines` for the CPU floor.
+//!
+//! Either way the contract on THIS boundary is unchanged: bounds crossing into
+//! verification are host-resident `f32` arrays, materialized by the caller.
+//!
+//! The stable exchange type at the public boundary remains
+//! [`BoundedTensor`].
 
 use ny_core::Result;
 use ny_tensor::{BoundedScalar, BoundedTensor, GenericBounds};

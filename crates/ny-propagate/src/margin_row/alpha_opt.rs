@@ -63,19 +63,24 @@
 //! * The forward tableau is NOT rebuilt: the stored `l`/`u`/`clip_rows` were
 //!   produced by a valid relaxation and remain valid enclosures of the true
 //!   pre-activation ranges regardless of which (valid) backward alpha is used
-//!   later. In particular `apply_gates`' outward widening constant — the one
-//!   build-time line whose derivation assumes a binary lower product — never
-//!   sees a fractional alpha, because backward-only optimization never
-//!   executes it.
+//!   later. In particular `apply_gates`' outward widening — whose HISTORICAL
+//!   constant's derivation assumes a binary lower product — never sees a
+//!   fractional alpha through this module, because backward-only optimization
+//!   never executes it. (#rebake DOES bake fractional alpha forward; for that
+//!   path `apply_gates` carries its own magnitude-scaled widening branch with
+//!   the re-derivation in its header doc.)
 //! * Search iterates evaluate through `DomainGates` overrides (the engine's
 //!   established injection point); the root struct is mutated ONCE, on accept.
-//!   With the gate off, or on refusal/abort/no-improvement, the root is
-//!   byte-identical to the build.
+//!   With the gate off, on refusal before a certified candidate, or on
+//!   no-improvement, the root is byte-identical to the build. A later pass
+//!   error stops new candidates but may still publish the best earlier,
+//!   strictly improving certified candidate.
 //!
-//! GATE. `NY_MARGIN_ROW_ALPHA_OPT=1` (exact) arms it; default OFF.
-//! `NY_MARGIN_ROW_ALPHA_ITERS` (default 8) caps iterations;
-//! `NY_MARGIN_ROW_ALPHA_SECS` (default 20, further capped to 40% of the
-//! remaining deadline) caps wall clock. Engagement telemetry
+//! GATE. The scored [`super::RootAlphaRuntimePolicy`] is frozen once from the
+//! typed preset/LeverSet; its exact legacy `NY_MARGIN_ROW_ALPHA_OPT=1` overlay
+//! also arms it, and the declaration default is OFF. The frozen iteration
+//! control (default 20) caps iterations; the frozen wall request (default 20,
+//! further capped to 40% of the remaining deadline) caps wall clock. Engagement telemetry
 //! (`[alpha-opt] iter=...`) prints unconditionally when armed, so an inert
 //! arming is detectable in one log (a null from a lever that never fired is
 //! vacuous).
@@ -97,35 +102,103 @@ use super::engine::{BackwardEngine, Collect, DomainGates, GateVecs, LaneDir, Pas
 use super::net::{conv_apply_forward, TwinNet, TwinOp};
 use super::root::RootGates;
 
-/// Is the optimizer armed? Exact `"1"` only; default OFF.
-pub fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_ALPHA_OPT)
-            .value
-            .as_bool()
-    })
+/// Fully resolved root-alpha optimizer controls. `Default` deliberately means
+/// "resolve the compatibility layered process" for direct tests and research
+/// callers. Scored execution always uses [`AlphaOptCfg::from_policy`] so the
+/// optimizer cannot reopen a process-global authority after the flight receipt
+/// was frozen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AlphaOptCfg {
+    pub(crate) iters: usize,
+    pub(crate) secs: f64,
+    /// Adam step. Zero selects the historical normalized-supergradient path.
+    pub(crate) lr: f64,
+    /// Number of worst frozen-frame columns averaged for steering.
+    pub(crate) cols: usize,
+    /// Revert unless the independently recomputed published root improves.
+    pub(crate) guard: bool,
 }
 
-fn env_iters() -> usize {
-    ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_ALPHA_ITERS)
-        .value
-        .as_u64()
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(8)
-        .clamp(1, 64)
+impl Default for AlphaOptCfg {
+    fn default() -> Self {
+        Self::from_policy(super::RootAlphaRuntimePolicy::from_layered_process())
+    }
 }
 
-fn env_secs() -> f64 {
-    ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_ALPHA_SECS)
-        .value
-        .as_f64()
-        .filter(|s| s.is_finite() && *s > 0.0)
-        .unwrap_or(20.0)
+impl AlphaOptCfg {
+    pub(super) const fn from_policy(policy: super::RootAlphaRuntimePolicy) -> Self {
+        Self {
+            iters: policy.alpha_iters,
+            secs: policy.alpha_secs,
+            lr: policy.alpha_lr,
+            cols: policy.alpha_cols,
+            guard: policy.alpha_guard,
+        }
+    }
+
+    /// Controls shared by the joint re-bake ascent. Re-bake owns its round
+    /// iteration/wall policy and performs the published-frame guard after the
+    /// rebuild, so only the two steering controls are resolved here. Keeping
+    /// this constructor explicit prevents discarded reads of the standalone
+    /// optimizer's iters/secs/guard axes from polluting attribution receipts.
+    pub(super) const fn for_rebake(
+        policy: super::RootAlphaRuntimePolicy,
+        iters: usize,
+        secs: f64,
+    ) -> Self {
+        Self {
+            iters,
+            secs,
+            lr: policy.alpha_lr,
+            cols: policy.alpha_cols,
+            guard: false,
+        }
+    }
+}
+
+/// Cheap, side-effect-free admission fact shared by the standalone and rebake
+/// execution receipts.  It deliberately excludes budget/data-path failures:
+/// those require a completed report before T1 can award armed engagement.
+pub(crate) fn execution_eligible(root: &RootGates, adv: &[usize]) -> bool {
+    root.mode.outward() && !adv.is_empty() && root.layers.iter().any(|layer| !layer.unst.is_empty())
 }
 
 /// What one optimization run did (telemetry + test surface).
 pub struct AlphaOptReport {
+    pub(crate) cfg: AlphaOptCfg,
+    /// Effective wall slice after the 40%-of-remaining cap.
+    pub effective_secs: f64,
+    /// Whether the instance deadline, rather than the configured request,
+    /// reduced the effective wall slice.
+    pub deadline_capped: bool,
+    /// Whether the next certified pass was refused by the effective wall cap.
+    pub budget_exhausted: bool,
+    /// Whether all configured iterations completed their candidate pass.
+    pub iters_cap_exhausted: bool,
+    /// Largest number of frozen-frame columns actually used by a gradient.
+    pub max_steer_cols: usize,
+    /// Published-frame baseline evaluations owned by the guard.
+    pub guard_baseline_evals: usize,
+    /// Published-frame candidate evaluations owned by the guard.
+    pub guard_candidate_evals: usize,
+    /// Guard-triggered rollbacks.
+    pub guard_reversions: usize,
+    /// Frozen-frame failing objective columns available to steering.
+    pub fail_classes: usize,
+    /// Candidate updates applied before a certified evaluation.
+    pub candidate_steps: usize,
+    /// Candidate updates that used the legacy normalized step.
+    pub legacy_steps: usize,
+    /// Candidate updates that used Adam.
+    pub adam_steps: usize,
+    /// Candidate evaluations that strictly improved the frozen objective.
+    pub frozen_improvements: usize,
+    /// Candidate commits for which the guard had a publish/revert decision.
+    pub guard_opportunities: usize,
+    /// Published baseline already computed by the guard, when present.
+    pub published_before: Option<f64>,
+    /// Published candidate already computed by the guard, when finite.
+    pub published_after: Option<f64>,
     /// Certified frozen-frame objective of the heuristic (binary) alpha.
     pub baseline: f64,
     /// Best certified frozen-frame objective found (>= baseline by monotone
@@ -143,25 +216,199 @@ pub struct AlphaOptReport {
     pub max_dalpha: f64,
 }
 
-/// Env-gated entry: no-op unless `NY_MARGIN_ROW_ALPHA_OPT=1`.
+/// Closed root-phase execution evidence for the jointly governed standalone
+/// alpha and rebake controls.  Configuration is copied from the immutable
+/// receipt-owned policy; observations are populated only from reports returned
+/// by the actual dispatches.  Tree code can carry this value but never reads it
+/// to make a bound or scheduling decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RootAlphaExecutionEvidence {
+    pub alpha_enabled: bool,
+    pub alpha_iters: usize,
+    pub alpha_secs: f64,
+    pub alpha_lr: f64,
+    pub alpha_cols: usize,
+    pub alpha_guard: bool,
+    pub rebake_enabled: bool,
+    pub rebake_rounds: usize,
+    pub rebake_secs: f64,
+    pub eligible: bool,
+    pub standalone_suppressed: usize,
+    pub standalone_attempted: usize,
+    pub standalone_completed: usize,
+    pub standalone_effective_secs: f64,
+    pub standalone_deadline_capped: bool,
+    pub standalone_budget_exhausted: bool,
+    pub standalone_iters_cap_exhausted: bool,
+    pub standalone_fail_classes: usize,
+    pub standalone_iters_attempted: usize,
+    pub standalone_candidate_steps: usize,
+    pub standalone_legacy_steps: usize,
+    pub standalone_adam_steps: usize,
+    pub standalone_passes: usize,
+    pub standalone_max_steer_cols: usize,
+    pub standalone_frozen_improvements: usize,
+    pub standalone_accepted: bool,
+    pub standalone_moved_neurons: usize,
+    pub standalone_guard_opportunities: usize,
+    pub standalone_guard_baseline_evals: usize,
+    pub standalone_guard_candidate_evals: usize,
+    pub standalone_guard_reversions: usize,
+    pub standalone_frozen_before_bits: Option<u64>,
+    pub standalone_frozen_best_bits: Option<u64>,
+    pub standalone_published_before_bits: Option<u64>,
+    pub standalone_published_after_bits: Option<u64>,
+    pub rebake_suppressed: usize,
+    pub rebake_attempted: usize,
+    pub rebake_completed: usize,
+    pub rebake_effective_secs: f64,
+    pub rebake_deadline_capped: bool,
+    pub rebake_budget_exhausted: bool,
+    pub rebake_round_cap_exhausted: bool,
+    pub rebake_entry_unbaked_alpha: bool,
+    pub rebake_baseline_evals: usize,
+    pub rebake_rounds_started: usize,
+    pub rebake_alpha_completed: usize,
+    pub rebake_alpha_iters_attempted: usize,
+    pub rebake_alpha_candidate_steps: usize,
+    pub rebake_alpha_legacy_steps: usize,
+    pub rebake_alpha_adam_steps: usize,
+    pub rebake_alpha_passes: usize,
+    pub rebake_alpha_max_fail_classes: usize,
+    pub rebake_alpha_max_steer_cols: usize,
+    pub rebake_alpha_moved_neurons: usize,
+    pub rebake_rebuilds_completed: usize,
+    pub rebake_rounds_scored: usize,
+    pub rebake_rounds_accepted: usize,
+    pub rebake_fixed_point_stops: usize,
+    pub rebake_affordability_refusals: usize,
+    pub rebake_aborts: usize,
+    pub rebake_published_before_bits: Option<u64>,
+    pub rebake_published_after_bits: Option<u64>,
+    pub policy_mismatch: bool,
+}
+
+impl RootAlphaExecutionEvidence {
+    pub(crate) fn completed(
+        policy: super::RootAlphaRuntimePolicy,
+        eligible: bool,
+        standalone: Option<&AlphaOptReport>,
+        rebake: Option<&super::rebake::RebakeReport>,
+    ) -> Self {
+        let standalone_matches = standalone.is_none_or(|report| {
+            policy.alpha_enabled && eligible && report.cfg == AlphaOptCfg::from_policy(policy)
+        });
+        let rebake_matches = rebake
+            .is_none_or(|report| policy.rebake_enabled && eligible && report.policy == policy);
+        Self {
+            alpha_enabled: policy.alpha_enabled,
+            alpha_iters: policy.alpha_iters,
+            alpha_secs: policy.alpha_secs,
+            alpha_lr: policy.alpha_lr,
+            alpha_cols: policy.alpha_cols,
+            alpha_guard: policy.alpha_guard,
+            rebake_enabled: policy.rebake_enabled,
+            rebake_rounds: policy.rebake_rounds,
+            rebake_secs: policy.rebake_secs,
+            eligible,
+            standalone_suppressed: usize::from(eligible && !policy.alpha_enabled),
+            standalone_attempted: usize::from(policy.alpha_enabled),
+            standalone_completed: usize::from(standalone.is_some()),
+            standalone_effective_secs: standalone.map_or(0.0, |report| report.effective_secs),
+            standalone_deadline_capped: standalone.is_some_and(|report| report.deadline_capped),
+            standalone_budget_exhausted: standalone.is_some_and(|report| report.budget_exhausted),
+            standalone_iters_cap_exhausted: standalone
+                .is_some_and(|report| report.iters_cap_exhausted),
+            standalone_fail_classes: standalone.map_or(0, |report| report.fail_classes),
+            standalone_iters_attempted: standalone.map_or(0, |report| report.iters),
+            standalone_candidate_steps: standalone.map_or(0, |report| report.candidate_steps),
+            standalone_legacy_steps: standalone.map_or(0, |report| report.legacy_steps),
+            standalone_adam_steps: standalone.map_or(0, |report| report.adam_steps),
+            standalone_passes: standalone.map_or(0, |report| report.passes),
+            standalone_max_steer_cols: standalone.map_or(0, |report| report.max_steer_cols),
+            standalone_frozen_improvements: standalone
+                .map_or(0, |report| report.frozen_improvements),
+            standalone_accepted: standalone.is_some_and(|report| report.accepted),
+            standalone_moved_neurons: standalone.map_or(0, |report| report.moved_neurons),
+            standalone_guard_opportunities: standalone
+                .map_or(0, |report| report.guard_opportunities),
+            standalone_guard_baseline_evals: standalone
+                .map_or(0, |report| report.guard_baseline_evals),
+            standalone_guard_candidate_evals: standalone
+                .map_or(0, |report| report.guard_candidate_evals),
+            standalone_guard_reversions: standalone.map_or(0, |report| report.guard_reversions),
+            standalone_frozen_before_bits: standalone.map(|report| report.baseline.to_bits()),
+            standalone_frozen_best_bits: standalone.map(|report| report.best.to_bits()),
+            standalone_published_before_bits: standalone
+                .and_then(|report| report.published_before.map(f64::to_bits)),
+            standalone_published_after_bits: standalone
+                .and_then(|report| report.published_after.map(f64::to_bits)),
+            rebake_suppressed: usize::from(eligible && !policy.rebake_enabled),
+            rebake_attempted: usize::from(policy.rebake_enabled),
+            rebake_completed: usize::from(rebake.is_some()),
+            rebake_effective_secs: rebake.map_or(0.0, |report| report.effective_secs),
+            rebake_deadline_capped: rebake.is_some_and(|report| report.deadline_capped),
+            rebake_budget_exhausted: rebake.is_some_and(|report| report.budget_exhausted),
+            rebake_round_cap_exhausted: rebake.is_some_and(|report| report.round_cap_exhausted),
+            rebake_entry_unbaked_alpha: rebake.is_some_and(|report| report.entry_unbaked_alpha),
+            rebake_baseline_evals: usize::from(rebake.is_some()),
+            rebake_rounds_started: rebake.map_or(0, |report| report.rounds_started),
+            rebake_alpha_completed: rebake.map_or(0, |report| report.alpha_completed),
+            rebake_alpha_iters_attempted: rebake.map_or(0, |report| report.alpha_iters_attempted),
+            rebake_alpha_candidate_steps: rebake.map_or(0, |report| report.alpha_candidate_steps),
+            rebake_alpha_legacy_steps: rebake.map_or(0, |report| report.alpha_legacy_steps),
+            rebake_alpha_adam_steps: rebake.map_or(0, |report| report.alpha_adam_steps),
+            rebake_alpha_passes: rebake.map_or(0, |report| report.alpha_passes),
+            rebake_alpha_max_fail_classes: rebake.map_or(0, |report| report.alpha_max_fail_classes),
+            rebake_alpha_max_steer_cols: rebake.map_or(0, |report| report.alpha_max_steer_cols),
+            rebake_alpha_moved_neurons: rebake.map_or(0, |report| report.alpha_moved_neurons),
+            rebake_rebuilds_completed: rebake.map_or(0, |report| report.rebuilds_completed),
+            rebake_rounds_scored: rebake.map_or(0, |report| report.rounds_run),
+            rebake_rounds_accepted: rebake.map_or(0, |report| report.rounds_accepted),
+            rebake_fixed_point_stops: rebake.map_or(0, |report| report.fixed_point_stops),
+            rebake_affordability_refusals: rebake.map_or(0, |report| report.affordability_refusals),
+            rebake_aborts: rebake.map_or(0, |report| report.aborts),
+            rebake_published_before_bits: rebake.map(|report| report.baseline.to_bits()),
+            rebake_published_after_bits: rebake.map(|report| report.best.to_bits()),
+            policy_mismatch: !(standalone_matches && rebake_matches),
+        }
+    }
+}
+
+impl Default for RootAlphaExecutionEvidence {
+    fn default() -> Self {
+        Self::completed(super::RootAlphaRuntimePolicy::default(), false, None, None)
+    }
+}
+
+/// Frozen-policy entry: no-op unless root alpha is armed.
 ///
 /// Called from `lane_impl` between the root build and the BaB driver, where
-/// the root is still owned mutably. Bound-quality only: any internal error
-/// aborts the search and leaves the root byte-identical to the build.
+/// the root is still owned mutably. Bound-quality only: an internal error
+/// stops further candidates; only the best earlier, strictly improving
+/// certified candidate can still be committed.
 pub fn maybe_optimize_root_alpha(
     net: &TwinNet,
     root: &mut RootGates,
     t: usize,
     adv: &[usize],
     deadline: Option<Instant>,
-) {
-    if !enabled() {
-        return;
+    policy: super::RootAlphaRuntimePolicy,
+) -> Option<AlphaOptReport> {
+    if !policy.alpha_enabled {
+        return None;
     }
-    let _ = optimize_root_alpha(net, root, t, adv, deadline, env_iters(), env_secs());
+    optimize_root_alpha(
+        net,
+        root,
+        t,
+        adv,
+        deadline,
+        AlphaOptCfg::from_policy(policy),
+    )
 }
 
-/// The optimizer proper (test-visible; the env gate lives in
+/// The optimizer proper (test-visible; the policy gate lives in
 /// [`maybe_optimize_root_alpha`]).
 pub(crate) fn optimize_root_alpha(
     net: &TwinNet,
@@ -169,8 +416,7 @@ pub(crate) fn optimize_root_alpha(
     t: usize,
     adv: &[usize],
     deadline: Option<Instant>,
-    max_iters: usize,
-    secs_budget: f64,
+    cfg: AlphaOptCfg,
 ) -> Option<AlphaOptReport> {
     let t0 = Instant::now();
     if !root.mode.outward() {
@@ -186,19 +432,50 @@ pub(crate) fn optimize_root_alpha(
     }
     // Never starve the tree search: cap at 40% of the remaining deadline.
     let budget = match deadline {
-        Some(dl) => secs_budget.min(0.4 * dl.saturating_duration_since(t0).as_secs_f64()),
-        None => secs_budget,
+        Some(dl) => cfg
+            .secs
+            .min(0.4 * dl.saturating_duration_since(t0).as_secs_f64()),
+        None => cfg.secs,
     };
+    let deadline_capped = budget < cfg.secs;
     if budget < 0.5 {
         eprintln!("[alpha-opt] refuse: no budget (deadline too close)");
         return None;
     }
-    let sr = search_alpha(net, &*root, t, adv, t0, budget, max_iters)?;
+    let published_before = if cfg.guard {
+        match super::rebake::certified_root_bound(net, root, t, adv) {
+            Ok(bound) if bound.is_finite() => Some(bound),
+            Ok(_) => {
+                eprintln!("[alpha-opt] refuse: non-finite published baseline");
+                return None;
+            }
+            Err(error) => {
+                eprintln!("[alpha-opt] refuse: published baseline root_eval: {error}");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let sr = search_alpha(net, &*root, t, adv, t0, budget, cfg)?;
     // COMMIT: strictly-better certified objective only (monotone accept). The
     // heuristic alpha is otherwise retained bit-identically.
-    let accepted = sr.best > sr.baseline;
+    let mut accepted = sr.best > sr.baseline;
     let mut moved_neurons = 0usize;
     let mut max_dalpha = 0.0f64;
+    // A rollback copy is needed only when the published-frame guard may reject
+    // an otherwise accepted frozen-frame iterate. Avoid cloning every layer on
+    // the common no-improvement path (and when the guard is explicitly off).
+    let original = (accepted && published_before.is_some()).then(|| {
+        root.layers
+            .iter()
+            .map(|layer| (layer.alpha.clone(), layer.ms.clone()))
+            .collect::<Vec<_>>()
+    });
+    let guard_opportunities = usize::from(accepted);
+    let guard_candidate_evals = usize::from(accepted && published_before.is_some());
+    let mut guard_reversions = 0usize;
+    let mut published_after = None;
     if accepted {
         for (li, layer) in root.layers.iter_mut().enumerate() {
             let cand = &sr.best_alpha[li];
@@ -227,9 +504,41 @@ pub(crate) fn optimize_root_alpha(
             }
         }
     }
+    if accepted {
+        if let Some(before) = published_before {
+            let after = super::rebake::certified_root_bound(net, root, t, adv);
+            let keep = after
+                .as_ref()
+                .is_ok_and(|value| value.is_finite() && *value > before);
+            published_after = after
+                .as_ref()
+                .ok()
+                .copied()
+                .filter(|value| value.is_finite());
+            match after {
+                Ok(value) => eprintln!(
+                    "[alpha-opt] published_guard before={before:.6} after={value:.6} accepted={keep}"
+                ),
+                Err(error) => eprintln!(
+                    "[alpha-opt] published_guard before={before:.6} after=error accepted=false: {error}"
+                ),
+            }
+            if !keep {
+                let original = original.expect("accepted guarded iterate retained rollback state");
+                for (layer, (alpha, ms)) in root.layers.iter_mut().zip(original) {
+                    layer.alpha = alpha;
+                    layer.ms = ms;
+                }
+                accepted = false;
+                moved_neurons = 0;
+                max_dalpha = 0.0;
+                guard_reversions = 1;
+            }
+        }
+    }
     eprintln!(
         "[alpha-opt] done iters={} passes={} root_bound_before={:.6} after={:.6} accepted={} \
-moved_neurons={} max_dalpha={:.4} secs={:.2}",
+moved_neurons={} max_dalpha={:.4} lr={:.4} cols={} guard={} secs={:.2}",
         sr.iters,
         sr.passes,
         sr.baseline,
@@ -237,9 +546,29 @@ moved_neurons={} max_dalpha={:.4} secs={:.2}",
         accepted,
         moved_neurons,
         max_dalpha,
+        cfg.lr,
+        cfg.cols,
+        cfg.guard,
         t0.elapsed().as_secs_f64()
     );
     Some(AlphaOptReport {
+        cfg,
+        effective_secs: budget,
+        deadline_capped,
+        budget_exhausted: sr.budget_exhausted,
+        iters_cap_exhausted: sr.candidate_steps == cfg.iters,
+        max_steer_cols: sr.max_steer_cols,
+        guard_baseline_evals: usize::from(published_before.is_some()),
+        guard_candidate_evals,
+        guard_reversions,
+        fail_classes: sr.fail_classes,
+        candidate_steps: sr.candidate_steps,
+        legacy_steps: if cfg.lr == 0.0 { sr.candidate_steps } else { 0 },
+        adam_steps: if cfg.lr == 0.0 { 0 } else { sr.candidate_steps },
+        frozen_improvements: sr.frozen_improvements,
+        guard_opportunities,
+        published_before,
+        published_after,
         baseline: sr.baseline,
         best: sr.best,
         iters: sr.iters,
@@ -256,6 +585,11 @@ struct SearchRes {
     best: f64,
     iters: usize,
     passes: usize,
+    candidate_steps: usize,
+    budget_exhausted: bool,
+    fail_classes: usize,
+    max_steer_cols: usize,
+    frozen_improvements: usize,
 }
 
 /// The search: immutable root, candidates injected as `DomainGates`.
@@ -266,7 +600,7 @@ fn search_alpha(
     adv: &[usize],
     t0: Instant,
     budget: f64,
-    max_iters: usize,
+    cfg: AlphaOptCfg,
 ) -> Option<SearchRes> {
     let eng = BackwardEngine::new(net, root);
     let mode = root.mode;
@@ -324,7 +658,7 @@ fn search_alpha(
     // One evaluation = one certified Lower pass under the candidate alpha
     // (with the pre-transform coefficient capture the gradient needs) plus the
     // frozen-frame objective: min over classes of max(direct, m1, m2v).
-    let eval = |alpha: &[Vec<f64>]| -> Result<(f64, usize, PassOut), String> {
+    let eval = |alpha: &[Vec<f64>]| -> Result<(f64, Vec<usize>, PassOut), String> {
         let dom = gates_override(root, alpha);
         let pass = eng
             .run_collect(
@@ -340,24 +674,27 @@ fn search_alpha(
             )
             .map_err(|e| e.to_string())?;
         let direct = per_class_direct(&eng, &pass, &ms_f, 0..nf);
-        let mut worst = f64::INFINITY;
-        let mut worst_col = 0usize;
+        let mut scored = Vec::with_capacity(nf);
         for f in 0..nf {
             let d = direct[f].max(ms_f.m1[f]).max(m2v_f[f]);
             if !d.is_finite() {
                 return Err("non-finite objective".into());
             }
-            if d < worst {
-                worst = d;
-                worst_col = f;
-            }
+            scored.push((d, f));
         }
-        Ok((worst, worst_col, pass))
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let worst = scored[0].0;
+        let steer_cols = scored
+            .into_iter()
+            .take(cfg.cols.min(nf).max(1))
+            .map(|(_, col)| col)
+            .collect();
+        Ok((worst, steer_cols, pass))
     };
 
     let init: Vec<Vec<f64>> = root.layers.iter().map(|l| l.alpha.clone()).collect();
     let te = Instant::now();
-    let (baseline, mut worst_col, mut best_pass) = match eval(&init) {
+    let (baseline, mut steer_cols, baseline_pass) = match eval(&init) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[alpha-opt] abort: baseline pass: {e}");
@@ -371,13 +708,20 @@ fn search_alpha(
     );
     let mut best = baseline;
     let mut best_alpha = init;
-    let mut grad = supergradient(net, root, &best_alpha, &best_pass, worst_col);
+    let mut grad = mean_supergradient(net, root, &best_alpha, &baseline_pass, &steer_cols);
     let mut eta = 0.25f64;
+    let mut adam_m: Vec<Vec<f64>> = root.layers.iter().map(|l| vec![0.0; l.n]).collect();
+    let mut adam_v = adam_m.clone();
     let mut passes = 1usize;
     let mut iters = 0usize;
-    for it in 1..=max_iters {
+    let mut candidate_steps = 0usize;
+    let mut budget_exhausted = false;
+    let mut max_steer_cols = steer_cols.len();
+    let mut frozen_improvements = 0usize;
+    for it in 1..=cfg.iters {
         // Leave room for the pass we are about to spend.
         if t0.elapsed().as_secs_f64() + 1.5 * pass_secs > budget {
+            budget_exhausted = true;
             break;
         }
         let Some(g) = grad.as_ref() else { break };
@@ -388,12 +732,25 @@ fn search_alpha(
         if !(gmax.is_finite() && gmax > 0.0) {
             break;
         }
-        // Projected normalized supergradient step FROM THE BEST iterate.
+        // Projected step FROM THE BEST iterate. `lr == 0` is the exact legacy
+        // globally-normalized update; otherwise Adam makes the step scale-free
+        // per coordinate, with alpha-beta-CROWN's 0.98 learning-rate decay.
         let mut cand = best_alpha.clone();
         let mut moved = false;
         for (li, layer) in root.layers.iter().enumerate() {
             for &j in &layer.unst {
-                let a2 = (cand[li][j] + eta * g[li][j] / gmax).clamp(0.0, 1.0);
+                let gn = g[li][j] / gmax;
+                let step = if cfg.lr == 0.0 {
+                    eta * gn
+                } else {
+                    adam_m[li][j] = 0.9 * adam_m[li][j] + 0.1 * gn;
+                    adam_v[li][j] = 0.999 * adam_v[li][j] + 0.001 * gn * gn;
+                    let mhat = adam_m[li][j] / (1.0 - 0.9f64.powi(it as i32));
+                    let vhat = adam_v[li][j] / (1.0 - 0.999f64.powi(it as i32));
+                    let lr = cfg.lr * 0.98f64.powi((it - 1) as i32);
+                    lr * mhat / (vhat.sqrt() + 1e-8)
+                };
+                let a2 = (cand[li][j] + step).clamp(0.0, 1.0);
                 if a2 != cand[li][j] {
                     cand[li][j] = a2;
                     moved = true;
@@ -405,7 +762,7 @@ fn search_alpha(
         }
         iters = it;
         let te = Instant::now();
-        let (f, fcol, pass) = match eval(&cand) {
+        let (f, fcols, pass) = match eval(&cand) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[alpha-opt] abort: pass failed at iter {it}: {e}");
@@ -414,18 +771,26 @@ fn search_alpha(
         };
         pass_secs = pass_secs.max(te.elapsed().as_secs_f64());
         passes += 1;
+        candidate_steps += 1;
+        max_steer_cols = max_steer_cols.max(fcols.len());
         let improved = f > best;
         eprintln!(
             "[alpha-opt] iter={it} root_bound_before={best:.6} after={f:.6} accepted={improved} \
-eta={eta:.3}"
+step={} cols={}",
+            if cfg.lr == 0.0 {
+                format!("legacy_eta:{eta:.3}")
+            } else {
+                format!("adam_lr:{:.4}", cfg.lr * 0.98f64.powi((it - 1) as i32))
+            },
+            steer_cols.len()
         );
         if improved {
+            frozen_improvements += 1;
             best = f;
             best_alpha = cand;
-            best_pass = pass;
-            worst_col = fcol;
-            grad = supergradient(net, root, &best_alpha, &best_pass, worst_col);
-        } else {
+            steer_cols = fcols;
+            grad = mean_supergradient(net, root, &best_alpha, &pass, &steer_cols);
+        } else if cfg.lr == 0.0 {
             eta *= 0.5;
             if eta < 0.01 {
                 break;
@@ -438,7 +803,43 @@ eta={eta:.3}"
         best,
         iters,
         passes,
+        candidate_steps,
+        budget_exhausted,
+        fail_classes: nf,
+        max_steer_cols,
+        frozen_improvements,
     })
+}
+
+/// Average the frozen-sign supergradients of the K worst objective columns.
+/// K=1 deliberately calls the historical primitive once and is therefore the
+/// exact steering control arm.
+fn mean_supergradient(
+    net: &TwinNet,
+    root: &RootGates,
+    alpha: &[Vec<f64>],
+    pass: &PassOut,
+    cols: &[usize],
+) -> Option<Vec<Vec<f64>>> {
+    if cols.is_empty() {
+        return None;
+    }
+    let mut mean: Vec<Vec<f64>> = root.layers.iter().map(|l| vec![0.0; l.n]).collect();
+    for &col in cols {
+        let grad = supergradient(net, root, alpha, pass, col)?;
+        for (dst_layer, src_layer) in mean.iter_mut().zip(grad) {
+            for (dst, src) in dst_layer.iter_mut().zip(src_layer) {
+                *dst += src;
+            }
+        }
+    }
+    let scale = 1.0 / cols.len() as f64;
+    for layer in &mut mean {
+        for value in layer {
+            *value *= scale;
+        }
+    }
+    Some(mean)
 }
 
 /// Full-layer gate override for a candidate alpha. `s`/`c` are the root's
@@ -473,7 +874,15 @@ fn gates_override(root: &RootGates, alpha: &[Vec<f64>]) -> DomainGates {
 ///
 /// Heuristic-only: the direction never feeds a verdict — every accepted
 /// iterate is re-scored by the unchanged certified pass.
-fn supergradient(
+///
+/// `pub(crate)`: #margin-row-domain-alpha reuses this EXACT gradient per BaB
+/// domain, passing the domain's effective alpha vectors — the same
+/// direction-only contract `beta::step_scales` already relies on. Note the
+/// gradient is NOT sign-definite: `vp >= 0` but `U` is the pre-activation of an
+/// UNSTABLE neuron at `x*`, so it straddles zero. (The banked "ny's alpha
+/// gradient is sign-definite <= 0" finding is about the INTERNAL verifier's
+/// alpha-CROWN, a different lane; it does not apply here.)
+pub(crate) fn supergradient(
     net: &TwinNet,
     root: &RootGates,
     alpha: &[Vec<f64>],
@@ -665,4 +1074,116 @@ pub(crate) fn linearized_walk(
         Vec::new()
     };
     Some((u_out, y))
+}
+
+#[cfg(test)]
+mod execution_evidence_tests {
+    use super::{AlphaOptCfg, AlphaOptReport, RootAlphaExecutionEvidence};
+    use crate::margin_row::{rebake::RebakeReport, RootAlphaRuntimePolicy};
+
+    #[test]
+    fn root_alpha_evidence_is_route_split_and_policy_bound() {
+        let policy = RootAlphaRuntimePolicy {
+            alpha_enabled: true,
+            alpha_iters: 4,
+            alpha_secs: 12.5,
+            alpha_lr: 0.05,
+            alpha_cols: 3,
+            alpha_guard: true,
+            rebake_enabled: true,
+            rebake_rounds: 2,
+            rebake_secs: 30.0,
+        };
+        let standalone = AlphaOptReport {
+            cfg: AlphaOptCfg::from_policy(policy),
+            effective_secs: 10.0,
+            deadline_capped: true,
+            budget_exhausted: false,
+            iters_cap_exhausted: true,
+            max_steer_cols: 3,
+            guard_baseline_evals: 1,
+            guard_candidate_evals: 1,
+            guard_reversions: 0,
+            fail_classes: 7,
+            candidate_steps: 4,
+            legacy_steps: 0,
+            adam_steps: 4,
+            frozen_improvements: 1,
+            guard_opportunities: 1,
+            published_before: Some(-1.0),
+            published_after: Some(-0.5),
+            baseline: -1.25,
+            best: -0.75,
+            iters: 4,
+            passes: 5,
+            accepted: true,
+            moved_neurons: 6,
+            max_dalpha: 0.25,
+        };
+        let rebake = RebakeReport {
+            policy,
+            effective_secs: 20.0,
+            deadline_capped: true,
+            budget_exhausted: true,
+            round_cap_exhausted: false,
+            entry_unbaked_alpha: true,
+            rounds_started: 1,
+            alpha_completed: 1,
+            alpha_iters_attempted: 4,
+            alpha_candidate_steps: 4,
+            alpha_legacy_steps: 0,
+            alpha_adam_steps: 4,
+            alpha_passes: 5,
+            alpha_max_fail_classes: 7,
+            alpha_max_steer_cols: 3,
+            alpha_moved_neurons: 6,
+            rebuilds_completed: 1,
+            fixed_point_stops: 0,
+            affordability_refusals: 1,
+            aborts: 0,
+            baseline: -1.0,
+            best: -0.25,
+            rounds_run: 1,
+            rounds_accepted: 1,
+        };
+
+        let evidence =
+            RootAlphaExecutionEvidence::completed(policy, true, Some(&standalone), Some(&rebake));
+        assert!(!evidence.policy_mismatch);
+        assert_eq!(evidence.standalone_candidate_steps, 4);
+        assert_eq!(
+            evidence.standalone_frozen_before_bits,
+            Some((-1.25f64).to_bits())
+        );
+        assert_eq!(
+            evidence.standalone_published_after_bits,
+            Some((-0.5f64).to_bits())
+        );
+        assert_eq!(evidence.rebake_alpha_candidate_steps, 4);
+        assert_eq!(evidence.rebake_rounds_scored, 1);
+        assert_eq!(
+            evidence.rebake_published_after_bits,
+            Some((-0.25f64).to_bits())
+        );
+
+        let suppressed = RootAlphaExecutionEvidence::completed(
+            RootAlphaRuntimePolicy::default(),
+            true,
+            None,
+            None,
+        );
+        assert_eq!(suppressed.standalone_suppressed, 1);
+        assert_eq!(suppressed.rebake_suppressed, 1);
+
+        let disabled_report = RootAlphaExecutionEvidence::completed(
+            RootAlphaRuntimePolicy {
+                alpha_enabled: false,
+                ..policy
+            },
+            true,
+            Some(&standalone),
+            None,
+        );
+        assert!(disabled_report.policy_mismatch);
+    }
 }

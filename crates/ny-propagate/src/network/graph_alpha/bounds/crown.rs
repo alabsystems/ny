@@ -220,6 +220,17 @@ pub(crate) struct CrownIbpCollectOptions<'a> {
     /// Typed root collection strategy. The default preserves the ordinary
     /// all-demanded collector.
     pub collection_mode: CrownIbpCollectionMode,
+    /// Row ceiling for demanded CROWN targets (`#cgan-narrow-target-budget`).
+    ///
+    /// `None` (default) keeps the historical all-demanded candidate set. When
+    /// set, a target whose objective-row count exceeds the ceiling is declined
+    /// as a tightening candidate and keeps the caller-supplied baseline
+    /// enclosure, so the collection budget is spent on the narrow targets
+    /// instead of being split in proportion to row count.
+    ///
+    /// Like `min_width_to_tighten` this changes WHICH nodes are tightened, so
+    /// it suppresses complete-map caching for the same reason.
+    pub cgan_narrow_target_max_rows: Option<usize>,
 }
 
 impl GraphNetwork {
@@ -267,14 +278,18 @@ impl GraphNetwork {
             record_cgan_complete_collection_entry();
         }
 
-        // Snapshot every bound-changing collector gate once. The same values
-        // identify any cache entry and drive the fresh collection, so an
-        // environment mutation cannot make lookup/store policy disagree with
-        // the target walks performed by this call.
+        // Snapshot the collector gates that participate in complete-cache or
+        // provenance identity. The same values identify any cache entry and
+        // drive the fresh collection, so an environment mutation cannot make
+        // lookup/store policy disagree with the target walks performed by this
+        // call.
         let downstream_resweep = crown_ibp_downstream_resweep_enabled();
         let deadline_salvage_policy =
             target_backward::PartialCrownDeadlineSalvagePolicy::from_environment();
         let prefix_cost_admission_enabled = budget_policy::prefix_cost_admission_enabled();
+        let runtime_policy = self.crown_ibp_runtime_policy();
+        let cut_segment = target_backward::crown_cut_segment_from_env();
+        let published_margin_indices = crate::output_margin_seed::published_margin_indices();
         let tightening_cap = options.tightening_cap;
         let complete_cache_lookup_only =
             options.complete_cache_lookup_only || tightening_cap.is_some();
@@ -331,7 +346,9 @@ impl GraphNetwork {
         //
         // `min_width_to_tighten` stays excluded: it changes WHICH nodes are
         // tightened, so a served map could omit work the caller asked for.
-        let cacheable = !cache_disabled && options.min_width_to_tighten.is_none();
+        let cacheable = !cache_disabled
+            && options.min_width_to_tighten.is_none()
+            && options.cgan_narrow_target_max_rows.is_none();
         // #cgan-truncated-cache is intentionally narrower than the general
         // complete-map cache:
         //   * explicit opt-in;
@@ -372,12 +389,15 @@ impl GraphNetwork {
                 .deadline
                 .is_some_and(|deadline| Instant::now() < deadline);
         let cache_key = cacheable.then(|| {
-            let fingerprint = self.crown_ibp_collection_cache_fingerprint_for_policies(
+            let fingerprint = self.crown_ibp_collection_cache_fingerprint_with_runtime_policy(
                 input,
                 options.engine.is_some(),
                 downstream_resweep,
                 deadline_salvage_policy,
                 options.collection_mode,
+                runtime_policy,
+                cut_segment,
+                published_margin_indices.as_deref(),
             );
             use std::hash::Hasher;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -405,25 +425,35 @@ impl GraphNetwork {
             );
         }
         if let Some((key, ref fp)) = cache_key {
-            // #cgan-engine-agnostic-serve (2026-08-03): the fingerprint embeds
-            // `engine_present` (crown.rs:314), and the wrappers split on it —
-            // `..._with_precomputed_ibp` threads no engine while
-            // `..._and_engine` does. Two callers collecting the SAME box on the
-            // SAME network therefore never see each other's entry. MEASURED on
-            // cgan_2023: stable key, 12 merge events on it, ZERO serves, 403s of
-            // an 851s budget spent recollecting a bit-identical box.
+            // #cgan-engine-agnostic-serve (2026-08-03; removed unannounced by
+            // 12ef71f6c and RESTORED 2026-08-27). The fingerprint embeds
+            // `engine_present` and the wrappers split on it —
+            // `..._with_precomputed_ibp` threads no engine while `..._and_engine`
+            // does — so two callers collecting the SAME box on the SAME network
+            // never see each other's entry. MEASURED on cgan_2023: stable key,
+            // 12 merge events on it, ZERO serves, 403 s of an 851 s budget spent
+            // recollecting a bit-identical box.
             //
-            // Serving across the engine bit is sound: an engine-computed and a
+            // Serving across the engine bit is SOUND: an engine-computed and a
             // CPU-computed collection are both valid enclosures of the same
             // (network, box) — the argument the merge path already relies on —
-            // and the served result is then intersected with the caller's own
-            // IBP map below, so what publishes is at least as tight as either.
-            let alt_fp = self.crown_ibp_collection_cache_fingerprint_for_policies(
+            // and the served result is intersected with the caller's own IBP map
+            // below, so what publishes is at least as tight as either.
+            //
+            // The bridge spans the backend bit and NOTHING ELSE. Every identity
+            // field added by #frozen-crown-authority — the frozen LeverSet
+            // digest, the objective publication, the cut segment and the whole
+            // runtime policy — is carried unchanged into `alt_fp`, so exactness
+            // is relaxed on exactly one axis, deliberately, with a measurement.
+            let alt_fp = self.crown_ibp_collection_cache_fingerprint_with_runtime_policy(
                 input,
                 options.engine.is_none(),
                 downstream_resweep,
                 deadline_salvage_policy,
                 options.collection_mode,
+                runtime_policy,
+                cut_segment,
+                published_margin_indices.as_deref(),
             );
             use std::hash::Hasher;
             let mut alt_hasher = std::collections::hash_map::DefaultHasher::new();
@@ -436,6 +466,9 @@ impl GraphNetwork {
                     truncated_reuse_allowed_now,
                     consumer_tightening_budget,
                     prefix_cost_admission_enabled,
+                    runtime_policy,
+                    cut_segment,
+                    published_margin_indices.as_ref(),
                 )
                 .or_else(|| {
                     // Same box, other engine state. Sound per the note above.
@@ -445,11 +478,14 @@ impl GraphNetwork {
                         truncated_reuse_allowed_now,
                         consumer_tightening_budget,
                         prefix_cost_admission_enabled,
+                        runtime_policy,
+                        cut_segment,
+                        published_margin_indices.as_ref(),
                     )
                     .inspect(|_| {
                         debug!(
                             "CROWN-IBP DAG: served cached collection across the engine bit \
-                         for alternate key {alt_key:016x} (#cgan-engine-agnostic-serve)"
+                             for alternate key {alt_key:016x} (#cgan-engine-agnostic-serve)"
                         );
                     })
                 })
@@ -471,6 +507,143 @@ impl GraphNetwork {
                     None => hit,
                 };
                 return Ok(hit);
+            }
+        }
+
+        // #cgan-reclaim CROSS-MODE serve (NY_CGAN_RECLAIM=1, default dark ⇒
+        // byte-identical). MEASURED (2026-08-19 st/cg arms): the CLI per-output
+        // precheck's ~385 s Standard-mode collection STORES for this exact box,
+        // yet the in-verifier CganComplete consumer re-collects for ≤223 s more
+        // and `stage=complete-cache-hit` never appears — the fingerprints differ
+        // ONLY in the collection-mode tag byte (`cache_tag`: Standard=0 vs
+        // CganComplete=1; every other field — box bits, shape, node count,
+        // output node, patches mode, resweep/salvage policy — is identical, and
+        // the engine bit is already bridged above).
+        //
+        // The mode tag exists for two reasons, and neither forbids THIS serve:
+        // (a) target selection — but `CganComplete` runs "the ordinary
+        // all-demanded cascade" (its own doc), the same demanded target set as
+        // Standard, and only a COMPLETE entry (no time truncation) is served
+        // here, so coverage is the full map either way; (b) shrink-only
+        // publication vs the typed consumer's certified forward-linear
+        // baseline — enforced AT SERVE TIME below with the bug-19
+        // `census_commit::shrink_only_commit` machinery: both operands are
+        // independently certified enclosures of the same (graph, box), the
+        // elementwise `[max(l), min(u)]` is sound and never wider than the
+        // baseline, and disjoint-after-rounding f32 corners fail closed to the
+        // served certified value (counted, never manufactured). Truncated
+        // entries never serve across modes — their reuse scopes are
+        // mode-specific and stay separated.
+        if crate::cgan_reclaim::cgan_reclaim_armed()
+            && cacheable
+            && options.collection_mode != CrownIbpCollectionMode::Standard
+            && options.collection_mode.requires_shrink_only_publication()
+        {
+            if let Some(baseline) = options.precomputed_ibp.as_ref() {
+                use std::hash::Hasher;
+                let lookup_std = |engine_present: bool| {
+                    let std_fp = self.crown_ibp_collection_cache_fingerprint_with_runtime_policy(
+                        input,
+                        engine_present,
+                        downstream_resweep,
+                        deadline_salvage_policy,
+                        CrownIbpCollectionMode::Standard,
+                        runtime_policy,
+                        cut_segment,
+                        published_margin_indices.as_deref(),
+                    );
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    hasher.write(&std_fp);
+                    let std_key = hasher.finish();
+                    // allow_truncated=false: COMPLETE Standard entries only.
+                    self.crown_ibp_collection_lookup_with_prefix_cost_policy(
+                        std_key,
+                        &std_fp,
+                        false,
+                        consumer_tightening_budget,
+                        prefix_cost_admission_enabled,
+                        runtime_policy,
+                        cut_segment,
+                        published_margin_indices.as_ref(),
+                    )
+                    .map(|hit| (hit, std_key))
+                };
+                let served = lookup_std(options.engine.is_some())
+                    .or_else(|| lookup_std(options.engine.is_none()));
+                match served {
+                    Some((mut hit, std_key)) => {
+                        if tightening_cap.is_some() {
+                            eprintln!(
+                                "[NY_CROWN_IBP_COLLECTOR_CAP_V1] stage=complete-cache-hit \
+                                 tightening_skipped=true"
+                            );
+                        }
+                        let stats =
+                            census_commit::shrink_only_commit(&mut hit.bounds, baseline, true);
+                        census_commit::emit_census_commit(
+                            "cgan-reclaim-cross-mode-serve",
+                            true,
+                            &stats,
+                        );
+                        eprintln!(
+                            "[cgan-reclaim] stage=cross-mode-serve consumer_mode={:?} \
+                             std_key={std_key:016x} nodes={} baseline_nodes={} \
+                             tightened_elems={} kept_elems={} disjoint_kept={}",
+                            options.collection_mode,
+                            hit.bounds.len(),
+                            baseline.len(),
+                            stats.elems_would_loosen,
+                            stats.elems_candidate_tighter,
+                            stats.elems_disjoint_kept,
+                        );
+                        return Ok(hit);
+                    }
+                    None => {
+                        // Name WHY the cross-mode serve refused, so the A/B run
+                        // can distinguish "no Standard entry" (precheck did not
+                        // store / different box) from "entry present but
+                        // truncated" (precheck collection was deadline-cut).
+                        let std_fp_hash = |engine_present: bool| {
+                            let fp = self
+                                .crown_ibp_collection_cache_fingerprint_with_runtime_policy(
+                                input,
+                                engine_present,
+                                downstream_resweep,
+                                deadline_salvage_policy,
+                                CrownIbpCollectionMode::Standard,
+                                runtime_policy,
+                                cut_segment,
+                                published_margin_indices.as_deref(),
+                            );
+                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                            hasher.write(&fp);
+                            (hasher.finish(), fp)
+                        };
+                        let candidates = [
+                            std_fp_hash(options.engine.is_some()),
+                            std_fp_hash(options.engine.is_none()),
+                        ];
+                        let (present, complete) = self
+                            .cached_crown_ibp_collection
+                            .slots
+                            .read()
+                            .ok()
+                            .map(|slots| {
+                                let entry = slots.iter().find(|e| {
+                                    candidates.iter().any(|(key, fp)| {
+                                        e.key == *key && e.fingerprint.as_ref() == fp.as_slice()
+                                    })
+                                });
+                                (entry.is_some(), entry.is_some_and(|e| e.complete))
+                            })
+                            .unwrap_or((false, false));
+                        eprintln!(
+                            "[cgan-reclaim] stage=cross-mode-miss consumer_mode={:?} \
+                             standard_entry_present={present} standard_entry_complete={complete}",
+                            options.collection_mode,
+                        );
+                    }
+                }
             }
         }
 
@@ -535,10 +708,14 @@ impl GraphNetwork {
             tightening_deadline_is_hard,
             options.engine,
             options.min_width_to_tighten,
+            cut_segment,
+            published_margin_indices.clone(),
             downstream_resweep,
             deadline_salvage_policy,
             options.collection_mode,
+            options.cgan_narrow_target_max_rows,
             prefix_cost_admission_enabled,
+            runtime_policy,
         )?;
         // #cgan-restart-root-collection-cache: typed cGAN producers always run
         // capped (`complete_cache_lookup_only`), so the historical guard meant
@@ -560,10 +737,13 @@ impl GraphNetwork {
                 // tightening authority than this producer had.
                 let truncated_scope = truncated_reuse_requested
                     .then(|| {
-                        self.crown_ibp_truncated_reuse_scope_with_prefix_cost_policy(
+                        self.crown_ibp_truncated_reuse_scope_with_prefix_cost_policy_and_snapshots(
                             &fresh,
                             producer_tightening_budget,
                             prefix_cost_admission_enabled,
+                            runtime_policy,
+                            cut_segment,
+                            published_margin_indices.as_ref(),
                         )
                     })
                     .flatten();
@@ -603,25 +783,32 @@ impl GraphNetwork {
         input: &BoundedTensor,
         engine_present: bool,
     ) -> Vec<u8> {
-        self.crown_ibp_collection_cache_fingerprint_for_policies(
+        let published_margin_indices = crate::output_margin_seed::published_margin_indices();
+        self.crown_ibp_collection_cache_fingerprint_with_runtime_policy(
             input,
             engine_present,
             crown_ibp_downstream_resweep_enabled(),
             target_backward::PartialCrownDeadlineSalvagePolicy::from_environment(),
             CrownIbpCollectionMode::Standard,
+            self.crown_ibp_runtime_policy(),
+            target_backward::crown_cut_segment_from_env(),
+            published_margin_indices.as_deref(),
         )
     }
 
-    fn crown_ibp_collection_cache_fingerprint_for_policies(
+    fn crown_ibp_collection_cache_fingerprint_with_runtime_policy(
         &self,
         input: &BoundedTensor,
         engine_present: bool,
         downstream_resweep: bool,
         deadline_salvage_policy: target_backward::PartialCrownDeadlineSalvagePolicy,
         collection_mode: CrownIbpCollectionMode,
+        runtime_policy: crate::network::core::graph::CrownIbpRuntimePolicy,
+        cut_segment: usize,
+        published_margin_indices: Option<&[usize]>,
     ) -> Vec<u8> {
         let mut fp = Vec::with_capacity(8 * input.lower().len() + 8 * input.shape().len() + 64);
-        fp.extend_from_slice(b"ny.crown-ibp-coverage.v5\0");
+        fp.extend_from_slice(b"ny.crown-ibp-coverage.v9\0");
         for v in input.lower().iter().chain(input.upper().iter()) {
             fp.extend_from_slice(&v.to_bits().to_le_bytes());
         }
@@ -642,39 +829,90 @@ impl GraphNetwork {
         // Deadline salvage changes only truncated target quality, not
         // soundness, but that is still a distinct cache/provenance policy.
         fp.push(u8::from(deadline_salvage_policy.is_enabled()));
+        // Snapshot every graph runtime control explicitly, including for
+        // compatibility graphs that carry no frozen LeverSet. The same policy
+        // drives the fresh collection, so environment drift after entry cannot
+        // relabel or reuse work under a different chunk/Patches/provenance arm.
+        fp.extend_from_slice(&(runtime_policy.objective_chunk_rows as u64).to_le_bytes());
+        fp.push(u8::from(
+            runtime_policy.chunk_projection_abort_enabled,
+        ));
+        fp.push(u8::from(runtime_policy.chunk_adaptive_growth_enabled));
+        fp.push(u8::from(runtime_policy.chunk_wave_parallel_enabled));
+        fp.push(u8::from(
+            runtime_policy.patches_deadline_flat_bias_enabled,
+        ));
+        fp.push(u8::from(runtime_policy.honest_provenance_enabled));
         // The collection mode decides target selection and publication policy
         // (#cgan-restart-root-collection-cache); entries never serve across
         // modes.
         fp.push(collection_mode.cache_tag());
+        // Cut segments trade correlation quality for a shorter backward walk.
+        // A no-cut caller must never inherit a cut-produced map (or vice versa).
+        fp.extend_from_slice(&(cut_segment as u64).to_le_bytes());
+        // The raw, sorted objective publication controls both OUTPUT row
+        // selection and intermediate influence cones. Length-prefix the exact
+        // indices so two objective scopes can never share quality state.
+        match published_margin_indices {
+            Some(indices) => {
+                fp.push(1);
+                fp.extend_from_slice(&(indices.len() as u64).to_le_bytes());
+                for &index in indices {
+                    fp.extend_from_slice(&(index as u64).to_le_bytes());
+                }
+            }
+            None => fp.push(0),
+        }
+        // Scored execution carries the exact receipt-owning set on the graph.
+        // This makes every declared lever part of cache identity by
+        // construction instead of relying only on a hand-maintained field list.
+        match self.frozen_levers.as_ref() {
+            Some(levers) => {
+                fp.push(1);
+                fp.extend_from_slice(&levers.fingerprint());
+            }
+            None => fp.push(0),
+        }
         fp
     }
 
-    /// Whether a collection result was truncated by a TIME budget (overall
-    /// deadline, per-node share, or the aggregate patches budget). Only these
-    /// reasons depend on wall-clock luck; every other fallback reason
-    /// (memory budget, unsupported op, shape/NaN, demand skip) is a
-    /// deterministic function of (graph, input, options) and recurs
-    /// identically on a re-run.
-    fn crown_ibp_result_is_complete(result: &GraphCrownIbpBoundsResult) -> bool {
-        fn is_time_truncation(reason: CrownIbpFallbackReason) -> bool {
-            matches!(
-                reason,
-                CrownIbpFallbackReason::DeadlineExceeded
-                    | CrownIbpFallbackReason::PerNodeDeadlineExceeded
-                    | CrownIbpFallbackReason::PartialCrownRowsDeadlineExceeded
-                    | CrownIbpFallbackReason::PatchesBudgetExceeded
-                    | CrownIbpFallbackReason::WalkCostRefused
-            )
-        }
+    /// Focused cache-policy tests override provenance without mutating the
+    /// process environment. Production always supplies one complete snapshot.
+    #[cfg(test)]
+    fn crown_ibp_collection_cache_fingerprint_for_policies(
+        &self,
+        input: &BoundedTensor,
+        engine_present: bool,
+        downstream_resweep: bool,
+        deadline_salvage_policy: target_backward::PartialCrownDeadlineSalvagePolicy,
+        collection_mode: CrownIbpCollectionMode,
+        honest_provenance_enabled: bool,
+        cut_segment: usize,
+        published_margin_indices: Option<&[usize]>,
+    ) -> Vec<u8> {
+        let mut runtime_policy = self.crown_ibp_runtime_policy();
+        runtime_policy.honest_provenance_enabled = honest_provenance_enabled;
+        self.crown_ibp_collection_cache_fingerprint_with_runtime_policy(
+            input,
+            engine_present,
+            downstream_resweep,
+            deadline_salvage_policy,
+            collection_mode,
+            runtime_policy,
+            cut_segment,
+            published_margin_indices,
+        )
+    }
 
-        let partial_provenance = result.provenance.values().any(|provenance| {
-            matches!(provenance, BoundsProvenance::ForwardFallback(reason) if is_time_truncation(*reason))
-        });
-        !partial_provenance
-            && !result
-                .fallback_events
-                .iter()
-                .any(|event| is_time_truncation(event.reason))
+    /// Whether every requested CROWN target completed.
+    ///
+    /// A sound fallback map is not necessarily quality-complete. In particular,
+    /// memory admission and backend capability can improve between consumers;
+    /// promoting such a map to the policy-agnostic complete lane would suppress
+    /// a fresh tightening pass that may now solve the property. Only genuine
+    /// CROWN results and documented structural omissions are complete.
+    fn crown_ibp_result_is_complete(result: &GraphCrownIbpBoundsResult) -> bool {
+        result.all_requested_crown_targets_completed()
     }
 
     /// Completeness order for two collections of the same key: number of
@@ -706,15 +944,42 @@ impl GraphNetwork {
             result,
             tightening_budget,
             budget_policy::prefix_cost_admission_enabled(),
+            self.crown_ibp_runtime_policy().honest_provenance_enabled,
         )
     }
 
+    #[cfg(test)]
     fn crown_ibp_truncated_reuse_scope_with_prefix_cost_policy(
         &self,
         result: &GraphCrownIbpBoundsResult,
         tightening_budget: Option<Duration>,
         prefix_cost_admission_enabled: bool,
+        honest_provenance_enabled: bool,
     ) -> Option<crate::network::core::graph::CrownIbpTruncatedReuseScope> {
+        let published_margin_indices = crate::output_margin_seed::published_margin_indices();
+        let mut runtime_policy = self.crown_ibp_runtime_policy();
+        runtime_policy.honest_provenance_enabled = honest_provenance_enabled;
+        self.crown_ibp_truncated_reuse_scope_with_prefix_cost_policy_and_snapshots(
+            result,
+            tightening_budget,
+            prefix_cost_admission_enabled,
+            runtime_policy,
+            target_backward::crown_cut_segment_from_env(),
+            published_margin_indices.as_ref(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn crown_ibp_truncated_reuse_scope_with_prefix_cost_policy_and_snapshots(
+        &self,
+        result: &GraphCrownIbpBoundsResult,
+        tightening_budget: Option<Duration>,
+        prefix_cost_admission_enabled: bool,
+        runtime_policy: crate::network::core::graph::CrownIbpRuntimePolicy,
+        cut_segment: usize,
+        published_margin_indices: Option<&std::sync::Arc<[usize]>>,
+    ) -> Option<crate::network::core::graph::CrownIbpTruncatedReuseScope> {
+        let honest_provenance_enabled = runtime_policy.honest_provenance_enabled;
         // Every refusal below names itself on the armed lane
         // (#cgan-truncated-serve-telemetry): the Aug-03 investigation measured
         // 7 of 48 lookups failing with `current=None` and could only NARROW the
@@ -728,7 +993,36 @@ impl GraphNetwork {
             truncated_lane_event("scope-refused", "reason=no-crown-nodes");
             return None;
         }
-        if target_backward::crown_cut_segment_from_env() != 0 {
+        // This lane is for time-truncated work only. Resource/backend/shape
+        // fallbacks can become executable for a later consumer even under the
+        // same requested policy (for example after host memory is released),
+        // so they must never acquire reusable truncated authority.
+        let reusable_reason = |reason: CrownIbpFallbackReason| {
+            matches!(
+                reason,
+                CrownIbpFallbackReason::DeadlineExceeded
+                    | CrownIbpFallbackReason::PerNodeDeadlineExceeded
+                    | CrownIbpFallbackReason::PerNodeBudgetBelowFloor
+                    | CrownIbpFallbackReason::PartialCrownRowsDeadlineExceeded
+                    | CrownIbpFallbackReason::PatchesBudgetExceeded
+                    | CrownIbpFallbackReason::WalkCostRefused
+                    | CrownIbpFallbackReason::DemandDrivenSkip
+                    | CrownIbpFallbackReason::StableReluRowsSkipped
+                    | CrownIbpFallbackReason::ObjectiveConeRowsSkipped
+                    | CrownIbpFallbackReason::CrownVacuousResult
+            )
+        };
+        let has_unscoped_fallback = result.provenance.values().any(|provenance| {
+            matches!(provenance, BoundsProvenance::ForwardFallback(reason) if !reusable_reason(*reason))
+        }) || result
+            .fallback_events
+            .iter()
+            .any(|event| !reusable_reason(event.reason));
+        if has_unscoped_fallback {
+            truncated_lane_event("scope-refused", "reason=resource-or-backend-fallback");
+            return None;
+        }
+        if cut_segment != 0 {
             truncated_lane_event("scope-refused", "reason=cut-segment-armed");
             return None;
         }
@@ -763,13 +1057,18 @@ impl GraphNetwork {
         // output node, behavior is bit-identical to the historical path.
         match result.bounds.get(output_name) {
             Some(output_bounds) => {
-                if crate::output_margin_seed::margin_subset_indices(output_bounds.len()).is_some() {
+                if crate::output_margin_seed::margin_subset_indices_from_published(
+                    published_margin_indices,
+                    output_bounds.len(),
+                )
+                .is_some()
+                {
                     truncated_lane_event("scope-refused", "reason=margin-subset-engaged");
                     return None;
                 }
             }
             None => {
-                if crate::output_margin_seed::margin_subset_published() {
+                if published_margin_indices.is_some() {
                     truncated_lane_event(
                         "scope-refused",
                         "reason=margin-published-output-dim-unknown",
@@ -789,6 +1088,10 @@ impl GraphNetwork {
         Some(crate::network::core::graph::CrownIbpTruncatedReuseScope {
             policy: crate::network::core::graph::CrownIbpTruncatedReusePolicy {
                 deadline_bearing: true,
+                frozen_lever_fingerprint: self
+                    .frozen_levers
+                    .as_ref()
+                    .map(|levers| levers.fingerprint()),
                 effective_per_node_floor_bits: budget.floor_secs.to_bits(),
                 effective_per_node_cap_bits: budget.cap_secs.to_bits(),
                 per_node_cap_is_explicit: budget.cap_is_explicit,
@@ -803,18 +1106,19 @@ impl GraphNetwork {
                 patches_reentry_min_rows_env: std::env::var_os("NY_PATCHES_REENTRY_MIN_ROWS"),
                 fast_f32_gemm_installed: crate::fast_f32_gemm::is_installed(),
                 sound_f64_gemm_installed: crate::sound_f64_gemm::is_installed(),
-                objective_chunk_rows: target_backward::crown_obj_chunk_size(),
+                objective_chunk_rows: runtime_policy.objective_chunk_rows,
                 chunk_aware_budget_enabled: budget_policy::crown_chunk_aware_budget_enabled(),
-                chunk_wave_parallel_enabled: target_backward::chunk_wave_parallel_enabled(),
-                chunk_wave_workers: rayon::current_num_threads(),
-                chunk_abort_enabled: target_backward::chunk_projection_abort_enabled(),
-                chunk_grow_enabled: target_backward::chunk_adaptive_growth_enabled(),
-                no_chunk_wave_parallel_env: std::env::var_os("NY_NO_CHUNK_WAVE_PAR"),
-                patches_deadline_flat_bias_env: std::env::var_os("NY_PATCHES_DEADLINE_FLAT_BIAS"),
-                patches_deadline_parallel_scatter_env: std::env::var_os(
-                    "NY_PATCHES_DEADLINE_PARALLEL_SCATTER",
-                ),
-                crown_honest_provenance_env: std::env::var_os("NY_CROWN_HONEST_PROVENANCE"),
+                chunk_wave_parallel_enabled: runtime_policy.chunk_wave_parallel_enabled,
+                chunk_wave_workers: if runtime_policy.chunk_wave_parallel_enabled {
+                    rayon::current_num_threads()
+                } else {
+                    1
+                },
+                chunk_abort_enabled: runtime_policy.chunk_projection_abort_enabled,
+                chunk_grow_enabled: runtime_policy.chunk_adaptive_growth_enabled,
+                patches_deadline_flat_bias_enabled: runtime_policy
+                    .patches_deadline_flat_bias_enabled,
+                crown_honest_provenance_enabled: honest_provenance_enabled,
                 hopeless_class_skip_enabled: crown_tighten::hopeless_class_skip_enabled(),
                 prefix_cost_admission_enabled,
             },
@@ -888,12 +1192,16 @@ impl GraphNetwork {
         allow_truncated: bool,
         consumer_tightening_budget: Option<Duration>,
     ) -> Option<GraphCrownIbpBoundsResult> {
+        let published_margin_indices = crate::output_margin_seed::published_margin_indices();
         self.crown_ibp_collection_lookup_with_prefix_cost_policy(
             key,
             fingerprint,
             allow_truncated,
             consumer_tightening_budget,
             budget_policy::prefix_cost_admission_enabled(),
+            self.crown_ibp_runtime_policy(),
+            target_backward::crown_cut_segment_from_env(),
+            published_margin_indices.as_ref(),
         )
     }
 
@@ -904,6 +1212,9 @@ impl GraphNetwork {
         allow_truncated: bool,
         consumer_tightening_budget: Option<Duration>,
         prefix_cost_admission_enabled: bool,
+        runtime_policy: crate::network::core::graph::CrownIbpRuntimePolicy,
+        cut_segment: usize,
+        published_margin_indices: Option<&std::sync::Arc<[usize]>>,
     ) -> Option<GraphCrownIbpBoundsResult> {
         let guard = self.cached_crown_ibp_collection.slots.read().ok()?;
         // Exact (key, fingerprint) match across the retained entries. The
@@ -920,10 +1231,13 @@ impl GraphNetwork {
         if !entry.complete {
             let current_scope = allow_truncated
                 .then(|| {
-                    self.crown_ibp_truncated_reuse_scope_with_prefix_cost_policy(
+                    self.crown_ibp_truncated_reuse_scope_with_prefix_cost_policy_and_snapshots(
                         &entry.result,
                         consumer_tightening_budget,
                         prefix_cost_admission_enabled,
+                        runtime_policy,
+                        cut_segment,
+                        published_margin_indices,
                     )
                 })
                 .flatten();
@@ -1601,6 +1915,7 @@ impl GraphNetwork {
         collector_patches_override: bool,
         deadline_salvage_policy: target_backward::PartialCrownDeadlineSalvagePolicy,
         expected_fixed_waves: Option<target_backward::ObjectiveChunkFixedWavePlan>,
+        runtime_policy: crate::network::core::graph::CrownIbpRuntimePolicy,
     ) -> Result<target_backward::TargetCrownCollectionResult> {
         self.propagate_crown_to_node_core_for_collector(
             input,
@@ -1620,6 +1935,7 @@ impl GraphNetwork {
             cut_ctx,
             deadline_salvage_policy,
             expected_fixed_waves,
+            runtime_policy,
         )
     }
 
@@ -1717,6 +2033,9 @@ mod collection_cache_key_tests {
             false,
             disabled,
             CrownIbpCollectionMode::Standard,
+            true,
+            0,
+            None,
         );
         let reswept = graph.crown_ibp_collection_cache_fingerprint_for_policies(
             &input,
@@ -1724,6 +2043,9 @@ mod collection_cache_key_tests {
             true,
             disabled,
             CrownIbpCollectionMode::Standard,
+            true,
+            0,
+            None,
         );
         assert_ne!(
             historical, reswept,
@@ -1741,6 +2063,9 @@ mod collection_cache_key_tests {
             false,
             target_backward::PartialCrownDeadlineSalvagePolicy::Disabled,
             CrownIbpCollectionMode::Standard,
+            true,
+            0,
+            None,
         );
         let enabled = graph.crown_ibp_collection_cache_fingerprint_for_policies(
             &input,
@@ -1748,10 +2073,44 @@ mod collection_cache_key_tests {
             false,
             target_backward::PartialCrownDeadlineSalvagePolicy::EnabledByExactEnvironment,
             CrownIbpCollectionMode::Standard,
+            true,
+            0,
+            None,
         );
         assert_ne!(
             disabled, enabled,
             "deadline-row salvage changes truncated quality and must invalidate cache identity"
+        );
+    }
+
+    #[test]
+    fn honest_provenance_guard_is_part_of_complete_cache_identity() {
+        let graph = small_graph();
+        let input = unit_box();
+        let disabled = target_backward::PartialCrownDeadlineSalvagePolicy::Disabled;
+        let guarded = graph.crown_ibp_collection_cache_fingerprint_for_policies(
+            &input,
+            false,
+            false,
+            disabled,
+            CrownIbpCollectionMode::Standard,
+            true,
+            0,
+            None,
+        );
+        let unguarded = graph.crown_ibp_collection_cache_fingerprint_for_policies(
+            &input,
+            false,
+            false,
+            disabled,
+            CrownIbpCollectionMode::Standard,
+            false,
+            0,
+            None,
+        );
+        assert_ne!(
+            guarded, unguarded,
+            "a guard-off complete entry must never serve guard-on provenance"
         );
     }
 
@@ -1769,6 +2128,9 @@ mod collection_cache_key_tests {
             false,
             disabled,
             CrownIbpCollectionMode::Standard,
+            true,
+            0,
+            None,
         );
         let cgan_complete = graph.crown_ibp_collection_cache_fingerprint_for_policies(
             &input,
@@ -1776,6 +2138,9 @@ mod collection_cache_key_tests {
             false,
             disabled,
             CrownIbpCollectionMode::CganComplete,
+            true,
+            0,
+            None,
         );
         let cgan_sparse = graph.crown_ibp_collection_cache_fingerprint_for_policies(
             &input,
@@ -1783,10 +2148,147 @@ mod collection_cache_key_tests {
             false,
             disabled,
             CrownIbpCollectionMode::CganSparseTargetComplete,
+            true,
+            0,
+            None,
         );
         assert_ne!(standard, cgan_complete);
         assert_ne!(standard, cgan_sparse);
         assert_ne!(cgan_complete, cgan_sparse);
+    }
+
+    #[test]
+    fn cut_segment_is_part_of_complete_cache_identity() {
+        let graph = small_graph();
+        let input = unit_box();
+        let disabled = target_backward::PartialCrownDeadlineSalvagePolicy::Disabled;
+        let full_prefix = graph.crown_ibp_collection_cache_fingerprint_for_policies(
+            &input,
+            false,
+            false,
+            disabled,
+            CrownIbpCollectionMode::Standard,
+            true,
+            0,
+            None,
+        );
+        let cut = graph.crown_ibp_collection_cache_fingerprint_for_policies(
+            &input,
+            false,
+            false,
+            disabled,
+            CrownIbpCollectionMode::Standard,
+            true,
+            4,
+            None,
+        );
+        assert_ne!(
+            full_prefix, cut,
+            "a cut-produced enclosure must not suppress a requested full-prefix walk"
+        );
+    }
+
+    #[test]
+    fn exact_objective_rows_are_part_of_complete_cache_identity() {
+        let graph = small_graph();
+        let input = unit_box();
+        let disabled = target_backward::PartialCrownDeadlineSalvagePolicy::Disabled;
+        let fingerprint = |rows: Option<&[usize]>| {
+            graph.crown_ibp_collection_cache_fingerprint_for_policies(
+                &input,
+                false,
+                false,
+                disabled,
+                CrownIbpCollectionMode::Standard,
+                true,
+                0,
+                rows,
+            )
+        };
+        assert_ne!(fingerprint(None), fingerprint(Some(&[3, 7])));
+        assert_ne!(fingerprint(Some(&[3, 7])), fingerprint(Some(&[3, 8])));
+        assert_ne!(fingerprint(Some(&[3, 7])), fingerprint(Some(&[3, 7, 8])));
+    }
+
+    #[test]
+    fn receipt_owning_lever_set_is_graph_local_cache_authority() {
+        let input = unit_box();
+        let default_set =
+            std::sync::Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |_| None));
+        let changed_set =
+            std::sync::Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |name| {
+                use ny_levers::decls::crown_ibp_budget::{
+                    CROWN_HONEST_PROVENANCE, CROWN_OBJ_CHUNK, NO_CHUNK_ABORT, NO_CHUNK_GROW,
+                    NO_CHUNK_WAVE_PAR, PATCHES_DEADLINE_FLAT_BIAS,
+                };
+                match name {
+                    value if value == CROWN_OBJ_CHUNK.name => Some("32".to_owned()),
+                    value if value == NO_CHUNK_ABORT.name => Some("1".to_owned()),
+                    value if value == NO_CHUNK_GROW.name => Some("1".to_owned()),
+                    value if value == NO_CHUNK_WAVE_PAR.name => Some("0".to_owned()),
+                    value if value == PATCHES_DEADLINE_FLAT_BIAS.name => Some("1".to_owned()),
+                    value if value == CROWN_HONEST_PROVENANCE.name => Some("0".to_owned()),
+                    _ => None,
+                }
+            }));
+
+        let mut graph = small_graph();
+        graph.set_frozen_levers(Some(std::sync::Arc::clone(&default_set)));
+        let default_fp = graph.crown_ibp_collection_cache_fingerprint(&input, false);
+        let cloned = graph.clone();
+        assert!(std::sync::Arc::ptr_eq(
+            cloned.frozen_levers().expect("clone retains authority"),
+            &default_set,
+        ));
+        assert_eq!(
+            graph.crown_ibp_runtime_policy(),
+            crate::network::core::graph::CrownIbpRuntimePolicy {
+                objective_chunk_rows: 0,
+                chunk_projection_abort_enabled: true,
+                chunk_adaptive_growth_enabled: true,
+                chunk_wave_parallel_enabled: false,
+                patches_deadline_flat_bias_enabled: false,
+                honest_provenance_enabled: true,
+            }
+        );
+        assert!(
+            !graph
+                .crown_ibp_runtime_policy()
+                .requires_graph_native_chunk_execution(),
+            "default chunk policy may retain the sequential shortcut"
+        );
+
+        graph.set_frozen_levers(Some(std::sync::Arc::clone(&changed_set)));
+        assert_eq!(
+            graph.crown_ibp_runtime_policy(),
+            crate::network::core::graph::CrownIbpRuntimePolicy {
+                objective_chunk_rows: 32,
+                chunk_projection_abort_enabled: false,
+                chunk_adaptive_growth_enabled: false,
+                chunk_wave_parallel_enabled: true,
+                patches_deadline_flat_bias_enabled: true,
+                honest_provenance_enabled: false,
+            }
+        );
+        assert!(
+            graph
+                .crown_ibp_runtime_policy()
+                .requires_graph_native_chunk_execution(),
+            "an explicit chunk treatment must use the graph-native executor"
+        );
+        let mut derived = GraphNetwork::new();
+        derived.inherit_frozen_levers_from(&graph);
+        assert!(std::sync::Arc::ptr_eq(
+            derived
+                .frozen_levers()
+                .expect("derived graph retains authority"),
+            &changed_set,
+        ));
+        let changed_fp = graph.crown_ibp_collection_cache_fingerprint(&input, false);
+        assert_ne!(
+            default_fp, changed_fp,
+            "every declared frozen lever must participate in scored cache identity"
+        );
     }
 
     /// #cgan-restart-root-collection-cache two-phase pin (cgan row 7 shape):
@@ -1912,6 +2414,123 @@ mod collection_cache_key_tests {
                 2,
                 "typed and Standard collections must occupy separate entries"
             );
+        });
+    }
+
+    /// #cgan-reclaim: a COMPLETE Standard-mode entry (the CLI per-output
+    /// precheck's exact producer shape — Standard mode, no cap, deadline
+    /// present) must serve a typed `CganComplete` consumer over the
+    /// bit-identical adopted box when `NY_CGAN_RECLAIM=1`, shrink-only
+    /// intersected against the consumer's own baseline; DARK, the modes stay
+    /// separated byte-for-byte (zero hits).
+    #[test]
+    fn cgan_reclaim_serves_complete_standard_entry_across_modes() {
+        ny_test_utils::env::with_env_edits(|env| {
+            for key in [
+                "NY_DISABLE_CROWN_COLLECTION_CACHE",
+                SERVE_TRUNCATED_COLLECTION_CACHE_ENV,
+                SPARSE_RELU_ROWS_ENV,
+                "NY_CROWN_IBP_DOWNSTREAM_RESWEEP",
+                "NY_CROWN_DEADLINE_CHUNK_SALVAGE",
+                "NY_CGAN_RECLAIM",
+            ] {
+                env.remove(key);
+            }
+
+            let graph = small_graph();
+            let input = unit_box();
+
+            // Producer: the precheck shape — Standard mode, uncapped, with a
+            // live deadline. Stores a COMPLETE Standard-tag entry.
+            let standard = graph
+                .collect_crown_ibp_bounds_dag_with_options(
+                    &input,
+                    CrownIbpCollectOptions {
+                        deadline: Some(Instant::now() + Duration::from_mins(1)),
+                        ..Default::default()
+                    },
+                )
+                .expect("standard precheck-shape collection");
+            assert!(!standard.bounds.is_empty());
+            {
+                let slots = graph
+                    .cached_crown_ibp_collection
+                    .slots
+                    .read()
+                    .expect("cache lock");
+                assert!(
+                    slots.first().is_some_and(|entry| entry.complete),
+                    "fixture Standard collection must store a COMPLETE entry"
+                );
+            }
+
+            let ibp = graph.collect_node_bounds(&input).expect("IBP baseline");
+
+            // DARK control: the typed consumer must MISS across modes.
+            let mut dark = graph.clone();
+            dark.adopt_bound_caches_from(&graph);
+            dark.collect_crown_ibp_bounds_dag_with_options(
+                &input,
+                CrownIbpCollectOptions {
+                    deadline: Some(Instant::now() + Duration::from_mins(1)),
+                    precomputed_ibp: Some(ibp.clone()),
+                    tightening_cap: Some(Duration::from_mins(5)),
+                    collection_mode: CrownIbpCollectionMode::CganComplete,
+                    ..Default::default()
+                },
+            )
+            .expect("typed collection (dark)");
+            assert_eq!(
+                dark.cached_crown_ibp_collection
+                    .hits
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "dark: typed cGAN entries must never serve across modes"
+            );
+
+            // ARMED: the cross-mode serve fires and stays shrink-only vs the
+            // consumer's baseline.
+            env.set("NY_CGAN_RECLAIM", "1");
+            let mut armed = graph.clone();
+            armed.adopt_bound_caches_from(&graph);
+            let served = armed
+                .collect_crown_ibp_bounds_dag_with_options(
+                    &input,
+                    CrownIbpCollectOptions {
+                        deadline: Some(Instant::now() + Duration::from_mins(1)),
+                        precomputed_ibp: Some(ibp.clone()),
+                        tightening_cap: Some(Duration::from_mins(5)),
+                        collection_mode: CrownIbpCollectionMode::CganComplete,
+                        ..Default::default()
+                    },
+                )
+                .expect("typed collection (armed)");
+            assert_eq!(
+                armed
+                    .cached_crown_ibp_collection
+                    .hits
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                1,
+                "armed: the COMPLETE Standard entry must serve the typed consumer"
+            );
+            for (name, bound) in &served.bounds {
+                let Some(base) = ibp.get(name) else { continue };
+                if base.shape() != bound.shape() {
+                    continue;
+                }
+                for ((&sl, &su), (&bl, &bu)) in bound
+                    .lower()
+                    .iter()
+                    .zip(bound.upper())
+                    .zip(base.lower().iter().zip(base.upper()))
+                {
+                    assert!(
+                        sl >= bl && su <= bu,
+                        "served map must be shrink-only vs the consumer baseline \
+                         (node {name}: served [{sl}, {su}] vs baseline [{bl}, {bu}])"
+                    );
+                }
+            }
         });
     }
 
@@ -2281,6 +2900,30 @@ mod collection_cache_key_tests {
     }
 
     #[test]
+    fn memory_fallback_is_not_complete_cache_authority() {
+        let reason = CrownIbpFallbackReason::MemoryBudgetExceeded;
+        let mut provenance = HashMap::new();
+        provenance.insert(
+            "wide".to_string(),
+            BoundsProvenance::ForwardFallback(reason),
+        );
+        let result = GraphCrownIbpBoundsResult {
+            bounds: HashMap::new(),
+            provenance,
+            fallback_events: vec![crate::types::CrownIbpFallbackEvent {
+                layer_index: 0,
+                layer_type: "Linear".to_string(),
+                reason,
+                details: "host headroom was temporarily below admission".to_string(),
+            }],
+        };
+        assert!(
+            !GraphNetwork::crown_ibp_result_is_complete(&result),
+            "released memory may admit a fresh CROWN walk, so the fallback cannot be complete"
+        );
+    }
+
+    #[test]
     fn partial_crown_row_provenance_stays_truncated_through_cache_serve() {
         let input = unit_box();
         let source = small_graph();
@@ -2483,11 +3126,16 @@ mod collection_cache_key_tests {
             let scope = graph
                 .crown_ibp_truncated_reuse_scope(&truncated, Some(Duration::from_mins(1)))
                 .expect("default cut-free, objective-independent scope");
+            assert_eq!(
+                scope.policy.chunk_wave_workers, 1,
+                "the guarded sequential route must not key cache quality on ambient Rayon width"
+            );
             let opposite_prefix_policy = graph
                 .crown_ibp_truncated_reuse_scope_with_prefix_cost_policy(
                     &truncated,
                     Some(Duration::from_mins(1)),
                     !scope.policy.prefix_cost_admission_enabled,
+                    scope.policy.crown_honest_provenance_enabled,
                 )
                 .expect("an injected admission policy must still form a valid scope");
             assert_ne!(
@@ -2589,36 +3237,12 @@ mod collection_cache_key_tests {
                 !scope.policy.conv_patches_collect_enabled
             );
             assert_policy_miss!(
-                no_chunk_wave_parallel_env,
-                scope
-                    .policy
-                    .no_chunk_wave_parallel_env
-                    .is_none()
-                    .then(|| std::ffi::OsString::from("1"))
+                patches_deadline_flat_bias_enabled,
+                !scope.policy.patches_deadline_flat_bias_enabled
             );
             assert_policy_miss!(
-                patches_deadline_flat_bias_env,
-                scope
-                    .policy
-                    .patches_deadline_flat_bias_env
-                    .is_none()
-                    .then(|| std::ffi::OsString::from("1"))
-            );
-            assert_policy_miss!(
-                patches_deadline_parallel_scatter_env,
-                scope
-                    .policy
-                    .patches_deadline_parallel_scatter_env
-                    .is_none()
-                    .then(|| std::ffi::OsString::from("1"))
-            );
-            assert_policy_miss!(
-                crown_honest_provenance_env,
-                scope
-                    .policy
-                    .crown_honest_provenance_env
-                    .is_none()
-                    .then(|| std::ffi::OsString::from("0"))
+                crown_honest_provenance_enabled,
+                !scope.policy.crown_honest_provenance_enabled
             );
             assert_policy_miss!(
                 hopeless_class_skip_enabled,
@@ -2690,6 +3314,8 @@ mod collection_cache_key_tests {
             graph.set_crown_ibp_per_node_time_budget(CrownIbpPerNodeTimeBudget {
                 floor_secs: Some(0.25),
                 cap_secs: Some(99.0),
+            prefix_cost_weighted: false,
+                max_target_share_frac: None,
             });
             assert!(
                 graph
@@ -2738,13 +3364,16 @@ mod collection_cache_key_tests {
                 "changed chunk-aware scheduling policy must force recomputation"
             );
             env.remove(budget_policy::CROWN_CHUNK_AWARE_BUDGET_ENV);
-            env.set("NY_NO_CHUNK_WAVE_PAR", "1");
+            graph.set_chunk_wave_parallel_enabled(true);
             assert!(
                 graph
                     .crown_ibp_collection_lookup(key, &fp, true, Some(Duration::from_mins(1)),)
                     .is_none(),
                 "changed chunk wave route must force recomputation"
             );
+            graph.set_chunk_wave_parallel_enabled(false);
+            // Keep the following legacy policy check independent from both
+            // the graph-local decision and any ambient interactive override.
             env.remove("NY_NO_CHUNK_WAVE_PAR");
             env.set("NY_CONV_SKIP_DEAD_F32", "0");
             assert!(
@@ -2876,5 +3505,292 @@ mod collection_cache_key_tests {
                 .expect("complete entry remains servable");
             assert!(GraphNetwork::crown_ibp_result_is_complete(&served));
         });
+    }
+}
+
+/// `#cgan-narrow-target-budget` regression suite.
+///
+/// The ceiling is a SCHEDULING policy: it decides which demanded targets spend
+/// collection budget, and a declined target keeps the caller-supplied baseline
+/// enclosure. These tests pin both halves of that contract — that the ceiling
+/// really does change which targets are tightened (otherwise the lever is dead
+/// capability), and that every published bound still CONTAINS the reachable
+/// set on both sides of the switch (otherwise the lever is a false proof).
+#[cfg(test)]
+mod narrow_target_budget_tests {
+    use super::*;
+    use crate::layers::{LinearLayer, ReLULayer};
+    use crate::network::core::GraphNode;
+    use ndarray::{arr1, Array1, Array2};
+
+    /// 2 -> 8 -> ReLU -> 3 -> ReLU -> 1.
+    ///
+    /// The 8-row hidden target stands in for a wide cGAN generator node and the
+    /// 3-row target for a narrow discriminator node, so a ceiling between them
+    /// separates the two exactly as it does on the official rows.
+    fn wide_then_narrow_graph() -> GraphNetwork {
+        let mut graph = GraphNetwork::new();
+        // The wide target must sit DOWNSTREAM OF A RELU: a linear layer applied
+        // straight to the input box is bounded EXACTLY by interval arithmetic,
+        // so CROWN has nothing to tighten and the fixture is inert — which is
+        // what the `fixture is inert` guard below caught when this was first
+        // written. SIX rows, deliberately ABOVE the ceiling=4 the test uses: at
+        // or under it this pre-layer would itself be demanded, and refining it
+        // would tighten what flows into `wide`, so `wide` would come back
+        // tighter than baseline while genuinely being declined.
+        let w0 = Array2::from_shape_fn((6, 2), |(r, c)| 0.9 - 0.35 * (r as f32) + 0.55 * (c as f32));
+        let l0 = LinearLayer::new(w0, Some(Array1::from_shape_fn(6, |r| 0.1 - 0.08 * r as f32)))
+            .unwrap();
+        graph.add_node(GraphNode::from_input("pre", Layer::Linear(l0)));
+        graph.add_node(GraphNode::new(
+            "pre_relu",
+            Layer::ReLU(ReLULayer),
+            vec!["pre".into()],
+        ));
+        let w1 = Array2::from_shape_fn((8, 6), |(r, c)| {
+            0.6 - 0.17 * (r as f32) + 0.43 * (c as f32) - 0.09 * ((r * c) as f32)
+        });
+        let l1 = LinearLayer::new(w1, Some(Array1::from_shape_fn(8, |r| 0.05 * r as f32 - 0.2)))
+            .unwrap();
+        graph.add_node(GraphNode::new(
+            "wide",
+            Layer::Linear(l1),
+            vec!["pre_relu".into()],
+        ));
+        graph.add_node(GraphNode::new(
+            "wide_relu",
+            Layer::ReLU(ReLULayer),
+            vec!["wide".into()],
+        ));
+        let w2 = Array2::from_shape_fn((3, 8), |(r, c)| {
+            0.31 - 0.11 * (r as f32) + 0.07 * (c as f32) - 0.05 * ((r + c) as f32)
+        });
+        let l2 =
+            LinearLayer::new(w2, Some(Array1::from_shape_fn(3, |r| 0.1 - 0.04 * r as f32))).unwrap();
+        graph.add_node(GraphNode::new(
+            "narrow",
+            Layer::Linear(l2),
+            vec!["wide_relu".into()],
+        ));
+        graph.add_node(GraphNode::new(
+            "narrow_relu",
+            Layer::ReLU(ReLULayer),
+            vec!["narrow".into()],
+        ));
+        let l3 = LinearLayer::new(
+            Array2::from_shape_fn((1, 3), |(_, c)| 0.9 - 0.3 * c as f32),
+            Some(arr1(&[0.05_f32])),
+        )
+        .unwrap();
+        graph.add_node(GraphNode::new(
+            "out",
+            Layer::Linear(l3),
+            vec!["narrow_relu".into()],
+        ));
+        graph.set_output("out");
+        graph
+    }
+
+    fn box_input() -> BoundedTensor {
+        BoundedTensor::new(
+            arr1(&[-0.75_f32, -0.5]).into_dyn(),
+            arr1(&[0.6_f32, 0.85]).into_dyn(),
+        )
+        .unwrap()
+    }
+
+    fn collect(graph: &GraphNetwork, max_rows: Option<usize>) -> HashMap<String, BoundedTensor> {
+        let input = box_input();
+        let ibp = graph.collect_node_bounds(&input).expect("IBP baseline");
+        graph
+            .collect_crown_ibp_bounds_dag_with_options(
+                &input,
+                CrownIbpCollectOptions {
+                    deadline: Some(Instant::now() + Duration::from_mins(1)),
+                    precomputed_ibp: Some(ibp),
+                    tightening_cap: Some(Duration::from_mins(5)),
+                    collection_mode: CrownIbpCollectionMode::CganComplete,
+                    cgan_narrow_target_max_rows: max_rows,
+                    ..Default::default()
+                },
+            )
+            .expect("typed cGAN collection")
+            .bounds
+    }
+
+    /// An independently computed reachable envelope: the true per-node
+    /// activation at each of a grid of concrete input points, taken through the
+    /// pointwise activation collector (`#cgan-eval`), which is exact to ~ULP.
+    ///
+    /// This is the analogue of the ORT-sampled envelope used to qualify the
+    /// lever offline. It is an INNER approximation of the reachable set, so a
+    /// bound that fails to contain it is unsound beyond any doubt.
+    fn reachable_envelope(graph: &GraphNetwork) -> HashMap<String, (Array1<f32>, Array1<f32>)> {
+        let input = box_input();
+        let lo = input.lower().to_owned();
+        let hi = input.upper().to_owned();
+        let steps = 21;
+        let mut env: HashMap<String, (Array1<f32>, Array1<f32>)> = HashMap::new();
+        for i in 0..steps {
+            for j in 0..steps {
+                let t0 = i as f32 / (steps - 1) as f32;
+                let t1 = j as f32 / (steps - 1) as f32;
+                let pt = arr1(&[
+                    lo[0] + t0 * (hi[0] - lo[0]),
+                    lo[1] + t1 * (hi[1] - lo[1]),
+                ])
+                .into_dyn();
+                let point = BoundedTensor::new(pt.clone(), pt).unwrap();
+                let acts = graph
+                    .collect_node_activations_pointwise(&point, None)
+                    .expect("pointwise activations");
+                for (name, value) in acts {
+                    let v: Array1<f32> =
+                        value.center().iter().copied().collect::<Vec<_>>().into();
+                    match env.get_mut(&name) {
+                        Some((mn, mx)) => {
+                            for (k, x) in v.iter().enumerate() {
+                                if *x < mn[k] {
+                                    mn[k] = *x;
+                                }
+                                if *x > mx[k] {
+                                    mx[k] = *x;
+                                }
+                            }
+                        }
+                        None => {
+                            env.insert(name, (v.clone(), v));
+                        }
+                    }
+                }
+            }
+        }
+        env
+    }
+
+    /// Assert every published node bound CONTAINS the reachable envelope.
+    ///
+    /// Deliberately a containment assertion and never a finiteness one: a
+    /// tighter bound that excludes a reachable point is exactly the false-proof
+    /// shape this suite exists to catch, and `is_finite()` stays green through
+    /// it.
+    fn assert_contains(
+        bounds: &HashMap<String, BoundedTensor>,
+        env: &HashMap<String, (Array1<f32>, Array1<f32>)>,
+        label: &str,
+    ) {
+        let tol = 1e-4_f32;
+        let mut checked = 0usize;
+        for (name, bound) in bounds {
+            let Some((mn, mx)) = env.get(name) else {
+                continue;
+            };
+            let lower: Vec<f32> = bound.lower().iter().copied().collect();
+            let upper: Vec<f32> = bound.upper().iter().copied().collect();
+            if lower.len() != mn.len() {
+                continue;
+            }
+            checked += 1;
+            for k in 0..lower.len() {
+                assert!(
+                    lower[k] <= mn[k] + tol,
+                    "{label}: node '{name}' row {k} lower bound {} EXCLUDES reachable min {} \
+                     (a tighter bound that excludes a reachable point is a false proof)",
+                    lower[k],
+                    mn[k],
+                );
+                assert!(
+                    upper[k] >= mx[k] - tol,
+                    "{label}: node '{name}' row {k} upper bound {} EXCLUDES reachable max {}",
+                    upper[k],
+                    mx[k],
+                );
+            }
+        }
+        assert!(
+            checked >= 4,
+            "{label}: containment check covered only {checked} nodes — the envelope join \
+             matched nothing, so this assertion is a no-op rather than a pass"
+        );
+    }
+
+    /// The ceiling must actually change which targets are tightened. Without
+    /// this the lever could ship as dead capability with a green suite.
+    #[test]
+    fn narrow_ceiling_declines_the_wide_target_and_retains_the_narrow_one() {
+        let graph = wide_then_narrow_graph();
+        let baseline = graph
+            .collect_node_bounds(&box_input())
+            .expect("IBP baseline");
+        let all_demanded = collect(&graph, None);
+        let ceiling = collect(&graph, Some(4));
+
+        let wide_base = baseline["wide"].max_width();
+        let wide_all = all_demanded["wide"].max_width();
+        let wide_ceiling = ceiling["wide"].max_width();
+        let narrow_base = baseline["narrow"].max_width();
+        let narrow_ceiling = ceiling["narrow"].max_width();
+
+        assert!(
+            wide_all < wide_base - 1e-6,
+            "fixture is inert: the 8-row target must be tightenable when demanded \
+             (baseline {wide_base}, all-demanded {wide_all})"
+        );
+        assert!(
+            (wide_ceiling - wide_base).abs() <= 1e-6,
+            "ceiling=4 must DECLINE the 8-row target and leave it at the supplied \
+             baseline (baseline {wide_base}, got {wide_ceiling})"
+        );
+        assert!(
+            narrow_ceiling < narrow_base - 1e-6,
+            "ceiling=4 must still tighten the 3-row target (baseline {narrow_base}, \
+             got {narrow_ceiling})"
+        );
+    }
+
+    /// Soundness gate. Both sides of the switch must contain the reachable set.
+    #[test]
+    fn every_published_bound_contains_the_reachable_envelope() {
+        let graph = wide_then_narrow_graph();
+        let env = reachable_envelope(&graph);
+        assert_contains(&collect(&graph, None), &env, "all-demanded");
+        assert_contains(&collect(&graph, Some(4)), &env, "ceiling=4");
+        assert_contains(&collect(&graph, Some(1)), &env, "ceiling=1");
+    }
+
+    /// The declined target is published at an enclosure the collector already
+    /// held, so the ceiling can never widen a bound relative to the baseline it
+    /// was seeded with.
+    #[test]
+    fn ceiling_never_widens_a_published_bound_below_its_baseline() {
+        let graph = wide_then_narrow_graph();
+        let baseline = graph
+            .collect_node_bounds(&box_input())
+            .expect("IBP baseline");
+        for ceiling in [Some(1), Some(4), Some(8), None] {
+            let published = collect(&graph, ceiling);
+            for (name, bound) in &published {
+                let Some(base) = baseline.get(name) else {
+                    continue;
+                };
+                if base.lower().len() != bound.lower().len() {
+                    continue;
+                }
+                for (k, (b, p)) in base.lower().iter().zip(bound.lower().iter()).enumerate() {
+                    assert!(
+                        *p >= *b - 1e-4,
+                        "ceiling={ceiling:?}: node '{name}' row {k} lower {p} is BELOW the \
+                         seeded baseline {b}; the published map must stay shrink-only"
+                    );
+                }
+                for (k, (b, p)) in base.upper().iter().zip(bound.upper().iter()).enumerate() {
+                    assert!(
+                        *p <= *b + 1e-4,
+                        "ceiling={ceiling:?}: node '{name}' row {k} upper {p} is ABOVE the \
+                         seeded baseline {b}; the published map must stay shrink-only"
+                    );
+                }
+            }
+        }
     }
 }

@@ -27,13 +27,14 @@ pub(crate) use gpu_extraction::{
 };
 
 // Dense backward-step dispatch and materialization budget helpers (Packet 4, #4162).
-mod backward_step;
+pub(crate) mod backward_step;
 
 // Patches backward step dispatch (Packet 1 of crown.rs three-module extraction, #4005).
 pub(crate) mod patches_step;
 pub(crate) use patches_step::{
     crown_backward_step_patches, crown_backward_step_patches_spec_crown,
-    crown_backward_step_patches_with_deadline_authority, SpecPatchesStepError,
+    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy,
+    SpecPatchesStepError,
 };
 
 // Public CROWN entry-point wrappers (Packet B of #4233 crown.rs decomposition).
@@ -141,7 +142,16 @@ fn clone_crown_forward_fallback(
     deadline: Option<Instant>,
 ) -> Result<BoundedTensor> {
     if deadline.is_some() {
-        tighten::clone_forward_bounds_with_deadline(bounds, deadline)
+        // #cgan-reclaim item 5: same publication rule as the DAG-CROWN twin —
+        // copying an already-certified, already-resident enclosure is bounded
+        // work whose refusal costs the whole run and saves nothing.
+        tighten::clone_forward_bounds_with_deadline(
+            bounds,
+            crate::cgan_reclaim::fallback_publication_deadline(
+                deadline,
+                "sequential-crown-forward",
+            ),
+        )
     } else {
         Ok(bounds.clone())
     }
@@ -325,6 +335,13 @@ impl Network {
         // Reference: designs/2026-02-28-patches-mode-wrapper-enum-design.md
         // output >= 1 * output + 0, output <= 1 * output + 0
         let has_conv2d = self.layers.iter().any(|l| matches!(l, Layer::Conv2d(_)));
+        // `crown_backward_layers` exists to escape the Conv2d backward cost; on a
+        // conv-free network it only loosens the bound. See `crown_backward_cap`.
+        let effective_backward_layers = crate::crown_backward_cap::effective_backward_cap(
+            crown_backward_layers,
+            has_conv2d,
+            "CROWN",
+        );
         let mut crown_bounds = if has_conv2d && output_shape.len() == 3 {
             let spatial = (output_shape[0], output_shape[1], output_shape[2]);
             debug!(
@@ -537,7 +554,7 @@ impl Network {
                 }
             }
 
-            if crown_backward_layers.is_some_and(|max_layers| backward_steps >= max_layers) {
+            if effective_backward_layers.is_some_and(|max_layers| backward_steps >= max_layers) {
                 info!(
                     "CROWN: truncating backward after {} layers at frontier {} of {}",
                     backward_steps,

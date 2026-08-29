@@ -38,14 +38,19 @@ impl Default for AbsLayer {
 impl BoundPropagation for AbsLayer {
     #[inline]
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
-        // Guard: reject non-finite inputs. Previously the only IBP without this
-        // guard — NaN inputs fell through comparisons to the crossing branch
-        // where (-l).max(u) silently swallowed NaN (IEEE 754-2008 §5.3.1). (#3316)
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        // Guard: NaN input bounds fail closed. NaN inputs fell through
+        // comparisons to the crossing branch where (-l).max(u) silently
+        // swallowed NaN (IEEE 754-2008 §5.3.1). (#3316)
+        //
+        // ±Inf endpoints are NOT rejected (deep-stack IBP overflow saturation,
+        // dc9da0fde class): the interval analysis below is limit-correct at
+        // infinity — Abs(-inf) = Abs(+inf) = +inf — so every branch maps a
+        // saturated endpoint to its exact limit: l >= 0 keeps [l, u] (u = +inf
+        // → +inf); u <= 0 negates to [-u, -l] (l = -inf → upper +inf);
+        // crossing yields [0, max(-l, u)] (either endpoint infinite → +inf).
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "Abs IBP: non-finite input bounds".to_string(),
+                "Abs IBP: NaN input bounds".to_string(),
             ));
         }
         // For x ∈ [l, u], |x| bounds:
@@ -70,7 +75,12 @@ impl BoundPropagation for AbsLayer {
             }
         }
 
-        BoundedTensor::new(out_lower, out_upper)
+        // Conservative-bounds convention (dc9da0fde class): a saturated input
+        // legitimately yields an infinite upper endpoint (Abs(±inf) = +inf).
+        // An infinite endpoint is a sound, maximally conservative bound —
+        // reject only NaN (fail closed, and already impossible given the
+        // entry guard), never the saturation itself.
+        BoundedTensor::new_allow_infinite(out_lower, out_upper)
     }
 
     #[inline]

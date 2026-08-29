@@ -101,73 +101,27 @@ impl PeelOffReport {
     }
 }
 
-/// Compatibility seam for the quarantined constant-threshold terminal-Sigmoid
-/// peel (#cgan-sigmoid-peel).
+/// Retired compatibility seam for the quarantined constant-threshold
+/// terminal-Sigmoid peel (#cgan-sigmoid-peel).
 ///
-/// Even with `NY_SIGMOID_PEEL=1`, this entry point currently declines without
-/// mutation. A measured original-graph differential rejected a peeled witness;
-/// until region equivalence is independently repaired, a transformed UNSAT has
-/// no proof authority. Provably exact relational Sigmoid comparisons remain
-/// available only through the explicit legacy peel below.
+/// This entry point unconditionally declines without mutation. A measured
+/// original-graph differential rejected a peeled witness; until region
+/// equivalence is independently repaired, a transformed UNSAT has no proof
+/// authority. Provably exact relational Sigmoid comparisons remain available
+/// only through the explicit legacy peel below.
 pub fn peel_off_terminal_sigmoid_auto(
-    model: &mut OnnxModel,
-    vnnlib: &mut VnnLibSpec,
+    _model: &mut OnnxModel,
+    _vnnlib: &mut VnnLibSpec,
 ) -> PeelOffReport {
-    // QUARANTINED pending root-cause (2026-07-17): with the peel ON, the cgan
-    // upsample row's internal attack finds a witness that the trusted-ORT gate
+    // QUARANTINED pending root-cause (2026-07-17): with the historical peel, the
+    // cgan upsample row's internal attack finds a witness that the trusted-ORT gate
     // REJECTS on the original graph (false counterexample) — the rewritten
     // clause region does not match the original on that row. The sat side is
     // ORT-gated, but a subset-direction defect would make the UNSAT side
     // unsound with no gate to catch it, so the path stays quarantined until the
     // region-equivalence bug is found and a differential region test lands.
-    if std::env::var("NY_SIGMOID_PEEL").ok().as_deref() != Some("1") {
-        return PeelOffReport::skipped("NY_SIGMOID_PEEL not enabled (opt-in)");
-    }
-    let Some(terminal) = terminal_layer_type(model) else {
-        return PeelOffReport::skipped("no single terminal layer");
-    };
-    if terminal != LayerType::Sigmoid {
-        return PeelOffReport::skipped("terminal layer is not Sigmoid");
-    }
-    let all = vnnlib
-        .output_constraints
-        .iter()
-        .chain(vnnlib.output_constraint_clauses.iter().flatten());
-    let mut any = false;
-    for constraint in all {
-        any = true;
-        if !is_constant_threshold(constraint) {
-            return PeelOffReport::skipped("non-constant-threshold constraint");
-        }
-    }
-    if !any {
-        return PeelOffReport::skipped("no output constraints to rewrite");
-    }
     PeelOffReport::skipped(
         "constant-threshold terminal-Sigmoid peel is quarantined pending region-equivalence proof",
-    )
-}
-
-fn terminal_layer_type(model: &OnnxModel) -> Option<LayerType> {
-    if model.network.outputs.len() != 1 {
-        return None;
-    }
-    let output_name = &model.network.outputs[0].name;
-    model
-        .network
-        .layers
-        .iter()
-        .find(|layer| layer.outputs.iter().any(|o| o == output_name))
-        .map(|layer| layer.layer_type.clone())
-}
-
-fn is_constant_threshold(constraint: &OutputConstraint) -> bool {
-    matches!(
-        constraint,
-        OutputConstraint::LessEqConst(_, _)
-            | OutputConstraint::GreaterEqConst(_, _)
-            | OutputConstraint::LessThanConst(_, _)
-            | OutputConstraint::GreaterThanConst(_, _)
     )
 }
 
@@ -1076,92 +1030,32 @@ mod tests {
         spec
     }
 
-    /// Run `f` with `NY_SIGMOID_PEEL` set (`Some`) or removed (`None`),
-    /// serialized + restored via the blessed env choke point (clippy env wall).
-    fn with_sigmoid_peel_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        match value {
-            Some(v) => ny_test_utils::env::with_serialized_env_vars(&[("NY_SIGMOID_PEEL", v)], f),
-            None => ny_test_utils::env::with_serialized_env_vars_removed(&["NY_SIGMOID_PEEL"], f),
-        }
-    }
-
-    /// The known-bad constant-threshold lane stays quarantined even when its
-    /// historical environment gate is explicitly armed.
+    /// The known-bad constant-threshold lane is retired and cannot mutate the
+    /// model or property.
     #[test]
-    fn constant_threshold_sigmoid_peel_is_quarantined_without_mutation() {
-        with_sigmoid_peel_env(Some("1"), || {
-            let mut model = sigmoid_terminal_model();
-            let (low, high) = (0.1996644288301468, 0.23966443538665771);
-            let mut spec = band_clause_spec(low, high);
+    fn constant_threshold_sigmoid_peel_is_retired_without_mutation() {
+        let mut model = sigmoid_terminal_model();
+        let (low, high) = (0.1996644288301468, 0.23966443538665771);
+        let mut spec = band_clause_spec(low, high);
 
-            let report = peel_off_terminal_sigmoid_auto(&mut model, &mut spec);
-            assert!(!report.peeled);
-            assert_eq!(
-                report.reason.as_deref(),
-                Some(
-                    "constant-threshold terminal-Sigmoid peel is quarantined pending region-equivalence proof"
-                )
-            );
-            assert_eq!(model.network.layers.len(), 2);
-            assert_eq!(model.network.outputs[0].name, "y");
-            assert!(spec.output_constraints.is_empty());
-            assert_eq!(
-                spec.output_constraint_clauses,
-                vec![
-                    vec![OutputConstraint::GreaterEqConst(0, high)],
-                    vec![OutputConstraint::LessEqConst(0, low)],
-                ]
-            );
-        });
-    }
-
-    /// Auto-peel gates: non-Sigmoid terminal, relational constraint present,
-    /// out-of-range threshold, and a disabled environment gate all skip.
-    #[test]
-    fn auto_peel_gates_fail_closed() {
-        with_sigmoid_peel_env(Some("1"), || {
-            // Non-Sigmoid terminal.
-            let mut model = sigmoid_terminal_model();
-            model.network.outputs[0].name = "z".to_string(); // ReLU is now terminal
-            let mut spec = band_clause_spec(0.2, 0.8);
-            assert!(!peel_off_terminal_sigmoid_auto(&mut model, &mut spec).peeled);
-
-            // Relational constraint present -> not all-constant -> skip.
-            let mut model = sigmoid_terminal_model();
-            let mut spec = band_clause_spec(0.2, 0.8);
-            spec.output_constraint_clauses[0].push(OutputConstraint::LessEq(0, 0));
-            assert!(!peel_off_terminal_sigmoid_auto(&mut model, &mut spec).peeled);
-            assert_eq!(model.network.layers.len(), 2, "model must be untouched");
-
-            // Constant threshold outside (0, 1): the quarantined lane still
-            // skips without inspecting/rewriting its value.
-            let mut model = sigmoid_terminal_model();
-            let mut spec = band_clause_spec(0.2, 1.5);
-            assert!(!peel_off_terminal_sigmoid_auto(&mut model, &mut spec).peeled);
-            assert_eq!(model.network.layers.len(), 2);
-            match spec.output_constraint_clauses[0][0] {
-                OutputConstraint::GreaterEqConst(0, t) => assert_eq!(t, 1.5),
-                ref other => panic!("unexpected constraint {other:?}"),
-            }
-
-            // Empty spec -> skip.
-            let mut model = sigmoid_terminal_model();
-            let mut spec = VnnLibSpec::new();
-            assert!(!peel_off_terminal_sigmoid_auto(&mut model, &mut spec).peeled);
-        });
-
-        // Disabled gate.
-        with_sigmoid_peel_env(Some("0"), || {
-            let mut model = sigmoid_terminal_model();
-            let mut spec = band_clause_spec(0.2, 0.8);
-            let report = peel_off_terminal_sigmoid_auto(&mut model, &mut spec);
-            assert!(!report.peeled);
-            assert_eq!(
-                report.reason.as_deref(),
-                Some("NY_SIGMOID_PEEL not enabled (opt-in)")
-            );
-            assert_eq!(model.network.layers.len(), 2);
-        });
+        let report = peel_off_terminal_sigmoid_auto(&mut model, &mut spec);
+        assert!(!report.peeled);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some(
+                "constant-threshold terminal-Sigmoid peel is quarantined pending region-equivalence proof"
+            )
+        );
+        assert_eq!(model.network.layers.len(), 2);
+        assert_eq!(model.network.outputs[0].name, "y");
+        assert!(spec.output_constraints.is_empty());
+        assert_eq!(
+            spec.output_constraint_clauses,
+            vec![
+                vec![OutputConstraint::GreaterEqConst(0, high)],
+                vec![OutputConstraint::LessEqConst(0, low)],
+            ]
+        );
     }
 
     #[test]

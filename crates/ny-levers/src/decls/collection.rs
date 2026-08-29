@@ -4,10 +4,10 @@
 
 //! Collection and intermediate-tightening scheduling overrides.
 //!
-//! These declarations centralize the exact legacy parsers and make the
-//! values visible in the flight receipt. Their current runtime consumers
-//! still resolve process state directly (one is process-latched), so this is
-//! migration preparation rather than a completed per-run `LeverSet` wiring.
+//! These declarations centralize legacy parsers and make the values visible in
+//! the flight receipt. The root-joint execution family is also delivered
+//! through typed preset cells; older collection controls in this module remain
+//! migration-preparation readers until the per-run `LeverSet` reaches them.
 
 use crate::{
     declare_levers, Bucket, DefaultSpec, LeverDecl, LeverKind, MoatRisk, Provenance, ReaderSite,
@@ -17,6 +17,11 @@ use crate::{
 const JOINT_ALPHA_SCOPE: Scope = Scope {
     package: "ny-propagate",
     subsystem: "root-joint-interm-alpha",
+};
+
+const JOINT_ALPHA_CLI_SCOPE: Scope = Scope {
+    package: "ny-cli",
+    subsystem: "beta-crown-engine-selection",
 };
 
 const WIDE_DEMANDED_INTERM_SCOPE: Scope = Scope {
@@ -63,10 +68,495 @@ const ROOT_JOINT_MAX_DIM_READERS: &[ReaderSite] = &[
         site: "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/\
                interm_refine.rs:scoped_joint_alpha_targets_demand_ranked",
     },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "pin the effective input-split contextual ceiling in its execution receipt",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               root_bounds.rs:collect_input_split_root_node_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "pin the effective graph-route contextual ceiling in its execution receipt",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+               root_phases.rs:root_joint_interm_alpha",
+    },
+];
+
+const ROOT_JOINT_MASTER_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "admit the input-split root-map tightening transaction",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               root_bounds.rs:collect_root_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "admit the graph multi-objective root-map tightening transaction",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+               root_phases.rs:root_joint_interm_alpha",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "require the master arm before exposing the finite-deadline GPU lane",
+        site: "crates/ny-propagate/src/sound_gpu_gate.rs:\
+               root_joint_deadline_lane_requested",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_CLI_SCOPE,
+        role: "suppress the optional CPU engine handle when the root-joint treatment owns it",
+        site: "crates/ny-cli/src/commands/beta_crown/mod.rs:handle_beta_crown_command",
+    },
+];
+
+const CPU_COMPUTE_ENGINE_READERS: &[ReaderSite] = &[ReaderSite {
+    scope: JOINT_ALPHA_CLI_SCOPE,
+    role: "retain or suppress the optional CPU compute-engine presence handle without \
+           discarding a qualified WGPU proof device",
+    site: "crates/ny-cli/src/commands/beta_crown/mod.rs:handle_beta_crown_command",
+}];
+
+const ROOT_JOINT_SECS_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "size the input-split root-joint authority slice",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               root_bounds.rs:collect_root_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "cap the graph-lane root-joint authority slice",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+               root_phases.rs:root_joint_interm_alpha",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "price the root-joint phase for scheduler admission",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+               root_phases.rs:RootTightenPhase::predicted_cost",
+    },
+];
+
+const ROOT_JOINT_ITERS_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "set the input-split joint-alpha ascent iteration ceiling",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               root_bounds.rs:collect_root_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "set the graph-lane joint-alpha ascent iteration ceiling",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+               root_phases.rs:root_joint_interm_alpha",
+    },
+];
+
+const ROOT_JOINT_LR_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "set the input-split joint-alpha Adam step",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               root_bounds.rs:collect_root_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "set the graph-lane joint-alpha Adam step",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+               root_phases.rs:root_joint_interm_alpha",
+    },
+];
+
+const ROOT_JOINT_DEADLINE_ASCENT_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "complete the two-gate finite-deadline GPU admission",
+        site: "crates/ny-propagate/src/sound_gpu_gate.rs:\
+               root_joint_deadline_lane_requested",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "permit alpha ascent only through the exact bounded-deadline capability",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/\
+               interm_refine.rs:RootJointDeadlineAscentPolicy::from_governed",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "pin the input-split bounded-ascent request in its execution receipt",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               root_bounds.rs:collect_input_split_root_node_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "pin the graph-lane bounded-ascent request in its execution receipt",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+               root_phases.rs:root_joint_interm_alpha",
+    },
+];
+
+const ROOT_JOINT_OPTIONS_READER: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "construct the bounded root-joint target/fold options",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/\
+               interm_refine.rs:root_joint_tighten_options",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "pin the configured input-split treatment in its execution receipt",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               root_bounds.rs:collect_input_split_root_node_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "pin the configured graph-lane treatment in its execution receipt",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+               root_phases.rs:root_joint_interm_alpha",
+    },
+];
+
+const ROOT_JOINT_LAYERS_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "override automatic target selection for the legacy selector",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/\
+               interm_refine.rs:scoped_joint_alpha_targets",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "override automatic target selection for the demand-ranked selector",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/\
+               interm_refine.rs:scoped_joint_alpha_targets_demand_ranked",
+    },
+];
+
+const ROOT_JOINT_PROBE_READERS: &[ReaderSite] = &[
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "print the input-split frozen-bound width profile",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               root_bounds.rs:collect_input_split_root_node_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "print input-split root-bound fallback diagnostics",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/input_split/\
+               bounds_eval.rs:evaluate_root_bounds",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "print root-joint preparation and optimizer diagnostics",
+        site: "crates/ny-propagate/src/beta_crown/engine/graph/propagation/batched/\
+               interm_refine.rs:root_joint_tighten_options",
+    },
+    ReaderSite {
+        scope: JOINT_ALPHA_SCOPE,
+        role: "print graph CROWN demanded-target diagnostics",
+        site: "crates/ny-propagate/src/network/graph_crown/spec_propagation/\
+               core.rs:propagate_specifications",
+    },
 ];
 
 declare_levers! {
     registry COLLECTION_LEVERS;
+
+    /// `NY_CPU_COMPUTE_ENGINE` — legacy-armed optional CPU engine handle.
+    pub CPU_COMPUTE_ENGINE = LeverDecl {
+        name: "NY_CPU_COMPUTE_ENGINE",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(true),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Exact `0` suppresses the optional CPU compute-engine presence handle when no \
+qualified WGPU proof device is active. Exact `1`, absence, malformed input and \
+non-UTF-8 input retain the handle, preserving the historical default. This \
+selector may change which verifier work is available and therefore which sound \
+verdict is reached before the deadline, but it can never discard an already \
+qualified WGPU proof device. LEGACY-ARMED-UNQUALIFIED: the enabled-by-absence \
+policy predates governed measurement; Bucket::Debug classifies its explicit \
+kill switch rather than claiming evidence for the shipped arm.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "legacy-armed optional engine-selection policy; exact-zero \
+                     rollback is useful for controlled search, while current \
+                     category-wide conversion and moat evidence remain outstanding",
+        },
+        owner: JOINT_ALPHA_CLI_SCOPE,
+        readers: CPU_COMPUTE_ENGINE_READERS,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA` — master arm for the shrink-only root-map
+    /// joint intermediate-alpha transaction on both graph entry routes.
+    pub ROOT_JOINT_INTERM_ALPHA = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Exact `1` admits the root joint intermediate-alpha transaction before the root \
+bound map is frozen; exact `0`, absence and malformed input keep it dark. The \
+same governed answer owns the input-split and graph multi-objective gates, the \
+finite-deadline GPU admission, and the CLI's optional CPU-engine suppression, so \
+a typed preset cannot half-enable the mechanism. Every publication is an \
+intersection with an already-sound bound, but selection and wall use can move \
+which certified bounds reach BaB and therefore the verdict. Width-only research \
+measurements moved cGAN/CIFAR bounds; no current official-budget conversion and \
+moat sweep qualifies a shipped arm, so the declaration and every shipped preset \
+remain OFF.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-dark Debug treatment; the implemented transaction is \
+                     shrink-only, while scored conversion and category-wide moat \
+                     evidence remain outstanding",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_MASTER_READERS,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_SECS` — local wall request for the pass.
+    pub ROOT_JOINT_INTERM_ALPHA_SECS = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_SECS",
+        kind: LeverKind::U64Trimmed,
+        default: DefaultSpec::U64(30),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Trimmed unsigned seconds requested by the root-joint pass, default 30. It sizes \
+both live route slices and the root scheduler's predicted cost. The graph route \
+caps it by half the real remaining instance budget; the scored input-split route \
+caps it by the strictest route-local BaB boundary and scored wall, independently \
+of restart-cache availability. Only a standalone direct collector call without \
+either authority retains the historical grace. Malformed or non-UTF-8 \
+environment input suppresses any preset and restores 30.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert behind the default-dark root-joint master and not a \
+                     separately qualified scored-budget policy",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_SECS_READERS,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_ITERS` — joint-alpha ascent iteration cap.
+    pub ROOT_JOINT_INTERM_ALPHA_ITERS = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_ITERS",
+        kind: LeverKind::UsizeTrimmed,
+        default: DefaultSpec::U64(100),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Trimmed platform-sized iteration ceiling for both root-joint consumers, default \
+100. A finite-deadline request may reduce the effective count to zero unless the \
+separate bounded-ascent policy and backend capability are both present. It is \
+inert while the master is dark; when live it changes the sound bound reached \
+before the authority expires.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert behind the default-dark root-joint master",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_ITERS_READERS,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_LR` — joint-alpha Adam step.
+    pub ROOT_JOINT_INTERM_ALPHA_LR = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_LR",
+        // Both legacy readers trimmed and parsed f32. Governance keeps the
+        // finite f32 numeric range; the runtime narrows the resolved f64 back
+        // to f32 before entering the unchanged optimizer.
+        kind: LeverKind::F64ClosedTrimmed {
+            min: -3.402_823_466_385_288_6e38,
+            max: 3.402_823_466_385_288_6e38,
+        },
+        default: DefaultSpec::F64(0.1),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Trimmed finite f32-range Adam step for both root-joint consumers, default 0.1. \
+The governed value is represented as f64 in receipts and narrowed to f32 at the \
+unchanged optimizer boundary, matching ordinary legacy tokens exactly. It is \
+inert behind the dark master; when live it changes the optimization trajectory \
+and thus which shrink-only bounds are published.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert behind the default-dark root-joint master",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_LR_READERS,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT` — exact bounded-ascent arm.
+    pub ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Exact `1`, together with the root-joint master, requests alpha ascent under a \
+finite deadline. The request still executes only when the selected sound GPU \
+backend exposes NY's audited bounded joint-adjoint and sound-fold capability; \
+otherwise the pass retains the zero-iteration certified base fold. Absence, \
+exact `0`, malformed input and every shipped preset keep this policy OFF.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-dark capability request; unsupported engines fail \
+                     closed to the certified base fold",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_DEADLINE_ASCENT_READERS,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_MAX_SEL` — crossing-row ceiling per target.
+    pub ROOT_JOINT_INTERM_ALPHA_MAX_SEL = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_MAX_SEL",
+        kind: LeverKind::UsizeTrimmed,
+        default: DefaultSpec::U64(512),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Trimmed platform-sized ceiling on crossing rows seeded for each selected target, \
+default 512. Zero makes the tightener an immediate sound no-op. Smaller values \
+reduce backend work but can discard decisive rows; larger values increase seed \
+memory and may exceed a finite-deadline backend's audited row capacity. It is \
+inert behind the default-dark master and never expands the instance deadline.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert behind the default-dark root-joint master; the shipped \
+                     512-row research ceiling remains unchanged",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_OPTIONS_READER,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP` — truncated stop-box extraction.
+    pub ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Exact `1` permits root-joint extraction to stop at a finite frozen interior \
+node and concretize the certified suffix fold against that node's sound box. \
+This also admits the resulting pure-chain suffix. Exact `0`, absence and \
+malformed input preserve the historical requirement to reach the network input. \
+The stop can make otherwise unreachable cGAN targets executable, so it changes \
+which shrink-only bounds reach BaB and remains default-dark.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-dark research extraction extension; publication is \
+                     still certified and shrink-only, but scored conversion and \
+                     moat evidence remain outstanding",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_OPTIONS_READER,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN` — non-residual suffix admission.
+    pub ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Exact `1` permits an otherwise valid GPU suffix containing no residual block to \
+be represented as a single certified Chain segment. Exact `0`, absence and \
+malformed input retain the residual-required extraction contract. Frozen-stop \
+independently implies pure-chain admission, so execution receipts credit this \
+specific knob only when it was the necessary admitting authority.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-dark selection extension behind the root-joint \
+                     master; unsupported extraction fails closed",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_OPTIONS_READER,
+    };
+
+    /// `NY_BN_GPU_EXTRACT` — exact BatchNorm-to-certified-Conv extraction arm.
+    pub BN_GPU_EXTRACT = LeverDecl {
+        name: "NY_BN_GPU_EXTRACT",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Exact `1` lets the root-joint extractor represent a surviving BatchNorm as an \
+exact diagonal 1x1 convolution and discharge its certified precompute error \
+into the feeding ReLU. This is currently owned and consumed only by the \
+root-joint lane. Exact `0`, absence and malformed input refuse BatchNorm during \
+that extraction, preserving the shipped default. The July cGAN recipe required \
+this arm together with frozen-stop, but no scored conversion qualifies it ON.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-dark root-joint extraction authority; the certified \
+                     transform fails closed but remains unqualified for shipping",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_OPTIONS_READER,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_LAYERS` — instance-specific target override.
+    pub ROOT_JOINT_INTERM_ALPHA_LAYERS = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_LAYERS",
+        kind: LeverKind::Text,
+        default: DefaultSpec::Text(""),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Free-form comma-separated ReLU node names. Empty text, whitespace-only text or \
+case-insensitive `all` retains automatic structural selection; any other value \
+restricts selection to matching node names after trimming each list member. It \
+is typed-preset deliverable for reproducible instance research but deliberately \
+has no global search axis: graph-local node names do not define a portable \
+VNN-COMP treatment and unmatched text would replay the baseline mislabeled.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "instance-specific Debug override behind the default-dark \
+                     master; no portable finite domain exists for global search",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_LAYERS_READERS,
+    };
+
+    /// `NY_ROOT_JOINT_INTERM_ALPHA_PROBE` — print-only root-joint diagnostics.
+    pub ROOT_JOINT_INTERM_ALPHA_PROBE = LeverDecl {
+        name: "NY_ROOT_JOINT_INTERM_ALPHA_PROBE",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::Low,
+        doc: "\
+Exact `1` enables root-joint width, preparation, fallback and optimizer trace \
+lines at four diagnostic sites. No bound arithmetic, target selection or \
+publication predicate reads the value. It remains environment-only and is \
+intentionally excluded from the competition search space; logging overhead is \
+not a solver treatment.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "default-dark print-only instrumentation",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: ROOT_JOINT_PROBE_READERS,
+    };
+
+    /// `NY_ROOT_JOINT_MIN_REMAINING_SECS` — graph-route admission floor.
+    pub ROOT_JOINT_MIN_REMAINING_SECS = LeverDecl {
+        name: "NY_ROOT_JOINT_MIN_REMAINING_SECS",
+        kind: LeverKind::U64Trimmed,
+        default: DefaultSpec::U64(240),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Minimum real remaining instance seconds required before the graph-lane \
+root-joint pass starts, default 240; explicit zero disables the floor for \
+research. Below the floor the armed route is a byte-identical no-op. This is a \
+schedule/admission control rather than proof authority, but it decides whether \
+the shrink-only transaction publishes any bound before BaB and can therefore \
+move deadline verdicts.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert behind the default-dark master; the conservative \
+                     shipped floor remains unchanged",
+        },
+        owner: JOINT_ALPHA_SCOPE,
+        readers: &[ReaderSite {
+            scope: JOINT_ALPHA_SCOPE,
+            role: "decline the graph-lane pass when its measured tax cannot fit",
+            site: "crates/ny-propagate/src/beta_crown/engine/graph/multi_objective/\
+                   root_phases.rs:root_joint_interm_alpha",
+        }],
+    };
 
     /// `NY_ROOT_PHASE_RESIDENT_CROWN` — exact-one opt-in to the deferred,
     /// unified dense-head plus comprehensive resident root transaction.
@@ -370,6 +860,82 @@ mod tests {
             let resolved = read_with(&ROOT_JOINT_INTERM_ALPHA_MAX_DIM, |_| Some(raw.to_owned()));
             assert_eq!(resolved.value, LeverValue::Unset, "{raw:?}");
             assert_eq!(resolved.source, Source::LegacyEnvRejected, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn root_joint_family_parsers_preserve_the_governed_contracts() {
+        for decl in [
+            &ROOT_JOINT_INTERM_ALPHA,
+            &ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT,
+            &ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP,
+            &ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN,
+            &BN_GPU_EXTRACT,
+            &ROOT_JOINT_INTERM_ALPHA_PROBE,
+        ] {
+            for (raw, enabled, source) in [
+                (None, false, Source::Default),
+                (Some("0"), false, Source::LegacyEnv),
+                (Some("1"), true, Source::LegacyEnv),
+                (Some("true"), false, Source::LegacyEnvRejected),
+                (Some(" 1 "), false, Source::LegacyEnvRejected),
+            ] {
+                let resolved = read_with(decl, |_| raw.map(str::to_owned));
+                assert_eq!(resolved.value.as_bool(), enabled, "{} {raw:?}", decl.name);
+                assert_eq!(resolved.source, source, "{} {raw:?}", decl.name);
+            }
+        }
+
+        for (decl, raw, expected) in [
+            (&ROOT_JOINT_INTERM_ALPHA_SECS, " 60\t", 60_u64),
+            (&ROOT_JOINT_INTERM_ALPHA_ITERS, " 12\t", 12_u64),
+            (&ROOT_JOINT_INTERM_ALPHA_MAX_SEL, " 8\t", 8_u64),
+            (&ROOT_JOINT_MIN_REMAINING_SECS, " 0\t", 0_u64),
+        ] {
+            let resolved = read_with(decl, |_| Some(raw.to_owned()));
+            assert_eq!(resolved.value.as_u64(), Some(expected), "{}", decl.name);
+            assert_eq!(resolved.source, Source::LegacyEnv, "{}", decl.name);
+        }
+
+        let lr = read_with(&ROOT_JOINT_INTERM_ALPHA_LR, |_| Some(" 0.25\t".to_owned()));
+        assert_eq!(lr.value.as_f64(), Some(0.25));
+        assert_eq!(lr.source, Source::LegacyEnv);
+
+        for (decl, default) in [
+            (&ROOT_JOINT_INTERM_ALPHA_SECS, LeverValue::U64(30)),
+            (&ROOT_JOINT_INTERM_ALPHA_ITERS, LeverValue::U64(100)),
+            (&ROOT_JOINT_INTERM_ALPHA_MAX_SEL, LeverValue::U64(512)),
+            (&ROOT_JOINT_MIN_REMAINING_SECS, LeverValue::U64(240)),
+        ] {
+            let resolved = read_with(decl, |_| Some("malformed".to_owned()));
+            assert_eq!(resolved.value, default, "{}", decl.name);
+            assert_eq!(resolved.source, Source::LegacyEnvRejected, "{}", decl.name);
+        }
+
+        let lr = read_with(&ROOT_JOINT_INTERM_ALPHA_LR, |_| Some("nan".to_owned()));
+        assert_eq!(lr.value.as_f64(), Some(0.1));
+        assert_eq!(lr.source, Source::LegacyEnvRejected);
+
+        let layers = read_with(&ROOT_JOINT_INTERM_ALPHA_LAYERS, |_| {
+            Some("  Relu_7, Relu_11  ".to_owned())
+        });
+        assert_eq!(layers.value.as_str(), Some("  Relu_7, Relu_11  "));
+        assert_eq!(layers.source, Source::LegacyEnv);
+    }
+
+    #[test]
+    fn cpu_compute_engine_kill_switch_preserves_legacy_default_on_contract() {
+        for (raw, enabled, source) in [
+            (None, true, Source::Default),
+            (Some("0"), false, Source::LegacyEnv),
+            (Some("1"), true, Source::LegacyEnv),
+            (Some("true"), true, Source::LegacyEnvRejected),
+            (Some(" 0"), true, Source::LegacyEnvRejected),
+            (Some(""), true, Source::LegacyEnvRejected),
+        ] {
+            let resolved = read_with(&CPU_COMPUTE_ENGINE, |_| raw.map(str::to_owned));
+            assert_eq!(resolved.value.as_bool(), enabled, "{raw:?}");
+            assert_eq!(resolved.source, source, "{raw:?}");
         }
     }
 

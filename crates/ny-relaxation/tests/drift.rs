@@ -632,3 +632,136 @@ fn drift_relu() {
         );
     }
 }
+
+/// The mirror's duplicated directed casts must stay BIT-IDENTICAL to
+/// ny-tensor's.
+///
+/// `crates/ny-relaxation/src/rounding.rs` re-implements
+/// `cast_f64_to_f32_{down,up}` rather than importing them, because
+/// ny-relaxation must not depend on ny-tensor (that is what lets `proofs/kani`
+/// compile the scalar surface). Duplication is the price; this is the receipt.
+///
+/// Every other drift test here compares a RELAXATION. This one compares the
+/// rounding primitive underneath, because `drift_gelu_sound` can only catch a
+/// divergence on inputs its grid happens to reach, while a wrong cast is wrong
+/// everywhere. `ny_core::f64_to_f32_{down,up}` — already in ny-relaxation's
+/// dependency graph, and the obvious thing to reach for — would FAIL this test:
+/// it flushes the f32 subnormal range and maps NaN to an infinity.
+#[test]
+fn drift_directed_casts_bit_exact() {
+    let mut xs: Vec<f64> = Vec::new();
+    for &g in &grid() {
+        xs.push(f64::from(g));
+        xs.push(f64::from(g) * 0.5);
+        xs.push(f64::from(g) * 1.000_000_1);
+        xs.push(-f64::from(g) * 1.000_000_1);
+    }
+    xs.extend([
+        0.0,
+        -0.0,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from(f32::MAX) * 1.000_000_1,
+        f64::from(f32::MIN) * 1.000_000_1,
+        f64::from(f32::MIN_POSITIVE) * 0.5,
+        7.006_492_321_624_085e-46,
+        -0.169_971_207_479_903_66,
+    ]);
+
+    for x in xs {
+        let md = mirror::cast_f64_to_f32_down(x);
+        let pd = ny_tensor::cast_f64_to_f32_down(x);
+        assert!(
+            feq(md, pd),
+            "cast_f64_to_f32_down drift at x={x:e}: mirror={md:e} prod={pd:e}"
+        );
+        let mu = mirror::cast_f64_to_f32_up(x);
+        let pu = ny_tensor::cast_f64_to_f32_up(x);
+        assert!(
+            feq(mu, pu),
+            "cast_f64_to_f32_up drift at x={x:e}: mirror={mu:e} prod={pu:e}"
+        );
+
+        // Bracketing, at zero tolerance — the property the casts exist for.
+        if !x.is_nan() {
+            assert!(
+                f64::from(md) <= x,
+                "cast_f64_to_f32_down({x:e}) = {md:e} sits ABOVE its input"
+            );
+            assert!(
+                f64::from(mu) >= x,
+                "cast_f64_to_f32_up({x:e}) = {mu:e} sits BELOW its input"
+            );
+        }
+    }
+}
+
+/// ZERO-tolerance pin on the mirror's `l = -inf` GELU branch, at the one `u`
+/// where the violation needs no assumption about `libm::erff`.
+///
+/// `assert_band_sound` (used by `drift_gelu_sound` above) carries
+/// `rel_slack = 1e-11` and only runs on finite `l`, so it can reach neither this
+/// branch nor this magnitude. The bare bit-equality check in `drift_gelu_sound`
+/// would catch a re-divergence from production, but it would NOT catch the two
+/// crates drifting together — so this asserts the real-arithmetic fact
+/// directly.
+///
+/// At u = f32::from_bits(1) = 1.401298464324817e-45 the true
+/// GELU(u) = 7.0064923216240854e-46 > 0, while the pre-fix mirror published
+/// `max(gelu_eval(u), 0.0) = 0.0` as the certified upper intercept: a false
+/// proof at the interval's own endpoint. The f32 evaluation is forced —
+/// `1.0f32 + subnormal == 1.0f32` and `0.5f32 * f32::from_bits(1)` is exactly
+/// half an ULP, so round-half-to-even gives +0.0 under ANY erff.
+#[test]
+fn drift_gelu_infinite_lower_branch_is_exact_at_the_subnormal_endpoint() {
+    let u = f32::from_bits(1);
+    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+    let true_gelu = 0.5 * f64::from(u) * (1.0 + libm::erf(f64::from(u) * inv_sqrt2));
+    assert!(
+        true_gelu > 0.0,
+        "precondition: GELU({u:e}) must be strictly positive for this to bite, got {true_gelu:e}"
+    );
+
+    // `gelu_sound_linear_relaxation` returns the 4-tuple directly in BOTH crates
+    // (mirror sound_relax.rs:103, prod sound_relax.rs:118), so it already IS a
+    // `Band`. mirror_band/prod_band take the STRUCT-shaped relaxations and must
+    // not be applied here — doing so is a type error, not a conversion.
+    let m: Band = mirror::gelu_sound_linear_relaxation(f32::NEG_INFINITY, u);
+    let p: Band = prod_layers::gelu_sound_linear_relaxation(f32::NEG_INFINITY, u);
+    assert!(
+        band_eq(m, p),
+        "gelu l=-inf drift at u={u:e}: mirror={m:?} prod={p:?}"
+    );
+
+    // Constant branch: both slopes are 0, so the intercepts ARE the bounds.
+    assert_eq!(m.0, 0.0, "lower slope must be 0 on the constant branch");
+    assert_eq!(m.2, 0.0, "upper slope must be 0 on the constant branch");
+    assert!(
+        f64::from(m.3) >= true_gelu,
+        "mirror certified GELU(x) <= {:e} on (-inf, {u:e}], but \
+         GELU({u:e}) = {true_gelu:e} exceeds it (violation {:e})",
+        m.3,
+        true_gelu - f64::from(m.3),
+    );
+    // The lower intercept must sit at or below GELU's true global minimum,
+    // -0.1699712074799036616938685, which is attained inside (-inf, u].
+    //
+    // MARGIN, stated rather than assumed: the certified constant is
+    // `cast_f64_to_f32_down(gelu_eval_f64(x_hat))` where `x_hat` is the f32
+    // bisected critical point, so it bounds GELU at x_hat, not at the true
+    // minimiser x*. |x_hat - x*| is at most the f32 spacing near -0.75, about
+    // 6e-8, and GELU is locally quadratic there, so GELU(x_hat) sits at most
+    // ~1e-15 above the true minimum — while the single downward f32 step is
+    // ~1.5e-8 wide, seven orders larger. The gap is covered, but by a margin
+    // argument rather than by construction; this assertion is what would notice
+    // if that ever stopped holding.
+    let true_min = -0.169_971_207_479_903_66_f64;
+    assert!(
+        f64::from(m.1) <= true_min,
+        "mirror certified GELU(x) >= {:e} on (-inf, {u:e}], but GELU attains \
+         {true_min:e} there (violation {:e})",
+        m.1,
+        f64::from(m.1) - true_min,
+    );
+}

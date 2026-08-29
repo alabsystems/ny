@@ -62,6 +62,15 @@ pub(super) fn find_graph_input_nodes(
                 if weights.get(name).is_some() {
                     return false;
                 }
+                // Interval-valued frozen constants are baked into the layer too,
+                // but ONLY into `Layer::IntervalConst`. `guard_interval_constant_inputs`
+                // has already rejected every other layer that reads one, so
+                // reaching here with an interval input means the layer absorbed
+                // it. Keep the check anyway: a name filtered out of a layer that
+                // did NOT absorb it would silently drop an operand.
+                if weights.contains_interval(name) {
+                    return !matches!(layer, Layer::IntervalConst(_));
+                }
                 // Filter out evaluated constants (they're already embedded in the layer).
                 if evaluated_constants.contains_key(*name) {
                     return false;
@@ -127,19 +136,79 @@ pub(super) fn find_graph_input_nodes(
 
     // Resolve each activation input tensor to its producing graph node.
     // Network input tensors are pre-registered in tensor_to_node (builder.rs:55-58),
-    // so resolve_tensor_node_name returning None means a genuine dangling reference.
+    // so `resolve_tensor_node_name` returning None means one of two very
+    // different things, and reporting both as "dangling" costs a whole model's
+    // worth of misdirected diagnosis. Separate them.
     let resolve = |tensor_name: &str| -> Result<String> {
-        resolve_tensor_node_name(tensor_name, tensor_to_node, tensor_producer).ok_or_else(|| {
+        if let Some(node) = resolve_tensor_node_name(tensor_name, tensor_to_node, tensor_producer) {
+            return Ok(node);
+        }
+
+        // Case 1 — the tensor is a KNOWN CONSTANT that was folded out of the
+        // graph. This is not a dangling reference at all: the value exists, and
+        // `build_graph_network`'s pre-evaluation pass deliberately deleted the
+        // node chain that produced it (its `constant_skipped` path). What is
+        // missing is a way for THIS layer to absorb a frozen operand in THIS
+        // position.
+        //
+        // Every op that CAN absorb one already did, back in the converter: Add
+        // becomes AddConstant, Mul becomes MulConstant, Max/Min become a
+        // one-sided Clip, Concat embeds its constant slices, and the norm
+        // layers embed scale/bias. The residue is the shape ny-build has no
+        // representation for — a layer whose *data* input, not a parameter, is
+        // entirely constant. RT-DETR's decoder reaches it with a learned query
+        // embedding: `ConstantWeight -> Unsqueeze -> Expand -> LayerNorm`, where
+        // everything up to the LayerNorm const-folds away and the LayerNorm is
+        // left normalizing a constant it has nowhere to put.
+        //
+        // Const-folding through the consumer is NOT the fix, and is refused
+        // elsewhere for exactly this reason: `evaluate_constant_layer` returns
+        // `None` for InstanceNorm because "a point IBP image may still collapse
+        // around a rounded result, so it is not an exact-real materialization
+        // certificate" (`convert/const_eval/mod.rs`). Normalization folded to a
+        // point would assert an exactness the arithmetic does not have. The
+        // sound representation is a constant SOURCE node carrying the degenerate
+        // bound `[c, c]` and letting IBP/CROWN widen it — a layer ny-build does
+        // not have today.
+        //
+        // So fail closed, and do it as `UnsupportedOp`: the caller degrades that
+        // to a single OpaqueSkip node ([-inf, +inf] — sound, if vacuous, for
+        // this one tensor) instead of aborting the entire model load behind a
+        // misleading "dangling ONNX reference".
+        let constant_kind = if weights.get(tensor_name).is_some() {
+            Some("a model weight")
+        } else if evaluated_constants.contains_key(tensor_name) {
+            Some("a const-folded tensor")
+        } else if constant_tensors.contains(tensor_name) {
+            Some("a constant tensor whose value was never materialized")
+        } else {
+            None
+        };
+        if let Some(kind) = constant_kind {
             warn!(
-                "Layer '{}' ({:?}): tensor '{}' not produced by any graph node",
+                "Layer '{}' ({:?}): data input '{}' is a constant that was folded out of \
+                 the graph; failing closed to conservative bounds",
                 spec.name, spec.layer_type, tensor_name
             );
-            NyError::ModelLoad(format!(
-                "Layer '{}' ({:?}) references unresolvable tensor '{}' \
-                 — no producer found in graph (possible dangling ONNX reference)",
-                spec.name, spec.layer_type, tensor_name
-            ))
-        })
+            return Err(NyError::UnsupportedOp(format!(
+                "Layer '{}' ({:?}) takes {kind} '{}' as its DATA input, but that constant \
+                 was folded out of the graph and {:?} has no way to absorb a frozen data \
+                 operand — ny-build has no constant-source node to rebuild it from. \
+                 Refusing rather than guessing a bound",
+                spec.name, spec.layer_type, tensor_name, spec.layer_type
+            )));
+        }
+
+        // Case 2 — nothing in the model produces or defines this tensor.
+        warn!(
+            "Layer '{}' ({:?}): tensor '{}' not produced by any graph node",
+            spec.name, spec.layer_type, tensor_name
+        );
+        Err(NyError::ModelLoad(format!(
+            "Layer '{}' ({:?}) references unresolvable tensor '{}' \
+             — no producer found in graph (possible dangling ONNX reference)",
+            spec.name, spec.layer_type, tensor_name
+        )))
     };
 
     if is_concat {

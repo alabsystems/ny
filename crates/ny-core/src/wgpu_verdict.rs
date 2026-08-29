@@ -19,28 +19,14 @@
 //! The CLI conditionally uses the qualified device and reports a CPU fallback
 //! when qualification refuses.
 //!
-//! Neither `NY_WGPU_VERDICT` nor `NY_WGPU_VERDICT_DISABLE` can grant that typed
-//! production authority. They affect only the historical mode helpers retained
-//! here for tests and diagnostics. This module also retains interval-union
-//! arithmetic, independent CPU-reference helpers, and a monotone differential
-//! ledger so the rejected corpus design remains reviewable. Its notes are not
-//! the current production ledger; the U1/U3/U4/U5/U6+B0 authority case lives in
+//! The rejected environment-mode interface has been removed: process state
+//! cannot request proof authority or arm proof-path instrumentation. This
+//! module retains interval-union arithmetic, independent CPU-reference helpers,
+//! and a monotone differential ledger so the rejected corpus design remains
+//! reviewable. Its notes are not the current production ledger; the
+//! U1/U3/U4/U5/U6+B0 authority case lives in
 //! `crates/ny-gpu/src/wgpu_device/ops/sound_authority.rs`, summarized by
 //! `docs/CURRENT_STATE_2026-08-10.md`.
-//!
-//! # Retained mode semantics
-//!
-//! [`wgpu_verdict_mode`](crate::wgpu_verdict::wgpu_verdict_mode) defaults to
-//! [`WgpuVerdictMode::Off`](crate::wgpu_verdict::WgpuVerdictMode::Off).
-//! `NY_WGPU_VERDICT_DISABLE`, when present, forces `Off` regardless of
-//! `NY_WGPU_VERDICT`. The other parsed modes describe the rejected corpus
-//! design; they do not control the live typed constructor:
-//!
-//! | `NY_WGPU_VERDICT` | parsed mode | historical intended behavior |
-//! |---|---|---|
-//! | unset / `off` / `0` | [`Off`](crate::wgpu_verdict::WgpuVerdictMode::Off) | CPU/reference bound only |
-//! | `differential` | [`Differential`](crate::wgpu_verdict::WgpuVerdictMode::Differential) | compute both bounds and return their union |
-//! | `on` | [`Enabled`](crate::wgpu_verdict::WgpuVerdictMode::Enabled) | request GPU-only authority after qualification |
 //!
 //! [`union_bounds`](crate::wgpu_verdict::union_bounds) is sound whenever its
 //! reference input is sound: the elementwise union contains the reference even if
@@ -50,143 +36,8 @@
 //! stays fail-closed. The live public WGPU CROWN path instead uses its own exact
 //! request plus five-rung qualification and never consults this corpus.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
-
-/// Mode the rejected historical S1 corpus design would have requested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WgpuVerdictMode {
-    /// DEFAULT for the historical corpus design. No corpus-mode result may
-    /// decide a bound, and its legacy taint instrumentation is disarmed. This
-    /// does not close an independently typed and live-qualified production
-    /// CROWN device.
-    #[default]
-    Off,
-    /// Historical qualification mode: GPU and reference bounds would both be
-    /// computed and their [`union_bounds`] returned while recording comparisons.
-    Differential,
-    /// GPU-only bounds requested under the rejected corpus design. No production
-    /// caller consumes this value; the live typed constructor uses its own
-    /// five-rung report instead.
-    Enabled,
-}
-
-/// Environment variable selecting the mode. Unset ⇒ [`WgpuVerdictMode::Off`].
-pub const MODE_ENV: &str = "NY_WGPU_VERDICT";
-/// Disable-flag kill switch: set to anything ⇒ [`WgpuVerdictMode::Off`], always.
-pub const DISABLE_ENV: &str = "NY_WGPU_VERDICT_DISABLE";
-
-/// Parse a historical mode string. Unrecognized spellings are **Off**
-/// (fail-closed rather than approximating an authority request).
-#[must_use]
-pub fn parse_mode(raw: Option<&str>) -> WgpuVerdictMode {
-    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("differential") | Some("diff") => WgpuVerdictMode::Differential,
-        Some("on") | Some("1") | Some("true") => WgpuVerdictMode::Enabled,
-        _ => WgpuVerdictMode::Off,
-    }
-}
-
-/// Resolve the mode from the two environment variables, disable-flag first.
-#[must_use]
-fn mode_from_env(disable: Option<&str>, raw: Option<&str>) -> WgpuVerdictMode {
-    if disable.is_some() {
-        return WgpuVerdictMode::Off;
-    }
-    parse_mode(raw)
-}
-
-/// Test override, preserving the rejected hot-path design's one-load encoding.
-/// `0` = no override; otherwise [`mode_from_code`]. Production qualification
-/// does not read this value.
-static MODE_OVERRIDE: AtomicU8 = AtomicU8::new(0);
-
-const OVERRIDE_NONE: u8 = 0;
-const OVERRIDE_OFF: u8 = 1;
-const OVERRIDE_DIFFERENTIAL: u8 = 2;
-const OVERRIDE_ENABLED: u8 = 3;
-
-const fn mode_to_code(mode: WgpuVerdictMode) -> u8 {
-    match mode {
-        WgpuVerdictMode::Off => OVERRIDE_OFF,
-        WgpuVerdictMode::Differential => OVERRIDE_DIFFERENTIAL,
-        WgpuVerdictMode::Enabled => OVERRIDE_ENABLED,
-    }
-}
-
-/// Decode an override code. Anything unrecognized is `Off` (fail-closed).
-const fn mode_from_code(code: u8) -> WgpuVerdictMode {
-    match code {
-        OVERRIDE_DIFFERENTIAL => WgpuVerdictMode::Differential,
-        OVERRIDE_ENABLED => WgpuVerdictMode::Enabled,
-        _ => WgpuVerdictMode::Off,
-    }
-}
-
-/// The process's historical WGPU corpus mode. The environment is read once and
-/// cached, and the test override is a single relaxed atomic load.
-#[must_use]
-pub fn wgpu_verdict_mode() -> WgpuVerdictMode {
-    let forced = MODE_OVERRIDE.load(Ordering::Relaxed);
-    if forced != OVERRIDE_NONE {
-        return mode_from_code(forced);
-    }
-    static ENV_MODE: OnceLock<WgpuVerdictMode> = OnceLock::new();
-    *ENV_MODE.get_or_init(|| {
-        let disable = std::env::var(DISABLE_ENV).ok();
-        let raw = std::env::var(MODE_ENV).ok();
-        mode_from_env(disable.as_deref(), raw.as_deref())
-    })
-}
-
-/// RAII test override of the process mode; restores the previous value on drop.
-///
-/// Retained publicly for compatibility with historical qualification tests.
-/// Tests that use it must hold their suite's serialization guard because the
-/// override is process-global. It cannot affect the live typed constructor.
-#[derive(Debug)]
-pub struct ModeOverrideGuard {
-    previous: u8,
-}
-
-impl ModeOverrideGuard {
-    /// Force `mode` until the guard drops.
-    #[must_use]
-    pub fn force(mode: WgpuVerdictMode) -> Self {
-        let previous = MODE_OVERRIDE.swap(mode_to_code(mode), Ordering::SeqCst);
-        Self { previous }
-    }
-}
-
-impl Drop for ModeOverrideGuard {
-    fn drop(&mut self) {
-        MODE_OVERRIDE.store(self.previous, Ordering::SeqCst);
-    }
-}
-
-/// Whether the historical corpus design requested its taint instrumentation.
-///
-/// Armed in `Differential` and `Enabled`; disarmed in `Off`. Production WGPU
-/// qualification and its resident taint-word channel do not consult this bit.
-#[must_use]
-pub fn taint_instrumentation_armed() -> bool {
-    !matches!(wgpu_verdict_mode(), WgpuVerdictMode::Off)
-}
-
-/// Whether the historical mode requested GPU-only verdict authority.
-///
-/// This is never sufficient and has no production consumer. The live WGPU path
-/// requires an explicit typed constructor plus its independent five-rung report.
-#[must_use]
-pub fn verdict_authority_requested() -> bool {
-    matches!(wgpu_verdict_mode(), WgpuVerdictMode::Enabled)
-}
-
-/// Whether the historical mode requests a differential (GPU + reference union).
-#[must_use]
-pub fn differential_required() -> bool {
-    matches!(wgpu_verdict_mode(), WgpuVerdictMode::Differential)
-}
 
 // ---------------------------------------------------------------------------
 // Part 4: the differential gate.
@@ -599,43 +450,6 @@ pub fn corpus_has_violation() -> bool {
 mod tests {
     use super::*;
 
-    /// Unset historical mode state stays Off. Live production authority is
-    /// separately explicit and typed; it is not inferred from these variables.
-    #[test]
-    fn default_mode_is_off_and_grants_nothing() {
-        assert_eq!(parse_mode(None), WgpuVerdictMode::Off);
-        assert_eq!(mode_from_env(None, None), WgpuVerdictMode::Off);
-        let off = mode_from_env(None, Some("off"));
-        assert_eq!(off, WgpuVerdictMode::Off);
-    }
-
-    /// A typo must fail CLOSED, not fall through to some other mode.
-    #[test]
-    fn unrecognized_mode_spelling_is_off() {
-        for raw in ["yes", "enable", "ON!", "differential-mode", "", "  "] {
-            assert_eq!(
-                parse_mode(Some(raw)),
-                WgpuVerdictMode::Off,
-                "unrecognized {raw:?} must be Off"
-            );
-        }
-    }
-
-    /// The disable flag is read first and cannot be overridden by the mode var.
-    #[test]
-    fn disable_flag_beats_every_mode_request() {
-        assert_eq!(mode_from_env(Some("1"), Some("on")), WgpuVerdictMode::Off);
-        assert_eq!(
-            mode_from_env(Some(""), Some("differential")),
-            WgpuVerdictMode::Off
-        );
-        assert_eq!(mode_from_env(None, Some("on")), WgpuVerdictMode::Enabled);
-        assert_eq!(
-            mode_from_env(None, Some("differential")),
-            WgpuVerdictMode::Differential
-        );
-    }
-
     /// Strict enclosure: equality is fine, one ULP of narrowing is a violation.
     #[test]
     fn enclosure_is_strict_in_the_narrowing_direction() {
@@ -744,46 +558,6 @@ mod tests {
             !corpus_is_green(),
             "one violation must not revive the historical corpus gate"
         );
-    }
-
-    /// The override encoding round-trips, and an unknown code decodes to `Off`
-    /// (fail-closed) rather than to some other mode.
-    #[test]
-    fn override_codes_round_trip_and_decode_unknown_as_off() {
-        for mode in [
-            WgpuVerdictMode::Off,
-            WgpuVerdictMode::Differential,
-            WgpuVerdictMode::Enabled,
-        ] {
-            assert_eq!(mode_from_code(mode_to_code(mode)), mode);
-            assert_ne!(
-                mode_to_code(mode),
-                OVERRIDE_NONE,
-                "an override code must never collide with 'no override'"
-            );
-        }
-        assert_eq!(mode_from_code(OVERRIDE_NONE), WgpuVerdictMode::Off);
-        assert_eq!(mode_from_code(200), WgpuVerdictMode::Off);
-    }
-
-    /// The mode override guard restores whatever was there before.
-    #[test]
-    fn mode_override_guard_restores_previous() {
-        let outer = wgpu_verdict_mode();
-        {
-            let _g = ModeOverrideGuard::force(WgpuVerdictMode::Differential);
-            assert_eq!(wgpu_verdict_mode(), WgpuVerdictMode::Differential);
-            assert!(taint_instrumentation_armed());
-            assert!(differential_required());
-            assert!(!verdict_authority_requested());
-            {
-                let _inner = ModeOverrideGuard::force(WgpuVerdictMode::Enabled);
-                assert!(verdict_authority_requested());
-                assert!(taint_instrumentation_armed());
-            }
-            assert_eq!(wgpu_verdict_mode(), WgpuVerdictMode::Differential);
-        }
-        assert_eq!(wgpu_verdict_mode(), outer);
     }
 }
 

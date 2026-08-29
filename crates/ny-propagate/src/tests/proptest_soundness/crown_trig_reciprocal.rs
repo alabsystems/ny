@@ -263,6 +263,24 @@ proptest! {
     ///
     /// Range constrained to (-pi/2 + epsilon, pi/2 - epsilon) to stay within
     /// one period and avoid asymptotes.
+    ///
+    /// KEPT NARROW DELIBERATELY, and the off-branch coverage lives elsewhere.
+    /// This range is the principal branch, which for a long time was also the
+    /// only branch tan's concavity test got right — so it could not see the
+    /// branch-selector defect at all. It is NOT widened here because
+    /// `assert_crown_backward_sound` compares in f32 with a tolerance that
+    /// scales as `CROWN_TOLERANCE * max(|f(x)|, 1)`: a uniform draw over, say,
+    /// -20..20 lands intervals arbitrarily close to a pole, where the
+    /// relaxation's own intercept is many orders larger than `f(x)` and the
+    /// f32 cancellation in `slope * x + intercept` swamps that tolerance. That
+    /// makes a widened version flaky for reasons unrelated to soundness.
+    ///
+    /// The off-branch cases are pinned instead where the comparison can be
+    /// exact: `tan_off_principal_branches_are_exact_in_f64` and
+    /// `prop_tan_linear_relaxation_sound_exact_off_branch`
+    /// (layers/trigonometric/periodic/tests.rs) run in f64 with ZERO tolerance,
+    /// and `test_tan_crown_backward_soundness` carries [2,3], [-3,-2] and [5,6]
+    /// through this same CROWN backward path at fixed, well-conditioned points.
     #[ntest::timeout(10000)]
     #[test]
     fn soundness_tan_crown(l in -1.4f32..1.4, delta in 0.0f32..2.8) {

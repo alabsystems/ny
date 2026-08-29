@@ -76,6 +76,7 @@ pub fn bench_batched_dense_spec_backward(
         None,  // crown_backward_layers (None => batched fast-path eligible)
         false, // ibp_enhancement
         false, // stacked_rebound
+        None,  // nested_deadline (typed preset authority; None = keep)
     )?;
 
     let timing = &out.rebound_timing;

@@ -23,7 +23,15 @@ name = "cctsdb_cast_admission_loads"
 required-features = ["external-vnncomp"]
 
 [[test]]
+name = "cgan_int64_shape_arithmetic_admission"
+required-features = ["external-vnncomp"]
+
+[[test]]
 name = "ml4acopf_literal_cone_loads"
+required-features = ["external-vnncomp"]
+
+[[test]]
+name = "lsnc_interval_carrier"
 required-features = ["external-vnncomp"]
 
 [lints]
@@ -33,7 +41,7 @@ workspace = true
 default = ["onnx-value-info", "ort", "wgpu"]
 onnx-value-info = []
 benchmarks = []
-ort = ["dep:ort"]
+ort = ["dep:ort", "dep:ort-tract"]
 wgpu = ["ny-gpu/wgpu"]
 # Real exported models, competition corpora, and accelerator hardware are
 # conformance inputs rather than unit-test fixtures.  Their tests are
@@ -75,7 +83,6 @@ sha2.workspace = true
 sha1.workspace = true
 cap-std.workspace = true
 cap-fs-ext.workspace = true
-ort = { workspace = true, optional = true }
 npyz.workspace = true
 candle-core = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
@@ -105,3 +112,32 @@ ny-test-utils = { path = "../ny-test-utils" }
 libm.workspace = true
 ntest.workspace = true
 tracing-subscriber.workspace = true
+
+# ONNX EXECUTION ENGINE, chosen by target.
+#
+# `ort` is the API; the engine behind it is a build-time choice. Upstream ships
+# no prebuilt ONNX Runtime for Intel macOS (verified against rc.12 AND rc.13 —
+# both fail the same way), so that one target links tract, a pure-Rust ONNX
+# engine, through ort's `alternative-backend` seam. The call sites do not
+# change: `crate::runtime::session_builder()` installs whichever engine this
+# build carries.
+#
+# The two blocks are mutually exclusive, so their `ort` feature sets never
+# unify — `download-binaries` is never requested for the target that has none,
+# and the API LEVEL stays per-engine. That last part is load-bearing: ort-tract
+# implements the ort C API at api-17, and a shared `api-24` reaches editor-API
+# entry points it leaves unimplemented, so `ort` panics on its own
+# `expect("infallible")` the moment a session is committed. Raising the level
+# here means raising it only for an engine that implements it.
+
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+ort = { workspace = true, optional = true, features = [
+    "download-binaries",
+    "tls-rustls",
+    "copy-dylibs",
+    "api-24",
+] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+ort = { workspace = true, optional = true, features = ["alternative-backend", "api-17"] }
+ort-tract = { workspace = true, optional = true }

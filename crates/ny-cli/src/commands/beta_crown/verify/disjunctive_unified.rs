@@ -809,6 +809,8 @@ pub(super) fn try_unified_input_split_disjunctive_bab(
         BetaCrownModel::Sequential(network) => {
             let mut g = GraphNetwork::from_sequential(network)?;
             g.set_use_patches_mode(config.use_patches());
+            g.set_chunk_wave_parallel_enabled(config.chunk_wave_parallel_enabled);
+            g.set_frozen_levers(config.frozen_levers.clone());
             Box::new(g)
         }
     };

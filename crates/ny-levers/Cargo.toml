@@ -13,14 +13,22 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dev-dependencies]
+# For the blessed serialized env helper (env::with_env_edits). No cycle:
+# ny-test-utils depends only on ny-core/ny-tensor, neither of which reaches
+# ny-levers.
+ny-test-utils = { path = "../ny-test-utils" }
+
 [lints]
 workspace = true
 
 # Deliberately a LEAF crate: every workspace crate must be able to depend on it
-# without a cycle, so it depends on nothing in the workspace and on exactly one
-# third-party crate (`serde_json`, for `LeverSet::receipt`). No `serde` derive
+# without a cycle, so it depends on nothing in the workspace and on two small
+# third-party crates (`serde_json` for receipts and `sha2` for canonical frozen
+# authority identity). No `serde` derive
 # and no `thiserror` — the two error types here are hand-rolled `Display` +
 # `std::error::Error` impls, which is cheaper than a proc-macro dependency for
 # a crate every other crate will build.
 [dependencies]
 serde_json = { workspace = true }
+sha2.workspace = true

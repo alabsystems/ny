@@ -192,6 +192,37 @@ fn fake_repo() -> (TempDir, PathBuf) {
     (temp_repo, script)
 }
 
+/// The repo's own Trust opt-out, delivered the way `.cargo/config.toml` delivers
+/// it: a PER-TARGET section, not env `RUSTFLAGS`.
+///
+/// The real-Cargo fixtures synthesize a workspace in a temp dir and build it
+/// with the inherited toolchain — which, because cargo exports RUSTUP_TOOLCHAIN
+/// into the test process, is this repo's pinned `trust`. They did NOT inherit
+/// `.cargo/config.toml`, so the fail-closed verifier saw a bare
+/// `fn main() { println!(..) }` and refused it:
+///   "unsupported MIR rvalue CastKind::Transmute: transmute to
+///    NonNull<core::fmt::rt::Argument>" -> "Trust Level 0 safety verification
+///    incomplete for `ny::main`: 5 obligation(s) were not proved".
+/// Three real-Cargo tests were therefore permanently red on this host for a
+/// reason having nothing to do with the code under test.
+///
+/// Delivered as `[target.<triple>]` rather than as env `RUSTFLAGS` on purpose:
+/// an env RUSTFLAGS clobbers BOTH `build.rustflags` and
+/// `target.<triple>.rustflags`, so it would mask a target that the real
+/// `.cargo/config.toml` fails to cover. Mirroring the repo's own mechanism
+/// keeps the fixture honest — it stays red exactly where production would be.
+///
+/// `extra_build` is any additional `[build]` keys the caller needs (the two
+/// tests that pin a target write `target = "..."` here); the opt-out COMPOSES
+/// with them instead of overwriting, because cargo's rustflags precedence is
+/// first-match-wins on the WHOLE list, not a merge.
+fn trust_optout_cargo_config(extra_build: &str) -> String {
+    format!(
+        "[build]\n{extra_build}\n[target.{host}]\nrustflags = []\n",
+        host = rust_host()
+    )
+}
+
 fn real_cargo_repo() -> (TempDir, PathBuf) {
     let temp_repo = tempdir().expect("failed to create real-Cargo test repo");
     let script = copy_build_script(temp_repo.path());
@@ -230,6 +261,13 @@ fn real_cargo_repo() -> (TempDir, PathBuf) {
         .output()
         .expect("failed to generate tiny Cargo.lock");
     assert_success(&lock, "tiny cargo generate-lockfile");
+    // Deliver the Trust opt-out the way the repo does. Without it the pinned
+    // `trust` toolchain refuses this fixture's `println!` and the build dies
+    // before the harness can assert anything about artifact placement.
+    let cargo_dir = temp_repo.path().join(".cargo");
+    fs::create_dir_all(&cargo_dir).expect("failed to create fixture Cargo config directory");
+    fs::write(cargo_dir.join("config.toml"), trust_optout_cargo_config(""))
+        .expect("failed to write fixture Trust opt-out");
     write_archive_source_marker(temp_repo.path());
     (temp_repo, script)
 }
@@ -1042,7 +1080,7 @@ fn test_real_cargo_configured_native_target_replaces_stale_alias() {
     fs::create_dir_all(&cargo_dir).expect("failed to create real Cargo config directory");
     fs::write(
         cargo_dir.join("config.toml"),
-        format!("[build]\ntarget = \"{host}\"\n"),
+        trust_optout_cargo_config(&format!("target = \"{host}\"\n")),
     )
     .expect("failed to write explicit native Cargo target");
     let alias = write_stale_alias(temp_repo.path());
@@ -1095,7 +1133,7 @@ fn test_real_cargo_host_tuple_uses_targeted_artifact() {
     fs::create_dir_all(&cargo_dir).expect("failed to create host-tuple Cargo directory");
     fs::write(
         cargo_dir.join("config.toml"),
-        "[build]\ntarget = \"host-tuple\"\n",
+        trust_optout_cargo_config("target = \"host-tuple\"\n").as_str(),
     )
     .expect("failed to write real Cargo host-tuple target");
     let alias = write_stale_alias(temp_repo.path());

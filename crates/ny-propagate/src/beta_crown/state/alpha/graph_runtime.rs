@@ -10,6 +10,23 @@ use super::graph_init::{AlphaNeuronMaps, GraphDomainAlphaState};
 use super::neuron::AlphaNeuronState;
 use crate::beta_crown::config::AdaptiveOptConfig;
 
+fn mo_alpha_heuristic_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(crate::preset_gates::mo_alpha_heuristic_enabled)
+}
+
+fn unstable_lower_alpha(fresh: bool, lower: f32, upper: f32, stored: f32) -> f32 {
+    if fresh {
+        if upper > -lower {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        stored
+    }
+}
+
 fn step_graph_alpha_neuron_maps_adam(
     neuron_maps: &mut AlphaNeuronMaps,
     config: &AdaptiveOptConfig,
@@ -88,6 +105,7 @@ impl GraphDomainAlphaState {
     fn build_alpha_array_from_node_map(
         node_neurons: Option<&FxHashMap<usize, AlphaNeuronState>>,
         pre_activation: &BoundedTensor,
+        split_refresh: bool,
     ) -> ndarray::Array1<f32> {
         let pre_flat = pre_activation.flatten();
         let n = pre_flat.len();
@@ -102,7 +120,27 @@ impl GraphDomainAlphaState {
             } else if u <= 0.0 {
                 alphas[i] = 0.0;
             } else if let Some(neuron) = node_neurons.and_then(|m| m.get(&i)) {
-                alphas[i] = neuron.alpha();
+                // #alpha-split-refresh (STRUCTURAL, default-on): a split
+                // domain's inherited α was optimized under ancestor boxes;
+                // after clamps reshape the triangle the CURRENT-box heuristic
+                // is measurably better (-7.046 receipts, REGRESSION doc).
+                // Non-split reads keep the concurrently-landed GOVERNED
+                // candidate (unstable_lower_alpha + mo_alpha_heuristic lever)
+                // — both sides of this merge express the same insight; the
+                // structural flag is the receipted default-on activation.
+                alphas[i] = if split_refresh {
+                    // DELTA-FORM (#alpha-step v3): under split_refresh the
+                    // stored value is a delta around the CURRENT-box
+                    // heuristic (0.5 = neutral; the relu_split_route eval
+                    // zeroes deltas at alpha_local creation, so iteration 0
+                    // is exactly the receipted heuristic baseline and the
+                    // α-only SPSA rounds step a clean offset on top). The
+                    // clamp keeps the composed α sound in [0,1].
+                    let heuristic = if u > -l { 1.0 } else { 0.0 };
+                    (heuristic + (neuron.alpha() - 0.5)).clamp(0.0, 1.0)
+                } else {
+                    unstable_lower_alpha(mo_alpha_heuristic_enabled(), l, u, neuron.alpha())
+                };
             } else {
                 alphas[i] = if u > -l { 1.0 } else { 0.0 };
             }
@@ -123,7 +161,11 @@ impl GraphDomainAlphaState {
         node_name: &str,
         pre_activation: &BoundedTensor,
     ) -> ndarray::Array1<f32> {
-        Self::build_alpha_array_from_node_map(self.neurons.get(node_name), pre_activation)
+        Self::build_alpha_array_from_node_map(
+            self.neurons.get(node_name),
+            pre_activation,
+            self.split_refresh,
+        )
     }
 
     /// Build an upper-path alpha array for a specific ReLU node.
@@ -132,7 +174,11 @@ impl GraphDomainAlphaState {
         node_name: &str,
         pre_activation: &BoundedTensor,
     ) -> ndarray::Array1<f32> {
-        Self::build_alpha_array_from_node_map(self.upper_neurons.get(node_name), pre_activation)
+        Self::build_alpha_array_from_node_map(
+            self.upper_neurons.get(node_name),
+            pre_activation,
+            self.split_refresh,
+        )
     }
 
     /// Reset all gradients to zero.
@@ -278,5 +324,22 @@ impl GraphDomainAlphaState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mo_alpha_heuristic_tests {
+    use super::unstable_lower_alpha;
+
+    #[test]
+    fn current_box_candidate_replaces_only_the_stored_unstable_alpha() {
+        assert_eq!(unstable_lower_alpha(false, -1.0, 3.0, 0.37), 0.37);
+        assert_eq!(unstable_lower_alpha(true, -1.0, 3.0, 0.37), 1.0);
+        assert_eq!(unstable_lower_alpha(true, -3.0, 1.0, 0.63), 0.0);
+        assert_eq!(
+            unstable_lower_alpha(true, -1.0, 1.0, 0.63),
+            0.0,
+            "the existing strict current-box heuristic must keep the tie at zero"
+        );
     }
 }

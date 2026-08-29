@@ -15,15 +15,47 @@
 #   because frozen root alpha bounds don't tighten for sub-domains (#3453).
 #   Plain CROWN is set via solver.bound_prop_method below, plus --no-alpha
 #   in benchmark_vnncomp.sh as a belt-and-suspenders safety net.
+#   VERIFIED STILL WIRED 2026-08-24: scripts/benchmark_vnncomp.sh:80 still sets
+#   CATEGORY_EXTRA_FLAGS="--no-alpha" under the acasxu_2023 case at :76, and
+#   solver.bound_prop_method below is still `crown`. Both halves present.
 # - ny BetaCrownConfig::acas_xu() baseline: input_split, no alpha,
 #   relaxed_clip, pgd_restarts=10000, batch_size=16384
-# - Canonical measurement: 123/186 at 30s timeout (2026-03-11).
-#   Targeted 116s rerun on prop_2 (42 timeouts) showed NO additional
-#   verifications — search frontier grows faster than domain discharge.
-#   See reports/benchmarks/acasxu_2023_prop2_116s_20260311.md.
-#   Remaining gaps: prop_2 (42 timeout), prop_1 (11 domain-budget),
-#   prop_3/4 (6 timeout), prop_5/7 (2 disjunctive), prop_6/8 (2 disjunctive).
-#   Recovery requires algorithmic improvement, not longer timeouts.
+#   VERIFIED 2026-08-24: beta_config.rs:1610 still sets exactly those, and
+#   config/tests.rs:acas_xu_preset_has_expected_values pins every one of them.
+#
+# STANDING (re-derived 2026-08-24 from the checked-in bank,
+# reports/measured/acasxu_2023.csv, 186 scored rows plus one `test_nano`
+# harness row that is not an instance):
+#
+#   183/186 solved — 137 unsat + 46 sat — under run_id
+#   `l1audit-20260804-d1282d23`. THREE rows are unsolved and all three are
+#   prop_2: 1_5 timeout @113.65s, 3_3 unknown @111.04s, 4_2 unknown @110.53s.
+#
+#   THE PREVIOUS HEADER HERE WAS STALE BY SIXTY ROWS AND IT ARGUED AGAINST THE
+#   FILE'S OWN BODY. It read: "Canonical measurement: 123/186 at 30s timeout
+#   (2026-03-11). Targeted 116s rerun on prop_2 (42 timeouts) showed NO
+#   additional verifications — search frontier grows faster than domain
+#   discharge. See reports/benchmarks/acasxu_2023_prop2_116s_20260311.md.
+#   Remaining gaps: prop_2 (42 timeout), prop_1 (11 domain-budget), prop_3/4
+#   (6 timeout), prop_5/7 (2 disjunctive), prop_6/8 (2 disjunctive). Recovery
+#   requires algorithmic improvement, not longer timeouts."
+#
+#   Every one of those numbers was measured at a 30 s harness budget in March
+#   2026, on a binary that predates the joint multi-objective conjunctive
+#   input-split BaB, the max_domains bump below, and the 0.4 upfront-PGD share
+#   below. All three of those changes are recorded IN THIS FILE, and the `bab:`
+#   block already said in as many words that the "prop_1: 11 domain-budget"
+#   line was STALE (measured 2026-07-08: 46/46 prop_1 at the DEFAULT 100k cap,
+#   zero gap). So the header asserted a 63-row gap while the body documented
+#   closing it — the exact shape a future reader "fixes" in the wrong
+#   direction. The cited report path does not exist in this repository either:
+#   reports/benchmarks/ is absent entirely.
+#
+#   WHAT SURVIVES, and it is the useful half: prop_2 IS still the only place
+#   ny loses acasxu rows, and its failure mode is still that the search
+#   frontier grows faster than domains discharge. The count is 3, not 42, and
+#   longer timeouts are still not the lever — the three failures sit at
+#   110-114 s of a 116 s budget, i.e. hard against the wall.
 
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/acasxu_2023
@@ -51,6 +83,11 @@ bab:
   # historical "prop_1: 11 domain-budget" note (123/186, 2026-03-11) is STALE — the
   # domain-budget gap was already closed by later branching/bound work, as the
   # 2026-07-08 A/B above measured directly.
+  #   (2026-08-24: that historical note is no longer live in the header — the
+  #   whole 123/186 block was replaced by the 183/186 standing above, which
+  #   quotes the old text so this cross-reference still resolves. The bank now
+  #   shows ZERO unsolved prop_1 rows, which is the same result from the other
+  #   direction.)
   #
   # UPDATE (MEASURED 2026-07-10): with prop_2 now routed to the JOINT multi-objective
   # conjunctive input-split BaB (per-domain any-row-verified semantics — the only

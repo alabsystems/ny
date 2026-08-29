@@ -27,7 +27,7 @@ kernel (`KERNEL_IMPORT.md`). ReLU / depth-k / softmax / LayerNorm / β-CROWN are
 instantiations.
 
 Clean is a pinned Lake dependency, not vendored source. `proofs/lean/lakefile.toml`
-uses private Clean commit `a119ed0cfdafcb3eca4904253fdc51283e2ff0f8` with
+uses private Clean commit `9a9b16e44b9233d0c387839ea205a22fb77ac4bb` with
 `subDir = "crown-proofs/lean"`; the dependency supplies `Crownproof`. NY's 67
 NY-origin modules live in the separate `NyProof` library under
 `proofs/lean/NyProof/`. The dependency contains the shared soundness-method

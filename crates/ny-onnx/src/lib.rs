@@ -86,6 +86,9 @@ pub mod optimization;
 pub mod profile;
 /// Quantization safety analysis: checks whether outputs can safely be quantized to float16/int8.
 pub mod quantize;
+/// Which ONNX execution engine this build links, and the seam that installs it.
+#[cfg(feature = "ort")]
+pub mod runtime;
 /// SafeTensors format loader for reading Hugging Face model weights.
 pub mod safetensors;
 /// Sensitivity analysis: measures how each layer amplifies input uncertainty.
@@ -124,6 +127,7 @@ mod whisper;
 
 /// Prost-derived protobuf struct definitions (`ModelProto`, etc.) for the ONNX format.
 pub mod onnx_proto;
+pub mod tail_surrogate;
 
 #[cfg(test)]
 pub(crate) mod test_fixtures;
@@ -145,9 +149,9 @@ pub use decoder::{
 /// ONNX model loaders with optional custom operator registry.
 pub use loader::{
     load_onnx, load_onnx_bytes, load_onnx_bytes_with_config, load_onnx_with_config,
-    read_onnx_bytes_maybe_gzip, serve_shape_infer_request, BatchNormFoldingPolicy, CustomOpHandler,
-    CustomOpRegistry, OnnxLoadConfig, OnnxOptimizationFlag, ShapeInferBackend,
-    ShapeInferencePolicy, SHAPE_INFER_SUBCOMMAND,
+    read_onnx_bytes_maybe_gzip, serve_shape_infer_request, set_const_matmul_interval_preset,
+    BatchNormFoldingPolicy, CustomOpHandler, CustomOpRegistry, OnnxLoadConfig,
+    OnnxOptimizationFlag, ShapeInferBackend, ShapeInferencePolicy, SHAPE_INFER_SUBCOMMAND,
 };
 /// ONNX model representation: layer specs, weight storage, and conversion options.
 pub use model::{

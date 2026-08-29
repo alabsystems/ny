@@ -23,7 +23,9 @@ use super::batching::{
     root_map_spec_obj_bounds, should_run_adv_check_on_batch, try_adv_check_on_batch,
 };
 use super::mul_binary::maybe_optimize_mul_binary_alphas;
-use super::root_bounds::collect_input_split_root_node_bounds;
+use super::root_bounds::{
+    collect_input_split_root_node_bounds, input_split_root_authority_deadline,
+};
 use super::shared::{
     compute_crown_or_ibp_bounds, compute_crown_or_ibp_bounds_with_node_bounds,
     graph_output_bounds_are_finite, graph_spec_ibp_root_screen_with_deadline, scalar_output_bounds,
@@ -147,6 +149,10 @@ impl BetaCrownVerifier {
             &self.config,
             engine,
             initial_deadline,
+            input_split_root_authority_deadline(
+                crown_deadline,
+                self.config.input_split_scored_wall,
+            ),
             "input splitting",
             None,
         )?;
@@ -249,7 +255,9 @@ impl BetaCrownVerifier {
             Option<LinearBounds>,
             crate::bounds::GraphAlphaState,
         )> {
-            let (bounds, linear, refined_alpha) =
+            // `_anchors` (warm-refined node bounds + box) are consumed only by
+            // the disjunctive f64-tail hook; this scalar lane drops them.
+            let (bounds, linear, refined_alpha, _anchors) =
                 super::shared::compute_warm_start_crown_bounds_with_refined_alpha(
                     graph,
                     input_bounds,

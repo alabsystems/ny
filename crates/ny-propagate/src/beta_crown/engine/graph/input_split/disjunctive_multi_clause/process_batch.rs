@@ -4,7 +4,7 @@
 
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant as FreshClipInstant};
+use std::time::Instant as FreshClipInstant;
 
 use ndarray::{Array2, ArrayD};
 use ny_core::{GemmEngine, NyError, Result};
@@ -27,8 +27,10 @@ use super::super::ibp_prescreen_flat::batched_ibp_prescreen_from_flat;
 use super::super::shared::{build_child_input, MultiObjBounds, MultiObjInputDomain};
 use super::push_survivors::{push_batched_relaxed_survivors, push_fallback_survivors};
 use super::screen_child::{
-    screen_disjunctive_child, WarmAlphaTelemetry, WarmDisjunctiveComputeBoundsFn,
+    screen_disjunctive_child, set_current_split_dim, SurvivorPolish, WarmAlphaTelemetry,
+    WarmDisjunctiveComputeBoundsFn,
 };
+use super::BabWall;
 
 pub(super) fn graph_ibp_prescreen_error_should_skip(err: &NyError) -> bool {
     match err {
@@ -165,9 +167,11 @@ pub(super) fn process_disjunctive_domain_batch<F>(
     compute_bounds: &F,
     warm_compute_bounds: Option<&WarmDisjunctiveComputeBoundsFn<'_>>,
     warm_alpha_telemetry: &WarmAlphaTelemetry,
+    survivor_polish: Option<&SurvivorPolish<'_>>,
+    f64_tail_hook: Option<&super::super::f64_tail::F64TailHook<'_>>,
     fresh_domain_clip_telemetry: &FreshDomainClipTelemetry,
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
-    bab_timeout: Duration,
+    bab_wall: BabWall,
     queue: &mut BinaryHeap<MultiObjInputDomain>,
     lifecycle: &mut GraphBabLifecycle,
     domains_verified_by_clip: &mut usize,
@@ -178,6 +182,10 @@ where
     debug_assert!(
         !verifier.config.reorder_bab || warm_compute_bounds.is_none(),
         "reordered grouped-disjunctive BaB must keep eager warm alpha disabled"
+    );
+    debug_assert!(
+        !verifier.config.reorder_bab || survivor_polish.is_none(),
+        "the survivor polish is an eager-lane mechanism; the reordered rebound must not carry it"
     );
     if verifier.config.reorder_bab && verifier.config.input_split_ibp_enhancement {
         process_reorder_prescreen_batch(
@@ -191,7 +199,7 @@ where
             compute_bounds,
             fresh_domain_clip_telemetry,
             mul_binary_alphas,
-            bab_timeout,
+            bab_wall,
             queue,
             lifecycle,
             domains_verified_by_clip,
@@ -208,8 +216,10 @@ where
             compute_bounds,
             warm_compute_bounds,
             warm_alpha_telemetry,
+            survivor_polish,
+            f64_tail_hook,
             mul_binary_alphas,
-            bab_timeout,
+            bab_wall,
             queue,
             lifecycle,
             domains_verified_by_clip,
@@ -229,7 +239,7 @@ fn process_reorder_prescreen_batch<F>(
     compute_bounds: &F,
     fresh_domain_clip_telemetry: &FreshDomainClipTelemetry,
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
-    bab_timeout: Duration,
+    bab_wall: BabWall,
     queue: &mut BinaryHeap<MultiObjInputDomain>,
     lifecycle: &mut GraphBabLifecycle,
     domains_verified_by_clip: &mut usize,
@@ -259,7 +269,7 @@ where
             thresholds,
             clause_sizes,
             engine,
-            bab_timeout,
+            bab_wall,
             queue,
             lifecycle,
             domains_verified_by_clip,
@@ -274,7 +284,7 @@ where
     let mut edge_alpha_budget = verifier.config.input_split_edge_alpha_top;
 
     for mut domain in domains {
-        if lifecycle.start_time.elapsed() > bab_timeout {
+        if bab_wall.expired(lifecycle.start_time) {
             return Ok(Some(lifecycle.timeout_result()));
         }
         if lifecycle.domains_explored >= verifier.config.max_domains {
@@ -342,7 +352,7 @@ where
                     spec_matrix,
                     &row_indices,
                     engine,
-                    lifecycle.deadline(bab_timeout),
+                    lifecycle.deadline(bab_wall.horizon()),
                 ) {
                     domain.obj_bounds =
                         super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
@@ -367,13 +377,13 @@ where
             thresholds,
             clause_sizes,
             engine,
-            lifecycle.deadline(bab_timeout),
+            lifecycle.deadline(bab_wall.horizon()),
         ) {
             lifecycle.domains_verified += 1;
             continue;
         }
         if fresh_domain_clip_telemetry.enabled() {
-            let fresh_clip_deadline = lifecycle.deadline(bab_timeout);
+            let fresh_clip_deadline = lifecycle.deadline(bab_wall.horizon());
             if fresh_clip_current_domain(
                 verifier,
                 &mut domain,
@@ -437,7 +447,8 @@ where
                 clause_sizes,
                 mul_binary_alphas,
                 engine,
-                lifecycle.deadline(bab_timeout),
+                lifecycle.deadline(bab_wall.horizon()),
+                &verifier.config,
             ) {
                 lifecycle.domains_verified += 1;
                 continue;
@@ -596,8 +607,10 @@ fn process_per_child_batch<F>(
     compute_bounds: &F,
     warm_compute_bounds: Option<&WarmDisjunctiveComputeBoundsFn<'_>>,
     warm_alpha_telemetry: &WarmAlphaTelemetry,
+    survivor_polish: Option<&SurvivorPolish<'_>>,
+    f64_tail_hook: Option<&super::super::f64_tail::F64TailHook<'_>>,
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
-    bab_timeout: Duration,
+    bab_wall: BabWall,
     queue: &mut BinaryHeap<MultiObjInputDomain>,
     lifecycle: &mut GraphBabLifecycle,
     domains_verified_by_clip: &mut usize,
@@ -608,7 +621,7 @@ where
     // #relational-bab option B: per-wave α edge-pass budget.
     let mut edge_alpha_budget = verifier.config.input_split_edge_alpha_top;
     for mut domain in domains {
-        if lifecycle.start_time.elapsed() > bab_timeout {
+        if bab_wall.expired(lifecycle.start_time) {
             return Ok(Some(lifecycle.timeout_result()));
         }
         if lifecycle.domains_explored >= verifier.config.max_domains {
@@ -666,7 +679,7 @@ where
                     spec_matrix,
                     &row_indices,
                     engine,
-                    lifecycle.deadline(bab_timeout),
+                    lifecycle.deadline(bab_wall.horizon()),
                 ) {
                     domain.obj_bounds =
                         super::super::batching::tighten_obj_lower_bounds(&domain.obj_bounds, fresh);
@@ -687,7 +700,7 @@ where
             thresholds,
             clause_sizes,
             engine,
-            lifecycle.deadline(bab_timeout),
+            lifecycle.deadline(bab_wall.horizon()),
         ) {
             lifecycle.domains_verified += 1;
             continue;
@@ -739,7 +752,8 @@ where
                     clause_sizes,
                     mul_binary_alphas,
                     engine,
-                    lifecycle.deadline(bab_timeout),
+                    lifecycle.deadline(bab_wall.horizon()),
+                    &verifier.config,
                 ) {
                     lifecycle.domains_verified += 1;
                     continue;
@@ -747,6 +761,11 @@ where
                 lifecycle.unresolved_due_to_unsplittable = true;
                 continue;
             }
+            // FIX-0 (#cgan-dark-tail): the multi-dim lane splits k dims at
+            // once, so there is no single dim to attribute — publish `None` and
+            // let the slow-child line print `split_dim=?` rather than carry a
+            // stale value from the single-dim lane.
+            set_current_split_dim(None);
             for (child_lower, child_upper) in child_boxes {
                 let child_input = build_child_input(&child_lower, &child_upper, &shape)?;
                 screen_disjunctive_child(
@@ -760,6 +779,8 @@ where
                     compute_bounds,
                     warm_compute_bounds,
                     warm_alpha_telemetry,
+                    survivor_polish,
+                    f64_tail_hook,
                     &domain,
                     queue,
                     lifecycle,
@@ -795,7 +816,8 @@ where
                 clause_sizes,
                 mul_binary_alphas,
                 engine,
-                lifecycle.deadline(bab_timeout),
+                lifecycle.deadline(bab_wall.horizon()),
+                &verifier.config,
             ) {
                 lifecycle.domains_verified += 1;
                 continue;
@@ -807,6 +829,10 @@ where
         let u = flat.upper()[[split_dim]];
 
         let mid = l + (u - l) / 2.0;
+        // FIX-0 (#cgan-dark-tail): publish the split dim for the slow-child
+        // stderr line. Telemetry only — nothing reads this but one `eprintln!`
+        // in `screen_child.rs`; it never reaches a bound, a clip or a verdict.
+        set_current_split_dim(Some(split_dim));
         let shape = domain.input_bounds.as_ref().lower().shape().to_vec();
         let mut child_lower = flat.lower().clone();
         let mut child_upper = flat.upper().clone();
@@ -825,6 +851,8 @@ where
             compute_bounds,
             warm_compute_bounds,
             warm_alpha_telemetry,
+            survivor_polish,
+            f64_tail_hook,
             &domain,
             queue,
             lifecycle,
@@ -845,6 +873,8 @@ where
             compute_bounds,
             warm_compute_bounds,
             warm_alpha_telemetry,
+            survivor_polish,
+            f64_tail_hook,
             &domain,
             queue,
             lifecycle,

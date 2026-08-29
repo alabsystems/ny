@@ -60,12 +60,20 @@ pub(super) fn propagate_node_ibp_with_engine(
 
 /// Deadline-bearing graph-node IBP dispatch.
 ///
-/// With a finite deadline, Conv1d, Conv2d, and ConvTranspose1d route their
-/// certified pass through pollable CPU work and never enter the caller engine
-/// or faer. The 1D certificate is a directed-f64 interval contraction; Conv2d's
-/// finite-deadline certificate is the f64 dual-accumulator kernel (strictly
-/// tighter than its deadline=None coefficient-abssum widening,
-/// #cgan-conv-ibp-magnitude-floor).
+/// With a finite deadline, Conv1d, Conv2d, ConvTranspose1d AND ConvTranspose2d
+/// route their certified pass through pollable CPU work and never enter the
+/// caller engine or faer. The 1D certificate is a directed-f64 interval
+/// contraction; Conv2d's finite-deadline certificate is the f64
+/// dual-accumulator kernel (strictly tighter than its deadline=None
+/// coefficient-abssum widening, #cgan-conv-ibp-magnitude-floor);
+/// ConvTranspose2d's is the directed-f64 pollable contraction
+/// (`propagate_ibp_pollable_f64`).
+///
+/// Conv2d's certificate is unchanged, but its KERNEL is no longer the per-MAC
+/// scalar loop: `conv2d/ops_ibp_blocked.rs` publishes the same endpoints
+/// byte-for-byte from a blocked, tap-hoisted fold that polls between
+/// MAC-budgeted output blocks (#pollable-conv-ibp). The 1D variants and
+/// ConvTranspose2d still take their per-MAC forms.
 pub(super) fn propagate_node_ibp_with_engine_and_deadline(
     layer: &Layer,
     input: &BoundedTensor,
@@ -93,7 +101,19 @@ pub(super) fn propagate_node_ibp_with_engine_and_deadline(
         Layer::ConvTranspose1d(c) => {
             c.propagate_ibp_sound_with_engine_and_deadline(input, engine, deadline)
         }
-        Layer::ConvTranspose2d(c) => c.propagate_ibp_sound_with_engine(input, engine),
+        // ConvTranspose2d used to route to the deadline-BLIND
+        // `propagate_ibp_sound_with_engine` while all three siblings above took
+        // the `..._and_deadline` variant. On a cGAN generator every node is a
+        // ConvTranspose2d, so the graph IBP had an UNPOLLABLE window at its most
+        // expensive nodes and a deadline could only surface at the NEXT check
+        // (the NaN firewall), long after it expired. The deadline-bearing method
+        // exists (`conv2d/bound_transpose.rs`), delegates VERBATIM to the
+        // historical Higham path when `deadline` is `None`, and takes the
+        // directed-f64 pollable contraction (itself a sound enclosure) when the
+        // deadline is finite. (#cgan-dark-tail FIX-2.)
+        Layer::ConvTranspose2d(c) => {
+            c.propagate_ibp_sound_with_engine_and_deadline(input, engine, deadline)
+        }
         _ => layer.propagate_ibp(input),
     }
 }
@@ -164,25 +184,47 @@ impl GraphNetwork {
 
     /// `deadline` is the LOOP authority: it aborts the collection between nodes.
     /// `layer_deadline` is what reaches the layer kernels, and it is a different
-    /// question. A finite layer deadline forces every Conv2d off im2col+GEMM onto
-    /// `conv2d_ibp_forward_grouped_with_deadline`, a serial per-MAC pollable scalar
-    /// contraction (`conv2d/ops_ibp_fwd.rs`), and makes `conv2d/bound.rs`'s
-    /// `propagate_ibp_with_engine_and_deadline`
-    /// discard the engine outright. The two routes are documented as
-    /// "mathematically identical"; the finite-deadline one buys INTRA-node
-    /// cancellation and pays for it in throughput.
+    /// question. ATTACK-ONLY node collection: it withholds the layer deadline so
+    /// every kernel keeps its deadline-free route.
     ///
-    /// Verdict paths want that trade and keep passing `layer_deadline == deadline`.
-    /// ATTACK-ONLY node collection: layer kernels keep their im2col/GEMM route.
+    /// # The 91x this comment used to describe is GONE (#pollable-conv-ibp)
     ///
-    /// `attack_point_gradient` was measured at **8.5 s/step** on
-    /// CIFAR100_resnet_large, which gives the upfront falsification lane ZERO
-    /// gradient steps inside its 4 s slice. This module's own
-    /// `point_vjp_batched_resnet.rs:9-12` records the same call on the same model
-    /// family at **~93 ms/step** — a ~91x regression, and the cause is entirely
-    /// the finite deadline reaching the kernels: 20 convs x 2 passes is ~718M
-    /// serial per-MAC scalar iterations with `IxDyn` indexing, checked arithmetic
-    /// and a poll counter, on one core.
+    /// HISTORICAL, and no longer the reason to withhold the layer deadline. A
+    /// finite layer deadline used to force every Conv2d onto a serial per-MAC
+    /// pollable scalar contraction: for the SOUND route this graph lane
+    /// actually takes (`propagate_node_ibp_with_engine_and_deadline` ->
+    /// `Conv2dLayer::propagate_ibp_sound_with_engine_and_deadline`) that is the
+    /// certified f64 dual-accumulator kernel
+    /// `conv2d_ibp_forward_grouped_certified_f64_with_deadline`, which paid
+    /// three `IxDyn` index computations, a full `conv2d_tap_source` checked
+    /// resolution and a poll counter PER MAC, on one core.
+    /// `attack_point_gradient` measured **8.5 s/step** on
+    /// CIFAR100_resnet_large against the **~93 ms/step** this crate's own
+    /// `point_vjp_batched_resnet.rs:9-12` records for the same call with no
+    /// layer deadline — ~91x, and ZERO gradient steps inside the upfront lane's
+    /// 4 s slice.
+    ///
+    /// That was never an intrinsic cost of pollability, and it is now paid down
+    /// in the KERNEL rather than routed around: `conv2d/ops_ibp_blocked.rs`
+    /// folds every output over the SAME taps in the SAME order — so its
+    /// published endpoints are BYTE-IDENTICAL to the scalar oracle, pinned by
+    /// `conv2d_blocked_certified_f64_bit_identical_to_scalar_route` — with the
+    /// tap arithmetic hoisted into separable per-axis tables, the kernel
+    /// transposed for a contiguous inner loop over output channels, and the
+    /// deadline observed between MAC-budgeted OUTPUT BLOCKS instead of every
+    /// 4096 MACs. Verdict paths therefore no longer trade throughput for
+    /// INTRA-node cancellation, and `layer_deadline == deadline` is no longer a
+    /// throughput decision. `NY_CONV_IBP_BLOCKED=0` restores the scalar kernel
+    /// byte-for-byte if an A/B needs it.
+    ///
+    /// What survives unchanged: ConvTranspose2d's finite-deadline arm
+    /// (`bound_transpose.rs::propagate_ibp_pollable_f64`) is still a per-MAC
+    /// directed-f64 contraction and has NOT received this treatment, so a
+    /// ConvTranspose-heavy graph (cgan) still pays the scalar tax; and the plain
+    /// (non-sound) `conv2d_ibp_forward_grouped_with_deadline`, which
+    /// `propagate_ibp_with_engine_and_deadline` still selects while discarding
+    /// the engine, is likewise untouched. Neither is on this collection's
+    /// Conv2d path.
     ///
     /// THE BOUND ONLY EVER TIGHTENS. The plain forward
     /// `conv2d_ibp_forward_grouped_with_deadline` is documented as
@@ -306,7 +348,7 @@ impl GraphNetwork {
     /// `bounds_cache` (the network input box for `NETWORK_INPUT`). Extracted
     /// verbatim from [`Self::collect_node_bounds_core`] so the #stabilize
     /// downstream resweep can reuse the exact same sound per-node dispatch.
-    pub(super) fn node_ibp_step(
+    pub(crate) fn node_ibp_step(
         &self,
         node_name: &str,
         node: &crate::network::GraphNode,

@@ -1012,14 +1012,7 @@ fn every_preallocation_cap_fails_before_expansion() {
 #[test]
 #[cfg(feature = "external-vnncomp")]
 fn real_metaroom_119_builds_161_symbol_first_conv_stem() {
-    let root = std::env::var_os("NY_METAROOM_119_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../benchmarks/vnncomp2025/benchmarks/metaroom_2023")
-        });
-    let onnx = root.join("onnx/6cnn_ry_39_6_no_custom_OP.onnx");
-    let vnnlib = root.join("vnnlib/spec_idx_119_eps_0.00000436.vnnlib");
+    let MetaroomAssets { onnx, vnnlib } = metaroom_119_default_assets();
     assert!(
         onnx.is_file() && vnnlib.is_file(),
         "external metaroom fixtures missing (model={}, property={}); run \
@@ -1073,14 +1066,7 @@ fn real_metaroom_119_builds_161_symbol_first_conv_stem() {
 #[test]
 #[cfg(feature = "external-vnncomp")]
 fn real_metaroom_119_reaches_first_relu_with_bounded_symbol_growth() {
-    let root = std::env::var_os("NY_METAROOM_119_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../benchmarks/vnncomp2025/benchmarks/metaroom_2023")
-        });
-    let onnx = root.join("onnx/6cnn_ry_39_6_no_custom_OP.onnx");
-    let vnnlib = root.join("vnnlib/spec_idx_119_eps_0.00000436.vnnlib");
+    let MetaroomAssets { onnx, vnnlib } = metaroom_119_default_assets();
     assert!(
         onnx.is_file() && vnnlib.is_file(),
         "external metaroom fixtures missing (model={}, property={}); run \
@@ -1669,31 +1655,104 @@ pub(crate) fn real_metaroom_119_measures_projected_full_conv_relu_trunk_resource
         .expect("explicit projected qualification requires the checked Metaroom119 trunk");
 }
 
+/// The one instance this lane is qualified for. Every sealed count in this
+/// module was measured on these two files; the wired production caller passes
+/// the harness-provided paths here and every mismatch fails closed (a panic in
+/// a sealed assert, caught at the lane boundary).
+pub(crate) struct MetaroomAssets {
+    pub(crate) onnx: PathBuf,
+    pub(crate) vnnlib: PathBuf,
+}
+
+/// Historical research-probe resolution: `NY_METAROOM_119_ROOT` or the
+/// checked-out benchmark tree. The wired lane never uses this — it receives
+/// the instance paths from the competition harness arguments.
+fn metaroom_119_default_assets() -> MetaroomAssets {
+    let root = std::env::var_os("NY_METAROOM_119_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../benchmarks/vnncomp2025/benchmarks/metaroom_2023")
+        });
+    MetaroomAssets {
+        onnx: root.join("onnx/6cnn_ry_39_6_no_custom_OP.onnx"),
+        vnnlib: root.join("vnnlib/spec_idx_119_eps_0.00000436.vnnlib"),
+    }
+}
+
 fn qualify_real_metaroom_119_full_conv_relu_trunk(
     mode: FullTrunkPredicateMode,
 ) -> Option<QualifiedMetaroomConvReluTrunk> {
-    qualify_real_metaroom_119_full_conv_relu_trunk_impl(mode, None, None, false)
+    qualify_real_metaroom_119_full_conv_relu_trunk_impl(mode, None, None, false, None, false)
 }
 
 fn qualify_real_metaroom_119_full_conv_relu_trunk_with_box(
     mode: FullTrunkPredicateMode,
     diagnostic: &mut MetaroomBoxDiagnostic,
 ) -> Option<QualifiedMetaroomConvReluTrunk> {
-    qualify_real_metaroom_119_full_conv_relu_trunk_impl(mode, Some(diagnostic), None, false)
+    qualify_real_metaroom_119_full_conv_relu_trunk_impl(
+        mode,
+        Some(diagnostic),
+        None,
+        false,
+        None,
+        false,
+    )
 }
 
 fn qualify_real_metaroom_119_full_conv_relu_trunk_with_box_counterfactual(
     mode: FullTrunkPredicateMode,
     diagnostic: &mut MetaroomBoxDiagnostic,
 ) -> Option<QualifiedMetaroomConvReluTrunk> {
-    qualify_real_metaroom_119_full_conv_relu_trunk_impl(mode, Some(diagnostic), None, true)
+    qualify_real_metaroom_119_full_conv_relu_trunk_impl(
+        mode,
+        Some(diagnostic),
+        None,
+        true,
+        None,
+        false,
+    )
 }
 
 fn qualify_real_metaroom_119_full_conv_relu_trunk_with_auxiliary_trace(
     mode: FullTrunkPredicateMode,
     auxiliary_trace: &[CertifiedAuxiliaryBounds64],
 ) -> Option<QualifiedMetaroomConvReluTrunk> {
-    qualify_real_metaroom_119_full_conv_relu_trunk_impl(mode, None, Some(auxiliary_trace), false)
+    qualify_real_metaroom_119_full_conv_relu_trunk_impl(
+        mode,
+        None,
+        Some(auxiliary_trace),
+        false,
+        None,
+        false,
+    )
+}
+
+/// Single-traversal inductive Box/CZ hybrid (#cz-hybrid, wired lane).
+///
+/// The two-pass cascade first runs a full BASELINE CZ traversal purely to
+/// drive the independent certified Box trace, then re-propagates the hybrid
+/// CZ against that trace. But the Box trace is CZ-independent by the M16
+/// proof boundary — `MetaroomBoxDiagnostic` propagates outward-rounded
+/// binary64 bounds from the certified input box alone, and `record_relu`
+/// pushes `try_from_certified_box(box_bounds)` untouched by any CZ value —
+/// and the diagnostic pushes each stage's auxiliary entry BEFORE that stage's
+/// ReLU transform runs. So one traversal that consumes the just-pushed entry
+/// inline produces the bit-identical hybrid CZ at roughly half the trunk
+/// cost, which is what fits this lane inside the official 210 s budget.
+fn qualify_real_metaroom_119_inline_box_hybrid_trunk(
+    mode: FullTrunkPredicateMode,
+    diagnostic: &mut MetaroomBoxDiagnostic,
+    assets: &MetaroomAssets,
+) -> Option<QualifiedMetaroomConvReluTrunk> {
+    qualify_real_metaroom_119_full_conv_relu_trunk_impl(
+        mode,
+        Some(diagnostic),
+        None,
+        false,
+        Some(assets),
+        true,
+    )
 }
 
 fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
@@ -1701,22 +1760,32 @@ fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
     mut box_diagnostic: Option<&mut MetaroomBoxDiagnostic>,
     auxiliary_trace: Option<&[CertifiedAuxiliaryBounds64]>,
     measure_relu4_auxiliary_counterfactual: bool,
+    assets: Option<&MetaroomAssets>,
+    inline_box_hybrid: bool,
 ) -> Option<QualifiedMetaroomConvReluTrunk> {
     if let Some(trace) = auxiliary_trace {
         assert_eq!(trace.len(), 4);
     }
     assert!(!measure_relu4_auxiliary_counterfactual || box_diagnostic.is_some());
     assert!(!(measure_relu4_auxiliary_counterfactual && auxiliary_trace.is_some()));
-    let is_hybrid = auxiliary_trace.is_some();
+    // Inline hybrid consumes the Box diagnostic's just-pushed auxiliary entry
+    // at each ReLU, so it requires the diagnostic and excludes both the
+    // precomputed trace and the counterfactual measurement.
+    assert!(!inline_box_hybrid || box_diagnostic.is_some());
+    assert!(!(inline_box_hybrid && auxiliary_trace.is_some()));
+    assert!(!(inline_box_hybrid && measure_relu4_auxiliary_counterfactual));
+    let is_hybrid = auxiliary_trace.is_some() || inline_box_hybrid;
     let mut relu_resources = Vec::with_capacity(4);
-    let root = std::env::var_os("NY_METAROOM_119_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../benchmarks/vnncomp2025/benchmarks/metaroom_2023")
-        });
-    let onnx = root.join("onnx/6cnn_ry_39_6_no_custom_OP.onnx");
-    let vnnlib = root.join("vnnlib/spec_idx_119_eps_0.00000436.vnnlib");
+    let default_assets;
+    let assets = match assets {
+        Some(assets) => assets,
+        None => {
+            default_assets = metaroom_119_default_assets();
+            &default_assets
+        }
+    };
+    let onnx = assets.onnx.clone();
+    let vnnlib = assets.vnnlib.clone();
     if !onnx.exists() || !vnnlib.exists() {
         return None;
     }
@@ -1795,15 +1864,32 @@ fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
     let (baseline_relu1_output, first_plan) = mode
         .propagate_first_relu(&model, &graph, &box_, first_limits)
         .unwrap();
-    let relu1_output = match auxiliary_trace {
-        Some(trace) => mode
-            .transform_relu_with_auxiliary(
-                conv1_for_auxiliary.as_ref().unwrap(),
-                &trace[0],
-                first_limits.relu,
-            )
-            .unwrap(),
-        None => baseline_relu1_output,
+    // NOT clippy's slice pattern. The SAME `auxiliary_trace` binding is indexed
+    // at [0], [1] and [2] in this function, so the suggested fixed-length
+    // patterns (`Some([t])`, `Some([_, t])`, ...) are mutually contradictory:
+    // a real 3-element trace would fail the length match here and silently fall
+    // through to the `inline_box_hybrid` arm, i.e. quietly run a DIFFERENT
+    // relaxation than the one this qualification is measuring. Indexing keeps
+    // the current fail-fast behaviour on a malformed trace.
+    #[allow(clippy::index_refutable_slice)]
+    let relu1_output = if let Some(trace) = auxiliary_trace {
+        mode.transform_relu_with_auxiliary(
+            conv1_for_auxiliary.as_ref().unwrap(),
+            &trace[0],
+            first_limits.relu,
+        )
+        .unwrap()
+    } else if inline_box_hybrid {
+        let diagnostic = box_diagnostic.as_deref().unwrap();
+        assert_eq!(diagnostic.auxiliary_preactivations.len(), 1);
+        mode.transform_relu_with_auxiliary(
+            conv1_for_auxiliary.as_ref().unwrap(),
+            &diagnostic.auxiliary_preactivations[0],
+            first_limits.relu,
+        )
+        .unwrap()
+    } else {
+        baseline_relu1_output
     };
     let relu1_resource =
         MetaroomReluResources::capture("ReLU1", first_plan.input_alpha_dim, &relu1_output);
@@ -1982,11 +2068,28 @@ fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
         max_unstable: 687,
         max_exact_terms: mode.select(561_468, 816_278),
     };
-    let relu2_output = match auxiliary_trace {
-        Some(trace) => mode
-            .transform_relu_with_auxiliary(&conv2_output, &trace[1], relu2_limits)
-            .unwrap(),
-        None => mode.transform_relu(&conv2_output, relu2_limits).unwrap(),
+    // NOT clippy's slice pattern. The SAME `auxiliary_trace` binding is indexed
+    // at [0], [1] and [2] in this function, so the suggested fixed-length
+    // patterns (`Some([t])`, `Some([_, t])`, ...) are mutually contradictory:
+    // a real 3-element trace would fail the length match here and silently fall
+    // through to the `inline_box_hybrid` arm, i.e. quietly run a DIFFERENT
+    // relaxation than the one this qualification is measuring. Indexing keeps
+    // the current fail-fast behaviour on a malformed trace.
+    #[allow(clippy::index_refutable_slice)]
+    let relu2_output = if let Some(trace) = auxiliary_trace {
+        mode.transform_relu_with_auxiliary(&conv2_output, &trace[1], relu2_limits)
+            .unwrap()
+    } else if inline_box_hybrid {
+        let diagnostic = box_diagnostic.as_deref().unwrap();
+        assert_eq!(diagnostic.auxiliary_preactivations.len(), 2);
+        mode.transform_relu_with_auxiliary(
+            &conv2_output,
+            &diagnostic.auxiliary_preactivations[1],
+            relu2_limits,
+        )
+        .unwrap()
+    } else {
+        mode.transform_relu(&conv2_output, relu2_limits).unwrap()
     };
     let relu2_generator_nonzeros = relu2_output
         .generators()
@@ -2182,11 +2285,28 @@ fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
         max_unstable: 681,
         max_exact_terms: mode.select(812_708, 1_207_450),
     };
-    let relu3_output = match auxiliary_trace {
-        Some(trace) => mode
-            .transform_relu_with_auxiliary(&conv3_output, &trace[2], relu3_limits)
-            .unwrap(),
-        None => mode.transform_relu(&conv3_output, relu3_limits).unwrap(),
+    // NOT clippy's slice pattern. The SAME `auxiliary_trace` binding is indexed
+    // at [0], [1] and [2] in this function, so the suggested fixed-length
+    // patterns (`Some([t])`, `Some([_, t])`, ...) are mutually contradictory:
+    // a real 3-element trace would fail the length match here and silently fall
+    // through to the `inline_box_hybrid` arm, i.e. quietly run a DIFFERENT
+    // relaxation than the one this qualification is measuring. Indexing keeps
+    // the current fail-fast behaviour on a malformed trace.
+    #[allow(clippy::index_refutable_slice)]
+    let relu3_output = if let Some(trace) = auxiliary_trace {
+        mode.transform_relu_with_auxiliary(&conv3_output, &trace[2], relu3_limits)
+            .unwrap()
+    } else if inline_box_hybrid {
+        let diagnostic = box_diagnostic.as_deref().unwrap();
+        assert_eq!(diagnostic.auxiliary_preactivations.len(), 3);
+        mode.transform_relu_with_auxiliary(
+            &conv3_output,
+            &diagnostic.auxiliary_preactivations[2],
+            relu3_limits,
+        )
+        .unwrap()
+    } else {
+        mode.transform_relu(&conv3_output, relu3_limits).unwrap()
     };
     let relu3_generator_nonzeros = relu3_output
         .generators()
@@ -2402,11 +2522,20 @@ fn qualify_real_metaroom_119_full_conv_relu_trunk_impl(
         max_unstable: 1_128,
         max_exact_terms: mode.select(3_511_840, 5_257_936),
     };
-    let relu4_output = match auxiliary_trace {
-        Some(trace) => mode
-            .transform_relu_with_auxiliary(&conv4_output, &trace[3], relu4_limits)
-            .unwrap(),
-        None => mode.transform_relu(&conv4_output, relu4_limits).unwrap(),
+    let relu4_output = if let Some(trace) = auxiliary_trace {
+        mode.transform_relu_with_auxiliary(&conv4_output, &trace[3], relu4_limits)
+            .unwrap()
+    } else if inline_box_hybrid {
+        let diagnostic = box_diagnostic.as_deref().unwrap();
+        assert_eq!(diagnostic.auxiliary_preactivations.len(), 4);
+        mode.transform_relu_with_auxiliary(
+            &conv4_output,
+            &diagnostic.auxiliary_preactivations[3],
+            relu4_limits,
+        )
+        .unwrap()
+    } else {
+        mode.transform_relu(&conv4_output, relu4_limits).unwrap()
     };
     let relu4_generator_nonzeros = relu4_output
         .generators()
@@ -2829,13 +2958,7 @@ fn measure_projected_metaroom_119_affine1_resources(
 }
 
 pub(crate) fn real_metaroom_119_seals_affine_tail_topology_and_float32_bits() {
-    let root = std::env::var_os("NY_METAROOM_119_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../benchmarks/vnncomp2025/benchmarks/metaroom_2023")
-        });
-    let onnx = root.join("onnx/6cnn_ry_39_6_no_custom_OP.onnx");
+    let onnx = metaroom_119_default_assets().onnx;
     assert!(
         onnx.is_file(),
         "explicit qualification requires the Metaroom119 model at {}",
@@ -4883,6 +5006,324 @@ pub(crate) fn real_metaroom_119_diagnoses_inductive_hybrid_tail_cascade() {
     }
     // Diagnostic only: no value above is connected to a command, verifier
     // verdict, VNN-COMP score, or any default-on path.
+}
+
+/// One hybrid ReLU stage of the wired lane's engagement report.
+// EVIDENCE RECORD. These fields are populated by the wired lane and carried
+// for `Debug` rendering -- they are what an operator reads to decide whether
+// the lane actually engaged. No code path consumes them today, which is why
+// the lint fires; they are kept because a report whose fields are dropped is
+// exactly the silent-telemetry failure this lane exists to make visible.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MetaroomCzWiredReluRow {
+    pub(crate) stage: &'static str,
+    pub(crate) baseline_unstable: usize,
+    pub(crate) hybrid_unstable: usize,
+    pub(crate) output_alpha_dim: usize,
+}
+
+/// Per-challenger certificate outcome of the wired lane.
+// EVIDENCE RECORD. These fields are populated by the wired lane and carried
+// for `Debug` rendering -- they are what an operator reads to decide whether
+// the lane actually engaged. No code path consumes them today, which is why
+// the lint fires; they are kept because a report whose fields are dropped is
+// exactly the silent-telemetry failure this lane exists to make visible.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MetaroomCzWiredCertificate {
+    pub(crate) challenger_output: usize,
+    pub(crate) best_dual_lower_bound: Option<f64>,
+    pub(crate) ay_strictly_positive: bool,
+    pub(crate) strictly_positive: bool,
+}
+
+/// Everything the wired #cz-hybrid lane learned about this run, whether or
+/// not it proved the property. `proved_unsat` is true ONLY when every one of
+/// the 19 sealed challenger margins holds an independently replayed strictly
+/// positive rigorous lower bound (dual replay or exact AY MILP).
+// EVIDENCE RECORD. These fields are populated by the wired lane and carried
+// for `Debug` rendering -- they are what an operator reads to decide whether
+// the lane actually engaged. No code path consumes them today, which is why
+// the lint fires; they are kept because a report whose fields are dropped is
+// exactly the silent-telemetry failure this lane exists to make visible.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct MetaroomCzWiredReport {
+    pub(crate) proved_unsat: bool,
+    pub(crate) hybrid_relu_rows: Vec<MetaroomCzWiredReluRow>,
+    pub(crate) relu5_cz_unstable: usize,
+    pub(crate) relu5_box_unstable: usize,
+    pub(crate) certificates: Vec<MetaroomCzWiredCertificate>,
+    pub(crate) unresolved: Vec<usize>,
+    pub(crate) trunk_elapsed: Duration,
+    pub(crate) tail_elapsed: Duration,
+}
+
+/// The baseline (Box-free) unstable counts sealed by the M8/M16 replays, per
+/// conv-trunk ReLU stage. Reported next to the hybrid counts so a single log
+/// line shows what the certified-Box intersection bought.
+const METAROOM_BASELINE_TRUNK_UNSTABLE: [usize; 4] = [476, 687, 681, 1_128];
+
+/// Wired #cz-hybrid production cascade (M17/M20 dual portfolio, retry, exact
+/// AY MILP fallback) over the single-traversal inline Box/CZ hybrid trunk.
+///
+/// SOUNDNESS CHAIN for a `true` verdict:
+/// 1. the certified VNN-LIB input box outward-encloses the instance's input
+///    region (`CertifiedInputBox`);
+/// 2. the independent Box trace propagates outward-rounded binary64 bounds
+///    (`CertifiedBox64`), so every true preactivation lies in its auxiliary
+///    boxes;
+/// 3. the hybrid CZ trunk (exact dyadic arithmetic, contraction charged to
+///    the remainder, M16 witness contract for the Box intersection) then
+///    over-approximates the true reachable set at every layer;
+/// 4. every accepted tail bound is an independent outward CPU replay (M17
+///    over the CZ hull, M20 over the CZ with the certified ReLU5 box, exact
+///    rational AY MILP for the fallback);
+/// 5. all 19 sealed challenger margins strictly positive ⇒ the unsafe
+///    disjunction is unreachable ⇒ `unsat`.
+///
+/// Every structural assumption is enforced by the module's sealed asserts; a
+/// mismatch panics and the production caller treats the panic as a decline
+/// (`commands::cz_metaroom_wired` wraps this in `catch_unwind`). Returns
+/// `None` only when the asset files do not exist.
+pub(crate) fn run_wired_metaroom_cz_hybrid(
+    assets: &MetaroomAssets,
+    outer_deadline: Instant,
+) -> Option<MetaroomCzWiredReport> {
+    let trunk_started = Instant::now();
+    let mut box_diagnostic = MetaroomBoxDiagnostic::default();
+    let trunk = qualify_real_metaroom_119_inline_box_hybrid_trunk(
+        FullTrunkPredicateMode::Preserve,
+        &mut box_diagnostic,
+        assets,
+    )?;
+    assert_metaroom_preserve_hybrid_resources(&trunk);
+    assert_eq!(box_diagnostic.relus.len(), 4);
+    assert_eq!(box_diagnostic.auxiliary_preactivations.len(), 4);
+    let property = qualify_metaroom_119_unsafe_contract(&trunk.vnnlib_spec);
+    assert_eq!(property.target_output, METAROOM_TAIL_TARGET);
+    let tail = qualify_real_metaroom_119_affine_tail_topology(
+        &trunk.model,
+        &trunk.graph,
+        &trunk.graph_relu4_name,
+        &trunk.model_relu4_output,
+    );
+    let hybrid_relu_rows: Vec<MetaroomCzWiredReluRow> = trunk
+        .relu_resources
+        .iter()
+        .zip(METAROOM_BASELINE_TRUNK_UNSTABLE)
+        .map(|(row, baseline_unstable)| MetaroomCzWiredReluRow {
+            stage: row.stage,
+            baseline_unstable,
+            hybrid_unstable: row.unstable,
+            output_alpha_dim: row.output_alpha_dim,
+        })
+        .collect();
+
+    // Release everything the tail does not need before building the prepared
+    // geometry; the trunk model/graph alone hold hundreds of MiB.
+    let QualifiedMetaroomConvReluTrunk {
+        model,
+        graph,
+        vnnlib_spec,
+        relu4_output,
+        graph_relu4_name,
+        model_relu4_output,
+        relu_resources,
+        relu4_auxiliary_counterfactual,
+    } = trunk;
+    drop((
+        model,
+        graph,
+        vnnlib_spec,
+        graph_relu4_name,
+        model_relu4_output,
+        relu_resources,
+        relu4_auxiliary_counterfactual,
+    ));
+    box_diagnostic.auxiliary_preactivations.clear();
+
+    let affine1_output = propagate_metaroom_preserve_hybrid_affine1(&relu4_output, &tail);
+    drop(relu4_output);
+
+    // Continue the independent Box to the exact ReLU5 preactivation (same
+    // contract as the cascade diagnostic: `affine_relu` records the certified
+    // box via `try_from_certified_box` before applying ReLU).
+    box_diagnostic.affine_relu(
+        "ReLU5",
+        tail.first_weights.view(),
+        &tail.first_bias,
+        &affine1_output,
+    );
+    assert_eq!(box_diagnostic.relus.len(), 5);
+    assert_eq!(box_diagnostic.auxiliary_preactivations.len(), 1);
+    assert_eq!(box_diagnostic.relus[4].value_count, 256);
+    assert_eq!(box_diagnostic.relus[4].ignored_cz_constraints, 0);
+    let relu5_cz_unstable = box_diagnostic.relus[4].cz_unstable;
+    let relu5_box_unstable = box_diagnostic.relus[4].box_unstable;
+    let relu5_auxiliary = box_diagnostic.auxiliary_preactivations.pop().unwrap();
+    assert_eq!(relu5_auxiliary.value_dim(), 256);
+    assert_eq!(relu5_auxiliary.value_dim(), affine1_output.value_dim());
+    assert_eq!(tail.first_weights.nrows(), relu5_auxiliary.value_dim());
+    assert_eq!(tail.first_bias.len(), relu5_auxiliary.value_dim());
+    assert_eq!(tail.second_weights.ncols(), relu5_auxiliary.value_dim());
+    let box_limits = metaroom_box_limits();
+    assert!(relu5_auxiliary.value_dim() <= box_limits.max_values);
+    assert!(relu5_auxiliary.value_dim().checked_mul(2).unwrap() <= box_limits.max_stored_f64);
+    assert!(relu5_auxiliary
+        .lower()
+        .iter()
+        .chain(relu5_auxiliary.upper())
+        .all(|endpoint| endpoint.is_finite()));
+    drop(box_diagnostic);
+    let trunk_elapsed = trunk_started.elapsed();
+
+    let mut certificates = property
+        .challengers
+        .iter()
+        .copied()
+        .map(MetaroomTailCertificateState::new)
+        .collect::<Vec<_>>();
+    let tail_started = Instant::now();
+    let report_from = |certificates: &[MetaroomTailCertificateState], tail_elapsed: Duration| {
+        let unresolved = unresolved_metaroom_tail_challengers(certificates);
+        MetaroomCzWiredReport {
+            proved_unsat: unresolved.is_empty(),
+            hybrid_relu_rows: hybrid_relu_rows.clone(),
+            relu5_cz_unstable,
+            relu5_box_unstable,
+            certificates: certificates
+                .iter()
+                .map(|certificate| MetaroomCzWiredCertificate {
+                    challenger_output: certificate.challenger_output,
+                    best_dual_lower_bound: certificate.best_dual_lower_bound,
+                    ay_strictly_positive: certificate.ay_strictly_positive,
+                    strictly_positive: certificate.strictly_positive(),
+                })
+                .collect(),
+            unresolved,
+            trunk_elapsed,
+            tail_elapsed,
+        }
+    };
+    if remaining_metaroom_tail_budget(outer_deadline).is_none() {
+        eprintln!("Metaroom119 wired cz-hybrid: outer deadline reached before the tail phase");
+        return Some(report_from(&certificates, tail_started.elapsed()));
+    }
+
+    let prepared = MetaroomPreparedTailDomain::try_new(&affine1_output).unwrap();
+    assert_eq!(prepared.geometry.value_dim(), 256);
+    assert_eq!(
+        prepared.geometry.coordinate_hull_generator_additions(),
+        592_384
+    );
+    let primary_complete = run_metaroom_tail_dual_pass(
+        "wired-all8",
+        &prepared,
+        &relu5_auxiliary,
+        &tail,
+        property.target_output,
+        &property.challengers,
+        8,
+        outer_deadline,
+        &mut certificates,
+    );
+
+    let mut retry_complete = primary_complete;
+    if primary_complete {
+        let retry = unresolved_metaroom_tail_challengers(&certificates);
+        if !retry.is_empty() {
+            retry_complete = run_metaroom_tail_dual_pass(
+                "wired-retry20",
+                &prepared,
+                &relu5_auxiliary,
+                &tail,
+                property.target_output,
+                &retry,
+                20,
+                outer_deadline,
+                &mut certificates,
+            );
+        }
+    }
+
+    if retry_complete {
+        let ay_challengers = unresolved_metaroom_tail_challengers(&certificates);
+        if !ay_challengers.is_empty() {
+            if let Some(remaining) = remaining_metaroom_tail_budget(outer_deadline)
+                .filter(|remaining| *remaining >= Duration::from_secs(1))
+            {
+                let ay =
+                    diagnose_constrained_zonotope_relu_affine_tail_with_ay_lp_for_challengers_unwired(
+                        &affine1_output,
+                        tail.second_weights.view(),
+                        &tail.second_bias,
+                        &ay_challengers,
+                        metaroom_tail_lp_config(
+                            property.target_output,
+                            ay_challengers.len(),
+                            remaining.min(Duration::from_mins(3)),
+                        ),
+                    )
+                    .unwrap();
+                assert_eq!(ay.target_output, property.target_output);
+                assert_eq!(ay.plan.solve_count, ay_challengers.len());
+                assert_eq!(
+                    ay.margins
+                        .iter()
+                        .map(|margin| margin.challenger_output)
+                        .collect::<Vec<_>>(),
+                    ay_challengers
+                );
+                assert!(ay.plan.model_columns <= 3_109 + ay_challengers.len());
+                assert!(ay.plan.model_rows <= 788 + ay_challengers.len());
+                assert!(ay.plan.model_nonzeros <= 599_060 + 3 * ay_challengers.len());
+                assert!(ay.exact_milp.within_declared_caps);
+
+                let exact_zero = BigRational::from_integer(0.into());
+                for margin in &ay.margins {
+                    let strictly_positive = matches!(
+                        &margin.outcome,
+                        TailLpMarginOutcome::RigorousLowerBound(bound) if bound > &exact_zero
+                    );
+                    certificates
+                        .iter_mut()
+                        .find(|certificate| {
+                            certificate.challenger_output == margin.challenger_output
+                        })
+                        .unwrap()
+                        .ay_strictly_positive = strictly_positive;
+                }
+                eprintln!(
+                    "Metaroom119 wired cz-hybrid AY fallback: requested={ay_challengers:?}, \
+                     all_positive={}, unresolved={}, minimum={:?}, elapsed={:?}",
+                    ay.all_margins_strictly_positive,
+                    ay.unresolved_margin_count,
+                    ay.minimum_rigorous_lower_bound,
+                    ay.elapsed,
+                );
+            } else {
+                eprintln!(
+                    "Metaroom119 wired cz-hybrid: outer deadline left no AY construction budget; \
+                     requested={ay_challengers:?}"
+                );
+            }
+        }
+    }
+
+    let report = report_from(&certificates, tail_started.elapsed());
+    eprintln!(
+        "Metaroom119 wired cz-hybrid final: proved_unsat={}, strictly_positive={}/{}, \
+         unresolved={:?}, trunk_elapsed={:?}, tail_elapsed={:?}, certificates={certificates:#?}",
+        report.proved_unsat,
+        report.certificates.len() - report.unresolved.len(),
+        report.certificates.len(),
+        report.unresolved,
+        report.trunk_elapsed,
+        report.tail_elapsed,
+    );
+    Some(report)
 }
 
 pub(crate) fn real_metaroom_119_diagnoses_target_6_tail_with_exact_ay_lp() {

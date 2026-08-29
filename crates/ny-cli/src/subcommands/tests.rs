@@ -409,13 +409,37 @@ fn cli_top_level_about_matches_repo_scope() {
     );
 }
 
+/// `ny --version` must report the DERIVED build version, not the frozen
+/// `Cargo.toml` one (#binary-identity).
+///
+/// This test previously asserted the opposite — that clap tracks
+/// `CARGO_PKG_VERSION` — which is exactly the property that made every binary
+/// of this campaign answer `ny 0.3.0`. `[workspace.package] version` did not
+/// move while the verifier changed underneath it many times, so on
+/// 2026-08-21 a manifest sealed against one binary and 330 rows measured by
+/// another could not be told apart by their reported versions.
 #[test]
-fn cli_version_comes_from_package_metadata() {
+fn cli_version_is_the_derived_build_version_not_the_frozen_cargo_patch() {
     let cmd = Cli::command();
+    let version = cmd.get_version().expect("clap must carry a version");
     assert_eq!(
-        cmd.get_version(),
-        Some(env!("CARGO_PKG_VERSION")),
-        "Clap version must track the package version"
+        version,
+        crate::build_id::DISPLAY_VERSION,
+        "clap must report the build-stamped version"
+    );
+
+    // major.minor still come from Cargo.toml; only the patch is derived.
+    let mut cargo = env!("CARGO_PKG_VERSION").split('.');
+    let major = cargo.next().expect("major");
+    let minor = cargo.next().expect("minor");
+    assert!(
+        version.starts_with(&format!("{major}.{minor}.")),
+        "derived version {version} must keep the manifest's major.minor"
+    );
+    assert_ne!(
+        version,
+        env!("CARGO_PKG_VERSION"),
+        "a version equal to the frozen Cargo.toml version distinguishes nothing"
     );
 }
 

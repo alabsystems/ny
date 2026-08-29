@@ -36,6 +36,14 @@ pub const UNIT_F32: f64 = 5.960_464_477_539_063e-8;
 /// underflow, so this floor is a rigor belt, not a load-bearing term).
 pub const SUBNORMAL_F32: f64 = 1.401_298_464_324_817e-45;
 
+/// `f32::MIN_POSITIVE` (2^-126) as f64. The directed-up f32 store
+/// (`ny_core::f64_to_f32_up`) never publishes an f32 subnormal — positive
+/// values in the gradual-underflow range widen up to `MIN_POSITIVE` — so the
+/// absolute movement of one up-store is bounded by this, not by
+/// [`SUBNORMAL_F32`]. Used by the `#tableau-f32` storage-dust charges.
+#[allow(clippy::cast_possible_truncation)]
+pub const F32_MIN_POSITIVE: f64 = f32::MIN_POSITIVE as f64;
+
 /// Relative error bound on BN-folded conv weights and biases produced by the
 /// f64 fold `W' = W * w_bn / sqrt(var + eps)` (4 nearest-rounded ops:
 /// add, sqrt, div, mul => relative error <= (1+u)^4 - 1 ~= 4.44e-16).
@@ -142,6 +150,47 @@ pub fn certify_up(x: f64, rel: f64) -> f64 {
 #[inline]
 pub fn slack16(x: f64) -> f64 {
     next_up(x * (1.0 + 16.0 * UNIT))
+}
+
+/// Certified upper bound on the perturbation `|fl32(x) - x|` of one nearest
+/// f64->f32 STORE, evaluated from the STORED value (`NY_MARGIN_ROW_TABLEAU_F32`
+/// storage lane only).
+///
+/// The exact bound is `UNIT_F32 * |x| <= UNIT_F32 * |stored| / (1 - UNIT_F32)`
+/// for normals and one half-ulp (`SUBNORMAL_F32 / 2`) in the gradual-underflow
+/// range (total underflow to `0.0` included: `|x| < SUBNORMAL_F32 / 2` there).
+/// DOUBLING both terms swallows (a) the `|x| -> |stored|` rebasing factor
+/// `1/(1 - u32)`, (b) the f64 rounding of the charge expression itself and of
+/// the site expression it is folded into, and (c) every `u64`-scale cross-term
+/// at the site (`u64 / u32 = 2^-29`, i.e. the f64-arithmetic noise is nine
+/// orders of magnitude below this charge). The margin is enforced empirically
+/// by the per-site containment oracle (`tableau_f32_store_*` tests), which
+/// also carries a would-fail counterexample for the UNcharged formula.
+#[inline]
+pub fn f32_store_slack(stored: f32) -> f64 {
+    2.0 * UNIT_F32 * f64::from(stored).abs() + 2.0 * SUBNORMAL_F32
+}
+
+/// RETIRED worst-case `#tableau-f32` per-coefficient storage-dust charge —
+/// kept ONLY as the regression-pin yardstick
+/// (`tableau_f32_store_dust_charge_regression_pin`): the live sites now
+/// charge the EXACT per-site deviation `(|m32 - m64| + |d32 - d64|)` instead
+/// (2026-08-20 ship-gate FAIL fix; see the `#tableau-f32` doc block in
+/// `root.rs`).
+///
+/// Dominates `|m32 - m64| + |d32 - d64|` for one CENTER nearest store
+/// (`<= UNIT_F32*|m32|/(1-UNIT_F32) + subnormal half-ulp`) PLUS its same-site
+/// D fold (`f32_store_slack`, `<= 2*UNIT_F32*|m32| + 2*SUBNORMAL_F32`) PLUS
+/// one RADIUS directed-up store (`<= 2*UNIT_F32*d32 + F32_MIN_POSITIVE` — the
+/// up-cast never publishes a subnormal, so its absolute floor is
+/// `F32_MIN_POSITIVE`, not `SUBNORMAL_F32`). Total need:
+/// `~3*UNIT_F32*|m32| + 2*UNIT_F32*d32 + F32_MIN_POSITIVE + dust`; the `4x`
+/// coefficients give a `>= 4/3` margin on the tightest term — which is
+/// exactly the conservatism (worst-case magnitudes instead of the realized
+/// movement) that the exact charge removed.
+#[inline]
+pub fn f32_store_gerr_term(m_wide: f64, d_wide: f64) -> f64 {
+    4.0 * UNIT_F32 * (m_wide.abs() + d_wide.abs()) + 4.0 * F32_MIN_POSITIVE
 }
 
 #[cfg(test)]

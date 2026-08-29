@@ -213,7 +213,13 @@ fn evaluate_batch_via_ort(
 }
 
 pub(super) enum BatchedGraphPgdOutcome {
-    Completed(Option<Box<(ArrayD<f32>, ArrayD<f32>)>>),
+    Completed {
+        result: Option<Box<(ArrayD<f32>, ArrayD<f32>)>>,
+        /// At least the initial restart-batch evaluation completed, proving
+        /// that the generic route did real treatment work rather than merely
+        /// discovering an already-expired deadline.
+        work_started: bool,
+    },
     FallbackToSequential,
 }
 
@@ -353,7 +359,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
             "Graph PGD: deadline exceeded before batched restart 0/{}",
             pgd_config.num_restarts
         );
-        return Ok(BatchedGraphPgdOutcome::Completed(None));
+        return Ok(BatchedGraphPgdOutcome::Completed {
+            result: None,
+            work_started: false,
+        });
     }
 
     let rngs: Vec<SimpleRng> = (0..pgd_config.num_restarts)
@@ -373,7 +382,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
         Ok(BatchForward::Output(output_batch)) => output_batch,
         Ok(BatchForward::DeadlineExceeded) => {
             emit_batch_deadline("initial sample");
-            return Ok(BatchedGraphPgdOutcome::Completed(None));
+            return Ok(BatchedGraphPgdOutcome::Completed {
+                result: None,
+                work_started: false,
+            });
         }
         Err(err) if should_retry_with_folded_batch(input.shape(), &err) => {
             layout = RestartBatchLayout::FoldLeadingAxis {
@@ -385,7 +397,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
                 BatchEval::Output(output_batch) => output_batch,
                 BatchEval::DeadlineExceeded => {
                     emit_batch_deadline("initial sample (folded)");
-                    return Ok(BatchedGraphPgdOutcome::Completed(None));
+                    return Ok(BatchedGraphPgdOutcome::Completed {
+                        result: None,
+                        work_started: false,
+                    });
                 }
                 BatchEval::Incompatible => {
                     return Ok(BatchedGraphPgdOutcome::FallbackToSequential);
@@ -421,7 +436,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
             // on expensive models (#four-walls).
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 emit_batch_deadline("OSI initialization");
-                return Ok(BatchedGraphPgdOutcome::Completed(None));
+                return Ok(BatchedGraphPgdOutcome::Completed {
+                    result: None,
+                    work_started: true,
+                });
             }
             let mut rng = super::graph_pgd::SimpleRng::new(42 + restart as u64);
             let osi_point = super::graph_pgd::initialize_graph_point(
@@ -438,7 +456,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
             BatchEval::Output(recomputed) => recomputed,
             BatchEval::DeadlineExceeded => {
                 emit_batch_deadline("OSI re-evaluation");
-                return Ok(BatchedGraphPgdOutcome::Completed(None));
+                return Ok(BatchedGraphPgdOutcome::Completed {
+                    result: None,
+                    work_started: true,
+                });
             }
             BatchEval::Incompatible => {
                 return Ok(BatchedGraphPgdOutcome::FallbackToSequential);
@@ -482,7 +503,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
                 constraints,
                 &ctx,
             )? {
-                return Ok(BatchedGraphPgdOutcome::Completed(Some(Box::new(pair))));
+                return Ok(BatchedGraphPgdOutcome::Completed {
+                    result: Some(Box::new(pair)),
+                    work_started: true,
+                });
             }
         }
     }
@@ -504,7 +528,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
                 step,
                 pgd_config.num_steps
             );
-            return Ok(BatchedGraphPgdOutcome::Completed(None));
+            return Ok(BatchedGraphPgdOutcome::Completed {
+                result: None,
+                work_started: true,
+            });
         }
 
         let mut perturbation_batch = ArrayD::zeros(IxDyn(
@@ -586,7 +613,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
             BatchEval::Output(outputs) => outputs,
             BatchEval::DeadlineExceeded => {
                 emit_batch_deadline("SPSA probe");
-                return Ok(BatchedGraphPgdOutcome::Completed(None));
+                return Ok(BatchedGraphPgdOutcome::Completed {
+                    result: None,
+                    work_started: true,
+                });
             }
             BatchEval::Incompatible => {
                 return Ok(BatchedGraphPgdOutcome::FallbackToSequential);
@@ -653,7 +683,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
             BatchEval::Output(recomputed) => recomputed,
             BatchEval::DeadlineExceeded => {
                 emit_batch_deadline("step re-evaluation");
-                return Ok(BatchedGraphPgdOutcome::Completed(None));
+                return Ok(BatchedGraphPgdOutcome::Completed {
+                    result: None,
+                    work_started: true,
+                });
             }
             BatchEval::Incompatible => {
                 return Ok(BatchedGraphPgdOutcome::FallbackToSequential);
@@ -676,7 +709,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
                     constraints,
                     &ctx,
                 )? {
-                    return Ok(BatchedGraphPgdOutcome::Completed(Some(Box::new(pair))));
+                    return Ok(BatchedGraphPgdOutcome::Completed {
+                        result: Some(Box::new(pair)),
+                        work_started: true,
+                    });
                 }
             }
         }
@@ -700,7 +736,10 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
                 constraints,
                 &ctx,
             )? {
-                return Ok(BatchedGraphPgdOutcome::Completed(Some(Box::new(pair))));
+                return Ok(BatchedGraphPgdOutcome::Completed {
+                    result: Some(Box::new(pair)),
+                    work_started: true,
+                });
             }
         }
     }
@@ -713,5 +752,8 @@ pub(super) fn try_graph_pgd_upfront_batched_with_config(
             engine_label
         ),
     );
-    Ok(BatchedGraphPgdOutcome::Completed(None))
+    Ok(BatchedGraphPgdOutcome::Completed {
+        result: None,
+        work_started: true,
+    })
 }

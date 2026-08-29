@@ -77,19 +77,15 @@ use core::contracts::ensures;
 use trust::ensures;
 
 /// Errors that can arise while building a deep certificate.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeepCrownError {
     /// A matrix/vector dimension did not line up.
-    #[error("dimension mismatch: {0}")]
     Dimension(String),
     /// The network has no hidden layers.
-    #[error("a deep network needs at least one hidden layer")]
     NoHiddenLayers,
     /// An α slope was outside `[0, 1]` (would make the lower envelope unsound).
-    #[error("alpha[layer {0}][unit {1}] must lie in [0, 1]")]
     AlphaOutOfRange(usize, usize),
     /// The requested safety threshold exceeds the certified lower bound.
-    #[error("threshold {threshold} exceeds certified lower bound {bound}")]
     ThresholdAboveBound {
         /// Requested threshold.
         threshold: String,
@@ -97,13 +93,11 @@ pub enum DeepCrownError {
         bound: String,
     },
     /// Exact arithmetic failure.
-    #[error(transparent)]
-    Rat(#[from] RatError),
+    Rat(RatError),
     /// A CROWN f64 intermediate bound was non-finite (NaN/±inf). We fail closed
     /// rather than convert it via a saturating `as i128` cast, which could clamp
     /// a lower bound up / an upper bound down and yield an unsound (too-tight)
     /// snapped enclosure.
-    #[error("non-finite CROWN intermediate bound: {0}")]
     NonFiniteBound(String),
     /// A 2-neuron joint cut was requested on a network whose input dimension is
     /// too large to enumerate `2ⁿ` box corners. We fail closed: the corner sweep
@@ -111,12 +105,10 @@ pub enum DeepCrownError {
     /// a silently WRONG joint upper bound `B_ij` — an UNSOUND cut premise. Rather
     /// than emit such a premise we reject the request. (`2ⁿ` is in any case far
     /// too expensive for `n` anywhere near this bound.)
-    #[error("cut box-corner enumeration needs input dim < 32, got {0}")]
     CutDimTooLarge(usize),
     /// The caller-installed wall-clock budget ([`crate::budget`]) expired while
     /// building the certificate. Certification is post-verdict, optional work,
     /// so this fails OPEN to "no certificate" — the verdict is unaffected.
-    #[error("certificate construction exceeded its wall-clock budget")]
     BudgetExceeded,
     /// The thread's rational interning arena is poisoned: one of the
     /// unreachable-by-construction fallback arms in [`crate::rational`] was
@@ -124,8 +116,81 @@ pub enum DeepCrownError {
     /// `Rat` touched on this thread since then is suspect, so certificate
     /// construction fails CLOSED (checked at entry and again before returning
     /// a built certificate — a poison that appears mid-build must also refuse).
-    #[error("rational arena poisoned (fallback arm was reached); certificate must not be trusted")]
     ArenaPoisoned,
+}
+
+// --- Hand-written `thiserror` expansion -------------------------------------
+//
+// `thiserror::Error` was removed from the derive list above so that ny-cert
+// carries NO proc-macro dependency: verified Targo refuses to admit a unit whose
+// build pulls an in-process proc macro (it shares rustc's argv/memory/stderr and
+// could forge TRUSTJSON proof transport), which in turn kept the bignum stack
+// (`num-bigint`/`num-rational`/`num-integer`/`num-traits`) outside the proof
+// frontier as unproven absent callees. The three impls below reproduce exactly
+// what `#[derive(thiserror::Error)]` generated — the `Display` strings are
+// byte-identical to the former `#[error("…")]` attributes, and `source()`
+// preserves the per-variant behaviour (see the note on `Rat`).
+
+impl core::fmt::Display for DeepCrownError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Dimension(msg) => write!(f, "dimension mismatch: {msg}"),
+            Self::NoHiddenLayers => write!(f, "a deep network needs at least one hidden layer"),
+            Self::AlphaOutOfRange(layer, unit) => {
+                write!(f, "alpha[layer {layer}][unit {unit}] must lie in [0, 1]")
+            }
+            Self::ThresholdAboveBound { threshold, bound } => {
+                write!(f, "threshold {threshold} exceeds certified lower bound {bound}")
+            }
+            // Was `#[error(transparent)]`: no message of its own, the inner
+            // error's `Display` IS this variant's `Display`. Delegating through
+            // `Display::fmt` (rather than `write!(f, "{e}")`) also forwards the
+            // formatter's width/fill/precision flags, exactly as thiserror did.
+            Self::Rat(e) => core::fmt::Display::fmt(e, f),
+            Self::NonFiniteBound(msg) => write!(f, "non-finite CROWN intermediate bound: {msg}"),
+            Self::CutDimTooLarge(n) => {
+                write!(f, "cut box-corner enumeration needs input dim < 32, got {n}")
+            }
+            Self::BudgetExceeded => {
+                write!(f, "certificate construction exceeded its wall-clock budget")
+            }
+            Self::ArenaPoisoned => write!(
+                f,
+                "rational arena poisoned (fallback arm was reached); certificate must not be trusted"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for DeepCrownError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            // `Rat` was `#[error(transparent)] Rat(#[from] RatError)`. thiserror
+            // forwards a transparent variant's `source()` STRAIGHT THROUGH to the
+            // inner error — it does *not* return `Some(inner)`. That is the whole
+            // point of `transparent`: the variant adds no message, so it adds no
+            // chain link either; returning `Some(inner)` would make a chain walk
+            // print the same message twice. Reproduced verbatim.
+            Self::Rat(e) => core::error::Error::source(e),
+            // Every other variant had no `#[source]`/`#[from]` field. Listed
+            // explicitly (no `_` arm) so a future variant is a compile error here
+            // rather than a silent `None`.
+            Self::Dimension(_)
+            | Self::NoHiddenLayers
+            | Self::AlphaOutOfRange(..)
+            | Self::ThresholdAboveBound { .. }
+            | Self::NonFiniteBound(_)
+            | Self::CutDimTooLarge(_)
+            | Self::BudgetExceeded
+            | Self::ArenaPoisoned => None,
+        }
+    }
+}
+
+impl From<RatError> for DeepCrownError {
+    fn from(source: RatError) -> Self {
+        Self::Rat(source)
+    }
 }
 
 /// Return `Err(BudgetExceeded)` iff the thread's certificate budget
@@ -511,7 +576,15 @@ impl DeepReluProblem {
         // an absent `<{closure} as Fn>::call` shim, so the accumulator update
         // stays in verified code. Captures nothing (only its params + `Rat::ZERO`).
         fn add_at(v: &mut [Rat], idx: usize, delta: Rat) -> Result<(), RatError> {
-            let cur = v.get(idx).copied().unwrap_or(Rat::ZERO);
+            // Explicit `match`, not `.unwrap_or(Rat::ZERO)`: identical semantics
+            // (`Rat` is `Copy`, so nothing is dropped either way), but the generic
+            // `Option::<T>::unwrap_or` is an absent callee the verifier must treat
+            // as may-panic, since for some `T` the discarded value has a panicking
+            // `Drop`. Writing the match monomorphises `T` to `Rat` and discharges.
+            let cur = match v.get(idx).copied() {
+                Some(x) => x,
+                None => Rat::ZERO,
+            };
             let next = cur.add(delta)?;
             if let Some(slot) = v.get_mut(idx) {
                 *slot = next;
@@ -1358,7 +1431,15 @@ impl DeepReluProblem {
         // an absent `<{closure} as Fn>::call` shim, so the accumulator update
         // stays in verified code. Captures nothing (only its params + `Rat::ZERO`).
         fn add_at(v: &mut [Rat], idx: usize, delta: Rat) -> Result<(), RatError> {
-            let cur = v.get(idx).copied().unwrap_or(Rat::ZERO);
+            // Explicit `match`, not `.unwrap_or(Rat::ZERO)`: identical semantics
+            // (`Rat` is `Copy`, so nothing is dropped either way), but the generic
+            // `Option::<T>::unwrap_or` is an absent callee the verifier must treat
+            // as may-panic, since for some `T` the discarded value has a panicking
+            // `Drop`. Writing the match monomorphises `T` to `Rat` and discharges.
+            let cur = match v.get(idx).copied() {
+                Some(x) => x,
+                None => Rat::ZERO,
+            };
             let next = cur.add(delta)?;
             if let Some(slot) = v.get_mut(idx) {
                 *slot = next;
@@ -2255,12 +2336,12 @@ mod tests {
         if let Ok(dir) = std::env::var("NY_CERT_OUT_DIR") {
             std::fs::write(
                 format!("{dir}/ny_deep_entailment.json"),
-                serde_json::to_string_pretty(&ent).unwrap(),
+                crate::json::to_string_pretty(&ent),
             )
             .unwrap();
             std::fs::write(
                 format!("{dir}/ny_deep_farkas.json"),
-                serde_json::to_string_pretty(&far).unwrap(),
+                crate::json::to_string_pretty(&far),
             )
             .unwrap();
         }

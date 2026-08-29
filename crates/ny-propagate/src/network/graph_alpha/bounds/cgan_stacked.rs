@@ -51,9 +51,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// `env::var(..).ok()` lookup this used to do inline, so a non-UTF-8 value still
 /// reads as absent); the arming RULE stays in the pure predicate below, which is
 /// unit-tested and is therefore the spec.
+///
+/// DELIVERY SEAM (#lever-reachability): the pure predicate below still owns the
+/// arming RULE and still decides whenever the environment speaks, in both
+/// directions; absent, the typed `bab.cgan_stacked_backward` key decides.
 pub(super) fn stacked_backward_enabled() -> bool {
-    stacked_backward_enabled_from_raw(
-        ny_levers::read_raw(&ny_levers::decls::cgan_stacked::CGAN_STACKED_BACKWARD).as_deref(),
+    ny_levers::gate::resolve_raw_predicate(
+        &ny_levers::decls::cgan_stacked::CGAN_STACKED_BACKWARD,
+        crate::preset_gates::cgan_stacked_backward_cell(),
+        false,
+        stacked_backward_enabled_from_raw,
     )
 }
 
@@ -74,9 +81,7 @@ fn stacked_backward_enabled_from_raw(raw: Option<&str>) -> bool {
 /// `0`: a zero-byte budget refuses every member, which is a different thing from
 /// absence.
 pub(super) fn stacked_budget_bytes() -> usize {
-    ny_levers::read(&ny_levers::decls::cgan_stacked::CGAN_STACKED_BUDGET_MB)
-        .value
-        .as_u64()
+    crate::preset_gates::cgan_stacked_budget_mb_override()
         .and_then(|mib| usize::try_from(mib).ok())
         .and_then(|mib| mib.checked_mul(1024 * 1024))
         .unwrap_or_else(cpu_crown_dense_budget_bytes)

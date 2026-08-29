@@ -1713,10 +1713,14 @@ fn true_alpha_grads_from_replay(
 /// Opt-out gate for the GPU-evaluated replay (`NY_TRUE_GRAD_GPU_REPLAY=0`
 /// disables; default ON where a caller supplies operands). The no-GPU path is
 /// untouched either way: callers that pass no operands are byte-identical.
+///
+/// DELIVERY SEAM (#lever-reachability): because the shipped default is ON, the
+/// typed `bab.true_grad_gpu_replay` key is a per-category KILL SWITCH — the
+/// CPU-only arm, previously expressible only through an environment variable
+/// the scored harness never exports. `NY_TRUE_GRAD_GPU_REPLAY` still wins in
+/// both directions where present.
 pub(crate) fn true_grad_gpu_replay_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::telemetry::TRUE_GRAD_GPU_REPLAY)
-        .value
-        .as_bool()
+    crate::preset_gates::true_grad_gpu_replay_enabled()
 }
 
 /// Borrowed operands for one GPU-evaluated replay. Constructed only around a

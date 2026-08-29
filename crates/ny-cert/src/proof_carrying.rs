@@ -18,8 +18,41 @@
 //! already justify, and it is **fail-closed** (a missing or ungrounded citation never
 //! yields a "certified" status). The planned `trust_verify` integration (task #24) is
 //! a v2 that emits the same `CertifiedModuloCite` status from inside the verifier.
+//!
+//! # Status: QUARANTINED — an external-harness surface with no in-crate caller
+//!
+//! **No code in this workspace calls [`compose_from_surveys`] or [`classify`].**
+//! Neither `certify_onnx` nor `certify_onnx_diff` nor `tcb_check`/`cite_check`
+//! composes a status, so today the TCB's L0/L1 story is *computable* and
+//! *unreported*: a reader who sees this module must not infer that any shipped
+//! artifact carries a `ProofCarryingStatus`.
+//!
+//! It is nevertheless **externally reachable** — `lib.rs` declares
+//! `pub mod proof_carrying`, so `ny_cert::proof_carrying::compose_from_surveys`
+//! is callable by any dependent. It is absent from the `lib.rs` `pub use` block
+//! on purpose: that block is the *certificate* API (emit / check / schema), and
+//! this is a reporting layer over verifier output, not part of the trusted
+//! certificate path. Reaching it through its module path is the intended import.
+//!
+//! ## What would have to be true to drive it
+//!
+//! It is input-shaped for a harness, not for a library caller: it needs the two
+//! `targo trust survey` JSON results — the structural one (no `--contracts`,
+//! giving L0) and the contracts one (adding the L1 postcondition) — plus a
+//! `(function, theorem)` cite-map, plus a Clean corpus root that
+//! [`crate::cite_check::citation_status`] can resolve against. Producing those
+//! means running the verifier twice and assembling the cite-map (`cite_check.rs`
+//! already builds cite-maps); none of that belongs inside `certify_onnx`, which
+//! is why the natural home is the `pub check` / `pub doctor` tooling path or an
+//! out-of-tree harness.
+//!
+//! Composition cannot loosen anything it reports on: every status is derived
+//! from verdicts the two surveys already established, and [`classify`] is
+//! fail-closed — an unresolved or ungrounded citation degrades to
+//! [`ProofCarryingStatus::Incomplete`], never to a certified status.
 
 use crate::cite_check::{citation_status, CitationStatus};
+use crate::json::Json;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -129,7 +162,7 @@ pub fn classify(
 /// accepting the last duplicate would let ordering decide which proof result
 /// is trusted, so callers must treat ambiguous survey evidence as absent.
 #[must_use]
-pub fn function_verdicts(survey: &serde_json::Value) -> HashMap<String, String> {
+pub fn function_verdicts(survey: &Json) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let mut seen_names = HashSet::new();
     if let Some(fns) = survey["functions"].as_array() {
@@ -165,8 +198,8 @@ pub fn function_verdicts(survey: &serde_json::Value) -> HashMap<String, String> 
 /// modulo its cited theorem (fail-closed via [`classify`]).
 #[must_use]
 pub fn compose_from_surveys(
-    structural: &serde_json::Value,
-    contracts: &serde_json::Value,
+    structural: &Json,
+    contracts: &Json,
     cite_map: &[(String, String)],
     corpus_root: &Path,
 ) -> Vec<(String, ProofCarryingStatus)> {
@@ -204,12 +237,31 @@ pub fn compose_from_surveys(
 mod tests {
     use super::*;
     use crate::cite_check::clean_corpus_root;
+    use crate::json::Map;
 
     const PROVED_CAPTURED: FunctionFacts = FunctionFacts {
         l0_proved: true,
         l1_postcond_captured: true,
         l1_postcond_discharged: false,
     };
+
+    /// A `targo trust survey` value carrying exactly the given
+    /// `(function, verdict)` rows — the shape [`function_verdicts`] reads:
+    /// `{"functions": [{"function": …, "summary": {"verdict": …}}, …]}`.
+    fn survey_of(rows: &[(&str, &str)]) -> Json {
+        let mut functions: Vec<Json> = Vec::new();
+        for (function, verdict) in rows {
+            let mut summary = Map::new();
+            summary.insert(String::from("verdict"), Json::Str((*verdict).to_string()));
+            let mut row = Map::new();
+            row.insert(String::from("function"), Json::Str((*function).to_string()));
+            row.insert(String::from("summary"), Json::Obj(summary));
+            functions.push(Json::Obj(row));
+        }
+        let mut top = Map::new();
+        top.insert(String::from("functions"), Json::Arr(functions));
+        Json::Obj(top)
+    }
 
     #[test]
     fn captured_postcondition_with_grounded_cite_is_modulo_cite() {
@@ -302,23 +354,12 @@ mod tests {
 
     #[test]
     fn duplicate_survey_rows_are_ambiguous_and_omitted() {
-        let survey = serde_json::json!({
-            "functions": [
-                { "function": "f", "summary": { "verdict": "HasViolations" } },
-                { "function": "f", "summary": { "verdict": "Verified" } },
-                { "function": "g", "summary": { "verdict": "Verified" } }
-            ]
-        });
+        let survey = survey_of(&[("f", "HasViolations"), ("f", "Verified"), ("g", "Verified")]);
         let verdicts = function_verdicts(&survey);
         assert!(!verdicts.contains_key("f"));
         assert_eq!(verdicts.get("g").map(String::as_str), Some("Verified"));
 
-        let mixed_validity = serde_json::json!({
-            "functions": [
-                { "function": "f", "summary": { "verdict": "Verified" } },
-                { "function": "f", "summary": { "verdict": "Error" } }
-            ]
-        });
+        let mixed_validity = survey_of(&[("f", "Verified"), ("f", "Error")]);
         assert!(
             !function_verdicts(&mixed_validity).contains_key("f"),
             "an invalid duplicate must still make trusted evidence ambiguous"
@@ -327,17 +368,8 @@ mod tests {
 
     #[test]
     fn duplicate_contract_evidence_never_certifies() {
-        let structural = serde_json::json!({
-            "functions": [
-                { "function": "f", "summary": { "verdict": "Verified" } }
-            ]
-        });
-        let contracts = serde_json::json!({
-            "functions": [
-                { "function": "f", "summary": { "verdict": "HasViolations" } },
-                { "function": "f", "summary": { "verdict": "Verified" } }
-            ]
-        });
+        let structural = survey_of(&[("f", "Verified")]);
+        let contracts = survey_of(&[("f", "HasViolations"), ("f", "Verified")]);
         let cite_map = vec![("f".to_string(), "farkas_premise_combination".to_string())];
         let cert = compose_from_surveys(&structural, &contracts, &cite_map, &clean_corpus_root());
         assert_eq!(
@@ -348,17 +380,9 @@ mod tests {
 
     #[test]
     fn unknown_contract_verdict_does_not_count_as_captured_evidence() {
-        let structural = serde_json::json!({
-            "functions": [
-                { "function": "f", "summary": { "verdict": "Verified" } }
-            ]
-        });
+        let structural = survey_of(&[("f", "Verified")]);
         for verdict in ["Error", "Skipped", "arbitrary"] {
-            let contracts = serde_json::json!({
-                "functions": [
-                    { "function": "f", "summary": { "verdict": verdict } }
-                ]
-            });
+            let contracts = survey_of(&[("f", verdict)]);
             assert!(!function_verdicts(&contracts).contains_key("f"));
             let cite_map = vec![("f".to_string(), "farkas_premise_combination".to_string())];
             let cert =
@@ -390,13 +414,9 @@ mod tests {
     #[test]
     fn compose_from_two_surveys_yields_modulo_cite() {
         // Structural survey (L0 only): check_farkas L0-safe → Verified.
-        let structural = serde_json::json!({
-            "functions": [{ "function": "selfcheck::check_farkas", "summary": { "verdict": "Verified" } }]
-        });
+        let structural = survey_of(&[("selfcheck::check_farkas", "Verified")]);
         // Contracts survey (L0 + L1): the postcondition fails → HasViolations.
-        let contracts = serde_json::json!({
-            "functions": [{ "function": "selfcheck::check_farkas", "summary": { "verdict": "HasViolations" } }]
-        });
+        let contracts = survey_of(&[("selfcheck::check_farkas", "HasViolations")]);
         let cite_map = vec![(
             "selfcheck::check_farkas".to_string(),
             "farkas_premise_combination".to_string(),
@@ -416,9 +436,7 @@ mod tests {
     #[test]
     fn compose_fail_closed_when_l0_unproved() {
         // If L0 safety is not Verified structurally, never certify — even with a cite.
-        let structural = serde_json::json!({
-            "functions": [{ "function": "selfcheck::check_farkas", "summary": { "verdict": "HasViolations" } }]
-        });
+        let structural = survey_of(&[("selfcheck::check_farkas", "HasViolations")]);
         let contracts = structural.clone();
         let cite_map = vec![(
             "selfcheck::check_farkas".to_string(),

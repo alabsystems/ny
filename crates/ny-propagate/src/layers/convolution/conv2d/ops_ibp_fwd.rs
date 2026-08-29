@@ -43,6 +43,10 @@ const DEADLINE_CPU_POLL_OPS: usize = 4_096;
 
 /// Computed output interval of a grouped forward conv, in (out_c, out_h, out_w)
 /// layout, before bias is applied.
+///
+/// `Debug` is required by the blocked-route tests, which assert refusals with
+/// `expect_err` — that needs the `Ok` type to be printable.
+#[derive(Debug)]
 pub(crate) struct ConvIbpForward {
     pub lower: ArrayD<f32>,
     pub upper: ArrayD<f32>,
@@ -425,7 +429,12 @@ pub(crate) struct Conv2dDeadlineGeometry {
 /// Validate shapes/params for the deadline scalar forwards and derive the
 /// output geometry. Error variants and messages are those of the historical
 /// [`conv2d_ibp_forward_grouped_with_deadline`] validation block, verbatim.
-fn conv2d_deadline_geometry(
+///
+/// `pub(super)` so the blocked-pollable twin
+/// (`ops_ibp_blocked::conv2d_ibp_forward_grouped_certified_f64_blocked_with_deadline`)
+/// validates through the SAME function and therefore refuses the same shapes
+/// with the same messages (#pollable-conv-ibp).
+pub(super) fn conv2d_deadline_geometry(
     input_lower: &ArrayViewD<'_, f32>,
     input_upper: &ArrayViewD<'_, f32>,
     kernel: &ArrayD<f32>,
@@ -555,6 +564,32 @@ fn conv2d_deadline_geometry(
     })
 }
 
+/// Resolve ONE axis of a window tap: output index `o`, kernel index `k` and
+/// that axis's stride/dilation/padding/input extent, to the source input
+/// coordinate, or `None` when the tap falls in the zero padding.
+///
+/// The two axes of [`conv2d_tap_source`] are INDEPENDENT — a tap is live iff
+/// both axes are — which is what lets the blocked kernel hoist the per-axis
+/// resolution into two small tables (`out_h·kh` + `out_w·kw` entries) instead
+/// of redoing this checked arithmetic once per MAC. Both the scalar and the
+/// blocked kernels bottom out here, so the two enumerate the SAME taps in the
+/// SAME order by construction (#pollable-conv-ibp).
+#[inline]
+pub(super) fn conv2d_tap_axis(
+    out_index: usize,
+    tap: usize,
+    stride: usize,
+    dilation: usize,
+    padding: usize,
+    extent: usize,
+) -> Option<usize> {
+    out_index
+        .checked_mul(stride)
+        .and_then(|base| tap.checked_mul(dilation)?.checked_add(base))
+        .and_then(|padded| padded.checked_sub(padding))
+        .filter(|&index| index < extent)
+}
+
 /// Resolve one window tap `(oh, ow, ki, kj)` to its source input coordinate,
 /// or `None` when the tap falls in the zero padding. This is the SINGLE
 /// implementation of the grouped/dilated/padded/strided tap index math shared
@@ -572,19 +607,8 @@ fn conv2d_tap_source(
     in_h: usize,
     in_w: usize,
 ) -> Option<(usize, usize)> {
-    let (sh, sw) = stride;
-    let (ph, pw) = padding;
-    let (dh, dw) = dilation;
-    let ih = oh
-        .checked_mul(sh)
-        .and_then(|base| ki.checked_mul(dh)?.checked_add(base))
-        .and_then(|padded| padded.checked_sub(ph))
-        .filter(|&index| index < in_h)?;
-    let iw = ow
-        .checked_mul(sw)
-        .and_then(|base| kj.checked_mul(dw)?.checked_add(base))
-        .and_then(|padded| padded.checked_sub(pw))
-        .filter(|&index| index < in_w)?;
+    let ih = conv2d_tap_axis(oh, ki, stride.0, dilation.0, padding.0, in_h)?;
+    let iw = conv2d_tap_axis(ow, kj, stride.1, dilation.1, padding.1, in_w)?;
     Some((ih, iw))
 }
 
@@ -746,7 +770,7 @@ const ERR_PRODUCT_SLACK_F64: f64 = 1.0 + 4.0 * f64::EPSILON;
 /// finite f32 is then still a sound (smaller) lower endpoint. `-inf` and NaN
 /// pass through (NaN is repaired conservatively by the caller).
 #[inline]
-fn certified_cast_lower_f32(value: f64) -> f32 {
+pub(super) fn certified_cast_lower_f32(value: f64) -> f32 {
     let cast = value as f32;
     if cast == f32::INFINITY {
         return f32::MAX;
@@ -759,7 +783,7 @@ fn certified_cast_lower_f32(value: f64) -> f32 {
 /// `value < -f32::MAX`, for which `-f32::MAX` is a sound (larger) upper
 /// endpoint.
 #[inline]
-fn certified_cast_upper_f32(value: f64) -> f32 {
+pub(super) fn certified_cast_upper_f32(value: f64) -> f32 {
     let cast = value as f32;
     if cast == f32::NEG_INFINITY {
         return -f32::MAX;
@@ -767,9 +791,66 @@ fn certified_cast_upper_f32(value: f64) -> f32 {
     next_up_f32(cast)
 }
 
+/// The typed deadline refusal EVERY finite-deadline certified Conv2d IBP
+/// forward returns, whichever kernel produced it.
+///
+/// The blocked twin (`ops_ibp_blocked`) returns this same value, so a caller's
+/// `is_deadline_exceeded()` / message-matching fallback behaviour is identical
+/// on both routes (#pollable-conv-ibp).
+pub(super) fn certified_conv_deadline_error() -> NyError {
+    NyError::DeadlineExceeded(
+        "Conv2d certified IBP forward: deadline exceeded during pollable f64 contraction"
+            .to_string(),
+    )
+}
+
+/// `(γ_{K+2}^{f64}, abs_inflate)` for a window of `macs = (in_c/groups)·kh·kw`
+/// taps, saturating to `+inf` when `n·u64 ≥ 1` exactly as the historical f32
+/// arm did for its γ.
+///
+/// Extracted so the scalar and blocked certified kernels cannot drift on the
+/// certificate constants: bit-identity of the two routes depends on `err`
+/// being computed from the SAME γ and inflation, not merely the same formula
+/// re-typed (#pollable-conv-ibp).
+pub(super) fn certified_f64_gamma_and_inflate(macs: usize) -> (f64, f64) {
+    let n_terms = macs.saturating_add(2) as f64;
+    let gamma = if n_terms * UNIT_ROUNDOFF_F64 < 1.0 {
+        (n_terms * UNIT_ROUNDOFF_F64) / (1.0 - n_terms * UNIT_ROUNDOFF_F64)
+    } else {
+        f64::INFINITY
+    };
+    // acc_abs's own accumulation deficit: true abs-sum ≤ acc_abs/(1−γ).
+    let abs_inflate = if gamma < 1.0 {
+        1.0 / (1.0 - gamma)
+    } else {
+        f64::INFINITY
+    };
+    (gamma, abs_inflate)
+}
+
+/// `err = γ_{K+2}^{f64} · (acc_abs · abs_inflate) · ERR_PRODUCT_SLACK_F64`.
+///
+/// One implementation, two callers (scalar + blocked). The multiplication
+/// ASSOCIATION is part of the value — `γ·(a·i)` is not bitwise `(γ·a)·i` — so
+/// this must stay a single expression, not a re-derivation at each site.
+#[inline]
+pub(super) fn certified_err_term(acc_abs: f64, gamma: f64, abs_inflate: f64) -> f64 {
+    gamma * (acc_abs * abs_inflate) * ERR_PRODUCT_SLACK_F64
+}
+
 /// Finite-deadline CERTIFIED grouped Conv2d interval forward: f64 dual
 /// accumulators with an exact per-output Higham widening
 /// (#cgan-conv-ibp-magnitude-floor).
+///
+/// # Throughput
+///
+/// This is the per-MAC pollable ORACLE. It is retained as the bit-identity
+/// reference for — and the kill-switch fallback of — the blocked-pollable
+/// twin in `ops_ibp_blocked.rs`, which folds every output over the same taps
+/// in the same order but hoists the tap-index arithmetic, drops `IxDyn`
+/// indexing for contiguous slices and polls between MAC-budgeted OUTPUT
+/// BLOCKS instead of every 4096 MACs. Ship changes to the accumulation,
+/// certificate or publication of EITHER kernel in both (#pollable-conv-ibp).
 ///
 /// This kernel REPLACES the finite-deadline arm's previous 3-pass f32
 /// structure (interval forward, then a second `|W|·max(|l|,|u|)` abs-conv
@@ -858,12 +939,7 @@ pub(crate) fn conv2d_ibp_forward_grouped_certified_f64_with_deadline(
     groups: usize,
     deadline: Instant,
 ) -> Result<ConvIbpForward> {
-    let deadline_error = || {
-        NyError::DeadlineExceeded(
-            "Conv2d certified IBP forward: deadline exceeded during pollable f64 contraction"
-                .to_string(),
-        )
-    };
+    let deadline_error = certified_conv_deadline_error;
     if Instant::now() >= deadline {
         return Err(deadline_error());
     }
@@ -901,18 +977,7 @@ pub(crate) fn conv2d_ibp_forward_grouped_certified_f64_with_deadline(
     // γ_{K+2}^{f64} over K window taps + bias + one term of slack; saturate to
     // +inf when n·u64 ≥ 1 exactly as the f32 arm did for its γ.
     let macs = in_c_per_group.saturating_mul(kh).saturating_mul(kw);
-    let n_terms = macs.saturating_add(2) as f64;
-    let gamma = if n_terms * UNIT_ROUNDOFF_F64 < 1.0 {
-        (n_terms * UNIT_ROUNDOFF_F64) / (1.0 - n_terms * UNIT_ROUNDOFF_F64)
-    } else {
-        f64::INFINITY
-    };
-    // acc_abs's own accumulation deficit: true abs-sum ≤ acc_abs/(1−γ).
-    let abs_inflate = if gamma < 1.0 {
-        1.0 / (1.0 - gamma)
-    } else {
-        f64::INFINITY
-    };
+    let (gamma, abs_inflate) = certified_f64_gamma_and_inflate(macs);
 
     if Instant::now() >= deadline {
         return Err(deadline_error());
@@ -973,7 +1038,7 @@ pub(crate) fn conv2d_ibp_forward_grouped_certified_f64_with_deadline(
                     acc_hi += b;
                     acc_abs += b.abs();
                 }
-                let err = gamma * (acc_abs * abs_inflate) * ERR_PRODUCT_SLACK_F64;
+                let err = certified_err_term(acc_abs, gamma, abs_inflate);
                 let output_index = oc * spatial + oh * out_w + ow;
                 if err.is_finite() {
                     lower_flat[output_index] = certified_cast_lower_f32(acc_lo - err);

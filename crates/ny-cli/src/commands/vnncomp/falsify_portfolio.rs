@@ -66,26 +66,32 @@ const PORTFOLIO_MIN_BUDGET: Duration = Duration::from_millis(800);
 
 /// Whether the portfolio lane is armed.
 ///
-/// Environment only, and deliberately: there is no typed `attack.*` preset key,
-/// so a competition harness (which exports no `NY_*`) cannot reach this lane at
-/// all. Exact `"1"` arms it, exact `"0"` disarms it, any other byte string is a
-/// recorded rejection resolving to the declaration's `false` default. Fails
-/// CLOSED.
+/// PROMOTED 2026-08-23 (#lever-reachability). The paragraph that used to sit
+/// here said it plainly: "Environment only, and deliberately: there is no typed
+/// `attack.*` preset key, so a competition harness (which exports no `NY_*`)
+/// cannot reach this lane at all." That was the defect, not a design — the lane
+/// produces SAT verdicts, which is the half of the score BaB cannot reach, and
+/// it could not be delivered.
+///
+/// Now: `NY_FALSIFY_PORTFOLIO` still wins in BOTH directions where present —
+/// exact `"1"` arms, exact `"0"` disarms, any other byte string is a recorded
+/// rejection resolving to the declaration's `false` default — and absent, the
+/// typed `attack.falsify_portfolio` key decides. No shipped yaml sets it, so
+/// the lane is still dark on every scored run today. Fails CLOSED.
 pub(crate) fn portfolio_falsify_armed() -> bool {
-    ny_levers::read(&ny_levers::decls::dark_probes::FALSIFY_PORTFOLIO_LANE)
-        .value
-        .as_bool()
+    crate::preset_gates::falsify_portfolio_armed()
 }
 
 /// The operator-supplied wall cap in seconds, or `None` for the derived rule.
 ///
 /// Read only after [`portfolio_falsify_armed`] has already returned true, so on
 /// a default run this declaration has no reader.
+///
+/// Same delivery seam as the lane gate above: `NY_FALSIFY_PORTFOLIO_SECONDS`
+/// wins in both directions, then the typed `attack.falsify_portfolio_secs` key,
+/// then the declaration's `0` (which selects the derived rule).
 fn portfolio_wall_cap() -> Option<Duration> {
-    let seconds = ny_levers::read(&ny_levers::decls::dark_probes::FALSIFY_PORTFOLIO_SECONDS)
-        .value
-        .as_u64()
-        .unwrap_or(0);
+    let seconds = crate::preset_gates::falsify_portfolio_secs_override().unwrap_or(0);
     (seconds > 0).then(|| Duration::from_secs(seconds))
 }
 

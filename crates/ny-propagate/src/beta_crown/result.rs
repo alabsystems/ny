@@ -4,10 +4,85 @@
 
 //! Result types for β-CROWN verification.
 
-use std::time::Duration;
+use std::cell::Cell;
+use std::time::{Duration, Instant};
 
 use ny_core::{Bound, MethodUsed, SoundnessProvenance, UnknownReason, VerificationResult};
 use ny_tensor::{repair_inverted_bounds, BoundedTensor, InversionRepair};
+
+#[derive(Clone, Copy, Default)]
+struct GlobalTimeoutDeadlineCapture {
+    armed: bool,
+    invocations: u32,
+    source: Option<Instant>,
+    poisoned: bool,
+}
+
+thread_local! {
+    /// Exact global deadline observed by the current thread's β-CROWN engine.
+    ///
+    /// This is receipt provenance, not verdict authority. Only engine seams
+    /// that themselves classify an expiry against their global deadline may
+    /// record it; late publication gates and phase-local caps must not. More
+    /// than one engine invocation in a top-level capture poisons the source so
+    /// a timeout from one relational row cannot be attributed to another.
+    static GLOBAL_TIMEOUT_DEADLINE_SOURCE: Cell<GlobalTimeoutDeadlineCapture> =
+        const { Cell::new(GlobalTimeoutDeadlineCapture {
+            armed: false,
+            invocations: 0,
+            source: None,
+            poisoned: false,
+        }) };
+}
+
+/// Reset typed timeout provenance before one top-level β-CROWN invocation.
+pub fn reset_global_timeout_deadline_source() {
+    GLOBAL_TIMEOUT_DEADLINE_SOURCE.with(|capture| {
+        capture.set(GlobalTimeoutDeadlineCapture {
+            armed: true,
+            ..GlobalTimeoutDeadlineCapture::default()
+        });
+    });
+}
+
+/// Register one engine invocation inside the active top-level capture.
+pub(crate) fn note_global_timeout_engine_invocation() {
+    GLOBAL_TIMEOUT_DEADLINE_SOURCE.with(|capture| {
+        let mut state = capture.get();
+        if !state.armed {
+            return;
+        }
+        state.invocations = state.invocations.saturating_add(1);
+        if state.invocations != 1 {
+            state.source = None;
+            state.poisoned = true;
+        }
+        capture.set(state);
+    });
+}
+
+/// Record a timeout only where the engine itself observed its global deadline.
+pub(crate) fn record_global_timeout_deadline_source(deadline: Option<Instant>) {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        GLOBAL_TIMEOUT_DEADLINE_SOURCE.with(|capture| {
+            let mut state = capture.get();
+            if state.armed && state.invocations == 1 && !state.poisoned {
+                state.source = deadline;
+                capture.set(state);
+            }
+        });
+    }
+}
+
+/// Take typed timeout provenance after the corresponding engine invocation.
+pub fn take_global_timeout_deadline_source() -> Option<Instant> {
+    GLOBAL_TIMEOUT_DEADLINE_SOURCE.with(|capture| {
+        let state = capture.take();
+        (state.armed && state.invocations == 1 && !state.poisoned)
+            .then_some(state.source)
+            .flatten()
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct BetaCrownResult {
@@ -296,6 +371,34 @@ mod tests {
         let beta = make_beta_result(BabVerificationStatus::Timeout);
         let result: VerificationResult = beta.into();
         assert!(matches!(result, VerificationResult::Timeout { .. }));
+    }
+
+    #[test]
+    fn global_timeout_deadline_source_is_exact_scoped_and_fail_closed() {
+        reset_global_timeout_deadline_source();
+        note_global_timeout_engine_invocation();
+        let future = Instant::now() + Duration::from_secs(1);
+        record_global_timeout_deadline_source(Some(future));
+        assert_eq!(take_global_timeout_deadline_source(), None);
+
+        reset_global_timeout_deadline_source();
+        note_global_timeout_engine_invocation();
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond before now is representable");
+        record_global_timeout_deadline_source(Some(expired));
+        assert_eq!(take_global_timeout_deadline_source(), Some(expired));
+        assert_eq!(take_global_timeout_deadline_source(), None);
+
+        reset_global_timeout_deadline_source();
+        note_global_timeout_engine_invocation();
+        note_global_timeout_engine_invocation();
+        record_global_timeout_deadline_source(Some(expired));
+        assert_eq!(
+            take_global_timeout_deadline_source(),
+            None,
+            "multiple engine calls must poison cross-invocation attribution"
+        );
     }
 
     #[ntest::timeout(5000)]

@@ -148,7 +148,14 @@ impl BoundPropagation for GELULayer {
             });
         }
 
-        BoundedTensor::new(out_lower, out_upper)
+        // Conservative-bounds convention (#3423 / deep-IBP overflow class): a
+        // deep stack under production-scale weights can legitimately saturate
+        // this layer's input to ±inf (outward-rounded Linear IBP overflows f32
+        // upstream), and `gelu_bound_interval` maps those endpoints to the
+        // correct limits (GELU(-inf) = 0, GELU(+inf) = +inf). An infinite
+        // endpoint is a sound, maximally conservative bound — reject only NaN
+        // (fail closed), never the saturation itself.
+        BoundedTensor::new_allow_infinite(out_lower, out_upper)
     }
 
     #[inline]

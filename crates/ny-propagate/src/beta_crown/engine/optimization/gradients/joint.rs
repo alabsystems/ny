@@ -341,7 +341,18 @@ impl BetaCrownVerifier {
                 }
                 // === All other layers: exhaustive IBP concretization (#3424) ===
                 // Every variant listed — no catch-all. Compiler catches new variants.
-                Layer::Tile(_)
+                // Interval-valued frozen constant: this joint-gradient backward
+                // builds `A*W` open-coded from `linear.weight()`, which has no
+                // place to put the enclosure. Take the sound concretize-through-
+                // IBP arm instead — a looser bound, never a wrong one.
+                //
+                // Conv3d joins them for the same reason from the other side: it
+                // has no certified rank-3-spatial transposed convolution, so
+                // there is no backward to open-code. Concretizing through its
+                // (certified) IBP forward is sound.
+                Layer::Conv3d(_)
+                | Layer::IntervalConst(_)
+                | Layer::Tile(_)
                 | Layer::Slice(_)
                 | Layer::Gather(_)
                 | Layer::ScatterAdd(_)
@@ -355,6 +366,7 @@ impl BetaCrownVerifier {
                 | Layer::SkipMerge(_)
                 | Layer::OpaqueSkip(_)
                 | Layer::QdqPerturbation(_)
+                | Layer::EpsilonExpand(_)
                 | Layer::MulBinary(_)
                 | Layer::Where(_)
                 | Layer::Div(_)
@@ -571,9 +583,15 @@ impl BetaCrownVerifier {
                 // A=0 → no upstream dependence; disables optimization for prior parameters.
                 Layer::Conv1d(_)
                 | Layer::Conv2d(_)
+                | Layer::Conv3d(_)
                 | Layer::ConvTranspose1d(_)
                 | Layer::ConvTranspose2d(_)
                 | Layer::Transpose(_)
+                // Interval-valued frozen constant: this joint-gradient backward
+                // builds `A*W` open-coded from `linear.weight()`, which has no
+                // place to put the enclosure. Take the sound concretize-through-
+                // IBP arm instead — a looser bound, never a wrong one.
+                | Layer::IntervalConst(_)
                 | Layer::Tile(_)
                 | Layer::Slice(_)
                 | Layer::Gather(_)
@@ -590,6 +608,7 @@ impl BetaCrownVerifier {
                 | Layer::SkipMerge(_)
                 | Layer::OpaqueSkip(_)
                 | Layer::QdqPerturbation(_)
+                | Layer::EpsilonExpand(_)
                 | Layer::MulBinary(_)
                 | Layer::Where(_)
                 | Layer::Div(_)

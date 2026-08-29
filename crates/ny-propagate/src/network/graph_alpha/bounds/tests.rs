@@ -3796,6 +3796,8 @@ fn test_crown_ibp_precomputed_short_deadline_falls_back_to_exact_ibp_3499() {
     graph.set_crown_ibp_per_node_time_budget(crate::types::CrownIbpPerNodeTimeBudget {
         floor_secs: Some(120.0),
         cap_secs: None,
+    prefix_cost_weighted: false,
+        max_target_share_frac: None,
     });
     let linear = LinearLayer::new(arr2(&[[1.5_f32, -0.25]]), Some(arr1(&[0.75_f32])))
         .expect("valid linear layer");
@@ -3829,12 +3831,39 @@ fn test_crown_ibp_precomputed_short_deadline_falls_back_to_exact_ibp_3499() {
         .expect("CROWN-IBP collection should fall back, not fail");
 
     let output_name = graph.output_name();
+    // #per-node-floor-label — CONTAINMENT, not finiteness: the share (60 s
+    // window, one target) is BELOW the configured 120 s floor, so the backward
+    // walk is REFUSED and never starts. It must be reported as a refusal, and it
+    // must NOT carry the label a genuine mid-walk overrun produces: this exact
+    // test asserted `PerNodeDeadlineExceeded` for weeks, which is why nine
+    // lsnc_relu targets that never executed read as timeouts in every log.
     assert_eq!(
+        result.provenance.get(output_name),
+        Some(&BoundsProvenance::ForwardFallback(
+            crate::types::CrownIbpFallbackReason::PerNodeBudgetBelowFloor
+        )),
+        "#per-node-floor-label: a below-floor share is a REFUSAL and must report \
+         PerNodeBudgetBelowFloor"
+    );
+    assert_ne!(
         result.provenance.get(output_name),
         Some(&BoundsProvenance::ForwardFallback(
             crate::types::CrownIbpFallbackReason::PerNodeDeadlineExceeded
         )),
-        "#3499 short per-node budget should report PerNodeDeadlineExceeded"
+        "#per-node-floor-label: a walk that never ran must never claim a deadline overrun"
+    );
+    assert!(
+        result.fallback_events.iter().any(|event| {
+            event.reason == crate::types::CrownIbpFallbackReason::PerNodeBudgetBelowFloor
+                && event.details.contains("REFUSED before any backward step")
+        }),
+        "#per-node-floor-label: the fallback EVENT must say the walk did not run, \
+         got {:?}",
+        result
+            .fallback_events
+            .iter()
+            .map(|event| (event.reason, event.details.clone()))
+            .collect::<Vec<_>>()
     );
     assert_bounded_tensor_close(
         result
@@ -3897,6 +3926,61 @@ fn test_crown_ibp_sequential_fast_path_short_deadline_respects_per_node_budget_4
         crown_bounds.max_width() <= ibp_output.max_width() + 1e-6,
         "#4413 CROWN-IBP bounds should be at least as tight as IBP"
     );
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn sequential_fast_path_uses_frozen_patches_flat_bias_policy() {
+    ny_test_utils::env::with_env_edits(|env| {
+        env.set("NY_PATCHES_DEADLINE_FLAT_BIAS", "0");
+
+        let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![0.5_f32, -0.25, 0.75, 0.4])
+            .expect("kernel");
+        let conv =
+            Conv2dLayer::with_input_shape(kernel, Some(arr1(&[0.1_f32])), (1, 1), (0, 0), 4, 4)
+                .expect("conv");
+        let mut graph = GraphNetwork::new();
+        graph.add_node(GraphNode::from_input("conv", Layer::Conv2d(conv)));
+        graph.add_node(GraphNode::new(
+            "relu",
+            Layer::ReLU(ReLULayer),
+            vec!["conv".into()],
+        ));
+        graph.set_output("relu");
+        let frozen =
+            std::sync::Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |name| {
+                (name == ny_levers::decls::crown_ibp_budget::PATCHES_DEADLINE_FLAT_BIAS.name)
+                    .then(|| "1".to_owned())
+            }));
+        graph.set_frozen_levers(Some(frozen));
+
+        let input = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[1, 4, 4]), -0.4_f32),
+            ArrayD::from_elem(IxDyn(&[1, 4, 4]), 0.7_f32),
+        )
+        .expect("input");
+        let ibp = graph.collect_node_bounds(&input).expect("IBP bounds");
+        let exec_order = graph.exec_order().expect("execution order").to_vec();
+        let _ = crate::layers::convolution::conv2d::take_last_flat_bias_policy();
+
+        graph
+            .try_collect_crown_ibp_bounds_via_sequential_network(
+                &exec_order,
+                &input,
+                &ibp,
+                Some(&NaiveCpuGemmEngine),
+                None,
+                graph.crown_ibp_runtime_policy(),
+            )
+            .expect("sequential delegate succeeds")
+            .expect("unary graph takes sequential delegate");
+
+        assert_eq!(
+            crate::layers::convolution::conv2d::take_last_flat_bias_policy(),
+            Some(true),
+            "the graph's frozen authority must override the opposite live environment on the sequential shortcut",
+        );
+    });
 }
 
 #[ntest::timeout(10000)]

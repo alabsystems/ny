@@ -8,8 +8,13 @@
 //! (Ziyin et al., 2020). Used in neural audio synthesis (e.g., BigVGAN).
 //!
 //! Properties:
-//! - Monotonically non-decreasing: f'(x) = 1 + sin(2ax) >= 0
-//! - Output range: f(x) ∈ [x, x + 1/a] for all x
+//! - Monotonically non-decreasing for EVERY real `a`: f'(x) = 1 + sin(2ax) >= 0
+//!   (the `a` in the quotient rule cancels)
+//! - Output range: f(x) ∈ [x, x + 1/a] for a > 0; f(x) ∈ [x - 1/|a|, x] for
+//!   a < 0 (the periodic term takes the sign of `a`)
+//! - Point reflection: f_a(x) = -f_{|a|}(-x) exactly in real arithmetic
+//!   (1/a = -1/|a| and sin² is even) — the negative-alpha envelope is the
+//!   reflected positive-alpha envelope, see [`snake_linear_relaxation`]
 //! - Frequency parameter `a` controls oscillation frequency
 //!
 //! Reference: avoice Snake kernel uses this as `x + (1/alpha) * sin²(alpha * x)`.
@@ -34,14 +39,17 @@ pub struct SnakeLayer {
 impl SnakeLayer {
     /// Create a new Snake layer with the given scalar alpha parameter.
     ///
-    /// Requires `a > 0`. The Ziyin et al. 2020 paper defines Snake only for
-    /// positive alpha parameters. Negative `a` causes unsound CROWN
-    /// relaxation bounds because `enumerate_periodic_points` produces an
-    /// empty range when `a < 0` (#3095).
+    /// Requires `a` finite and non-zero (the Snake form divides by `a`; both
+    /// IEEE zeros are refused). Negative `a` is certified via the point
+    /// reflection `f_a(x) = -f_{|a|}(-x)` in [`snake_linear_relaxation`];
+    /// production checkpoints (Kokoro `alpha1/alpha2`) carry small negative
+    /// alphas. The #3095 unsoundness (empty `enumerate_periodic_points`
+    /// range for `a < 0`) is unreachable: the chord path only ever sees
+    /// `a > 0` behind the reflection.
     pub fn new(a: f32) -> Result<Self> {
-        if a <= 0.0 || !a.is_finite() {
+        if a == 0.0 || !a.is_finite() {
             return Err(NyError::InvalidSpec(format!(
-                "Snake frequency parameter `a` must be positive and finite, got {a}"
+                "Snake frequency parameter `a` must be finite and non-zero, got {a}"
             )));
         }
         Ok(Self {
@@ -50,6 +58,9 @@ impl SnakeLayer {
     }
 
     /// Create a Snake layer with per-channel alpha values.
+    ///
+    /// Each element must be finite and non-zero; signs may be MIXED within
+    /// one alpha tensor (the Kokoro checkpoint mixes signs per channel).
     pub fn per_channel(alpha: Array1<f32>) -> Result<Self> {
         if alpha.is_empty() {
             return Err(NyError::InvalidSpec(
@@ -57,9 +68,9 @@ impl SnakeLayer {
             ));
         }
         for (i, &a) in alpha.iter().enumerate() {
-            if a <= 0.0 || !a.is_finite() {
+            if a == 0.0 || !a.is_finite() {
                 return Err(NyError::InvalidSpec(format!(
-                    "Snake alpha[{i}] must be positive and finite, got {a}"
+                    "Snake alpha[{i}] must be finite and non-zero, got {a}"
                 )));
             }
         }
@@ -307,6 +318,26 @@ fn enumerate_periodic_points(
 /// take the exact monotone enclosure; small `|a|` and unresolvable phase take
 /// the universal band.
 ///
+/// NEGATIVE `a` is handled by point reflection, not by its own derivation.
+/// `f_a(x) = -f_{|a|}(-x)` EXACTLY in real arithmetic (`1/a = -1/|a|`, `sin²`
+/// even), so a sound relaxation `Ls·t + Li ≤ f_{|a|}(t) ≤ Us·t + Ui` on
+/// `t ∈ [-u, -l]` becomes, substituting `t = -x` and negating (which reverses
+/// the inequalities and SWAPS the lower/upper roles):
+///
+/// ```text
+///     Us·x - Ui  ≤  f_a(x)  ≤  Ls·x - Li      for all real x ∈ [l, u]
+/// ```
+///
+/// Every value in the transfer (`-l`, `-u`, `-Li`, `-Ui`) is an exact IEEE
+/// negation, so the reflection adds ZERO rounding obligations: the positive
+/// path's `next_up` on its upper intercept becomes a downward-rounded lower
+/// intercept after negation, and vice versa — outward stays outward. The swap
+/// itself is load-bearing: applying the lines to their original sides is
+/// silently unsound in both directions. The reflection also keeps the #3095
+/// chord-path defects (empty `enumerate_periodic_points` range, inverted
+/// conservative fallback) unreachable — no `sin`-evaluating branch ever
+/// executes with `a < 0`.
+///
 /// THE THRESHOLDS HERE ARE RELATIVE TO `a`, NOT ABSOLUTE. Every earlier
 /// violation this function had came from an absolute cutoff applied to a
 /// function whose only intrinsic scale is `1/a`: `|a| < 1e-8 ⇒ identity` (the
@@ -316,6 +347,18 @@ fn enumerate_periodic_points(
 pub(crate) fn snake_linear_relaxation(l: f32, u: f32, a: f32) -> LinearRelaxation {
     if l.is_nan() || u.is_nan() || a.is_nan() {
         return LinearRelaxation::nan_fallback();
+    }
+    // Point-reflection transfer for negative alpha (see the doc comment).
+    // Strict `<` on purpose: `-0.0` continues to the band branch below, which
+    // resolves both zeros to the exact identity limit — same as `+0.0`.
+    if a < 0.0 {
+        let r = snake_linear_relaxation(-u, -l, -a);
+        return LinearRelaxation::new(
+            r.upper_slope,
+            -r.upper_intercept,
+            r.lower_slope,
+            -r.lower_intercept,
+        );
     }
     let l64 = f64::from(l);
     let u64 = f64::from(u);
@@ -433,6 +476,13 @@ fn snake_monotone_enclosure(l64: f64, u64: f64, a64: f64) -> LinearRelaxation {
 ///
 /// `d` is single-signed — it takes the sign of `a`, since `sin² ≥ 0` — so the
 /// band is one-sided and only the intercept on that side moves.
+///
+/// With the point-reflection transfer at the top of
+/// [`snake_linear_relaxation`], negative `a` normally arrives here already
+/// reflected to `|a|` (the reflected band `(1, -B, 1, 0)` is the same
+/// one-sided answer, one ulp tighter than this function's own negative
+/// branch). The `a64 < 0.0` branch below is retained as defense in depth for
+/// any direct caller.
 fn snake_band_relaxation(l: f32, u: f32, a: f32) -> LinearRelaxation {
     let a64 = f64::from(a);
     // `M` may be infinite (this branch is reached before the infinite-bound

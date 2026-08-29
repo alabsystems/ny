@@ -285,6 +285,13 @@ pub(super) fn backward_pass_core(
                     linear_bounds = next;
                 }
             }
+            Layer::IntervalConst(ic) => {
+                // Same scalar backward as Linear; alpha reparameterizes ReLU
+                // slopes only, so the enclosure discharge is orthogonal to it.
+                if let Cow::Owned(next) = ic.propagate_linear(&linear_bounds)? {
+                    linear_bounds = next;
+                }
+            }
             Layer::ReLU(r) => {
                 if let Some(&relu_idx) = config.layer_to_relu_idx.get(&layer_idx) {
                     // Store intermediates before ReLU if requested
@@ -328,6 +335,10 @@ pub(super) fn backward_pass_core(
             // Every variant listed — no catch-all. Compiler catches new variants.
             Layer::Conv1d(_)
             | Layer::Conv2d(_)
+            // Conv3d has no CROWN backward; `propagate_generic_layer_backward`
+            // reaches its `propagate_crown_backward`, gets `UnsupportedOp`, and
+            // returns `BackwardPassResult::Fallback` — the sound degrade.
+            | Layer::Conv3d(_)
             | Layer::ConvTranspose1d(_)
             | Layer::ConvTranspose2d(_)
             | Layer::Transpose(_)
@@ -343,6 +354,7 @@ pub(super) fn backward_pass_core(
             | Layer::SkipMerge(_)
             | Layer::OpaqueSkip(_)
             | Layer::QdqPerturbation(_)
+            | Layer::EpsilonExpand(_)
             | Layer::MulBinary(_)
             | Layer::Where(_)
             | Layer::Div(_)

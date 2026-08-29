@@ -5,12 +5,12 @@
 //! Property-bound attachment for the certified imgSz32 cGAN leaf-row bounder.
 //!
 //! The bounder itself is deliberately verdict-neutral.  This module is the
-//! narrow authority layer: an exact `cgan_2023` route, authored ONNX/profile
-//! seal, exact-decimal scalar-moat parse, complete two-singleton planner, graph
-//! scope, five-dimensional leaf, one caller deadline, and one logical
-//! peak-live ceiling must all agree before both strict safe inequalities can
-//! discharge a leaf.  Every mismatch is `Undecided`; this lane never returns a
-//! SAT verdict.
+//! narrow authority layer: an exact `cgan_2023`/`cgan2026` category allowlist,
+//! authored ONNX/profile seal, exact-decimal scalar-moat parse, complete
+//! two-singleton planner, graph scope, five-dimensional leaf, one caller
+//! deadline, and one logical peak-live ceiling must all agree before both
+//! strict safe inequalities can discharge a leaf. Every mismatch is
+//! `Undecided`; this lane never returns a SAT verdict.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2307,7 +2307,7 @@ impl GraphMipLeafOracle for CganInputLeafOracle {
     }
 }
 
-/// Build the exact-category, default-dark imgSz32 cGAN input-leaf oracle.
+/// Build the exact-allowlist, default-dark imgSz32 cGAN input-leaf oracle.
 ///
 /// All constructor failures are ordinary declines.  The underlying authored
 /// seal is replayed again on every leaf report before row bounds are consumed.
@@ -2465,7 +2465,7 @@ pub(super) fn maybe_cgan_input_leaf_oracle(
             .total_wall_budget
             .as_secs_f64(),
         depth_two_production_mode = CGAN_DEPTH_TWO_PRODUCTION_MODE,
-        "cGAN input-leaf oracle armed (default-dark exact cgan_2023 route; depth-two replay disabled)"
+        "cGAN input-leaf oracle armed (default-dark exact cgan_2023/cgan2026 allowlist; depth-two replay disabled)"
     );
     Some(CganInputLeafAttachment(Arc::new(CganInputLeafOracle {
         profile,

@@ -325,6 +325,43 @@ pub fn any_rows_retained(root: &RootGates) -> bool {
         .any(|l: &LayerGates| l.clip_rows.is_some())
 }
 
+/// THE FAIL-CLOSED FRAME GATE, shared by every Clip-and-Verify consumer.
+///
+/// A retained row in the wrong frame (transposed, output-relative, or missing
+/// the augmented bias) still produces plausible numbers, and the halfspace built
+/// from it cuts away part of the TRUE subdomain — a false-`unsat` generator, and
+/// exactly how the sequential clip earned its quarantine. So every consumer must
+/// pass this before it may tighten anything.
+///
+/// WHY IT LIVES HERE. It used to be a private `OnceLock` inside
+/// `bab::clip_tighten_pack`, which meant the y-box consumer was guarded and the
+/// INTERMEDIATE-gate consumer (`engine::clip_tighten_gates`) was not — and the
+/// intermediate consumer is the more dangerous of the two, because it is the one
+/// that can mark a domain `infeasible` and CLOSE it outright without any
+/// backward pass ever disagreeing. One latch, checked once per process, shared
+/// by both; a failure disables the whole path for the run rather than degrading
+/// it quietly.
+///
+/// TOLERANCE 0.5, preserved verbatim from the y-box consumer's own note:
+/// `concretize_box` widens both sides by an additive certified slack this check
+/// does not re-derive (measured on cifar100 idx_8600 at ~1e-4 relative), while a
+/// REAL frame error is wrong by factors, not by one slack term.
+#[must_use]
+pub fn frame_ok(root: &RootGates) -> bool {
+    static FRAME_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FRAME_OK.get_or_init(|| {
+        let ok = super::root::clip_rows_frame_holds(root, 0.5);
+        if !ok {
+            eprintln!("[clip] FRAME CHECK FAILED - clip-and-verify disabled for this run");
+        } else {
+            // R9: the gate is a precondition of every clip measurement, so a
+            // run must be able to prove it PASSED rather than never ran.
+            eprintln!("[clip] frame check PASSED (tol 0.5) - clip consumers admitted");
+        }
+        ok
+    })
+}
+
 /// Non-negative tightening deltas for a set of concretized rows.
 ///
 /// For each column `ri` of `a` (shape `(n_in, r)`), returns

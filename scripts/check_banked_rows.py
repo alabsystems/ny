@@ -108,6 +108,27 @@ CAUSE_EARLY_GIVE_UP = "BOUND-REGRESSION(early-give-up)"
 CAUSE_MISSING_INPUT = "MISSING-INPUT"
 CAUSE_UNCLASSIFIED = "UNCLASSIFIED-REGRESSION"
 
+# Fixed publication reserve mirrored from
+# crates/ny-cli/src/commands/vnncomp.rs::internal_timeout_secs /
+# MIN_RESULTS_FLUSH_RESERVE_SECS. Kept here so the classifier compares a run
+# against NY'S OWN deadline rather than the scored budget.
+_NY_MIN_FLUSH_RESERVE_SECS = 5
+
+
+def ny_internal_solver_deadline(budget: float) -> float:
+    """Seconds of solve NY actually grants itself inside a scored budget.
+
+    NY never runs to the scored budget: it reserves
+    ``max(5, budget // 20)`` seconds to translate the verdict and publish
+    RESULTS_FILE atomically, and hands the verifier the remainder. On a 20 s
+    row that is 15 s — 75% of the budget — so a genuine budget-wall timeout
+    lands nowhere near a fixed 85%-of-budget threshold.
+    """
+    whole = int(budget)
+    grace = max(_NY_MIN_FLUSH_RESERVE_SECS, whole // 20)
+    solver = whole - grace
+    return float(solver) if solver >= 1 else float(whole)
+
 PRESET_MARKER = "Loading preset:"
 BACKEND_OVERRIDE_MARKER = "NY-HARNESS: BACKEND-OVERRIDE"
 LOAD_FAILURE_MARKERS = (
@@ -204,7 +225,13 @@ def load_ledger(path: Path) -> list[BankedRow]:
                     vnnlib=vnnlib,
                     verdict=verdict,
                     seconds=elapsed,
-                    ledger=str(path.relative_to(REPO)) if path.is_relative_to(REPO) else str(path),
+                    # POSIX form so a ledger identity does not depend on the host
+                    # that produced it.
+                    ledger=(
+                        path.relative_to(REPO).as_posix()
+                        if path.is_relative_to(REPO)
+                        else path.as_posix()
+                    ),
                 )
             )
     return rows
@@ -402,7 +429,16 @@ def classify(
     if any(marker in log for marker in CRASH_MARKERS):
         return False, f"{CAUSE_CRASH}{modifier}"
     if observed in ("timeout", "unknown"):
-        primary = CAUSE_BUDGET_WALL if elapsed >= 0.85 * budget else CAUSE_EARLY_GIVE_UP
+        # A run that reached NY's own internal deadline hit a WALL, even though
+        # that deadline is only 75% of a 20 s budget. Taking the min keeps the
+        # historical 85%-of-budget rule for long rows and can only ever move a
+        # row from "early-give-up" to "budget-wall", never the other way.
+        wall_threshold = min(
+            0.85 * budget, 0.95 * ny_internal_solver_deadline(budget)
+        )
+        primary = (
+            CAUSE_BUDGET_WALL if elapsed >= wall_threshold else CAUSE_EARLY_GIVE_UP
+        )
         return False, f"{primary}{modifier}"
     return False, f"{CAUSE_UNCLASSIFIED}{modifier}"
 

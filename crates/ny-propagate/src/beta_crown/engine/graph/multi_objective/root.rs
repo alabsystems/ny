@@ -10638,12 +10638,14 @@ fn resolve_root_wide_demanded_interm_crown_policy(
     })
 }
 
+/// DELIVERY SEAM (#lever-reachability): env first in BOTH directions, then the
+/// typed `bab.root_wide_demanded_interm_crown` key, then the declaration's
+/// dark default. Before the key existed this phase could not be selected on a
+/// scored run at all — `run_instance.sh` exports no `NY_*`.
 pub(super) fn root_wide_demanded_interm_crown_policy() -> Option<RootWideDemandedIntermCrownPolicy>
 {
     resolve_root_wide_demanded_interm_crown_policy(
-        ny_levers::read(&ny_levers::decls::collection::ROOT_WIDE_DEMANDED_INTERM_CROWN)
-            .value
-            .as_bool(),
+        crate::preset_gates::root_wide_demanded_interm_crown_enabled(),
     )
 }
 
@@ -10822,10 +10824,12 @@ mod bab_floor_split_tests {
 /// request, still honours `max_device_bytes` and the deadline, and the host still
 /// commits shrink-only. An over-large request is refused by the backend, which is
 /// exactly the signal being measured. Absent/malformed leaves the shipped cap.
+///
+/// DELIVERY SEAM (#lever-reachability): env first in BOTH directions, then the
+/// typed `bab.root_comprehensive_gpu_interm_rows` key, then the declaration's
+/// absent default (which keeps the shipped cap).
 fn root_comprehensive_gpu_interm_rows_override() -> Option<usize> {
-    ny_levers::read(&ny_levers::decls::comprehensive_rows::ROOT_COMP_GPU_INTERM_ROWS)
-        .value
-        .as_u64()
+    crate::preset_gates::root_comprehensive_gpu_interm_rows_override()
         .and_then(|rows| usize::try_from(rows).ok())
         .filter(|rows| *rows > 0)
 }
@@ -10842,11 +10846,12 @@ fn root_comprehensive_gpu_interm_rows_override() -> Option<usize> {
 /// Raising it cannot make a bound unsound — every chunk is still atomic,
 /// deadline-bounded and shrink-only — it can only spend more of the budget here
 /// and less elsewhere, which is exactly the trade being measured.
+///
+/// DELIVERY SEAM (#lever-reachability): env first in BOTH directions, then the
+/// typed `bab.root_comprehensive_gpu_interm_secs` key, then the declaration's
+/// absent default (which keeps the shipped slice).
 fn root_comprehensive_gpu_interm_secs_override() -> Option<u64> {
-    ny_levers::read(&ny_levers::decls::comprehensive_rows::ROOT_COMP_GPU_INTERM_SECS)
-        .value
-        .as_u64()
-        .filter(|secs| *secs > 0)
+    crate::preset_gates::root_comprehensive_gpu_interm_secs_override().filter(|secs| *secs > 0)
 }
 
 fn resolve_root_comprehensive_gpu_interm_crown_policy(
@@ -10867,35 +10872,44 @@ fn resolve_root_comprehensive_gpu_interm_crown_policy(
 }
 
 /// DELIVERY SEAM (`measured_gate_delivery.rs`): the scored entry point exports
-/// exactly one `NY_*` variable, so an env-only gate cannot fire in competition
+/// no `NY_*` variables, so an env-only gate cannot fire in competition
 /// however well it measured. The typed preset key is therefore the primary
-/// source and the env lever is an explicit force-on override for A/B/rollback.
+/// source and the env lever remains an override in BOTH directions for
+/// A/B/rollback. A present malformed env value suppresses the preset and lands
+/// on the declaration default, exactly as [`ny_levers::read_over_config`]
+/// specifies.
 pub(super) fn root_comprehensive_gpu_interm_crown_policy(
     config: &BetaCrownConfig,
 ) -> Option<RootComprehensiveGpuIntermCrownPolicy> {
-    let lever_on =
-        ny_levers::read(&ny_levers::decls::collection::ROOT_COMPREHENSIVE_GPU_INTERM_CROWN)
-            .value
-            .as_bool();
-    // Consult the GOVERNED lever, not a raw env read, so this stays inside the
-    // registry's chokepoint. Only an EXPLICIT environment value overrides the
-    // preset: the declaration's own default is `1`, so testing the value alone
-    // would let the shipped default silently beat the preset key and the typed
-    // delivery would be dead on arrival — the exact failure this seam exists to
-    // prevent. `Source::LegacyEnv` is the only source that means "a human asked
-    // for this"; `LegacyEnvRejected` deliberately does NOT qualify, because a
-    // malformed override is a kill switch rather than permission to reveal a
-    // preset.
-    let lever = ny_levers::read(&ny_levers::decls::comprehensive_rows::INTERM_ROW_CHUNKS);
-    let chunks = if matches!(lever.source, ny_levers::Source::LegacyEnv) {
-        usize::try_from(lever.value.as_u64().unwrap_or(1)).unwrap_or(1)
-    } else {
-        config.root_comprehensive_gpu_interm_chunks
-    };
-    resolve_root_comprehensive_gpu_interm_crown_policy(
-        config.root_comprehensive_gpu_interm || lever_on,
-        chunks,
+    root_comprehensive_gpu_interm_crown_policy_from_layered(
+        ny_levers::read_over_config(
+            &ny_levers::decls::collection::ROOT_COMPREHENSIVE_GPU_INTERM_CROWN,
+            Some(ny_levers::LeverValue::Bool(
+                config.root_comprehensive_gpu_interm,
+            )),
+        ),
+        ny_levers::read_over_config(
+            &ny_levers::decls::comprehensive_rows::INTERM_ROW_CHUNKS,
+            u64::try_from(config.root_comprehensive_gpu_interm_chunks)
+                .ok()
+                .map(ny_levers::LeverValue::U64),
+        ),
     )
+}
+
+fn root_comprehensive_gpu_interm_crown_policy_from_layered(
+    enabled: std::result::Result<ny_levers::Resolved, ny_levers::ResolveError>,
+    chunks: std::result::Result<ny_levers::Resolved, ny_levers::ResolveError>,
+) -> Option<RootComprehensiveGpuIntermCrownPolicy> {
+    let enabled = enabled
+        .map(|resolved| resolved.value.as_bool())
+        .unwrap_or(false);
+    let chunks = chunks
+        .ok()
+        .and_then(|resolved| resolved.value.as_u64())
+        .and_then(|chunks| usize::try_from(chunks).ok())
+        .unwrap_or(1);
+    resolve_root_comprehensive_gpu_interm_crown_policy(enabled, chunks)
 }
 
 /// Default-dark phase-resident dense plus comprehensive sweep policy.
@@ -10935,11 +10949,14 @@ fn resolve_root_phase_resident_crown_policy(enabled: bool) -> Option<RootPhaseRe
     })
 }
 
+/// DELIVERY SEAM (#lever-reachability): env first in BOTH directions, then the
+/// typed `bab.root_phase_resident_crown` key, then the declaration's dark
+/// default. This phase OWNS the root slot when armed, so it decides which
+/// intermediate tightening the whole instance gets — and until the key existed
+/// no scored run could ever select it.
 pub(super) fn root_phase_resident_crown_policy() -> Option<RootPhaseResidentCrownPolicy> {
     resolve_root_phase_resident_crown_policy(
-        ny_levers::read(&ny_levers::decls::collection::ROOT_PHASE_RESIDENT_CROWN)
-            .value
-            .as_bool(),
+        crate::preset_gates::root_phase_resident_crown_enabled(),
     )
 }
 
@@ -11493,6 +11510,7 @@ mod root_crown_interm_tests {
         resolve_root_comprehensive_gpu_interm_crown_policy, resolve_root_crown_interm_policy,
         resolve_root_phase_resident_crown_policy, resolve_root_sparse_interm_crown_policy,
         resolve_root_wide_demanded_interm_crown_policy,
+        root_comprehensive_gpu_interm_crown_policy_from_layered,
         root_interm_cuda_factory_requested_from_raw, root_interm_engine_route,
         root_intermediate_tightening_changed, root_sparse_finite_deadline_capability_usable,
         root_sparse_gate_env, shrink_only_intersect, RootCrownIntermSelection,
@@ -11960,6 +11978,49 @@ mod root_crown_interm_tests {
         assert_eq!(policy.max_targets, 16);
         assert_eq!(policy.max_device_bytes, 12 * 1024 * 1024 * 1024);
         assert_eq!(policy.max_secs, 20);
+    }
+
+    #[test]
+    fn comprehensive_gpu_interm_env_precedence_covers_both_directions_and_rejection() {
+        let policy = |gate_raw: Option<&str>,
+                      chunks_raw: Option<&str>,
+                      preset_gate: bool,
+                      preset_chunks: u64| {
+            let gate_raw = gate_raw.map(str::to_owned);
+            let chunks_raw = chunks_raw.map(str::to_owned);
+            root_comprehensive_gpu_interm_crown_policy_from_layered(
+                ny_levers::read_over_config_with(
+                    &ny_levers::decls::collection::ROOT_COMPREHENSIVE_GPU_INTERM_CROWN,
+                    move |_| gate_raw,
+                    Some(ny_levers::LeverValue::Bool(preset_gate)),
+                ),
+                ny_levers::read_over_config_with(
+                    &ny_levers::decls::comprehensive_rows::INTERM_ROW_CHUNKS,
+                    move |_| chunks_raw,
+                    Some(ny_levers::LeverValue::U64(preset_chunks)),
+                ),
+            )
+        };
+
+        assert_eq!(policy(None, None, true, 64).unwrap().chunks, 64);
+        assert!(policy(Some("0"), None, true, 64).is_none());
+        assert!(
+            policy(Some("true"), None, true, 64).is_none(),
+            "a present malformed env must suppress preset ON"
+        );
+        assert_eq!(policy(Some("1"), Some("1"), true, 64).unwrap().chunks, 1);
+        assert_eq!(
+            policy(Some("1"), Some("malformed"), true, 64)
+                .unwrap()
+                .chunks,
+            1,
+            "malformed chunks must suppress the preset and land on declaration default 1"
+        );
+        assert_eq!(policy(Some("1"), Some("64"), false, 1).unwrap().chunks, 64);
+        assert!(
+            policy(None, None, false, 1).is_none(),
+            "absent env must preserve preset OFF"
+        );
     }
 
     #[test]

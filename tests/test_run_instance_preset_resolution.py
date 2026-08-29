@@ -39,7 +39,7 @@ def _write_fake_ny(tmp_path: Path) -> Path:
         textwrap.dedent(f"""\
             #!/bin/bash
             printf '%s\n' "$@" > "{ny_args_file}"
-            printf 'AY_MILP_SMT=%s\nAY_MILP_GUB_CLIQUE=%s\nAY_MILP_STAB_ORBIT=%s\nAY_MILP_COVER_MINIMAL=%s\nAY_MILP_NODE_PROP=%s\nAY_MILP_IMPLIED_COL_BOUNDS=%s\nAY_MILP_ADOPT_FT_MAX_ROWS=%s\nAY_MILP_NO_SHAPE_CPR=%s\nAY_DISABLE_PHASE_EPOCH_SKIP=%s\nAY_SAT_L0_UNSAT_TRACE=%s\nAY_DUMP_QUERY_DIR=%s\nNY_MARGIN_ROW_RESERVE_MAX_FRAC=%s\nNY_GPU_AUTHORITY_SELFARM=%s\nNY_UPFRONT_ATTACK=%s\nNY_SAFENLP_SHORT_GRACE=%s\nMIMALLOC_PURGE_DELAY=%s\nMIMALLOC_FUTURE_OPTION=%s\n' \
+            printf 'AY_MILP_SMT=%s\nAY_MILP_GUB_CLIQUE=%s\nAY_MILP_STAB_ORBIT=%s\nAY_MILP_COVER_MINIMAL=%s\nAY_MILP_NODE_PROP=%s\nAY_MILP_IMPLIED_COL_BOUNDS=%s\nAY_MILP_ADOPT_FT_MAX_ROWS=%s\nAY_MILP_NO_SHAPE_CPR=%s\nAY_DISABLE_PHASE_EPOCH_SKIP=%s\nAY_SAT_L0_UNSAT_TRACE=%s\nAY_DUMP_QUERY_DIR=%s\nAY_FUTURE_EXPERIMENT=%s\nNY_MARGIN_ROW_RESERVE_MAX_FRAC=%s\nNY_GPU_AUTHORITY_SELFARM=%s\nNY_CROWN_OBJ_CHUNK=%s\nNY_NO_CHUNK_ABORT=%s\nNY_NO_CHUNK_GROW=%s\nNY_NO_CHUNK_WAVE_PAR=%s\nNY_PATCHES_DEADLINE_FLAT_BIAS=%s\nNY_CROWN_HONEST_PROVENANCE=%s\nNY_UPFRONT_ATTACK=%s\nNY_SAFENLP_SHORT_GRACE=%s\nNY_CONFIGS_DIR=%s\nNY_FUTURE_SOLVER_CONTROL=%s\nRAYON_NUM_THREADS=%s\nRAYON_RS_NUM_CPUS=%s\nNY_BIN=%s\nNY_EXPECT_BUILD_ID=%s\nVNNCOMP_SCORED_ENV_CLOSED=%s\nMIMALLOC_PURGE_DELAY=%s\nMIMALLOC_FUTURE_OPTION=%s\n' \
                 "${{AY_MILP_SMT-<unset>}}" \
                 "${{AY_MILP_GUB_CLIQUE-<unset>}}" \
                 "${{AY_MILP_STAB_ORBIT-<unset>}}" \
@@ -51,10 +51,24 @@ def _write_fake_ny(tmp_path: Path) -> Path:
                 "${{AY_DISABLE_PHASE_EPOCH_SKIP-<unset>}}" \
                 "${{AY_SAT_L0_UNSAT_TRACE-<unset>}}" \
                 "${{AY_DUMP_QUERY_DIR-<unset>}}" \
+                "${{AY_FUTURE_EXPERIMENT-<unset>}}" \
                 "${{NY_MARGIN_ROW_RESERVE_MAX_FRAC-<unset>}}" \
                 "${{NY_GPU_AUTHORITY_SELFARM-<unset>}}" \
+                "${{NY_CROWN_OBJ_CHUNK-<unset>}}" \
+                "${{NY_NO_CHUNK_ABORT-<unset>}}" \
+                "${{NY_NO_CHUNK_GROW-<unset>}}" \
+                "${{NY_NO_CHUNK_WAVE_PAR-<unset>}}" \
+                "${{NY_PATCHES_DEADLINE_FLAT_BIAS-<unset>}}" \
+                "${{NY_CROWN_HONEST_PROVENANCE-<unset>}}" \
                 "${{NY_UPFRONT_ATTACK-<unset>}}" \
                 "${{NY_SAFENLP_SHORT_GRACE-<unset>}}" \
+                "${{NY_CONFIGS_DIR-<unset>}}" \
+                "${{NY_FUTURE_SOLVER_CONTROL-<unset>}}" \
+                "${{RAYON_NUM_THREADS-<unset>}}" \
+                "${{RAYON_RS_NUM_CPUS-<unset>}}" \
+                "${{NY_BIN-<unset>}}" \
+                "${{NY_EXPECT_BUILD_ID-<unset>}}" \
+                "${{VNNCOMP_SCORED_ENV_CLOSED-<unset>}}" \
                 "${{MIMALLOC_PURGE_DELAY-<unset>}}" \
                 "${{MIMALLOC_FUTURE_OPTION-<unset>}}" > "{ny_env_file}"
             echo '{{"status": "unknown"}}'
@@ -393,7 +407,9 @@ def test_safenlp_short_grace_remains_default_dark(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     environment = _captured_ny_env(tmp_path)
-    assert environment["NY_UPFRONT_ATTACK"] == "1"
+    # SafeNLP's upfront route is a typed preset decision.  The scored wrapper
+    # must not manufacture a second, shell-only source of truth for it.
+    assert environment["NY_UPFRONT_ATTACK"] == "<unset>"
     assert environment["NY_SAFENLP_SHORT_GRACE"] == "<unset>"
 
 
@@ -447,8 +463,21 @@ def test_scored_root_wrapper_sanitizes_operator_environment(tmp_path: Path) -> N
             "AY_DISABLE_PHASE_EPOCH_SKIP": "0",
             "AY_SAT_L0_UNSAT_TRACE": "0",
             "AY_DUMP_QUERY_DIR": str(dump_dir),
+            "AY_FUTURE_EXPERIMENT": "0",
             "NY_MARGIN_ROW_RESERVE_MAX_FRAC": "0.25",
             "NY_GPU_AUTHORITY_SELFARM": "1",
+            "NY_CROWN_OBJ_CHUNK": "32",
+            "NY_NO_CHUNK_ABORT": "1",
+            "NY_NO_CHUNK_GROW": "1",
+            "NY_NO_CHUNK_WAVE_PAR": "0",
+            "NY_PATCHES_DEADLINE_FLAT_BIAS": "1",
+            "NY_CROWN_HONEST_PROVENANCE": "0",
+            "NY_UPFRONT_ATTACK": "0",
+            "NY_SAFENLP_SHORT_GRACE": "1",
+            "NY_CONFIGS_DIR": str(tmp_path / "host-configs"),
+            "NY_FUTURE_SOLVER_CONTROL": "armed",
+            "RAYON_NUM_THREADS": "3",
+            "RAYON_RS_NUM_CPUS": "5",
             "MIMALLOC_PURGE_DELAY": "0",
             "MIMALLOC_FUTURE_OPTION": "future-value",
         },
@@ -467,10 +496,28 @@ def test_scored_root_wrapper_sanitizes_operator_environment(tmp_path: Path) -> N
         "AY_DISABLE_PHASE_EPOCH_SKIP": "<unset>",
         "AY_SAT_L0_UNSAT_TRACE": "<unset>",
         "AY_DUMP_QUERY_DIR": "<unset>",
+        "AY_FUTURE_EXPERIMENT": "<unset>",
         "NY_MARGIN_ROW_RESERVE_MAX_FRAC": "<unset>",
         "NY_GPU_AUTHORITY_SELFARM": "<unset>",
+        "NY_CROWN_OBJ_CHUNK": "<unset>",
+        "NY_NO_CHUNK_ABORT": "<unset>",
+        "NY_NO_CHUNK_GROW": "<unset>",
+        "NY_NO_CHUNK_WAVE_PAR": "<unset>",
+        "NY_PATCHES_DEADLINE_FLAT_BIAS": "<unset>",
+        "NY_CROWN_HONEST_PROVENANCE": "<unset>",
         "NY_UPFRONT_ATTACK": "<unset>",
         "NY_SAFENLP_SHORT_GRACE": "<unset>",
+        "NY_CONFIGS_DIR": "<unset>",
+        "NY_FUTURE_SOLVER_CONTROL": "<unset>",
+        "RAYON_NUM_THREADS": "<unset>",
+        "RAYON_RS_NUM_CPUS": "<unset>",
+        # The root wrapper preserves these two across its scrub only so the
+        # delegated helper can locate/authenticate the binary; the helper
+        # removes them (and its own marker) before exec. Deleting that
+        # `unset` re-opens ambient authority and fails exactly here.
+        "NY_BIN": "<unset>",
+        "NY_EXPECT_BUILD_ID": "<unset>",
+        "VNNCOMP_SCORED_ENV_CLOSED": "<unset>",
         "MIMALLOC_PURGE_DELAY": "<unset>",
         "MIMALLOC_FUTURE_OPTION": "<unset>",
     }
@@ -502,8 +549,21 @@ def test_shared_helper_preserves_operator_environment(tmp_path: Path) -> None:
             "AY_DISABLE_PHASE_EPOCH_SKIP": "1",
             "AY_SAT_L0_UNSAT_TRACE": "1",
             "AY_DUMP_QUERY_DIR": str(dump_dir),
+            "AY_FUTURE_EXPERIMENT": "1",
             "NY_MARGIN_ROW_RESERVE_MAX_FRAC": "0.25",
             "NY_GPU_AUTHORITY_SELFARM": "1",
+            "NY_CROWN_OBJ_CHUNK": "32",
+            "NY_NO_CHUNK_ABORT": "1",
+            "NY_NO_CHUNK_GROW": "1",
+            "NY_NO_CHUNK_WAVE_PAR": "0",
+            "NY_PATCHES_DEADLINE_FLAT_BIAS": "1",
+            "NY_CROWN_HONEST_PROVENANCE": "0",
+            "NY_UPFRONT_ATTACK": "0",
+            "NY_SAFENLP_SHORT_GRACE": "1",
+            "NY_CONFIGS_DIR": str(tmp_path / "local-configs"),
+            "NY_FUTURE_SOLVER_CONTROL": "local",
+            "RAYON_NUM_THREADS": "7",
+            "RAYON_RS_NUM_CPUS": "11",
             "MIMALLOC_PURGE_DELAY": "17",
             "MIMALLOC_FUTURE_OPTION": "future-value",
         },
@@ -522,10 +582,27 @@ def test_shared_helper_preserves_operator_environment(tmp_path: Path) -> None:
         "AY_DISABLE_PHASE_EPOCH_SKIP": "1",
         "AY_SAT_L0_UNSAT_TRACE": "1",
         "AY_DUMP_QUERY_DIR": str(dump_dir),
+        "AY_FUTURE_EXPERIMENT": "1",
         "NY_MARGIN_ROW_RESERVE_MAX_FRAC": "0.25",
         "NY_GPU_AUTHORITY_SELFARM": "1",
-        "NY_UPFRONT_ATTACK": "<unset>",
-        "NY_SAFENLP_SHORT_GRACE": "<unset>",
+        "NY_CROWN_OBJ_CHUNK": "32",
+        "NY_NO_CHUNK_ABORT": "1",
+        "NY_NO_CHUNK_GROW": "1",
+        "NY_NO_CHUNK_WAVE_PAR": "0",
+        "NY_PATCHES_DEADLINE_FLAT_BIAS": "1",
+        "NY_CROWN_HONEST_PROVENANCE": "0",
+        "NY_UPFRONT_ATTACK": "0",
+        "NY_SAFENLP_SHORT_GRACE": "1",
+        "NY_CONFIGS_DIR": str(tmp_path / "local-configs"),
+        "NY_FUTURE_SOLVER_CONTROL": "local",
+        "RAYON_NUM_THREADS": "7",
+        "RAYON_RS_NUM_CPUS": "11",
+        # The lower developer wrapper is NOT environment-closed: the caller's
+        # own NY_BIN override survives to ny, which is what makes sealed A/B
+        # work possible. This is the discriminating half of the pair above.
+        "NY_BIN": str(ny),
+        "NY_EXPECT_BUILD_ID": "<unset>",
+        "VNNCOMP_SCORED_ENV_CLOSED": "<unset>",
         "MIMALLOC_PURGE_DELAY": "17",
         "MIMALLOC_FUTURE_OPTION": "future-value",
     }

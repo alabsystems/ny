@@ -320,11 +320,56 @@ impl<'a> BackwardEngine<'a> {
     /// ranges must exactly partition all seed columns.  Exceptions are local
     /// to their block and are shifted only after validation.  Any malformed
     /// layout fails closed before entering verdict arithmetic.
+    /// Cross-domain stacked pass with the DEFAULT collection spec.
+    ///
+    /// Preserved verbatim so the four existing call sites and the bit-identity
+    /// assert at `bab.rs` are untouched; see
+    /// [`Self::run_domain_stacked_collect`] for the general form.
     pub(crate) fn run_domain_stacked(
         &self,
         seed: &Seed,
         blocks: &[RowDomainGateBlock<'_>],
         dir: LaneDir,
+    ) -> Result<PassOut> {
+        self.run_domain_stacked_collect(
+            seed,
+            blocks,
+            dir,
+            Collect {
+                unst_abs: false,
+                rows: None,
+                unst_rows: false,
+            },
+        )
+    }
+
+    /// Cross-domain stacked pass with an EXPLICIT collection spec.
+    ///
+    /// WHY THIS EXISTS. `run_domain_stacked` hardcoded
+    /// `Collect { unst_abs: false, rows: None, unst_rows: false }`, which made
+    /// the batched path unable to capture the per-unstable-neuron
+    /// pre-transform coefficients — exactly the quantity a PER-DOMAIN alpha
+    /// gradient needs. That turned the one affordable route to per-domain alpha
+    /// (batching, measured at a constant ~2.4 ms/column, so 10 optimizer steps
+    /// cost 24*nf ms/domain instead of 1.28 s) into a dead end by a literal
+    /// rather than by a constraint.
+    ///
+    /// IT IS SAFE TO ASK FOR, and that is a structural fact rather than a
+    /// hope: the `unst_rows` capture (see `run_collect_impl`) runs BEFORE the
+    /// `domain_stack` branch, reads `cur.l` and emits an `(rec.unst.len(), r)`
+    /// matrix where `r` is the TOTAL stacked column count. Every block owns a
+    /// contiguous `block.columns` range, so a caller slices its own domain's
+    /// columns straight out. The capture is documented gradient-only —
+    /// "nothing verdict-bearing reads this" — so widening it cannot move a
+    /// published bound; it costs memory and a memcpy.
+    ///
+    /// The default wrapper above keeps the shipped path byte-identical.
+    pub(crate) fn run_domain_stacked_collect(
+        &self,
+        seed: &Seed,
+        blocks: &[RowDomainGateBlock<'_>],
+        dir: LaneDir,
+        collect: Collect,
     ) -> Result<PassOut> {
         let r = seed.s.ncols();
         if seed
@@ -352,19 +397,7 @@ impl<'a> BackwardEngine<'a> {
                 }
             }
         }
-        self.run_collect_impl(
-            seed,
-            None,
-            dir,
-            Some(&shifted),
-            Collect {
-                unst_abs: false,
-                rows: None,
-                unst_rows: false,
-            },
-            Some(blocks),
-            None,
-        )
+        self.run_collect_impl(seed, None, dir, Some(&shifted), collect, Some(blocks), None)
     }
 
     fn run_collect_impl(
@@ -939,10 +972,35 @@ impl<'a> BackwardEngine<'a> {
         if dom.is_some_and(|d| !d.beta.is_empty() || !d.beta_pc.is_empty()) {
             return self.run(seed, dom, dir, None, false);
         }
-        match super::gpu_seam::run_pass(self, seed, dom, dir, ctx) {
-            Ok(pass) => Ok(pass),
-            Err(_refused) => self.run(seed, dom, dir, None, false),
+        // #margin-row-gpu-eft (`NY_MARGIN_ROW_GPU_BACKWARD=1`, default OFF):
+        // the certified EFT/double-single lane. Disabled, it costs one latched
+        // env read; armed, it runs the once-per-process M1 device self-check
+        // and refuses `ShadowOnly` until the M3 A/B grants verdict authority
+        // (engagement telemetry per rule R9) — ANY `Err` falls through to the
+        // old seam + CPU path, bit-for-bit. Deadline stays HOST-side in that
+        // lane by construction.
+        let lane_ctx = super::gpu_backward::LaneCtx {
+            y_abs: ctx.y_abs,
+            deadline: ctx.deadline,
+            // The root direct pass runs ONCE per instance; a residency cache
+            // would have nothing to hit. The hot sites (B4/B5) carry the
+            // BaB-owned cache through their own `LaneCtx`.
+            plan_cache: None,
+        };
+        if let Ok(pass) = super::gpu_backward::run_pass_certified(self, seed, dom, dir, &lane_ctx) {
+            return Ok(pass);
         }
+        let out = match super::gpu_seam::run_pass(self, seed, dom, dir, ctx) {
+            Ok(pass) => pass,
+            Err(_refused) => self.run(seed, dom, dir, None, false)?,
+        };
+        // #margin-row-gpu-eft M2 (`NY_MARGIN_ROW_GPU_SHADOW=1`, default OFF):
+        // shadow the pass we are about to return — the device computes the
+        // same pass, is compared (enclosure overlap + probe + radius
+        // telemetry), and DISCARDED. `out` is returned unchanged either way,
+        // so a shadow run's verdicts are bit-identical to an unshadowed run.
+        super::gpu_backward::shadow_compare(self, seed, dom, dir, &lane_ctx, &out);
+        Ok(out)
     }
 
     /// The 2 x n_y y-row refresh, GPU-authoritative when the seam admits it.
@@ -963,14 +1021,162 @@ impl<'a> BackwardEngine<'a> {
             let au = self.run(&seed, dom, LaneDir::Upper, None, false)?;
             return Ok((al, au));
         }
-        match super::gpu_seam::run_pass_pair(self, &seed, dom, ctx) {
-            Ok(pair) => Ok(pair),
+        // B6 (#margin-row-gpu-eft, SITE_Y_REFRESH): the CERTIFIED lane gets
+        // the refresh BEFORE the dark old seam. Two transactions rather than
+        // one two-walk program: the lane's program shape is single-direction
+        // (the gate quads are DIRECTION-BAKED at build time,
+        // `transaction::Builder::apply_activation`), so a two-walk program
+        // would have to fork that baking — two transactions reuse the
+        // walk verbatim and cost one extra submit on a site the design ranks
+        // last. Both lanes must admit: a mixed (device lower / CPU upper)
+        // pack would pair enclosures from two different arithmetics inside
+        // one y-box, which is sound but makes the pack run-dependent — the
+        // `Busy`-nondeterminism risk the design names. So a refusal on
+        // EITHER lane falls through to the established path, bit-for-bit.
+        let lane_ctx = super::gpu_backward::LaneCtx {
+            y_abs: None,
+            deadline: ctx.deadline,
+            // UNFINISHED (integrator, 2 lines): the BaB-owned cache reaches
+            // this site only through `bab::build_pack`, and B6's brief is
+            // explicitly "no bab.rs change" — so the y-refresh rebuilds its
+            // statics per pass today. Verdict-neutral (the site is SHADOW),
+            // but it is the site's whole perf story.
+            plan_cache: None,
+        };
+        let certified =
+            super::gpu_backward::run_pass_certified_y(self, &seed, dom, LaneDir::Lower, &lane_ctx)
+                .and_then(|al| {
+                    super::gpu_backward::run_pass_certified_y(
+                        self,
+                        &seed,
+                        dom,
+                        LaneDir::Upper,
+                        &lane_ctx,
+                    )
+                    .map(|au| (al, au))
+                });
+        if let Ok(pair) = certified {
+            return Ok(pair);
+        }
+        let pair = match super::gpu_seam::run_pass_pair(self, &seed, dom, ctx) {
+            Ok(pair) => pair,
             Err(_refused) => {
                 let al = self.run(&seed, dom, LaneDir::Lower, None, false)?;
                 let au = self.run(&seed, dom, LaneDir::Upper, None, false)?;
-                Ok((al, au))
+                (al, au)
+            }
+        };
+        // Per-site shadow: compute, enclosure-compare against the CPU pass
+        // AT THIS CALL SITE, discard. `pair` is returned unchanged either
+        // way, so a shadowed run's verdicts are bit-identical.
+        for (dir, cpu) in [(LaneDir::Lower, &pair.0), (LaneDir::Upper, &pair.1)] {
+            super::gpu_backward::shadow_compare_site(
+                super::gpu_backward::SITE_Y_REFRESH,
+                self,
+                &seed,
+                dom,
+                dir,
+                super::gpu_backward::PassShape::default(),
+                &lane_ctx,
+                cpu,
+            );
+        }
+        Ok(pair)
+    }
+
+    /// B5 — the `eval_node` main pass, GPU-authoritative when the certified
+    /// lane admits it (#margin-row-gpu-eft, `SITE_EVAL`).
+    ///
+    /// Semantically IDENTICAL to `run_collect(seed, dom, dir, None, collect)`:
+    /// the lane either returns a certified [`PassOut`] carrying the same
+    /// `coll` map, or refuses — in which case this is exactly the CPU call,
+    /// bit-for-bit.
+    ///
+    /// ADMISSION (design B5): only the exact heuristic-collect shape
+    /// `Collect{unst_abs:true, rows:None, unst_rows:false}`. The tier-0 row
+    /// capture (`collect.rows`, gated on `tier0_exact > 0`, default 0) and
+    /// the #alpha-opt `unst_rows` capture (beta-armed, env-only) have no
+    /// device readback and stay on the CPU — where they are today.
+    /// Exceptions are never passed here (`eval_node` passes `exc = None`).
+    pub(crate) fn run_collect_seamed(
+        &self,
+        seed: &Seed,
+        dom: Option<&DomainGates>,
+        dir: LaneDir,
+        collect: Collect<'_>,
+        ctx: &super::gpu_backward::LaneCtx<'_>,
+    ) -> Result<PassOut> {
+        // #margin-row-beta: the lane predates the beta terms and would
+        // compute WITHOUT them (looser but sound). Refuse defensively — the
+        // same guard `run_seamed` carries.
+        let beta = dom.is_some_and(|d| !d.beta.is_empty() || !d.beta_pc.is_empty());
+        let admitted = !beta && super::gpu_backward::collect_shape_admits(collect);
+        if admitted {
+            if let Ok(pass) =
+                super::gpu_backward::run_pass_certified_collect(self, seed, dom, dir, collect, ctx)
+            {
+                return Ok(pass);
             }
         }
+        let out = self.run_collect(seed, dom, dir, None, collect)?;
+        if admitted {
+            super::gpu_backward::shadow_compare_site(
+                super::gpu_backward::SITE_EVAL,
+                self,
+                seed,
+                dom,
+                dir,
+                super::gpu_backward::PassShape {
+                    exc: None,
+                    collect_unst_abs: true,
+                },
+                ctx,
+                &out,
+            );
+        }
+        Ok(out)
+    }
+
+    /// B4 — the batched-children scoring pass, GPU-authoritative when the
+    /// certified lane admits it (#margin-row-gpu-eft, `SITE_SCORE`).
+    ///
+    /// Semantically IDENTICAL to `run(seed, dom, dir, Some(exc), false)`. The
+    /// exceptions ride the device FULLY CERTIFIED (FIX A1), because this
+    /// pass's concretized rows become child bounds without re-proving
+    /// (bab.rs:1612 / :1555).
+    pub(crate) fn run_exc_seamed(
+        &self,
+        seed: &Seed,
+        dom: Option<&DomainGates>,
+        dir: LaneDir,
+        exc: &Exceptions,
+        ctx: &super::gpu_backward::LaneCtx<'_>,
+    ) -> Result<PassOut> {
+        let beta = dom.is_some_and(|d| !d.beta.is_empty() || !d.beta_pc.is_empty());
+        if !beta {
+            if let Ok(pass) =
+                super::gpu_backward::run_pass_certified_exc(self, seed, dom, exc, dir, ctx)
+            {
+                return Ok(pass);
+            }
+        }
+        let out = self.run(seed, dom, dir, Some(exc), false)?;
+        if !beta {
+            super::gpu_backward::shadow_compare_site(
+                super::gpu_backward::SITE_SCORE,
+                self,
+                seed,
+                dom,
+                dir,
+                super::gpu_backward::PassShape {
+                    exc: Some(exc),
+                    collect_unst_abs: false,
+                },
+                ctx,
+                &out,
+            );
+        }
+        Ok(out)
     }
 
     /// Concretize lower rows over the root box: per row
@@ -1409,6 +1615,14 @@ fn clip_tighten_gates(root: &RootGates, trunk_splits: &[(usize, usize, i8)], dg:
     if trunk_splits.is_empty() || !clip_interm_enabled() {
         return;
     }
+    // FAIL-CLOSED FRAME GATE. This consumer is the DANGEROUS one: it can set
+    // `dg.infeasible` and close a domain outright, so a halfspace built from a
+    // mis-framed row would discharge a region that is not actually empty and no
+    // later backward pass would ever disagree. The y-box consumer has always
+    // been guarded; until now this one was not.
+    if !super::clip::frame_ok(root) {
+        return;
+    }
     let hs = super::clip::halfspaces_for_splits(root, trunk_splits);
     if hs.is_empty() {
         return;
@@ -1474,26 +1688,24 @@ fn clip_tighten_gates(root: &RootGates, trunk_splits: &[(usize, usize, i8)], dg:
 }
 
 /// #clip-and-verify intermediate tightening: default OFF.
+///
+/// #closure-adaptive: this was going to be a rung of the runtime ladder — it is
+/// the site that repairs `domain_gates_split_only`'s purely LOCAL edit, so it
+/// was the obvious candidate. The measurement removed it. `mean_rel_shrink`
+/// reads 8.4e-16 to 1.6e-4 with the mechanism provably armed, the closure
+/// numbers come out bit-identical to baseline, and the cause is geometric: one
+/// split is one halfspace in 3072 dimensions, which cuts the split neuron 63%
+/// and everything near-orthogonal to it by nothing. See `closure.rs`.
 fn clip_interm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_INTERM)
-            .value
-            .as_bool()
-    })
+    *ON.get_or_init(crate::preset_gates::margin_row_clip_interm_enabled)
 }
 
 /// How many unstable neurons per layer to re-concretize. Matches
 /// alpha-beta-CROWN's `bab.clip.interm_topk` default of 20.
 fn clip_interm_topk() -> usize {
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *K.get_or_init(|| {
-        ny_levers::read(&ny_levers::decls::sound_channel::MARGIN_ROW_CLIP_TOPK)
-            .value
-            .as_u64()
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(20)
-    })
+    *K.get_or_init(crate::preset_gates::margin_row_clip_topk)
 }
 
 fn domain_gates_split_only(root: &RootGates, trunk_splits: &[(usize, usize, i8)]) -> DomainGates {

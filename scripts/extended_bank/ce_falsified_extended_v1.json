@@ -1,0 +1,1810 @@
+{
+  "binding": {
+    "considered": 749,
+    "mismatches": [],
+    "verified": 749
+  },
+  "entries": [
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 1,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_16972_2",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_16972_2.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 2,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_05840_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_05840_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 3,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_01937_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_01937_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 4,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_12559_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_12559_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 6,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_03292_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_03292_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 9,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_13786_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_13786_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 10,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_07658_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_07658_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 11,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_01534_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_01534_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 12,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_15377_1",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_15377_1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 13,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_03396_1",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_03396_1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 15,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_12878_4",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_12878_4.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 16,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_03775_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_03775_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 17,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_00099_1",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_00099_1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 18,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_14771_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_14771_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 19,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_00269_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_00269_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 20,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_01673_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_01673_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 21,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_01613_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_01613_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 22,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_16845_1",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_16845_1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 24,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_08544_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_08544_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 25,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_04746_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_04746_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 26,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_03372_1",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_03372_1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 30,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_00055_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_00055_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 31,
+      "onnx": "onnx/patch-1.onnx",
+      "row_id": "patch-1-spec_onnx_patch-1_idx_15842_2",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-1_idx_15842_2.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 33,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_03746_1",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_03746_1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 34,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_06844_2",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_06844_2.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 36,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_13330_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_13330_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 37,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_00559_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_00559_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 38,
+      "onnx": "onnx/patch-3.onnx",
+      "row_id": "patch-3-spec_onnx_patch-3_idx_16384_0",
+      "track": "cctsdb_yolo_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec_onnx_patch-3_idx_16384_0.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 0,
+      "onnx": "onnx/yolov5nano_LRelu_640.onnx",
+      "row_id": "yolov5nano_LRelu_640-img_14421_perturbed_bbox_3_delta_0.001",
+      "track": "collins_aerospace_benchmark",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/img_14421_perturbed_bbox_3_delta_0.001.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 1,
+      "onnx": "onnx/yolov5nano_LRelu_640.onnx",
+      "row_id": "yolov5nano_LRelu_640-img_6876_perturbed_bbox_0_delta_0.005",
+      "track": "collins_aerospace_benchmark",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/img_6876_perturbed_bbox_0_delta_0.005.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 2,
+      "onnx": "onnx/yolov5nano_LRelu_640.onnx",
+      "row_id": "yolov5nano_LRelu_640-img_14386_perturbed_bbox_7_delta_0.01",
+      "track": "collins_aerospace_benchmark",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/img_14386_perturbed_bbox_7_delta_0.01.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 3,
+      "onnx": "onnx/yolov5nano_LRelu_640.onnx",
+      "row_id": "yolov5nano_LRelu_640-img_8758_perturbed_bbox_3_delta_0.02",
+      "track": "collins_aerospace_benchmark",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/img_8758_perturbed_bbox_3_delta_0.02.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 4,
+      "onnx": "onnx/yolov5nano_LRelu_640.onnx",
+      "row_id": "yolov5nano_LRelu_640-img_8758_perturbed_bbox_4_delta_0.05",
+      "track": "collins_aerospace_benchmark",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/img_8758_perturbed_bbox_4_delta_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 5,
+      "onnx": "onnx/yolov5nano_LRelu_640.onnx",
+      "row_id": "yolov5nano_LRelu_640-img_12761_perturbed_bbox_0_delta_0.1",
+      "track": "collins_aerospace_benchmark",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/img_12761_perturbed_bbox_0_delta_0.1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 1,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_1",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 26,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_26",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_26.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 28,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_28",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_28.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 31,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_31",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_31.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 34,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_34",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_34.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 36,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_36",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_36.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 43,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_43",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_43.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 45,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_45",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_45.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 51,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_51",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_51.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 67,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_67",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_67.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 68,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_68",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_68.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 74,
+      "onnx": "onnx/relu_quadrotor2d_state.onnx",
+      "row_id": "relu_quadrotor2d_state-quadrotor2d_state_74",
+      "track": "lsnc_relu",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/quadrotor2d_state_74.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance",
+        "sobolbox": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat",
+        "sobolbox"
+      ],
+      "index": 9,
+      "onnx": "./onnx/14_ieee_ml4acopf-linear-residual.onnx",
+      "row_id": "14_ieee_ml4acopf-linear-residual-14_ieee_prop1",
+      "track": "ml4acopf_2024",
+      "true_result_line": "unsat",
+      "vnnlib": "./vnnlib/14_ieee_prop1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance",
+        "sobolbox": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat",
+        "sobolbox"
+      ],
+      "index": 32,
+      "onnx": "./onnx/14_ieee_ml4acopf-linear-nonresidual.onnx",
+      "row_id": "14_ieee_ml4acopf-linear-nonresidual-14_ieee_prop1",
+      "track": "ml4acopf_2024",
+      "true_result_line": "unsat",
+      "vnnlib": "./vnnlib/14_ieee_prop1.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance",
+        "sobolbox": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat",
+        "sobolbox"
+      ],
+      "index": 40,
+      "onnx": "./onnx/118_ieee_ml4acopf-linear-nonresidual.onnx",
+      "row_id": "118_ieee_ml4acopf-linear-nonresidual-118_ieee_prop5",
+      "track": "ml4acopf_2024",
+      "true_result_line": "unsat",
+      "vnnlib": "./vnnlib/118_ieee_prop5.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 58,
+      "onnx": "./onnx/300_ieee_ml4acopf-linear-residual.onnx",
+      "row_id": "300_ieee_ml4acopf-linear-residual-300_ieee_prop2",
+      "track": "ml4acopf_2024",
+      "true_result_line": "unsat",
+      "vnnlib": "./vnnlib/300_ieee_prop2.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 67,
+      "onnx": "./onnx/300_ieee_ml4acopf.onnx",
+      "row_id": "300_ieee_ml4acopf-300_ieee_prop2",
+      "track": "ml4acopf_2024",
+      "true_result_line": "unsat",
+      "vnnlib": "./vnnlib/300_ieee_prop2.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 8,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4-mnist_fc_vnncomp2022_prop_4_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_4_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 9,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_4_0.05.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_4_0.05-mnist_fc_vnncomp2022_prop_4_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_4_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 10,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4-mnist_fc_vnncomp2022_prop_0_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_0_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 11,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_0_0.05.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_0_0.05-mnist_fc_vnncomp2022_prop_0_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_0_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "nnv": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "nnv",
+        "pyrat"
+      ],
+      "index": 16,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4-mnist_fc_vnncomp2022_prop_1_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_1_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "nnv": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "nnv",
+        "pyrat"
+      ],
+      "index": 17,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_1_0.05.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_1_0.05-mnist_fc_vnncomp2022_prop_1_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_1_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 18,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4-mnist_fc_vnncomp2022_prop_7_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_7_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 19,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_7_0.05.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_7_0.05-mnist_fc_vnncomp2022_prop_7_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_7_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 26,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4-mnist_fc_vnncomp2022_prop_2_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_2_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 27,
+      "onnx": "onnx/mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_2_0.05.onnx",
+      "row_id": "mnist_fc_vnncomp2022_mnist-net_256x4_RSPLITTER_mnist_fc_vnncomp2022_prop_2_0.05-mnist_fc_vnncomp2022_prop_2_0.05",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/mnist_fc_vnncomp2022_prop_2_0.05.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "nnenum": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "nnenum",
+        "pyrat"
+      ],
+      "index": 132,
+      "onnx": "onnx/oval21-benchmark_cifar_wide_kw.onnx",
+      "row_id": "oval21-benchmark_cifar_wide_kw-oval21-benchmark_cifar_wide_kw-img773-eps0.0026143790849673205",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/oval21-benchmark_cifar_wide_kw-img773-eps0.0026143790849673205.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "nnenum": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "nnenum",
+        "pyrat"
+      ],
+      "index": 133,
+      "onnx": "onnx/oval21-benchmark_cifar_wide_kw_RSPLITTER_oval21-benchmark_cifar_wide_kw-img773-eps0.0026143790849673205.onnx",
+      "row_id": "oval21-benchmark_cifar_wide_kw_RSPLITTER_oval21-benchmark_cifar_wide_kw-img773-eps0.0026143790849673205-oval21-benchmark_cifar_wide_kw-img773-eps0.0026143790849673205",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/oval21-benchmark_cifar_wide_kw-img773-eps0.0026143790849673205.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 146,
+      "onnx": "onnx/cifar_biasfield_vnncomp2022_cifar_bias_field_45.onnx",
+      "row_id": "cifar_biasfield_vnncomp2022_cifar_bias_field_45-cifar_biasfield_vnncomp2022_prop_45",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/cifar_biasfield_vnncomp2022_prop_45.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 147,
+      "onnx": "onnx/cifar_biasfield_vnncomp2022_cifar_bias_field_45_RSPLITTER_cifar_biasfield_vnncomp2022_prop_45.onnx",
+      "row_id": "cifar_biasfield_vnncomp2022_cifar_bias_field_45_RSPLITTER_cifar_biasfield_vnncomp2022_prop_45-cifar_biasfield_vnncomp2022_prop_45",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/cifar_biasfield_vnncomp2022_prop_45.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 160,
+      "onnx": "onnx/cifar_biasfield_vnncomp2022_cifar_bias_field_40.onnx",
+      "row_id": "cifar_biasfield_vnncomp2022_cifar_bias_field_40-cifar_biasfield_vnncomp2022_prop_40",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/cifar_biasfield_vnncomp2022_prop_40.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 161,
+      "onnx": "onnx/cifar_biasfield_vnncomp2022_cifar_bias_field_40_RSPLITTER_cifar_biasfield_vnncomp2022_prop_40.onnx",
+      "row_id": "cifar_biasfield_vnncomp2022_cifar_bias_field_40_RSPLITTER_cifar_biasfield_vnncomp2022_prop_40-cifar_biasfield_vnncomp2022_prop_40",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/cifar_biasfield_vnncomp2022_prop_40.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 166,
+      "onnx": "onnx/cifar_biasfield_vnncomp2022_cifar_bias_field_11.onnx",
+      "row_id": "cifar_biasfield_vnncomp2022_cifar_bias_field_11-cifar_biasfield_vnncomp2022_prop_11",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/cifar_biasfield_vnncomp2022_prop_11.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "pyrat"
+      ],
+      "index": 167,
+      "onnx": "onnx/cifar_biasfield_vnncomp2022_cifar_bias_field_11_RSPLITTER_cifar_biasfield_vnncomp2022_prop_11.onnx",
+      "row_id": "cifar_biasfield_vnncomp2022_cifar_bias_field_11_RSPLITTER_cifar_biasfield_vnncomp2022_prop_11-cifar_biasfield_vnncomp2022_prop_11",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/cifar_biasfield_vnncomp2022_prop_11.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "nnv": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "nnv",
+        "pyrat"
+      ],
+      "index": 192,
+      "onnx": "onnx/cifar_biasfield_vnncomp2022_cifar_bias_field_21.onnx",
+      "row_id": "cifar_biasfield_vnncomp2022_cifar_bias_field_21-cifar_biasfield_vnncomp2022_prop_21",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/cifar_biasfield_vnncomp2022_prop_21.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "nnv": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "nnv",
+        "pyrat"
+      ],
+      "index": 193,
+      "onnx": "onnx/cifar_biasfield_vnncomp2022_cifar_bias_field_21_RSPLITTER_cifar_biasfield_vnncomp2022_prop_21.onnx",
+      "row_id": "cifar_biasfield_vnncomp2022_cifar_bias_field_21_RSPLITTER_cifar_biasfield_vnncomp2022_prop_21-cifar_biasfield_vnncomp2022_prop_21",
+      "track": "relusplitter",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/cifar_biasfield_vnncomp2022_prop_21.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 0,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_7573_eps_1.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_30_idx_7573_eps_1.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 1,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_7573_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_7573_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 2,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_7573_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_7573_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 3,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_7573_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_7573_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 4,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_7573_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_7573_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 6,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_11379_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_11379_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 7,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_11379_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_11379_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 8,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_11379_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_30_idx_11379_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 9,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_11379_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_11379_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 11,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_12375_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_12375_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 12,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_12375_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_30_idx_12375_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 13,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_12375_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_30_idx_12375_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 14,
+      "onnx": "onnx/3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30.onnx",
+      "row_id": "3_30_30_QConv_16_3_QConv_32_2_Dense_43_ep_30-model_30_idx_12375_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_30_idx_12375_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 15,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10645_eps_1.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10645_eps_1.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 16,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10645_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10645_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 17,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10645_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10645_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 18,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10645_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10645_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 19,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10645_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10645_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 20,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10495_eps_1.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10495_eps_1.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 21,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10495_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10495_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 22,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10495_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10495_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 23,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10495_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10495_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 24,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_10495_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_10495_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 25,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_9022_eps_1.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_9022_eps_1.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 26,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_9022_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_9022_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 27,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_9022_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_9022_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 28,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_9022_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_9022_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 29,
+      "onnx": "onnx/3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_48_48_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_BN_Dense_256_BN_Dense_43_ep_30-model_48_idx_9022_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_48_idx_9022_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 30,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10645_eps_1.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_64_idx_10645_eps_1.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 31,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10645_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_64_idx_10645_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 32,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10645_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_10645_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 33,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10645_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_10645_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 34,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10645_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_10645_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 35,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10495_eps_1.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_10495_eps_1.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 36,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10495_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_10495_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 37,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10495_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_10495_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 38,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10495_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_64_idx_10495_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 39,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_10495_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_10495_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 40,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_9022_eps_1.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_64_idx_9022_eps_1.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 41,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_9022_eps_3.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_9022_eps_3.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 42,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_9022_eps_5.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "sat",
+      "vnnlib": "vnnlib/model_64_idx_9022_eps_5.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 43,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_9022_eps_10.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_9022_eps_10.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown"
+      ],
+      "index": 44,
+      "onnx": "onnx/3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30.onnx",
+      "row_id": "3_64_64_QConv_32_5_MP_2_BN_QConv_64_5_MP_2_BN_QConv_64_3_MP_2_BN_Dense_1024_BN_Dense_43_ep_30-model_64_idx_9022_eps_15.00000",
+      "track": "traffic_signs_recognition_2023",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/model_64_idx_9022_eps_15.00000.vnnlib"
+    },
+    {
+      "ce_validity": {
+        "alpha_beta_crown": "correct_up_to_tolerance",
+        "nnenum": "correct_up_to_tolerance",
+        "nnv": "correct_up_to_tolerance",
+        "pyrat": "correct_up_to_tolerance"
+      },
+      "falsifiers": [
+        "alpha_beta_crown",
+        "nnenum",
+        "nnv",
+        "pyrat"
+      ],
+      "index": 0,
+      "onnx": "onnx/vgg16-7.onnx",
+      "row_id": "vgg16-7-spec0_suit",
+      "track": "vggnet16_2022",
+      "true_result_line": "unsat",
+      "vnnlib": "vnnlib/spec0_suit.vnnlib"
+    }
+  ],
+  "per_track": {
+    "cctsdb_yolo_2023": {
+      "bound": 39,
+      "falsified": 28,
+      "instances": 39,
+      "official_rows": 39
+    },
+    "collins_aerospace_benchmark": {
+      "bound": 6,
+      "falsified": 6,
+      "instances": 6,
+      "official_rows": 6
+    },
+    "lsnc_relu": {
+      "bound": 80,
+      "falsified": 12,
+      "instances": 80,
+      "official_rows": 80
+    },
+    "ml4acopf_2024": {
+      "bound": 69,
+      "falsified": 5,
+      "instances": 69,
+      "official_rows": 69
+    },
+    "relusplitter": {
+      "bound": 220,
+      "falsified": 20,
+      "instances": 220,
+      "official_rows": 220
+    },
+    "traffic_signs_recognition_2023": {
+      "bound": 45,
+      "falsified": 43,
+      "instances": 45,
+      "official_rows": 45
+    },
+    "vggnet16_2022": {
+      "bound": 18,
+      "falsified": 1,
+      "instances": 18,
+      "official_rows": 18
+    },
+    "vit_2023": {
+      "bound": 200,
+      "falsified": 0,
+      "instances": 200,
+      "official_rows": 200
+    },
+    "yolo_2023": {
+      "bound": 72,
+      "falsified": 0,
+      "instances": 72,
+      "official_rows": 72
+    }
+  },
+  "schema": "extended_ce_falsified_watchlist_v1",
+  "source": {
+    "results_txt": "external_tools/vnncomp2025_results/SCORING-ZERO-TOL/results.txt",
+    "results_txt_sha256": "2686e1365738a92b6e10302bebb38f93a5c05a53a0c9fd0fa92409e0256178a2"
+  }
+}

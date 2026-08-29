@@ -20,7 +20,6 @@
 
 use ay_milp::{
     BabSession, EngineEconomics, Model, Outcome, Sense as AySense, SolveOpts, TargetFsbPrefixOpts,
-    Trust,
 };
 use num_rational::BigRational;
 use num_traits::ToPrimitive;
@@ -586,8 +585,9 @@ fn graph_mip_solve_opts(
 /// - The SAT direction is unaffected: every Sat is revalidated downstream by the
 ///   concrete forward pass.
 /// - The exposed surface was `Optimal` consumed as a prunable bound. That is now
-///   gated on `Outcome::trust` in `map_outcome`, so a search-trusted optimum no
-///   longer becomes a `dual_bound` a caller may prune on.
+///   gated on `Outcome::check_against` in `map_outcome`, so a search-trusted or
+///   merely shape-complete optimum no longer becomes a `dual_bound` a caller
+///   may prune on.
 ///
 /// THE OVERRIDE CONTRACT IS PRESERVED BY READING, NEVER WRITING. The old
 /// `set_if_unset` let a user/session `AY_MILP_*` win. The caller layer now
@@ -815,6 +815,52 @@ fn rigorous_dual_bound_f64(bound: &BigRational, sense: ObjSense) -> Option<f64> 
     safe.is_finite().then_some(safe)
 }
 
+/// Exact authority carried across the destructive `Outcome` match below.
+///
+/// `Rejected` retains the checker's own reason so the production seam can log
+/// the actual failed obligation (point, objective, model identity, or proof)
+/// instead of collapsing every refusal into a misleading "missing cert" note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PruningAuthority {
+    /// AY checked the complete outcome against this exact model and returned
+    /// its unforgeable rim-closed token.
+    Sealed,
+    /// The outcome claimed a pruning-relevant bound but exact checking refused
+    /// it. The string is diagnostic only and never affects the SAT verdict.
+    Rejected(String),
+    /// This outcome shape carries no bound NY could expose for pruning.
+    NotClaimed,
+}
+
+impl PruningAuthority {
+    fn is_sealed(&self) -> bool {
+        matches!(self, Self::Sealed)
+    }
+}
+
+fn pruning_authority(outcome: &Outcome, model: &Model) -> PruningAuthority {
+    let claims_pruning_bound = matches!(
+        outcome,
+        Outcome::Optimal { .. }
+            | Outcome::Feasible {
+                dual_bound: Some(_),
+                ..
+            }
+    );
+    if !claims_pruning_bound {
+        return PruningAuthority::NotClaimed;
+    }
+    match outcome.check_against(model) {
+        Ok(checked) if checked.is_rim_closed() => PruningAuthority::Sealed,
+        // `CheckedOutcome::is_rim_closed` is currently true by construction,
+        // but retain a fail-closed arm if AY ever makes the token multi-tiered.
+        Ok(_) => PruningAuthority::Rejected(
+            "AY returned a checked outcome without rim-closed authority".to_string(),
+        ),
+        Err(error) => PruningAuthority::Rejected(error.to_string()),
+    }
+}
+
 /// Map an `ay_milp::Outcome` to a `MipResult`.
 ///
 /// `objective` is the optimization target when this was an `optimize_col`
@@ -831,24 +877,31 @@ fn map_outcome_with_sat_relu_certificate(
     sat_relu_replay_deadline: Option<std::time::Instant>,
     strict_infeasibility_evidence: bool,
 ) -> MipResult {
-    // Classify BEFORE the match consumes the outcome (AY `f36f19a5b`). This is
-    // a method, not a field, so it must be read against the model NY handed AY.
-    let outcome_trust = outcome.trust(model);
+    // Seal pruning authority BEFORE the match consumes the outcome.  AY's
+    // `EvidenceShape::FieldsPresent` is deliberately diagnostic only: public
+    // Outcome fields can be fabricated or recombined, and the shape check does
+    // not validate point feasibility, objective attainment, certificate/model
+    // identity, or certificate replay.  `check_against` performs all of those
+    // exact checks and is the only API allowed to authorize a value that
+    // `MipResult::Sat::dual_bound` promises callers they may prune on.
+    //
+    // This includes interrupted `Feasible` outcomes.  AY currently exports no
+    // artifact for their tree bound, so `check_against` rejects that claim and
+    // NY withholds it.  A solver-internal "rigorous" contract is not an
+    // independently checked pruning capability at this boundary.
+    let pruning_authority = pruning_authority(&outcome, model);
+    if let PruningAuthority::Rejected(reason) = &pruning_authority {
+        tracing::warn!(
+            "ay-milp pruning claim FAILED exact model-bound validation: {reason}; \
+             withholding dual_bound"
+        );
+    }
     match outcome {
         Outcome::Optimal {
             value,
             model_values,
-            cert,
+            cert: _,
         } => {
-            if let Some(cert) = &cert {
-                match cert.verify(model) {
-                    Ok(()) => tracing::debug!("ay-milp optimality certificate verified"),
-                    Err(e) => tracing::warn!(
-                        "ay-milp optimality certificate FAILED verification: {e} \
-                         (verdict stands on the exact solver; certificate discarded)"
-                    ),
-                }
-            }
             // A proven optimum is a rigorous dual bound on itself ONLY when the
             // rim closed on it. AY `f36f19a5b` corrected the sentence NY had
             // been relying on: `LpSession::verify` asserts the certified dual
@@ -860,32 +913,21 @@ fn map_outcome_with_sat_relu_certificate(
             // setting CAN move an `Optimal` value on NY's own workload, and no
             // certificate refuses it.
             //
-            // `Outcome::trust` makes that readable from the API instead of
-            // inferable from AY's source. Gate the prunable bound on
-            // `RimClosed`: `MipResult::Sat::dual_bound` promises callers a
-            // bound they "may prune / tighten on directly" (solver.rs), and a
-            // search-trusted number does not meet that promise. This costs NY
-            // nothing today — no production caller reads this field (the only
-            // binding site is `tests/ay_backend.rs`) — so it is pure hygiene
-            // now and a closed hole later, rather than a bound a future caller
-            // inherits believing it is rim-closed.
+            // `MipResult::Sat::dual_bound` promises callers a bound they "may
+            // prune / tighten on directly" (solver.rs), so only AY's sealed
+            // `CheckedOutcome` may populate it.  A search-trusted number or a
+            // merely shape-complete public outcome does not meet that promise.
             //
-            // The Sat VERDICT is unaffected and stays exactly as sound as
-            // before: every Sat is revalidated downstream by the concrete
-            // forward pass.
-            let trust = outcome_trust;
-            let dual_bound = match trust {
-                Trust::RimClosed => {
-                    objective.and_then(|o| rigorous_dual_bound_f64(&value, o.sense))
-                }
-                Trust::SearchTrusted { why } => {
-                    tracing::debug!(
-                        "ay-milp optimum is search-trusted, not rim-closed ({why}); \
-                         withholding the prunable dual bound"
-                    );
-                    None
-                }
-            };
+            // AY `c230ccb14` retired `Outcome::trust`/`Trust` for
+            // `Outcome::evidence_shape`/`EvidenceShape` plus a separate,
+            // authoritative `Outcome::check_against` -> `CheckedOutcome`.
+            // Shape alone only asks whether the fields exist (and, for this
+            // outcome, whether bound and value coincide); `check_against`
+            // additionally validates the exact point and model-bound proof.
+            let dual_bound = pruning_authority
+                .is_sealed()
+                .then(|| objective.and_then(|o| rigorous_dual_bound_f64(&value, o.sense)))
+                .flatten();
             MipResult::Sat {
                 objective: value.to_f64().unwrap_or(f64::NAN),
                 output_values: extract_cols(&model_values, output_vars),
@@ -902,11 +944,11 @@ fn map_outcome_with_sat_relu_certificate(
             // the objective column's value at the feasible point (the model
             // is always built with a single unit-coefficient objective column
             // and no offset), and the rigorous interrupted-tree dual bound is
-            // OUTWARD-rounded. `Outcome::Feasible.dual_bound` is rigorous BY
-            // CONTRACT when present (`None` whenever any part of the tree was
-            // discarded without proof — ay contract property 3), so `Some`
-            // here always means "safe to prune on". Sat stays a candidate:
-            // callers revalidate the point downstream, unchanged.
+            // OUTWARD-rounded only after exact, model-bound authority exists.
+            // AY does not currently export an artifact for an interrupted-tree
+            // bound, so `check_against` rejects `dual_bound: Some(_)` and this
+            // seam withholds it. Sat stays a candidate: callers revalidate the
+            // point downstream, unchanged.
             let objective_value = objective
                 .map(|o| {
                     model_values
@@ -921,8 +963,8 @@ fn map_outcome_with_sat_relu_certificate(
                      (objective {objective_value}); a better point may exist"
                 );
             }
-            let dual = match (&dual_bound, objective) {
-                (Some(b), Some(o)) => rigorous_dual_bound_f64(b, o.sense),
+            let dual = match (&dual_bound, objective, pruning_authority.is_sealed()) {
+                (Some(b), Some(o), true) => rigorous_dual_bound_f64(b, o.sense),
                 _ => None,
             };
             MipResult::Sat {
@@ -1095,6 +1137,157 @@ fn map_outcome(
         None,
         false,
     )
+}
+
+#[cfg(test)]
+mod pruning_authority_tests {
+    use super::*;
+    use ay_milp::{LpSession, OptimalityCertificate};
+
+    fn br(value: i64) -> BigRational {
+        BigRational::from_integer(value.into())
+    }
+
+    fn objective_model() -> Model {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        model.set_objective(&[(x, 1.0)], AySense::Minimize);
+        model
+    }
+
+    fn objective_spec() -> Option<ObjectiveSpec> {
+        Some(ObjectiveSpec {
+            col: Col(0),
+            sense: ObjSense::Minimize,
+        })
+    }
+
+    fn mapped_dual(outcome: Outcome, model: &Model) -> Option<f64> {
+        let mapped = map_outcome_with_sat_relu_certificate(
+            outcome,
+            model,
+            &[],
+            &[],
+            objective_spec(),
+            None,
+            None,
+            false,
+        );
+        let MipResult::Sat { dual_bound, .. } = mapped else {
+            panic!("an optimal/feasible candidate must retain its SAT direction: {mapped:?}");
+        };
+        dual_bound
+    }
+
+    fn coincident_unproved_outcome() -> Outcome {
+        Outcome::Optimal {
+            value: br(0),
+            model_values: vec![br(0)],
+            // The bound happens to equal the claimed value, so the non-
+            // authoritative EvidenceShape is FieldsPresent. Empty multipliers
+            // do not prove the nonzero objective, however.
+            cert: Some(OptimalityCertificate {
+                sense: AySense::Minimize,
+                objective: vec![(0, br(1))],
+                bound: br(0),
+                multipliers: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn foreign_self_declared_certificate_cannot_authorize_pruning() {
+        let model = objective_model();
+        // This certificate genuinely proves its self-declared zero objective,
+        // but that is not the objective in `model`.
+        let foreign = OptimalityCertificate {
+            sense: AySense::Minimize,
+            objective: Vec::new(),
+            bound: br(0),
+            multipliers: Vec::new(),
+        };
+        foreign
+            .verify(&model)
+            .expect("the forged fixture must pass standalone self-declared replay");
+        let outcome = Outcome::Optimal {
+            value: br(0),
+            model_values: vec![br(0)],
+            cert: Some(foreign),
+        };
+        assert!(outcome.evidence_shape(&model).has_required_fields());
+        assert!(matches!(
+            pruning_authority(&outcome, &model),
+            PruningAuthority::Rejected(reason)
+                if reason.contains("does not target the model objective")
+        ));
+        assert_eq!(mapped_dual(outcome, &model), None);
+    }
+
+    #[test]
+    fn infeasible_point_cannot_authorize_pruning_with_a_valid_certificate() {
+        let model = objective_model();
+        let opts = SolveOpts::new().with_require_certificates(true);
+        let mut session = LpSession::new(&model, &opts).expect("valid LP session");
+        let solved = session
+            .optimize_model_objective()
+            .expect("the fixture objective is decided");
+        let Outcome::Optimal { value, cert, .. } = solved else {
+            panic!("the fixture must produce an exact optimum: {solved:?}");
+        };
+        let outcome = Outcome::Optimal {
+            value,
+            // Outside x's [0, 1] bounds. The certificate remains the genuine
+            // one returned for this exact model, isolating point validation.
+            model_values: vec![br(2)],
+            cert,
+        };
+        assert!(outcome.evidence_shape(&model).has_required_fields());
+        assert!(matches!(
+            pruning_authority(&outcome, &model),
+            PruningAuthority::Rejected(reason) if reason.contains("point is infeasible")
+        ));
+        assert_eq!(mapped_dual(outcome, &model), None);
+    }
+
+    #[test]
+    fn bound_value_coincidence_without_a_proof_cannot_authorize_pruning() {
+        let model = objective_model();
+        let outcome = coincident_unproved_outcome();
+        assert!(
+            outcome.evidence_shape(&model).has_required_fields(),
+            "the negative must reach the exact checker from FieldsPresent"
+        );
+        assert_eq!(mapped_dual(outcome, &model), None);
+    }
+
+    #[test]
+    fn certificate_verify_error_reason_is_preserved_for_the_logging_path() {
+        let model = objective_model();
+        let outcome = coincident_unproved_outcome();
+        let PruningAuthority::Rejected(reason) = pruning_authority(&outcome, &model) else {
+            panic!("an invalid certificate must be rejected");
+        };
+        assert!(
+            reason.contains("certificate does not verify"),
+            "production logging must retain the exact replay failure: {reason}"
+        );
+    }
+
+    #[test]
+    fn interrupted_tree_bound_without_an_artifact_is_withheld() {
+        let model = objective_model();
+        let outcome = Outcome::Feasible {
+            model_values: vec![br(0)],
+            incumbent_only: true,
+            dual_bound: Some(br(0)),
+        };
+        assert!(matches!(
+            pruning_authority(&outcome, &model),
+            PruningAuthority::Rejected(reason)
+                if reason.contains("interrupted-tree bound has no artifact")
+        ));
+        assert_eq!(mapped_dual(outcome, &model), None);
+    }
 }
 
 #[cfg(test)]
@@ -2133,6 +2326,16 @@ mod shared_binary_prefix_tests {
     fn marked_margin_target_fsb_entry_reaches_a_successful_ay_selection() {
         const CHILD_MODE: &str = "NY_TEST_SAFENLP_TARGET_FSB_PREFIX_SELECTED";
         if std::env::var_os(CHILD_MODE).is_some() {
+            // AY retired the `AY_MILP_TRACE` environment read (B46, in the
+            // 0.13 pin): the selector's trace stream is now gated on the
+            // process-constant `MilpDebugFlags` the embedding installs. The
+            // child arms it in-process; first caller wins, and this child
+            // exists only for this test.
+            let _ =
+                ay_milp::debug_flags::set_milp_debug_flags(ay_milp::debug_flags::MilpDebugFlags {
+                    trace: true,
+                    ..Default::default()
+                });
             let (problem, fallback, candidates) = target_fsb_selection_fixture();
             let result = check_feasibility_marked_margin_target_fsb_shared_binary_prefix(
                 &problem,
@@ -2163,7 +2366,6 @@ mod shared_binary_prefix_tests {
             .arg(test_name)
             .arg("--nocapture")
             .env(CHILD_MODE, "1")
-            .env("AY_MILP_TRACE", "1")
             .env_remove("AY_MILP_MAX_NODES")
             .env_remove("AY_MILP_NO_CUTS")
             .env_remove("AY_MILP_NO_MARGIN_REFRAME")
@@ -2176,8 +2378,9 @@ mod shared_binary_prefix_tests {
             String::from_utf8_lossy(&output.stderr),
         );
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // B46 prefix: the debug-flags stream spells its lines `--trace <ctx>`.
         assert!(
-            stderr.contains("AY_MILP_TRACE target-fsb-prefix selected:"),
+            stderr.contains("--trace target-fsb-prefix selected:"),
             "valid NY columns did not reach AY's successful selector:\n{stderr}"
         );
     }
@@ -2455,6 +2658,556 @@ mod shared_binary_prefix_tests {
     }
 }
 
+/// The margin dual bound AY exports from its PLAIN `check` entry.
+///
+/// The reframed bound exists at the seam — `ay_milp::margin::map_reframed`
+/// builds a `ReframeInfo { reframed_bound, .. }` from the reframed
+/// `Optimal::value` / `Feasible::dual_bound` and reads
+/// `Outcome::Bound::dual_bound` straight out of the interrupted tree — but
+/// `Reframed::info` is `pub(crate)` and is dropped on the way out of
+/// `BabSession::check`. `ay_milp::margin_profile_line()` is the typed export
+/// that reaches it: a process-global one-liner in the exact `sb_profile_line`
+/// convention this file already consumes, written once per reframed SOLVE at
+/// the single site that completes one (`session::run_reframed_nested`), so it
+/// covers the marked/`Auto` lane arm B rides and the explicit shared-prefix
+/// lane alike.
+///
+/// SAME CAVEAT AS EVERY OTHER PROFILE-LINE READER HERE: it is a
+/// process-global LAST-WRITE snapshot, not an exact per-call value. A
+/// concurrent or detached solve can overwrite it between the solve and this
+/// read, which is why it feeds a diagnostic marker and never a verdict.
+///
+/// An empty line (no reframe has completed in this process) and a line whose
+/// bound rendered as `-` (the outcome shape carried no bound at all) both
+/// return `None`. The marker's sentinel was renamed to
+/// `unavailable-on-this-outcome-shape` for exactly that reason — see
+/// [`MarginAutoSession::summary_line`], and do not read the old
+/// `not-exported-by-pinned-ay-typed-api` meaning into it.
+fn ay_margin_auto_dual_bound() -> Option<f64> {
+    ay_milp::margin_profile_line()
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("bound=")?.parse().ok())
+}
+
+/// One margin-auto observation, in the ORIGINAL model's frame.
+///
+/// # Why this exists
+///
+/// The plain `check_feasibility` entry is the `MarginMode::Auto` path: with a
+/// MARKED margin row the pinned AY reframes the objective-≡0 feasibility model
+/// into the margin optimization, solves it, and maps the verdict back. NY saw
+/// only the mapped verdict, so a session was SILENT between "AY direct-MIP
+/// margin reframe armed" and return (docs/BIG3_CORE_CAMPAIGN_2026-08-19.md,
+/// "L1 MEASUREMENT CAMPAIGN VERDICTS": arm B is an ENGAGED null that cannot
+/// currently be classified as wall-bound or shape-bound).
+///
+/// Everything here is print-only. It reads the caller's own IR for the row
+/// identity and AY's existing process-global counters for progress; it never
+/// touches the verdict, the deadline, or the model.
+struct MarginAutoSession {
+    margin_row: usize,
+    /// The reframed optimization direction implied by the row's finite side:
+    /// a `c·x <= t` row minimizes, a `c·x >= t` row maximizes.
+    sense: &'static str,
+    threshold: f64,
+    budget_secs: f64,
+    started: std::time::Instant,
+    nodes_before: u64,
+    lp_calls_before: Option<u64>,
+    progress: Option<MarginAutoProgress>,
+}
+
+/// A bounded, timestamped progress trajectory sampled ALONGSIDE the detached
+/// solve worker.
+///
+/// These are AY's process-global node counts, not dual values — the pinned
+/// typed API exports no in-flight dual (see [`ay_margin_auto_dual_bound`]).
+/// They still answer the question the null needs answered: a search still
+/// expanding nodes when the deadline arrives is WALL-bound, while a flat tail
+/// is not.
+struct MarginAutoProgress {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    samples: std::sync::Arc<std::sync::Mutex<Vec<(f64, u64)>>>,
+}
+
+impl MarginAutoProgress {
+    /// At most this many samples per session, so the trajectory is a fixed
+    /// cost no matter how long the budget is.
+    const MAX_SAMPLES: usize = 8;
+    /// Stop-flag granularity: the sampler never outlives the solve by more
+    /// than one tick.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn start(budget_secs: f64) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let samples = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let interval = std::time::Duration::from_secs_f64(
+            (budget_secs / Self::MAX_SAMPLES as f64).clamp(0.25, 5.0),
+        );
+        let ticks = (interval.as_secs_f64() / Self::TICK.as_secs_f64()).ceil() as u64;
+        let worker_stop = std::sync::Arc::clone(&stop);
+        let worker_samples = std::sync::Arc::clone(&samples);
+        let started = std::time::Instant::now();
+        // A failed spawn is not a solve problem: the trajectory is simply
+        // absent, exactly as it is when the gate is off.
+        let _ = std::thread::Builder::new()
+            .name("ny-mip-ay-margin-auto-progress".to_string())
+            .spawn(move || {
+                for _ in 0..Self::MAX_SAMPLES {
+                    for _ in 0..ticks.max(1) {
+                        if worker_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Self::TICK);
+                    }
+                    let sample = (started.elapsed().as_secs_f64(), ay_milp::nodes_explored());
+                    match worker_samples.lock() {
+                        Ok(mut samples) => samples.push(sample),
+                        Err(_) => return,
+                    }
+                }
+            });
+        Self { stop, samples }
+    }
+
+    fn finish(self) -> Vec<(f64, u64)> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.samples
+            .lock()
+            .map(|samples| samples.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl MarginAutoSession {
+    /// Begin an observation, or `None` when this is not the marked-margin
+    /// Auto path (no marker, or a row shape the reframe itself would decline).
+    fn begin(problem: &MilpProblem, budget_secs: f64) -> Option<Self> {
+        let row = problem.margin_row()?;
+        let spec = problem.rows().get(row.0)?;
+        // The same one-sided test `ay_milp::margin::prepare_row` applies: a
+        // range, an equality, or a free row is not a margin and AY declines
+        // the reframe outright.
+        let (sense, threshold) = match (spec.lb.is_finite(), spec.ub.is_finite()) {
+            (false, true) => ("minimize", spec.ub),
+            (true, false) => ("maximize", spec.lb),
+            _ => return None,
+        };
+        Some(Self {
+            margin_row: row.0,
+            sense,
+            threshold,
+            budget_secs,
+            started: std::time::Instant::now(),
+            nodes_before: ay_milp::nodes_explored(),
+            lp_calls_before: profiled_bounded_lp_calls(),
+            // The trajectory costs one sleeping thread, so it is behind the
+            // measurement's own gate; the final summary below is free and
+            // always fires.
+            progress: shared_prefix_phase_telemetry_enabled()
+                .then(|| MarginAutoProgress::start(budget_secs)),
+        })
+    }
+
+    fn finish(self, outcome_tag: &str, exported_dual_bound: Option<f64>) {
+        let elapsed_secs = self.started.elapsed().as_secs_f64();
+        let samples = self
+            .progress
+            .map(MarginAutoProgress::finish)
+            .unwrap_or_default();
+        let dual_bound = exported_dual_bound.or_else(ay_margin_auto_dual_bound);
+        let threshold_distance =
+            dual_bound.map(|bound| Self::threshold_distance_for(self.sense, self.threshold, bound));
+        let nodes_delta = ay_milp::nodes_explored().saturating_sub(self.nodes_before);
+        let lp_calls_delta =
+            profiled_bounded_lp_call_delta(self.lp_calls_before, profiled_bounded_lp_calls());
+        eprintln!(
+            "{}",
+            Self::summary_line(
+                self.margin_row,
+                self.sense,
+                self.threshold,
+                dual_bound,
+                threshold_distance,
+                outcome_tag,
+                elapsed_secs,
+                self.budget_secs,
+                nodes_delta,
+                &samples,
+            )
+        );
+        tracing::info!(
+            canary = "ay-plain-check-marked-margin-auto",
+            margin_row = self.margin_row,
+            sense = self.sense,
+            threshold = self.threshold,
+            dual_bound = ?dual_bound,
+            threshold_distance = ?threshold_distance,
+            // False means the pinned typed API dropped the reframed bound on
+            // this outcome shape, NOT that the search never had one — see
+            // [`ay_margin_auto_dual_bound`].
+            dual_bound_exported_by_pinned_ay = dual_bound.is_some(),
+            elapsed_secs,
+            budget_secs = self.budget_secs,
+            nodes_process_global_snapshot_delta = nodes_delta,
+            nodes_exact_per_call = false,
+            lp_calls_process_global_snapshot_delta = ?lp_calls_delta,
+            lp_calls_exact_per_call = false,
+            node_trajectory_samples = samples.len(),
+            outcome = outcome_tag,
+            "AY plain marked-margin (MarginMode::Auto) session completed"
+        );
+    }
+
+    /// The exact stderr shape the re-measure greps for. Pure, so the marker's
+    /// text is pinnable without a solve (R9: the observable is the deliverable
+    /// here, so its format is part of the contract).
+    #[allow(clippy::too_many_arguments)]
+    fn summary_line(
+        margin_row: usize,
+        sense: &str,
+        threshold: f64,
+        dual_bound: Option<f64>,
+        threshold_distance: Option<f64>,
+        outcome_tag: &str,
+        elapsed_secs: f64,
+        budget_secs: f64,
+        nodes_delta: u64,
+        samples: &[(f64, u64)],
+    ) -> String {
+        // ⚠ THE SENTINEL CHANGED MEANING WHEN THE ay DELTA LANDED (ay
+        // `1f4edea36`). It used to read `not-exported-by-pinned-ay-typed-api`,
+        // and docs/BIG3_CORE_CAMPAIGN_2026-08-19.md says "that string is itself
+        // the flag that the ay delta has not landed yet" — which is now FALSE:
+        // the bound IS exported, and `None` here means this OUTCOME SHAPE
+        // carried none. Concretely, a reframe that CROSSES the threshold
+        // returns `Outcome::Infeasible`, which has no bound field at all, so
+        // the decisive UNSAT prints the sentinel while every undecided arm
+        // (`Bound` / `FEASIBLE_UNDECIDED` / a mapped `Optimal`) prints a real
+        // number. That is the arm-B read: sentinel + `outcome=unsat-*` is a
+        // WIN, sentinel + `outcome=timeout` would mean the reframe never
+        // completed at all.
+        let render = |value: Option<f64>| {
+            value.map_or_else(
+                || "unavailable-on-this-outcome-shape".to_string(),
+                |value| format!("{value:.6}"),
+            )
+        };
+        let trajectory = samples
+            .iter()
+            .map(|(at_secs, nodes)| format!("{at_secs:.2}s:{nodes}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "NY_MIP_AY_MARGIN_AUTO_V1 event=session-complete margin_row={margin_row} \
+             sense={sense} threshold={threshold:.6} dual_bound={} threshold_distance={} \
+             outcome={outcome_tag} elapsed_s={elapsed_secs:.3} budget_s={budget_secs:.3} \
+             nodes_process_global_delta={nodes_delta} node_trajectory=[{trajectory}]",
+            render(dual_bound),
+            render(threshold_distance),
+        )
+    }
+
+    /// The signed gap the reframed dual still has to travel to EXCLUDE the
+    /// band: negative while the bound is inside it, `>= 0` once it has
+    /// crossed. Split out so the sign convention is pinnable without a solve.
+    fn threshold_distance_for(sense: &str, threshold: f64, dual_bound: f64) -> f64 {
+        match sense {
+            // `min c·x` must rise ABOVE a `c·x <= t` band to exclude it.
+            "minimize" => dual_bound - threshold,
+            // `max c·x` must fall BELOW a `c·x >= t` band to exclude it.
+            _ => threshold - dual_bound,
+        }
+    }
+}
+
+#[cfg(test)]
+mod margin_auto_tests {
+    use super::*;
+
+    fn problem_with_row(lb: f64, ub: f64, mark: bool) -> MilpProblem {
+        let mut problem = MilpProblem::new();
+        let x = problem.add_col(0.0, -1.0, 1.0);
+        if mark {
+            problem
+                .add_margin_row(lb, ub, [(x, 1.0)])
+                .expect("one-sided synthetic margin");
+        } else {
+            problem.add_row(lb, ub, [(x, 1.0)]);
+        }
+        problem
+    }
+
+    /// The observation opens on exactly the shape AY's reframe accepts, and on
+    /// nothing else — an unmarked model (the whole historical corpus) and a
+    /// two-sided row both stay silent.
+    #[test]
+    fn margin_auto_session_opens_only_on_a_marked_one_sided_row() {
+        let upper = problem_with_row(f64::NEG_INFINITY, 0.25, true);
+        let session = MarginAutoSession::begin(&upper, 20.0).expect("marked upper-bounded row");
+        assert_eq!(session.sense, "minimize");
+        assert_eq!(session.threshold.to_bits(), 0.25_f64.to_bits());
+        assert!(
+            session.progress.is_none(),
+            "the trajectory must stay behind NY_PHASE_TELEMETRY"
+        );
+
+        let lower = problem_with_row(-0.25, f64::INFINITY, true);
+        let session = MarginAutoSession::begin(&lower, 20.0).expect("marked lower-bounded row");
+        assert_eq!(session.sense, "maximize");
+        assert_eq!(session.threshold.to_bits(), (-0.25_f64).to_bits());
+
+        assert!(
+            MarginAutoSession::begin(&problem_with_row(f64::NEG_INFINITY, 0.25, false), 20.0)
+                .is_none(),
+            "an unmarked model is not the margin-auto path"
+        );
+        assert!(
+            MarginAutoSession::begin(&MilpProblem::new(), 20.0).is_none(),
+            "an empty model has no margin row"
+        );
+    }
+
+    /// The reported distance must be NEGATIVE while the dual is still inside
+    /// the band and non-negative once it has crossed, in BOTH orientations —
+    /// that sign is the whole wall-bound/shape-bound read.
+    #[test]
+    fn threshold_distance_is_signed_toward_exclusion_in_both_orientations() {
+        assert!(MarginAutoSession::threshold_distance_for("minimize", 0.0, -0.4) < 0.0);
+        assert!(MarginAutoSession::threshold_distance_for("minimize", 0.0, 0.4) > 0.0);
+        assert!(MarginAutoSession::threshold_distance_for("maximize", 0.0, 0.4) < 0.0);
+        assert!(MarginAutoSession::threshold_distance_for("maximize", 0.0, -0.4) > 0.0);
+        assert_eq!(
+            MarginAutoSession::threshold_distance_for("minimize", 1.5, 1.5).to_bits(),
+            0.0_f64.to_bits(),
+            "a bound exactly ON the closed band boundary is not yet an exclusion"
+        );
+    }
+
+    /// The observation rides the REAL plain entry — the `MarginMode::Auto`
+    /// path an armed reframe takes on Historical ingress. Run with
+    /// `--nocapture` to see the marker; its text is pinned by
+    /// `margin_auto_summary_marker_is_exact`.
+    ///
+    /// # What this fixture PINS, and what it used to be unable to
+    ///
+    /// A trivially satisfiable band (`x <= 0` over `x in {0,1}`) used to
+    /// return **`Sat` unmarked and `Timeout` MARKED**, so the assertion here
+    /// could only be "it does not error". The cause was upstream of NY and was
+    /// never a wall: the Auto path's nested reframed solve INHERITED the
+    /// caller's `require_certificates(true)`, and that policy DISCARDS a
+    /// finished reframed `Optimal` with no primal-meeting certificate — which
+    /// the native tree cannot emit for a model with a real objective, and the
+    /// reframed model always has one. Since ay `1f4edea36` the `Auto` lane
+    /// runs the same nested construction `MarginMode::Required` uses (design:
+    /// docs/ARM_B_CERTIFIED_DECISIVE_DESIGN.md), so both directions decide and
+    /// this test asserts the VERDICTS.
+    ///
+    /// It therefore also catches a pin that lacks the delta: without it the
+    /// marked arm degrades to `Timeout` again and the first assertion fires.
+    #[test]
+    fn plain_check_entry_decides_a_marked_margin_in_both_directions() {
+        let mut problem = MilpProblem::new();
+        let x = problem.add_integer_col(0.0, 0.0, 1.0);
+        let margin = problem.add_row(f64::NEG_INFINITY, 0.0, [(x, 1.0)]);
+        problem.mark_margin_row(margin).expect("one-sided margin");
+        assert!(
+            MarginAutoSession::begin(&problem, 10.0).is_some(),
+            "this fixture must BE the margin-auto path"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = check_feasibility(&problem, 10.0, Some(deadline), None, &[], &[], None, &[])
+            .expect("the marked plain entry must still return a verdict");
+        assert!(
+            matches!(result, MipResult::Sat { .. }),
+            "a REACHABLE band must decide SAT on the marked plain entry: {result:?}"
+        );
+
+        // The control that makes the above a measurement rather than an
+        // anecdote: the SAME band, unmarked, decides the same way.
+        let mut unmarked = MilpProblem::new();
+        let y = unmarked.add_integer_col(0.0, 0.0, 1.0);
+        unmarked.add_row(f64::NEG_INFINITY, 0.0, [(y, 1.0)]);
+        let control = check_feasibility(&unmarked, 10.0, Some(deadline), None, &[], &[], None, &[])
+            .expect("the unmarked control must return a verdict");
+        assert!(
+            matches!(control, MipResult::Sat { .. }),
+            "the unmarked control must still decide this band: {control:?}"
+        );
+        assert!(
+            MarginAutoSession::begin(&unmarked, 10.0).is_none(),
+            "and the control must NOT be observed as a margin-auto session"
+        );
+    }
+
+    /// T2. THE DECISIVE SHAPE, end to end through NY's own entry.
+    ///
+    /// `s = a + b`, `a + b <= 1`, and the marked band asserts `s >= 2`: the
+    /// reframed `max s` is `1`, a strict threshold crossing, so the property
+    /// HOLDS and the original is INFEASIBLE. NY must receive that as
+    /// `Unsat { certified: true }` — i.e. carrying an artifact NY itself
+    /// re-verified against the model it handed AY, never a bare UNSAT.
+    ///
+    /// This is the shape the whole arm-B cycle turns on, and the assertion is
+    /// deliberately the STRONG one: a pin without the ay-side delta returns
+    /// `Timeout` here and fails.
+    #[test]
+    fn plain_check_entry_certifies_the_decisive_marked_margin_shape() {
+        let mut problem = MilpProblem::new();
+        let a = problem.add_integer_col(0.0, 0.0, 1.0);
+        let b = problem.add_integer_col(0.0, 0.0, 1.0);
+        let s = problem.add_col(0.0, f64::NEG_INFINITY, f64::INFINITY);
+        problem.add_row(0.0, 0.0, [(a, 1.0), (b, 1.0), (s, -1.0)]);
+        problem.add_row(f64::NEG_INFINITY, 1.0, [(a, 1.0), (b, 1.0)]);
+        let margin = problem.add_row(2.0, f64::INFINITY, [(s, 1.0)]);
+        problem.mark_margin_row(margin).expect("one-sided margin");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        let result = check_feasibility(&problem, 20.0, Some(deadline), None, &[], &[], None, &[])
+            .expect("the decisive marked shape must return a verdict");
+        assert!(
+            matches!(result, MipResult::Unsat { certified: true }),
+            "the decisive marked shape must come back CERTIFIED UNSAT: {result:?}"
+        );
+    }
+
+    /// T2 (cover half). The same contract on a shape whose ORIGINAL LP
+    /// RELAXATION IS FEASIBLE, so no root Farkas exists and the only possible
+    /// evidence is the whole-tree cover replayed against NY's lowered model.
+    ///
+    /// `2x + 2y <= 3` admits `x + y = 1.5` in the relaxation but only
+    /// `x + y <= 1` integrally, and the marked band asks `x + y >= 1.5`.
+    #[test]
+    fn plain_check_entry_certifies_a_cover_only_marked_margin_shape() {
+        let mut problem = MilpProblem::new();
+        let x = problem.add_integer_col(0.0, 0.0, 1.0);
+        let y = problem.add_integer_col(0.0, 0.0, 1.0);
+        problem.add_row(f64::NEG_INFINITY, 3.0, [(x, 2.0), (y, 2.0)]);
+        let margin = problem.add_row(1.5, f64::INFINITY, [(x, 1.0), (y, 1.0)]);
+        problem.mark_margin_row(margin).expect("one-sided margin");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+        let result = check_feasibility(&problem, 20.0, Some(deadline), None, &[], &[], None, &[])
+            .expect("the cover-only marked shape must return a verdict");
+        assert!(
+            matches!(result, MipResult::Unsat { certified: true }),
+            "a cover-only crossing must come back CERTIFIED UNSAT: {result:?}"
+        );
+    }
+
+    /// T8. THE MOAT LINE. NY re-verifies every artifact against the model IT
+    /// handed AY, so an artifact that does not hold is a hard failure — never
+    /// a bare UNSAT, and never shopped to another lane for a second opinion.
+    ///
+    /// The empty multiplier combination proves `0 >= 0`, which is not a
+    /// contradiction, so this tree certificate cannot verify against any
+    /// model. It stands in for every way an artifact could arrive doctored.
+    #[test]
+    fn a_doctored_tree_certificate_is_an_error_never_an_unsat() {
+        let mut problem = MilpProblem::new();
+        let x = problem.add_integer_col(0.0, 0.0, 1.0);
+        problem.add_row(1.0, f64::INFINITY, [(x, 1.0)]);
+        problem.add_row(f64::NEG_INFINITY, 0.0, [(x, 1.0)]);
+        let model = to_ay_model(&problem).expect("lowering");
+
+        let doctored = ay_milp::MilpInfeasibilityCertificate {
+            root: ay_milp::TreeNode::Leaf {
+                farkas: ay_milp::FarkasCertificate {
+                    multipliers: Vec::new(),
+                },
+            },
+        };
+        assert!(
+            doctored.verify(&model).is_err(),
+            "the fixture must actually be doctored"
+        );
+
+        let mapped = map_outcome_with_sat_relu_certificate(
+            Outcome::Infeasible {
+                cert: None,
+                tree_cert: Some(doctored),
+            },
+            &model,
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            // Even with the strict-policy door open: the artifact is present
+            // and it does not hold, which is a different state from absence.
+            true,
+        );
+        assert!(
+            matches!(mapped, MipResult::Error(_)),
+            "a tree certificate that fails replay must be an ERROR: {mapped:?}"
+        );
+    }
+
+    /// The exact marker the re-measure greps for on the Historical/arm-B
+    /// route, including the honest "this outcome shape carried no bound"
+    /// rendering.
+    #[test]
+    fn margin_auto_summary_marker_is_exact() {
+        assert_eq!(
+            MarginAutoSession::summary_line(
+                45,
+                "minimize",
+                0.0,
+                None,
+                None,
+                "timeout",
+                6.912,
+                7.0,
+                1234,
+                &[],
+            ),
+            "NY_MIP_AY_MARGIN_AUTO_V1 event=session-complete margin_row=45 sense=minimize \
+             threshold=0.000000 dual_bound=unavailable-on-this-outcome-shape \
+             threshold_distance=unavailable-on-this-outcome-shape outcome=timeout \
+             elapsed_s=6.912 budget_s=7.000 nodes_process_global_delta=1234 node_trajectory=[]"
+        );
+        assert_eq!(
+            MarginAutoSession::summary_line(
+                45,
+                "minimize",
+                0.0,
+                Some(-0.125),
+                Some(-0.125),
+                "sat-candidate",
+                1.5,
+                7.0,
+                7,
+                &[(1.0, 3), (2.0, 9)],
+            ),
+            "NY_MIP_AY_MARGIN_AUTO_V1 event=session-complete margin_row=45 sense=minimize \
+             threshold=0.000000 dual_bound=-0.125000 threshold_distance=-0.125000 \
+             outcome=sat-candidate elapsed_s=1.500 budget_s=7.000 \
+             nodes_process_global_delta=7 node_trajectory=[1.00s:3,2.00s:9]"
+        );
+    }
+
+    /// The trajectory sampler must be bounded and must stop with the solve:
+    /// it is telemetry, not a second worker with its own lifetime.
+    #[test]
+    fn progress_sampler_is_bounded_and_stops_with_the_session() {
+        let progress = MarginAutoProgress::start(2.0);
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let samples = progress.finish();
+        assert!(
+            samples.len() <= MarginAutoProgress::MAX_SAMPLES,
+            "the sampler must stay bounded, got {}",
+            samples.len()
+        );
+        for window in samples.windows(2) {
+            assert!(
+                window[1].0 >= window[0].0,
+                "samples must be timestamped in order"
+            );
+        }
+    }
+}
+
 /// Feasibility check on the in-process backend.
 ///
 /// Both `warm_start_cols` (the PGD counter-example candidate, seeded as the
@@ -2511,6 +3264,10 @@ pub(crate) fn check_feasibility(
     if hard_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
         return Ok(MipResult::Timeout);
     }
+    // Opened after every pre-solve decline, so `elapsed_s` measures the solve
+    // this call actually launched, against the `budget_s` it actually owns.
+    // `None` on every unmarked model, which is the whole historical corpus.
+    let margin_auto = MarginAutoSession::begin(&problem, timeout_secs);
     let solve = move || {
         let model = to_ay_model(&problem)?;
         let opts = window_scoped_opts(
@@ -2558,12 +3315,33 @@ pub(crate) fn check_feasibility(
             opts.require_certificates,
         ))
     };
-    let result = match hard_deadline {
+    let outcome = match hard_deadline {
         Some(deadline) => run_with_hard_deadline_at(deadline, "check", solve),
         None => run_with_hard_deadline(timeout_secs, "check", solve),
-    }?;
+    }
     // Slice expired with the solve still running: Timeout, never a verdict.
-    Ok(result.unwrap_or(MipResult::Timeout))
+    .map(|result| result.unwrap_or(MipResult::Timeout));
+    if let Some(margin_auto) = margin_auto {
+        // A backend error is observed too — an errored margin session is
+        // exactly as diagnostic as a timed-out one, and reporting it here
+        // cannot change what the caller receives.
+        let (outcome_tag, exported_dual_bound) = match &outcome {
+            Ok(result) => (
+                shared_prefix_outcome_tag(result),
+                match result {
+                    // The ONE dual AY exports through this entry today: the
+                    // rigorous interrupted-tree bound that rides an
+                    // incumbent. It is in the ORIGINAL model's frame, so it
+                    // is directly comparable with the margin threshold.
+                    MipResult::Sat { dual_bound, .. } => *dual_bound,
+                    _ => None,
+                },
+            ),
+            Err(_) => ("error", None),
+        };
+        margin_auto.finish(outcome_tag, exported_dual_bound);
+    }
+    outcome
 }
 
 /// Optimize a single column on the in-process backend.

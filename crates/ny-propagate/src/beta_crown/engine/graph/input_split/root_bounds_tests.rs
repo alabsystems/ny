@@ -7,9 +7,232 @@ use crate::{
     Conv2dLayer, ConvTranspose2dLayer, GraphNode, Layer, LinearLayer, ReLULayer, TanhLayer,
 };
 use ndarray::{arr1, arr2, ArrayD, IxDyn};
+use ny_core::{GpuCrownBackward, GpuCrownLayer, GpuCrownResult};
 use ny_test_utils::{env::lock_env, CountingGemmEngine};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+struct RootJointFactoryCapabilityMock {
+    sound: bool,
+    bounded_joint: bool,
+    sound_fold_max_rows: usize,
+}
+
+impl GemmEngine for RootJointFactoryCapabilityMock {
+    fn gemm_f32(&self, m: usize, _k: usize, n: usize, _a: &[f32], _b: &[f32]) -> Result<Vec<f32>> {
+        Ok(vec![0.0; m * n])
+    }
+
+    fn as_gpu_crown_backward(&self) -> Option<&dyn GpuCrownBackward> {
+        Some(self)
+    }
+}
+
+impl GpuCrownBackward for RootJointFactoryCapabilityMock {
+    fn crown_backward_gpu(
+        &self,
+        _layers: &[GpuCrownLayer],
+        _spec: &[f32],
+        num_specs: usize,
+        _input_lower: &[f32],
+        _input_upper: &[f32],
+    ) -> Result<GpuCrownResult> {
+        Ok(GpuCrownResult {
+            lower_bounds: vec![0.0; num_specs],
+            upper_bounds: vec![0.0; num_specs],
+        })
+    }
+
+    fn provides_sound_gpu_crown(&self) -> bool {
+        self.sound
+    }
+
+    fn provides_deadline_bounded_joint_alpha_gradient_resident(&self) -> bool {
+        self.bounded_joint
+    }
+
+    fn deadline_bounded_resnet_sound_max_rows(&self) -> usize {
+        self.sound_fold_max_rows
+    }
+}
+
+#[test]
+fn root_joint_deadline_engine_none_reaches_qualified_factory_at_bounded_k() {
+    // Exact scored recipe preconditions: M=1, D=1, K<=8. The production
+    // caller evaluates the absent local engine before entering the same lazy
+    // factory branch exercised here.
+    let configured_master = true;
+    let configured_deadline_ascent = true;
+    let configured_max_sel = ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS;
+    assert!(
+        configured_master
+            && configured_deadline_ascent
+            && configured_max_sel <= ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS
+    );
+
+    let engine: Option<&dyn GemmEngine> = None;
+    let local = engine.and_then(|candidate| {
+        crate::sound_gpu_gate::with_root_joint_deadline_gpu(candidate, |_| 1usize)
+    });
+    let factory = RootJointFactoryCapabilityMock {
+        sound: true,
+        bounded_joint: true,
+        sound_fold_max_rows: ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
+    };
+    let factory_lookups = Cell::new(0usize);
+    let tightener_calls = Cell::new(0usize);
+    let dispatch = finish_root_joint_deadline_dispatch(local, || {
+        factory_lookups.set(factory_lookups.get() + 1);
+        Ok(Some(crate::sound_gpu_gate::with_root_joint_deadline_gpu(
+            &factory,
+            |selected| {
+                tightener_calls.set(tightener_calls.get() + 1);
+                selected.sound_fold_max_rows()
+            },
+        )))
+    });
+
+    assert_eq!(factory_lookups.get(), 1);
+    assert_eq!(tightener_calls.get(), 1);
+    assert_eq!(
+        dispatch.terminal_receipt(),
+        (
+            1,
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::Completed
+        )
+    );
+    assert!(matches!(
+        dispatch,
+        RootJointDeadlineDispatch::Completed(rows)
+            if rows == ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS
+    ));
+}
+
+#[test]
+fn root_joint_deadline_missing_exact_capability_is_sound_no_op() {
+    let unqualified = RootJointFactoryCapabilityMock {
+        sound: true,
+        bounded_joint: false,
+        sound_fold_max_rows: ny_core::DEADLINE_BOUNDED_RESNET_SOUND_MAX_ROWS,
+    };
+    let tightener_calls = Cell::new(0usize);
+    let dispatch = finish_root_joint_deadline_dispatch(None::<usize>, || {
+        Ok(Some(crate::sound_gpu_gate::with_root_joint_deadline_gpu(
+            &unqualified,
+            |_| {
+                tightener_calls.set(tightener_calls.get() + 1);
+                7usize
+            },
+        )))
+    });
+
+    assert_eq!(tightener_calls.get(), 0, "no bound producer may run");
+    assert_eq!(
+        dispatch.terminal_receipt(),
+        (
+            0,
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::CapabilityUnavailable
+        )
+    );
+    assert!(matches!(
+        dispatch,
+        RootJointDeadlineDispatch::CapabilityUnavailable
+    ));
+}
+
+#[test]
+fn root_joint_deadline_local_completion_owns_the_only_attempt() {
+    let dispatch = finish_root_joint_deadline_dispatch(Some(23usize), || {
+        panic!("a completed local attempt must not observe the factory")
+    });
+    assert_eq!(
+        dispatch.terminal_receipt(),
+        (
+            1,
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::Completed
+        )
+    );
+    assert!(matches!(dispatch, RootJointDeadlineDispatch::Completed(23)));
+}
+
+#[test]
+fn root_joint_deadline_factory_refusal_records_zero_attempts() {
+    let dispatch = finish_root_joint_deadline_dispatch::<usize>(None, || {
+        Err(NyError::DeadlineExceeded(
+            "test factory deadline expired".to_string(),
+        ))
+    });
+    assert_eq!(
+        dispatch.terminal_receipt(),
+        (
+            0,
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::ExecutionRefused
+        )
+    );
+    assert!(matches!(
+        dispatch,
+        RootJointDeadlineDispatch::ExecutionRefused(NyError::DeadlineExceeded(_))
+    ));
+}
+
+#[test]
+fn root_joint_scored_authority_caps_the_historical_grace_request() {
+    let now = Instant::now();
+    let requested = Duration::from_mins(1);
+    let caller = now + Duration::from_secs(20);
+    let overall = now + Duration::from_secs(9);
+    let later_scored_wall = now + Duration::from_secs(30);
+
+    assert_eq!(
+        input_split_root_authority_deadline(Some(caller), Some(overall)),
+        Some(overall),
+        "a stricter scored wall must beat a longer effort/caller horizon"
+    );
+    assert_eq!(
+        input_split_root_authority_deadline(Some(caller), None),
+        Some(caller),
+        "ordinary scored routes carry their caller deadline without a cache"
+    );
+    assert_eq!(
+        input_split_root_authority_deadline(Some(caller), Some(later_scored_wall)),
+        Some(caller),
+        "a route-local BaB boundary must preserve its post-BaB reserve"
+    );
+    assert_eq!(
+        input_split_root_authority_deadline(None, Some(overall)),
+        Some(overall),
+        "an explicit scored wall is authoritative even without a caller horizon"
+    );
+    assert_eq!(
+        input_split_root_authority_deadline(None, None),
+        None,
+        "only a genuinely standalone call retains unbounded research grace"
+    );
+
+    assert_eq!(
+        root_joint_pass_deadline(now, requested, Some(overall)),
+        Some(overall),
+        "a typed scored treatment may not extend the overall instance wall"
+    );
+    assert_eq!(
+        root_joint_pass_deadline(now, requested, None),
+        Some(now + requested),
+        "standalone research calls retain the historical explicit grace"
+    );
+
+    let expired = now.checked_sub(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        root_joint_pass_deadline(now, requested, Some(expired)),
+        Some(expired),
+        "an expired overall authority must stay expired"
+    );
+    assert_eq!(
+        root_joint_pass_deadline(now, Duration::MAX, None),
+        None,
+        "an overflowing unbounded research request fails closed"
+    );
+}
 
 fn restart_graph() -> (GraphNetwork, BoundedTensor) {
     let mut graph = GraphNetwork::new();
@@ -292,6 +515,7 @@ fn second_restart_hits_and_skips_collection_bit_exact_20260721() {
         &config,
         Some(&engine),
         overall_deadline,
+        overall_deadline,
         "test restart #1",
         Some((&cache, overall_deadline)),
     )
@@ -311,6 +535,7 @@ fn second_restart_hits_and_skips_collection_bit_exact_20260721() {
             d.checked_sub(Duration::from_secs(1))
                 .expect("test deadline must permit a one-second offset")
         }),
+        overall_deadline,
         "test restart #2",
         Some((&cache, overall_deadline)),
     )
@@ -382,6 +607,7 @@ fn typed_cgan_complete_second_grouped_restart_reuses_single_transaction() {
             &config,
             None,
             None,
+            None,
             "typed restart #1",
             Some((&cache, None)),
         )
@@ -390,6 +616,7 @@ fn typed_cgan_complete_second_grouped_restart_reuses_single_transaction() {
             &graph,
             &input,
             &config,
+            None,
             None,
             None,
             "typed restart #2",
@@ -456,6 +683,7 @@ fn typed_cgan_tanh_restarts_reuse_only_map_and_recompute_seeded_alpha() {
                 &config,
                 None,
                 None,
+                None,
                 "typed Tanh restart #1",
                 Some((&cache, None)),
             )
@@ -474,6 +702,7 @@ fn typed_cgan_tanh_restarts_reuse_only_map_and_recompute_seeded_alpha() {
                 &graph,
                 &input,
                 &config,
+                None,
                 None,
                 None,
                 "typed Tanh restart #2",
@@ -669,6 +898,7 @@ fn unsupported_forward_image_configuration_falls_back_without_aborting() {
         &graph,
         &input,
         &config,
+        None,
         None,
         None,
         "forward fail-closed test",

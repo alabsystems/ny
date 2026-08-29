@@ -9,9 +9,32 @@
 # - Single shared model per system (relu_quadrotor2d_state.onnx, etc.)
 # - 80 instances with 25s timeout each
 # - Disjunctive output properties (multi-constraint clauses)
-# - STATUS (2026-03-07): MulBinary CROWN + Gather CROWN working. PGD finds ~10%
-#   SAT instances (1/9 in sample). BaB runs but bounds too loose for UNSAT.
-#   Upgraded from 0% (error) to ~10% (PGD SAT) since MulBinary fix.
+# - STATUS (2026-08-25, RE-MEASURED; the 2026-03-07 line below was FALSE on the
+#   current binary and is kept only as the claim that was corrected):
+#     "BaB runs but bounds too loose for UNSAT" — IT DOES NOT RUN AT ALL.
+#   In the SHIPPED configuration (this preset, no NY_* levers, official 25 s
+#   budget, through vnncomp_scripts/run_instance.sh) every lsnc_relu row that
+#   PGD cannot falsify returns `unknown` from a HARD BOUND-PATH ERROR after
+#   ~8.1 s, having explored ZERO domains:
+#     Skipping unsupported layer /lyapunov/MatMul: two constant inputs that did
+#       not fold (the exact-dot gate declined a rounded product)
+#     -> GraphNetwork IBP: degrading tainted node '/MatMul' (BilinearCrown) ...
+#        Invalid specification: MatMul requires at least 2D inputs
+#     -> output node '/Concat_2' is tainted by an upstream OpaqueSkip
+#     -> "Verification produced no verdict (sound unknown)"
+#   Three both-constant MatMuls fail `try_fold_matmul_exact` on this model
+#   (/lyapunov/MatMul, /controller/net/net/net.2_1/MatMul,
+#   /dynamics_relu/model/model.0_1/MatMul); the Lyapunov matrix Q is lost and
+#   the root bound is [-inf, +inf] on all 8 outputs. The ONLY mechanism that
+#   makes this model boundable is NY_CONST_MATMUL_INTERVAL, which is
+#   `Deliver::EnvOnly` by explicit soundness policy (space.rs, 43666c6b7) and
+#   therefore CANNOT fire in competition. Every BaB tuning key below is
+#   consequently DEAD in the scored lane — do not tune them against a
+#   lever-armed measurement and call it a competition improvement.
+#   Evidence: reports/measured-2026/lsnc_relu_artifacts/asymptotic_exactness/
+# - (superseded) STATUS (2026-03-07): MulBinary CROWN + Gather CROWN working.
+#   PGD finds ~10% SAT instances (1/9 in sample). BaB runs but bounds too loose
+#   for UNSAT. Upgraded from 0% (error) to ~10% (PGD SAT) since MulBinary fix.
 # - alpha-beta-CROWN reference: 75/75 (10 SAT, 65 UNSAT)
 # - Reference uses plain CROWN (`bound_prop_method: crown`), SB-style input
 #   splitting, relaxed input clipping (`clip_input_domain` default clip type),

@@ -237,7 +237,7 @@ fn graph_pgd_batched_threads_gemm_engine_for_conv2d_nodes_4081() {
         false,
     )
     .expect("graph PGD should accept Conv2d restart batches");
-    let BatchedGraphPgdOutcome::Completed(result) = result else {
+    let BatchedGraphPgdOutcome::Completed { result, .. } = result else {
         panic!("Conv2d graph PGD should stay on the batched path");
     };
 
@@ -339,10 +339,18 @@ fn graph_pgd_batched_restart_when_stuck_resamples_live_rng_4278() {
     )
     .expect("batched graph PGD with restart_when_stuck should not error");
 
-    let BatchedGraphPgdOutcome::Completed(without_restart) = without_restart else {
+    let BatchedGraphPgdOutcome::Completed {
+        result: without_restart,
+        ..
+    } = without_restart
+    else {
         panic!("flat graph should stay on the batched graph PGD path");
     };
-    let BatchedGraphPgdOutcome::Completed(with_restart) = with_restart else {
+    let BatchedGraphPgdOutcome::Completed {
+        result: with_restart,
+        ..
+    } = with_restart
+    else {
         panic!("flat graph should stay on the batched graph PGD path");
     };
 

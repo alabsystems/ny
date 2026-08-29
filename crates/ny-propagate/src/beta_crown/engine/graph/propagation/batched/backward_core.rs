@@ -31,6 +31,40 @@ use crate::{Layer, LinearBounds, MulBinaryRelaxationMode, NETWORK_INPUT};
 use super::backward_stack;
 use super::indexed_pending::IndexedPendingLinearBounds;
 
+// Test-only probe: how many Linear-node backward DISPATCHES this thread has
+// run. One increment per Linear node per traversal, regardless of how many
+// logical domains that node carries — so it measures TRAVERSAL SHAPE ("was
+// this node walked once or once per target?"), not arithmetic volume.
+//
+// WHY THIS EXISTS. The one-walk multi-depth oracle used to prove its shared
+// walk by counting `gemm_f32` calls on an injected `GemmEngine`. The Linear
+// arm below no longer issues an engine GEMM at all — it runs the certified f64
+// CPU contraction (`propagate_linear_pollable_cpu`) — so that counter reads 0
+// on every traversal and silently stops measuring anything. An instrument that
+// can only read 0 is not a test. This probe is attached to the surviving
+// observable.
+//
+// Thread-local for the same reason `batched_bwd::engaged_on_thread` is: the
+// backward runs synchronously on the caller's thread, so the delta observes
+// exactly the test's own calls and never a concurrent test's.
+#[cfg(test)]
+thread_local! {
+    static LINEAR_DISPATCHES_ON_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Read the current thread's Linear-dispatch count (see
+/// `LINEAR_DISPATCHES_ON_THREAD`). Tests compare a DELTA across the call under
+/// test, never an absolute.
+#[cfg(test)]
+pub(crate) fn linear_dispatches_on_thread() -> usize {
+    LINEAR_DISPATCHES_ON_THREAD.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_linear_dispatch() {
+    LINEAR_DISPATCHES_ON_THREAD.with(|count| count.set(count.get() + 1));
+}
+
 /// Runtime gate for the #lsnc-relu STEP 2 DOMAIN-batched ReLU backward.
 ///
 /// `-1` = uninitialized (read the env once, then cache); `1` = ON; `0` = OFF.
@@ -196,28 +230,42 @@ pub(super) fn dispatch_node_backward(
         if active_bounds.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        note_linear_dispatch();
 
-        // A stacked batched GEMM has no intra-call cancellation seam. Preserve
-        // that fast path only for unscored work; deadline-scored traversal uses
-        // the row-chunked single-domain API and can stop between chunks/domains.
-        let new_bounds = if deadline.is_some() {
-            let mut propagated = Vec::with_capacity(active_bounds.len());
-            for bounds in active_bounds {
-                let bounds = l
-                    .propagate_linear_with_engine_and_deadline(bounds, Some(engine), deadline)?
-                    .into_owned();
-                if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
-                    return Err(NyError::DeadlineExceeded(format!(
-                        "batched CROWN backward exceeded its deadline at Linear node '{node_name}'"
-                    )));
-                }
-                propagated.push(bounds);
+        // #deadline-parity: ONE arithmetic path regardless of deadline presence.
+        //
+        // This site used to branch on `deadline.is_some()`, keeping a stacked
+        // batched GEMM "only for unscored work" because that call has no
+        // intra-call cancellation seam. That split put the competition binary
+        // (always deadlined) and the entire test suite (never deadlined) on
+        // DIFFERENT arithmetic: the batched arm stores the engine's f32 product
+        // with a `γ_n^{f32}·S` certified error, the per-domain arm the certified
+        // f64 contraction with `γ_n^{f64}·S`. No test could see the difference.
+        //
+        // Measured before removing it (`tests_deadline_parity.rs`, CPU engine,
+        // 6 domains x 24 objectives x 96->128): the per-domain arm is 0.75x the
+        // batched arm's wall clock — FASTER, not slower. Both arms pay the same
+        // per-domain f64 `aw_f64_with_abssum`; the batched arm merely adds a
+        // stacked f32 GEMM on top of it and then publishes the looser of the two
+        // certified errors. So there was no fast path here to preserve.
+        //
+        // `propagate_linear_pollable_cpu` (rather than
+        // `propagate_linear_with_engine_and_deadline`) because the latter routes
+        // `None` back to the engine f32 GEMM and would reinstate the very split
+        // this removes.
+        let mut new_bounds = Vec::with_capacity(active_bounds.len());
+        for bounds in active_bounds {
+            let bounds = l
+                .propagate_linear_pollable_cpu(bounds, Some(engine), deadline)?
+                .into_owned();
+            if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
+                return Err(NyError::DeadlineExceeded(format!(
+                    "batched CROWN backward exceeded its deadline at Linear node '{node_name}'"
+                )));
             }
-            propagated
-        } else {
-            // BATCHED GPU GEMM: Process all domains in one kernel call.
-            l.propagate_linear_batched_with_engine(&active_bounds, engine)?
-        };
+            new_bounds.push(bounds);
+        }
 
         // Distribute results back to domains
         for (result_idx, &domain_idx) in active_indices.iter().enumerate() {
@@ -639,14 +687,21 @@ pub(super) fn generic_backward_domain(
                     bias_upper,
                 )?;
                 sink(NETWORK_INPUT, bias_lb)?;
-                for (input_name, maybe_lb) in node.inputs.iter().zip(bounds) {
-                    if let Some(new_lb) = maybe_lb {
-                        GraphNetwork::verify_split_path_bias_zero(
-                            &new_lb,
-                            "Batched dispatch n-ary split path",
-                        )?;
-                        sink(input_name, new_lb)?;
-                    }
+                // #nary-zip: `bounds` is ONNX-ordered (`None` = embedded
+                // constant) while `node.inputs` is dynamic-only, so the pairing
+                // is owned by `NaryInputBounds` and refuses on a count
+                // mismatch. Authenticate EVERY carried path before publishing
+                // any of them.
+                let paired = bounds
+                    .pair_with_dynamic_inputs(&node.inputs, "Batched dispatch n-ary split path")?;
+                for (_, new_lb) in &paired {
+                    GraphNetwork::verify_split_path_bias_zero(
+                        new_lb,
+                        "Batched dispatch n-ary split path",
+                    )?;
+                }
+                for (input_name, new_lb) in paired {
+                    sink(input_name, new_lb)?;
                 }
             }
             BackwardDispatchResult::PassThrough => {

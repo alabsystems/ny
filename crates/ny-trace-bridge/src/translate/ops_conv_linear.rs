@@ -8,29 +8,61 @@
 //! Ported from NN's LayerSpec translators:
 //!
 //! - `ConvTranspose1d` / `ConvTranspose2d` mirror
-//!   `trace_to_graph_layerspec_conv_transpose.rs`, including the
-//!   `output_padding != 0` decomposition for the 1-D case
-//!   (`ConvTranspose1d(output_padding=0)` + identity-matrix Linear zero-pad)
-//!   and the fail-closed refusals (`dilation != 1` for both; 2-D
-//!   `output_padding != 0`).
+//!   `trace_to_graph_layerspec_conv_transpose.rs`, extended past NN's
+//!   refusals where ny's layers genuinely support the configuration:
+//!   both emit the `dilations` attribute (ny-propagate's
+//!   `ConvTranspose1dLayer::new_full` / `ConvTranspose2dLayer::new_full`
+//!   model dilation natively, threaded through ny-build's
+//!   `convert/conv.rs`), and the 2-D case emits `output_padding`
+//!   (`ConvTranspose2dLayer` carries it as a field). The 1-D
+//!   `output_padding != 0` case keeps the NN #2558 decomposition
+//!   (`ConvTranspose1d(output_padding=0)` + identity-matrix Linear
+//!   zero-pad, dilation-aware) because ny-build's 1-D converter refuses
+//!   the attribute. Fail-closed refusals that REMAIN: 2-D
+//!   `output_padding >= stride` (the transposed-conv output size is only
+//!   recoverable within one stride step; `ConvTranspose2dLayer::new_full`
+//!   enforces the same bound) and 2-D `groups != 1` (the layer models only
+//!   the dense groups=1 kernel layout — silently dropping groups would
+//!   reinterpret the grouped kernel as dense, which is unsound).
 //! - `QLinear` routes to the shared Linear translator, exactly as NN's
 //!   `translate_conv_dispatch` does (the dequantized f32 payload is a plain
 //!   Linear for bound purposes).
-//! - `Embedding` mirrors `trace_to_graph_layerspec_embed.rs`: a Linear with
-//!   zeros weight + per-dimension midpoint bias (sound but conservative table
-//!   lookup relaxation), plus a Reshape when the op adds an embedding dim.
+//! - `Embedding` extends `trace_to_graph_layerspec_embed.rs`: a Linear with
+//!   zeros weight + per-dimension midpoint bias, then an `EpsilonExpand`
+//!   carrying the outward-rounded per-dimension half-spreads (the widening
+//!   that makes the index-agnostic surrogate a true enclosure of every row),
+//!   plus a Reshape when the op adds an embedding dim.
 //! - `Narrow` mirrors `translate_narrow` (Slice with axis/start/end).
 //! - `Expand` mirrors `translate_expand` (chained Tile per broadcast dim;
 //!   identity Reshape when no dim expands).
-//! - `Conv3d` remains the fail-closed `UnsupportedOp` refusal: NN's LayerSpec
-//!   path has no Conv3d emission (its conv dispatch rejects it), so there is
-//!   no ground-truth lowering to port.
+//! - `Conv3d` → `LayerType::Conv3d`, mirroring the `Conv2d` attribute set with
+//!   one extra spatial axis (`strides`/`dilations` gain a depth entry, `pads`
+//!   becomes ONNX's rank-3 begin/end 6-tuple). See [`translate_conv3d`].
+//!
+//!   This arm used to be a fail-closed refusal, and the refusal was honest:
+//!   **ny-propagate had no 3-D convolution layer at all**, so there was no
+//!   emission target to wire a lowering TO and no amount of translator work
+//!   would have changed it. That premise is gone — `ny_core::LayerType` has a
+//!   `Conv3d` variant, `ny_propagate::layers::Conv3dLayer` exists, and
+//!   ny-build's `convert_conv3d` builds it (its ONNX path now dispatches a
+//!   rank-5 `Conv` kernel there instead of refusing). The layer is IBP-ONLY:
+//!   its interval forward is a certified directed-binary64 enclosure and its
+//!   CROWN backward fails closed, so a Conv3d node degrades the network to IBP
+//!   at that node rather than making it unverifiable — strictly better than the
+//!   permissive mode's vacuous `[-inf, +inf]` `OpaqueSkip` carrier, which was
+//!   the only escape while the refusal stood.
+//!
+//!   Unlike `Conv2d`'s trace arm, dilation is EMITTED rather than refused:
+//!   `Conv3dLayer::new_dilated` consumes it and the layer's IBP forward reads
+//!   `self.dilation`, so dropping the attribute would silently build a
+//!   `dilation = 1` layer whose bounds do not enclose the traced op.
 
 use std::collections::HashMap;
 
 use ndarray::{Array2, IxDyn};
 use ny_build::{AttributeValue, DataType, LayerSpec, WeightRef};
 use ny_core::{LayerType, NyError, Result};
+use ny_tensor::sub_up_f32;
 
 use crate::schema::{TraceNode, TraceOp, WeightPayload};
 
@@ -42,8 +74,10 @@ use super::{
 /// Translate a conv/linear-family op (`Conv3d`, `ConvTranspose1d`,
 /// `ConvTranspose2d`, `QLinear`, `Embedding`, `Narrow`, `Expand`) node.
 ///
-/// `Conv3d` (no NN LayerSpec emission exists) refuses with the exact
-/// [`NyError::UnsupportedOp`] error the pre-split catch-all arm produced.
+/// `Conv3d` lowers to `LayerType::Conv3d` (see [`translate_conv3d`]); the
+/// blanket refusal that stood here rested on ny-propagate having no 3-D
+/// convolution layer, which is no longer true. Any op mis-routed here keeps
+/// the pre-split catch-all's message shape.
 pub(super) fn translate_conv_linear(
     node: &TraceNode,
     name: &str,
@@ -132,13 +166,149 @@ pub(super) fn translate_conv_linear(
             ctx,
         ),
 
-        // Conv3d and anything mis-routed here: fail-closed refusal (same
-        // type, same message shape as the pre-split catch-all arm).
+        // Conv3d: LOWERED. The refusal that stood here was a MISSING-LAYER
+        // refusal ("ny-propagate has no 3-D convolution layer to emit"), and
+        // that premise no longer holds: `ny_propagate::layers::Conv3dLayer`
+        // exists, `ny_core::LayerType::Conv3d` names it, and ny-build's
+        // `convert_conv3d` arm builds it (it also now dispatches a rank-5 ONNX
+        // Conv kernel there instead of refusing).
+        TraceOp::Conv3d {
+            weight,
+            bias,
+            padding,
+            stride,
+            dilation,
+            groups,
+        } => translate_conv3d(
+            name,
+            weight,
+            bias,
+            padding,
+            stride,
+            dilation,
+            *groups,
+            input_tensors,
+            output_tensor,
+            ctx,
+        ),
+
+        // Anything mis-routed here: fail-closed refusal (same type, same
+        // message shape as the pre-split catch-all arm).
         _ => Err(NyError::UnsupportedOp(format!(
             "{} not supported in NY trace translation",
             op_name(&node.op)
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Conv3d
+// ---------------------------------------------------------------------------
+
+/// Translate `TraceOp::Conv3d` into a `LayerType::Conv3d` spec.
+///
+/// The attribute set mirrors [`ops_core::translate_conv2d`] with one extra
+/// spatial axis throughout: `strides` / `dilations` gain a leading depth entry
+/// and `pads` becomes ONNX's rank-3 begin/end form
+/// `[d, h, w, d, h, w]` — which ny-build's `parse_symmetric_padding_3d` reads
+/// as symmetric and threads into `Conv3dLayer`'s one-value-per-axis padding.
+/// The trace carries a single `padding[axis]` per axis (nn's `Conv3d` has no
+/// asymmetric form), so the emitted 6-tuple is symmetric by construction and
+/// can never hit that parser's asymmetric refusal.
+///
+/// # Dilation is emitted, not refused
+///
+/// [`ops_core::translate_conv2d`] refuses `dilation != 1` because ny's
+/// `Conv2dLayer` path there cannot consume it. `Conv3dLayer` can: ny-build
+/// calls `Conv3dLayer::new_dilated(.., dilation, groups)` and the layer's
+/// certified IBP forward reads `self.dilation` directly. Dropping the attribute
+/// instead would silently build a `dilation = 1` layer whose bounds do NOT
+/// enclose the traced op, so it is threaded through.
+///
+/// # Soundness / tier
+///
+/// A 3-D convolution is an affine map, so nothing here approximates: the
+/// emitted layer computes the traced function with the traced weights. The
+/// layer is IBP-ONLY — its interval forward is a certified directed-binary64
+/// enclosure and `Conv3dLayer`'s CROWN backward fails closed — so a Conv3d node
+/// degrades the network to IBP at that node rather than making it unverifiable,
+/// which is what the old refusal did (the permissive mode's vacuous
+/// `[-inf, +inf]` OpaqueSkip carrier was the only escape).
+#[allow(clippy::too_many_arguments)]
+fn translate_conv3d(
+    name: &str,
+    weight: &WeightPayload,
+    bias: &Option<WeightPayload>,
+    padding: &[usize; 3],
+    stride: &[usize; 3],
+    dilation: &[usize; 3],
+    groups: usize,
+    input_tensors: &[String],
+    output_tensor: &str,
+    ctx: &mut Ctx,
+) -> Result<NodeOutput> {
+    // ny-build refuses a non-rank-5 kernel with a bare ShapeMismatch; catching
+    // it here names the op and the actual shape instead.
+    if weight.shape.len() != 5 {
+        return Err(NyError::UnsupportedOp(format!(
+            "Conv3d: kernel must be rank 5 [out_c, in_c/group, kD, kH, kW], got {:?}",
+            weight.shape
+        )));
+    }
+
+    let w_name = format!("{name}_weight");
+    insert_payload(ctx, weight, &w_name, "Conv3d weight")?;
+    if let Some(b) = bias {
+        insert_payload(ctx, b, &format!("{name}_bias"), "Conv3d bias")?;
+    }
+
+    let sd = dim_as_i64(stride[0], "Conv3d stride_d")?;
+    let sh = dim_as_i64(stride[1], "Conv3d stride_h")?;
+    let sw = dim_as_i64(stride[2], "Conv3d stride_w")?;
+    let pd = dim_as_i64(padding[0], "Conv3d pad_d")?;
+    let ph = dim_as_i64(padding[1], "Conv3d pad_h")?;
+    let pw = dim_as_i64(padding[2], "Conv3d pad_w")?;
+    let dd = dim_as_i64(dilation[0], "Conv3d dilation_d")?;
+    let dh = dim_as_i64(dilation[1], "Conv3d dilation_h")?;
+    let dw = dim_as_i64(dilation[2], "Conv3d dilation_w")?;
+
+    let mut attrs = HashMap::new();
+    attrs.insert(
+        "strides".to_string(),
+        AttributeValue::Ints(vec![sd, sh, sw]),
+    );
+    // ONNX pads order: [x1_begin, .., xN_begin, x1_end, .., xN_end].
+    attrs.insert(
+        "pads".to_string(),
+        AttributeValue::Ints(vec![pd, ph, pw, pd, ph, pw]),
+    );
+    attrs.insert(
+        "dilations".to_string(),
+        AttributeValue::Ints(vec![dd, dh, dw]),
+    );
+    attrs.insert(
+        "group".to_string(),
+        AttributeValue::Int(dim_as_i64(groups, "Conv3d groups")?),
+    );
+
+    let mut spec_inputs = input_tensors.to_vec();
+    spec_inputs.push(w_name.clone());
+    if bias.is_some() {
+        spec_inputs.push(format!("{name}_bias"));
+    }
+
+    Ok(NodeOutput::one(LayerSpec {
+        name: name.to_string(),
+        layer_type: LayerType::Conv3d,
+        inputs: spec_inputs,
+        outputs: vec![output_tensor.to_string()],
+        weights: Some(WeightRef {
+            name: w_name,
+            shape: weight.shape.clone(),
+            original_dtype: DataType::Float32,
+        }),
+        attributes: attrs,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +343,6 @@ fn translate_conv_transpose1d(
     output_tensor: &str,
     ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
-    if dilation != 1 {
-        return Err(NyError::UnsupportedOp(
-            "ConvTranspose1d dilation != 1 not supported".to_string(),
-        ));
-    }
     let w_name = format!("{name}_weight");
     insert_payload(ctx, weight, &w_name, "ConvTranspose1d weight")?;
     if let Some(b) = bias {
@@ -186,6 +351,7 @@ fn translate_conv_transpose1d(
 
     let stride_i64 = dim_as_i64(stride, "ConvTranspose1d stride")?;
     let pad_i64 = dim_as_i64(padding, "ConvTranspose1d padding")?;
+    let dilation_i64 = dim_as_i64(dilation, "ConvTranspose1d dilation")?;
     let groups_i64 = dim_as_i64(groups, "ConvTranspose1d groups")?;
 
     let mut attrs = HashMap::new();
@@ -196,6 +362,15 @@ fn translate_conv_transpose1d(
     attrs.insert(
         "pads".to_string(),
         AttributeValue::Ints(vec![pad_i64, pad_i64]),
+    );
+    // ny-build's `parse_dilation_attr` reads `dilations` and threads it into
+    // `ConvTranspose1dLayer::new_full`, whose forward/IBP/CROWN paths all
+    // consume `self.dilation` (ny-propagate conv1d/types/transpose.rs) — no
+    // refusal needed; dropping the attribute instead would silently build a
+    // dilation=1 layer whose bounds do NOT enclose the traced op.
+    attrs.insert(
+        "dilations".to_string(),
+        AttributeValue::Ints(vec![dilation_i64]),
     );
     attrs.insert("group".to_string(), AttributeValue::Int(groups_i64));
 
@@ -283,7 +458,8 @@ fn translate_conv_transpose1d_with_output_padding(
         NyError::ModelLoad("ConvTranspose1d output_padding: weight rank < 3".to_string())
     })?;
 
-    // Recover stride and padding from attrs (already computed by caller).
+    // Recover stride, padding, and dilation from attrs (already computed by
+    // the caller).
     let stride = match attrs.get("strides") {
         Some(AttributeValue::Ints(v)) if !v.is_empty() => {
             checked_i64_to_usize(v[0], "ConvTranspose1d stride attr")?
@@ -296,18 +472,41 @@ fn translate_conv_transpose1d_with_output_padding(
         }
         _ => 0,
     };
+    let dilation = match attrs.get("dilations") {
+        Some(AttributeValue::Ints(v)) if !v.is_empty() => {
+            checked_i64_to_usize(v[0], "ConvTranspose1d dilation attr")?
+        }
+        _ => 1,
+    };
 
-    // ConvTranspose1d output without output_padding (dilation=1):
-    // T_mid = (in_len - 1) * stride - 2 * padding + kernel_size
+    // ConvTranspose1d output without output_padding:
+    // T_mid = (in_len - 1) * stride - 2 * padding + dilation * (kernel_size - 1) + 1
+    // (the dilated effective kernel extent; matches PyTorch ConvTranspose1d and
+    // ny-propagate `ConvTranspose1dLayer::output_length`). Using the raw
+    // kernel_size here with dilation != 1 would size the zero-pad Linear
+    // against the wrong T_mid and mis-place every output element — a silent
+    // enclosure break, so the arithmetic is derived from the same effective
+    // extent the layer itself uses.
+    let effective_kernel = kernel_size
+        .checked_sub(1)
+        .and_then(|v| v.checked_mul(dilation))
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| {
+            NyError::InternalError(format!(
+                "ConvTranspose1d output_padding: effective kernel overflow \
+                 (kernel_size={kernel_size}, dilation={dilation})"
+            ))
+        })?;
     let t_mid = in_len
         .checked_sub(1)
         .and_then(|v| v.checked_mul(stride))
-        .and_then(|v| v.checked_add(kernel_size))
+        .and_then(|v| v.checked_add(effective_kernel))
         .and_then(|v| v.checked_sub(2usize.checked_mul(padding)?))
         .ok_or_else(|| {
             NyError::InternalError(format!(
                 "ConvTranspose1d output_padding: T_mid overflow (in_len={in_len}, \
-                 stride={stride}, padding={padding}, kernel_size={kernel_size})"
+                 stride={stride}, padding={padding}, kernel_size={kernel_size}, \
+                 dilation={dilation})"
             ))
         })?;
     let t_out = t_mid.checked_add(output_padding).ok_or_else(|| {
@@ -402,15 +601,35 @@ fn translate_conv_transpose2d(
     output_tensor: &str,
     ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
-    if dilation[0] != 1 || dilation[1] != 1 {
-        return Err(NyError::UnsupportedOp(
-            "ConvTranspose2d dilation != 1 not supported".to_string(),
-        ));
+    // Fail-closed refusal: ny-propagate's `ConvTranspose2dLayer` models only
+    // the dense groups=1 kernel layout (`new_full` takes no groups argument,
+    // and ny-build's `convert_conv_transpose2d` refuses `group != 1`).
+    // Emitting anyway would let a grouped kernel `[C_in, C_out/groups, kH, kW]`
+    // be reinterpreted as dense — silently-wrong bounds, the worst failure —
+    // so refuse at the bridge with the reason spelled out.
+    if groups != 1 {
+        return Err(NyError::UnsupportedOp(format!(
+            "ConvTranspose2d groups={groups} not supported: ny's \
+             ConvTranspose2dLayer models only the dense groups=1 kernel layout; \
+             lowering a grouped kernel [C_in, C_out/groups, kH, kW] onto it \
+             would reinterpret the kernel as dense and produce wrong (not \
+             enclosing) bounds"
+        )));
     }
-    if output_padding[0] != 0 || output_padding[1] != 0 {
-        return Err(NyError::UnsupportedOp(
-            "ConvTranspose2d output_padding != 0 not supported".to_string(),
-        ));
+    // Fail-closed refusal: output_padding only disambiguates the recovered
+    // output size within one stride step, so it must be < stride per
+    // dimension (PyTorch ConvTranspose2d contract). ny-propagate's
+    // `ConvTranspose2dLayer::new_full` enforces the same bound downstream;
+    // refusing here keeps the error at the translation boundary with the
+    // trace's own parameters named.
+    if output_padding[0] >= stride[0] || output_padding[1] >= stride[1] {
+        return Err(NyError::UnsupportedOp(format!(
+            "ConvTranspose2d output_padding ({}, {}) must be < stride ({}, {}) \
+             per dimension: output_padding only disambiguates the \
+             transposed-conv output size within one stride step (PyTorch \
+             ConvTranspose2d contract, enforced by ny's ConvTranspose2dLayer)",
+            output_padding[0], output_padding[1], stride[0], stride[1]
+        )));
     }
 
     let w_name = format!("{name}_weight");
@@ -423,6 +642,10 @@ fn translate_conv_transpose2d(
     let stride_w = dim_as_i64(stride[1], "ConvTranspose2d stride_w")?;
     let pad_h = dim_as_i64(padding[0], "ConvTranspose2d padding_h")?;
     let pad_w = dim_as_i64(padding[1], "ConvTranspose2d padding_w")?;
+    let dil_h = dim_as_i64(dilation[0], "ConvTranspose2d dilation_h")?;
+    let dil_w = dim_as_i64(dilation[1], "ConvTranspose2d dilation_w")?;
+    let outpad_h = dim_as_i64(output_padding[0], "ConvTranspose2d output_padding_h")?;
+    let outpad_w = dim_as_i64(output_padding[1], "ConvTranspose2d output_padding_w")?;
     let groups_i64 = dim_as_i64(groups, "ConvTranspose2d groups")?;
 
     let mut attrs = HashMap::new();
@@ -433,6 +656,20 @@ fn translate_conv_transpose2d(
     attrs.insert(
         "pads".to_string(),
         AttributeValue::Ints(vec![pad_h, pad_w, pad_h, pad_w]),
+    );
+    // ny-build's `parse_dilation_attr` / `parse_output_padding_attr` read
+    // both attributes and thread them into `ConvTranspose2dLayer::new_full`
+    // (ny-build convert/conv.rs), whose output-size formula
+    // `stride*(in-1) + dilation*(kernel-1) + 1 - 2*pad + output_padding`
+    // consumes them natively. Dropping either would silently build a layer
+    // whose bounds do not enclose the traced op.
+    attrs.insert(
+        "dilations".to_string(),
+        AttributeValue::Ints(vec![dil_h, dil_w]),
+    );
+    attrs.insert(
+        "output_padding".to_string(),
+        AttributeValue::Ints(vec![outpad_h, outpad_w]),
     );
     attrs.insert("group".to_string(), AttributeValue::Int(groups_i64));
 
@@ -457,22 +694,29 @@ fn translate_conv_transpose2d(
 }
 
 // ---------------------------------------------------------------------------
-// Embedding (mirrors NN trace_to_graph_layerspec_embed.rs)
+// Embedding (midpoint Linear + EpsilonExpand hull widening)
 // ---------------------------------------------------------------------------
 //
-// NY's graph build has no Embedding converter. The embedding is a table lookup
-// where any row could be selected, so per-dimension bounds are:
+// NY's graph build has no Embedding converter, and which row a lookup selects
+// is not a quantity interval propagation can track. The surrogate is instead
+// INDEX-VALUE-INDEPENDENT: whatever row is selected, the output lies in the
+// per-dimension vocabulary hull
 //   lower[d] = min(weight[0..V, d]), upper[d] = max(weight[0..V, d])
 //
-// Modeled as a Linear layer with zeros weight and midpoint bias. The Embedding
-// maps [B, T] → [B, T, D], adding the embedding dimension. NY's Linear
-// preserves rank (maps last dim only), so:
-//   1. Linear: [B, T] → [B, T*D]  (W = zeros([T*D, T]), b = midpoint tiled T×)
-//   2. Reshape: [B, T*D] → [B, T, D]
+// Modeled as a Linear with zeros weight and midpoint bias — whose output is
+// pinned to the tiled hull midpoint regardless of the input — followed by an
+// EpsilonExpand carrying the outward-rounded per-dimension half-spreads, so
+// the propagated interval [midpoint - eps, midpoint + eps] encloses
+// [lower, upper] and with it every row the lookup could select. The midpoint
+// Linear alone (NN's historic lowering) claims the DEGENERATE interval
+// [midpoint, midpoint], which excludes almost every actual row; the
+// EpsilonExpand widening is what makes the surrogate an enclosure.
 //
-// Since W=zeros, the Linear always outputs the tiled midpoint regardless of
-// input. IBP then spreads the ±half-width through downstream layers. This is
-// sound (no false negatives) but conservative.
+// The Embedding maps [B, T] → [B, T, D], adding the embedding dimension. NY's
+// Linear preserves rank (maps last dim only), so:
+//   1. Linear: [B, T] → [B, T*D]  (W = zeros([T*D, T]), b = midpoint tiled T×)
+//   2. EpsilonExpand: [B, T*D] → [B, T*D]  (radii = half-spreads tiled T×)
+//   3. Reshape: [B, T*D] → [B, T, D]
 fn translate_embedding(
     name: &str,
     weight: &WeightPayload,
@@ -504,8 +748,21 @@ fn translate_embedding(
         )));
     }
 
-    // Compute per-dimension midpoint across all vocabulary rows.
+    // Per-dimension vocabulary hull [lo, hi], its midpoint, and an
+    // outward-rounded half-spread radius. eps[d] must dominate BOTH gaps in
+    // EXACT arithmetic — midpoint - eps <= lo AND midpoint + eps >= hi — or
+    // the widened interval would exclude an actual vocabulary row.
+    // `f32::midpoint` rounds to nearest, so a naive `(hi - lo) / 2` can land
+    // strictly inside a gap (e.g. lo = -2^26, hi = 1: the rounded half-spread
+    // 2^25 leaves midpoint + eps = 0 < hi); the max of the two upward-rounded
+    // gaps (`sub_up_f32` returns the smallest f32 >= the exact difference)
+    // gives eps >= midpoint - lo and eps >= hi - midpoint by construction,
+    // whichever side `f32::midpoint` rounded toward. Zero-spread dims
+    // collapse to a true 0 radius. EpsilonExpand's IBP then applies the radii
+    // with directed rounding (`sub_down_f32`/`add_up_f32`), which only ever
+    // moves further outward.
     let mut midpoints = Vec::with_capacity(embedding_dim);
+    let mut epsilons = Vec::with_capacity(embedding_dim);
     for d in 0..embedding_dim {
         let mut lo = f32::INFINITY;
         let mut hi = f32::NEG_INFINITY;
@@ -518,7 +775,16 @@ fn translate_embedding(
                 hi = val;
             }
         }
-        midpoints.push(f32::midpoint(lo, hi));
+        let mid = f32::midpoint(lo, hi);
+        let eps = sub_up_f32(mid, lo).max(sub_up_f32(hi, mid)).max(0.0);
+        if !eps.is_finite() {
+            return Err(NyError::NumericalInstability(format!(
+                "Embedding: half-spread radius overflows f32 at dim {d} \
+                 (lo={lo}, hi={hi}, midpoint={mid})"
+            )));
+        }
+        midpoints.push(mid);
+        epsilons.push(eps);
     }
 
     let data_input = first_input(input_tensors, "Embedding")?;
@@ -546,8 +812,9 @@ fn translate_embedding(
     let output_rank = output_shape.len();
 
     if output_rank > input_rank {
-        // Embedding adds dimensions: emit Linear → flat → Reshape to output
-        // shape. Linear maps in_features (T) → out_features (T * D).
+        // Embedding adds dimensions: emit Linear → flat → EpsilonExpand →
+        // Reshape to output shape. Linear maps in_features (T) →
+        // out_features (T * D).
         let out_features = in_features.checked_mul(embedding_dim).ok_or_else(|| {
             NyError::InternalError(format!(
                 "Embedding: in_features * embedding_dim overflow \
@@ -555,9 +822,16 @@ fn translate_embedding(
             ))
         })?;
 
-        // Tile midpoint for each input position:
-        // [mid[0]..mid[D-1], mid[0]..mid[D-1], ...]
+        // Tile midpoints and epsilon radii identically for each input
+        // position: [v[0]..v[D-1], v[0]..v[D-1], ...] — the same row-major
+        // layout the Reshape reads back as [.., T, D].
         let tiled_midpoints: Vec<f32> = midpoints
+            .iter()
+            .copied()
+            .cycle()
+            .take(out_features)
+            .collect();
+        let tiled_epsilons: Vec<f32> = epsilons
             .iter()
             .copied()
             .cycle()
@@ -591,33 +865,55 @@ fn translate_embedding(
             attributes: linear_attrs,
         };
 
-        // Record intermediate shape: input shape with last dim = out_features.
+        // EpsilonExpand: widen the pinned midpoint by the tiled half-spread
+        // radii, carried as a constant weight tensor named by inputs[1]
+        // (ny-build's convert_epsilon_expand contract).
+        let eps_w_name = format!("{name}_epsilons");
+        let epsilon_arr =
+            ndarray::ArrayD::from_shape_vec(IxDyn(&[out_features]), tiled_epsilons)
+                .map_err(|e| NyError::InternalError(format!("Embedding epsilon array: {e}")))?;
+        ctx.insert_weight(&eps_w_name, epsilon_arr)?;
+        let expand_name = format!("{name}_emb_eps");
+        let expand_out = format!("{expand_name}_out");
+        let expand_spec = simple_spec(
+            &expand_name,
+            LayerType::EpsilonExpand,
+            vec![linear_out.clone(), eps_w_name],
+            &expand_out,
+            HashMap::new(),
+        );
+
+        // Record intermediate shapes: input shape with last dim =
+        // out_features (EpsilonExpand preserves shape).
         if let Some(input_shape) = ctx.tensor_shapes.get(&input_tensors[0]).cloned() {
             let mut lin_shape = input_shape;
             if let Some(last) = lin_shape.last_mut() {
                 *last = dim_as_i64(out_features, "Embedding out_features")?;
             }
-            ctx.tensor_shapes.insert(linear_out.clone(), lin_shape);
+            ctx.tensor_shapes.insert(linear_out, lin_shape.clone());
+            ctx.tensor_shapes.insert(expand_out.clone(), lin_shape);
         }
 
-        // Reshape: flat → traced output shape [B, T, D].
+        // Reshape: flat widened tensor → traced output shape [B, T, D].
         let target_shape = shape_to_i64(output_shape, "Embedding output shape")?;
         let mut reshape_attrs = HashMap::new();
         reshape_attrs.insert("shape".to_string(), AttributeValue::Ints(target_shape));
         let reshape_spec = LayerSpec {
             name: name.to_string(),
             layer_type: LayerType::Reshape,
-            inputs: vec![linear_out],
+            inputs: vec![expand_out],
             outputs: vec![output_tensor.to_string()],
             weights: None,
             attributes: reshape_attrs,
         };
 
         Ok(NodeOutput {
-            specs: vec![linear_spec, reshape_spec],
+            specs: vec![linear_spec, expand_spec, reshape_spec],
         })
     } else {
-        // Output rank == input rank: single Linear suffices (degenerate case).
+        // Output rank == input rank (degenerate case): no Reshape needed —
+        // midpoint Linear then the EpsilonExpand hull widening, un-tiled
+        // (one radius per embedding dimension).
         let w_name = format!("{name}_weight");
         let zeros_weight =
             ndarray::ArrayD::from_elem(IxDyn(&[embedding_dim, in_features]), 0.0_f32);
@@ -628,21 +924,46 @@ fn translate_embedding(
             .map_err(|e| NyError::InternalError(format!("Embedding midpoint array: {e}")))?;
         ctx.insert_weight(&b_name, midpoint_arr)?;
 
+        let eps_w_name = format!("{name}_epsilons");
+        let epsilon_arr = ndarray::ArrayD::from_shape_vec(IxDyn(&[embedding_dim]), epsilons)
+            .map_err(|e| NyError::InternalError(format!("Embedding epsilon array: {e}")))?;
+        ctx.insert_weight(&eps_w_name, epsilon_arr)?;
+
         let mut attrs = HashMap::new();
         attrs.insert("transB".to_string(), AttributeValue::Int(1));
 
-        Ok(NodeOutput::one(LayerSpec {
-            name: name.to_string(),
+        let linear_name = format!("{name}_emb_linear");
+        let linear_out = format!("{linear_name}_out");
+        let linear_spec = LayerSpec {
+            name: linear_name,
             layer_type: LayerType::Linear,
             inputs: vec![data_input, w_name.clone(), b_name],
-            outputs: vec![output_tensor.to_string()],
+            outputs: vec![linear_out.clone()],
             weights: Some(WeightRef {
                 name: w_name,
                 shape: vec![embedding_dim, in_features],
                 original_dtype: DataType::Float32,
             }),
             attributes: attrs,
-        }))
+        };
+        // EpsilonExpand preserves shape, so the intermediate has the traced
+        // output shape.
+        ctx.tensor_shapes.insert(
+            linear_out.clone(),
+            shape_to_i64(output_shape, "Embedding linear shape")?,
+        );
+
+        let expand_spec = simple_spec(
+            name,
+            LayerType::EpsilonExpand,
+            vec![linear_out, eps_w_name],
+            output_tensor,
+            HashMap::new(),
+        );
+
+        Ok(NodeOutput {
+            specs: vec![linear_spec, expand_spec],
+        })
     }
 }
 
@@ -853,6 +1174,10 @@ mod tests {
             ct.attributes.get("pads"),
             Some(&AttributeValue::Ints(vec![0, 0]))
         );
+        assert_eq!(
+            ct.attributes.get("dilations"),
+            Some(&AttributeValue::Ints(vec![1]))
+        );
         assert_eq!(ct.attributes.get("group"), Some(&AttributeValue::Int(1)));
         // Data input + weight + bias.
         assert_eq!(ct.inputs.len(), 3);
@@ -863,17 +1188,23 @@ mod tests {
         builds(&model, "ConvTranspose1d");
     }
 
-    /// ConvTranspose1d with dilation != 1 refuses (fail-closed, NN parity).
+    /// Dilated ConvTranspose1d translates (the old fail-closed refusal is
+    /// gone), emits the `dilations` attribute, and the built network's IBP on
+    /// a point box matches a directly constructed
+    /// `ConvTranspose1dLayer::new_full` — pinning that the attribute really
+    /// reaches the layer (a dropped attribute would produce dilation=1
+    /// bounds that do NOT enclose the traced op).
     #[test]
-    fn conv_transpose1d_dilation_rejected() {
+    fn conv_transpose1d_dilated_matches_direct_layer() {
+        let kernel_data = vec![0.5_f32, 1.0, -0.5];
         let graph = ComputationGraph::from_nodes(vec![
             node(0, "x", TraceOp::Input, &[], &[1, 1, 4]),
             node(
                 1,
                 "ct",
                 TraceOp::ConvTranspose1d {
-                    weight: WeightPayload::f32(vec![0.5, 1.0, -0.5], vec![1, 1, 3]),
-                    bias: None,
+                    weight: WeightPayload::f32(kernel_data.clone(), vec![1, 1, 3]),
+                    bias: Some(WeightPayload::f32(vec![0.1], vec![1])),
                     padding: 0,
                     output_padding: 0,
                     stride: 1,
@@ -881,14 +1212,55 @@ mod tests {
                     groups: 1,
                 },
                 &[0],
+                // out_len = (4-1)*1 + 2*(3-1) + 1 = 8
                 &[1, 1, 8],
             ),
         ]);
-        let err = translate(&graph).expect_err("dilation != 1 must refuse");
-        assert!(
-            matches!(&err, NyError::UnsupportedOp(m) if m.contains("dilation")),
-            "expected dilation refusal, got {err:?}"
+        let model = translate(&graph).expect("dilated ConvTranspose1d translates");
+        let ct = find(&model, &LayerType::ConvTranspose1d);
+        assert_eq!(
+            ct.attributes.get("dilations"),
+            Some(&AttributeValue::Ints(vec![2]))
         );
+
+        let gn = model
+            .build_graph_network(GraphNetworkOptions::default())
+            .expect("dilated ConvTranspose1d builds");
+        let x = vec![1.0_f32, 2.0, -1.0, 3.0];
+        let point = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 4]), x).expect("shape");
+        let input = ny_tensor::BoundedTensor::new(point.clone(), point).expect("valid box");
+        let out = gn.propagate_ibp(&input).expect("dilated CT1d IBP");
+
+        // Direct layer construction — same kernel/bias/hyperparameters.
+        use ny_propagate::BoundPropagation;
+        let kernel = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 3]), kernel_data)
+            .expect("kernel shape");
+        let layer = ny_propagate::layers::ConvTranspose1dLayer::new_full(
+            kernel,
+            Some(ndarray::Array1::from_vec(vec![0.1])),
+            1, // stride
+            0, // padding
+            2, // dilation
+            1, // groups
+        )
+        .expect("direct layer constructs");
+        let reference = layer.propagate_ibp(&input).expect("direct layer IBP");
+
+        assert_eq!(out.shape(), &[1, 1, 8]);
+        assert_eq!(out.shape(), reference.shape());
+        for (i, (((gl, gu), rl), ru)) in out
+            .lower()
+            .iter()
+            .zip(out.upper().iter())
+            .zip(reference.lower().iter())
+            .zip(reference.upper().iter())
+            .enumerate()
+        {
+            assert!(
+                (gl - rl).abs() < 1e-6 && (gu - ru).abs() < 1e-6,
+                "element {i}: graph [{gl}, {gu}] vs direct layer [{rl}, {ru}]"
+            );
+        }
     }
 
     /// ConvTranspose1d with output_padding decomposes into
@@ -945,6 +1317,89 @@ mod tests {
         builds(&model, "ConvTranspose1d output_padding");
     }
 
+    /// Dilated ConvTranspose1d with output_padding: the decomposition's T_mid
+    /// must use the dilated effective kernel extent
+    /// (`dilation * (kernel_size - 1) + 1`), and the built network's IBP on a
+    /// point box must match the direct `ConvTranspose1dLayer` on the first
+    /// T_mid positions with an exact-zero pad tail. A T_mid computed from the
+    /// raw kernel_size would mis-size the pad Linear (caught here by both the
+    /// shape and the value assertions).
+    #[test]
+    fn conv_transpose1d_dilated_output_padding_matches_direct_layer() {
+        let kernel_data = vec![0.5_f32, 1.0, -0.5];
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 1, 4]),
+            node(
+                1,
+                "ct",
+                TraceOp::ConvTranspose1d {
+                    weight: WeightPayload::f32(kernel_data.clone(), vec![1, 1, 3]),
+                    bias: None,
+                    padding: 0,
+                    output_padding: 1,
+                    stride: 2,
+                    dilation: 2,
+                    groups: 1,
+                },
+                &[0],
+                // T_mid = (4-1)*2 + 2*(3-1) + 1 = 11; T_out = 12.
+                &[1, 1, 12],
+            ),
+        ]);
+        let model = translate(&graph).expect("dilated output_padding CT1d translates");
+        let lin = find(&model, &LayerType::Linear);
+        assert_eq!(
+            lin.weights.as_ref().expect("pad WeightRef").shape,
+            vec![12, 11],
+            "pad weight sized from the DILATED T_mid"
+        );
+
+        let gn = model
+            .build_graph_network(GraphNetworkOptions::default())
+            .expect("dilated output_padding CT1d builds");
+        let x = vec![1.0_f32, 2.0, -1.0, 3.0];
+        let point = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 4]), x).expect("shape");
+        let input = ny_tensor::BoundedTensor::new(point.clone(), point).expect("valid box");
+        let out = gn
+            .propagate_ibp(&input)
+            .expect("dilated output_padding CT1d IBP");
+        assert_eq!(out.shape(), &[1, 1, 12]);
+
+        // Direct layer (no output_padding field on ny's CT1d layer): compare
+        // the first T_mid positions, then the zero tail.
+        use ny_propagate::BoundPropagation;
+        let kernel = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 3]), kernel_data)
+            .expect("kernel shape");
+        let layer = ny_propagate::layers::ConvTranspose1dLayer::new_full(kernel, None, 2, 0, 2, 1)
+            .expect("direct layer constructs");
+        let reference = layer.propagate_ibp(&input).expect("direct layer IBP");
+        assert_eq!(reference.shape(), &[1, 1, 11]);
+
+        for t in 0..11 {
+            let (gl, gu) = (out.lower()[[0, 0, t]], out.upper()[[0, 0, t]]);
+            let (rl, ru) = (reference.lower()[[0, 0, t]], reference.upper()[[0, 0, t]]);
+            // The pad Linear's IBP is outward-rounded, so the graph interval
+            // may carry a few ULPs of directed-rounding slack around the
+            // direct layer's value: require ENCLOSURE (never inward) and
+            // tightness within float dust.
+            assert!(
+                gl <= rl + 1e-6 && gu >= ru - 1e-6,
+                "position {t}: graph [{gl}, {gu}] must enclose direct layer [{rl}, {ru}]"
+            );
+            assert!(
+                (gl - rl).abs() < 1e-4 && (gu - ru).abs() < 1e-4,
+                "position {t}: graph [{gl}, {gu}] vs direct layer [{rl}, {ru}]"
+            );
+        }
+        // The pad tail is the zero row of the pad Linear; its outward-rounded
+        // IBP encloses 0 within a subnormal-width sliver.
+        let (tl, tu) = (out.lower()[[0, 0, 11]], out.upper()[[0, 0, 11]]);
+        assert!(
+            tl <= 0.0 && 0.0 <= tu && tl > -1e-6 && tu < 1e-6,
+            "pad tail must be a tight enclosure of zero, got [{tl}, {tu}]"
+        );
+    }
+
     /// ConvTranspose2d emits NN's strides/pads/group attributes.
     #[test]
     fn conv_transpose2d_basic() {
@@ -977,13 +1432,102 @@ mod tests {
             ct.attributes.get("pads"),
             Some(&AttributeValue::Ints(vec![0, 0, 0, 0]))
         );
+        assert_eq!(
+            ct.attributes.get("dilations"),
+            Some(&AttributeValue::Ints(vec![1, 1]))
+        );
+        assert_eq!(
+            ct.attributes.get("output_padding"),
+            Some(&AttributeValue::Ints(vec![0, 0]))
+        );
         assert_eq!(ct.attributes.get("group"), Some(&AttributeValue::Int(1)));
         // Data input + weight (no bias).
         assert_eq!(ct.inputs.len(), 2);
         builds(&model, "ConvTranspose2d");
     }
 
-    /// ConvTranspose2d refusals: dilation != 1 and output_padding != 0.
+    /// Dilated ConvTranspose2d with output_padding < stride translates (both
+    /// old blanket refusals are gone), emits the `dilations` and
+    /// `output_padding` attributes, and the built network's IBP on a point
+    /// box matches a directly constructed `ConvTranspose2dLayer::new_full` —
+    /// pinning that both attributes reach the layer.
+    #[test]
+    fn conv_transpose2d_dilated_output_padding_matches_direct_layer() {
+        let kernel_data = vec![1.0_f32, 0.5, -0.5, 0.3];
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 1, 2, 2]),
+            node(
+                1,
+                "ct",
+                TraceOp::ConvTranspose2d {
+                    weight: WeightPayload::f32(kernel_data.clone(), vec![1, 1, 2, 2]),
+                    bias: Some(WeightPayload::f32(vec![0.25], vec![1])),
+                    padding: [0, 0],
+                    output_padding: [1, 1],
+                    stride: [2, 2],
+                    dilation: [2, 2],
+                    groups: 1,
+                },
+                &[0],
+                // out = (2-1)*2 + 2*(2-1) + 1 - 0 + 1 = 6 per spatial dim.
+                &[1, 1, 6, 6],
+            ),
+        ]);
+        let model = translate(&graph).expect("dilated output_padding CT2d translates");
+        let ct = find(&model, &LayerType::ConvTranspose2d);
+        assert_eq!(
+            ct.attributes.get("dilations"),
+            Some(&AttributeValue::Ints(vec![2, 2]))
+        );
+        assert_eq!(
+            ct.attributes.get("output_padding"),
+            Some(&AttributeValue::Ints(vec![1, 1]))
+        );
+
+        let gn = model
+            .build_graph_network(GraphNetworkOptions::default())
+            .expect("dilated output_padding CT2d builds");
+        let x = vec![1.0_f32, -2.0, 3.0, 0.5];
+        let point =
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 2, 2]), x).expect("shape");
+        let input = ny_tensor::BoundedTensor::new(point.clone(), point).expect("valid box");
+        let out = gn.propagate_ibp(&input).expect("dilated CT2d IBP");
+
+        use ny_propagate::BoundPropagation;
+        let kernel = ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 2, 2]), kernel_data)
+            .expect("kernel shape");
+        let layer = ny_propagate::layers::ConvTranspose2dLayer::new_full(
+            kernel,
+            Some(ndarray::Array1::from_vec(vec![0.25])),
+            (2, 2), // stride
+            (0, 0), // padding
+            (2, 2), // dilation
+            (1, 1), // output_padding
+        )
+        .expect("direct layer constructs");
+        let reference = layer.propagate_ibp(&input).expect("direct layer IBP");
+
+        assert_eq!(out.shape(), &[1, 1, 6, 6]);
+        assert_eq!(out.shape(), reference.shape());
+        for (i, (((gl, gu), rl), ru)) in out
+            .lower()
+            .iter()
+            .zip(out.upper().iter())
+            .zip(reference.lower().iter())
+            .zip(reference.upper().iter())
+            .enumerate()
+        {
+            assert!(
+                (gl - rl).abs() < 1e-6 && (gu - ru).abs() < 1e-6,
+                "element {i}: graph [{gl}, {gu}] vs direct layer [{rl}, {ru}]"
+            );
+        }
+    }
+
+    /// ConvTranspose2d refusals that REMAIN fail-closed: output_padding >=
+    /// stride (only recoverable within one stride step; the layer enforces
+    /// the same bound) and grouped kernels (the layer models groups=1 only —
+    /// a grouped kernel reinterpreted as dense would be silently wrong).
     #[test]
     fn conv_transpose2d_refusals() {
         let base_weight = || WeightPayload::f32(vec![1.0, 0.5, -0.5, 0.3], vec![1, 1, 2, 2]);
@@ -993,24 +1537,24 @@ mod tests {
                     weight: base_weight(),
                     bias: None,
                     padding: [0, 0],
-                    output_padding: [0, 0],
-                    stride: [1, 1],
-                    dilation: [2, 2],
+                    output_padding: [2, 0],
+                    stride: [2, 2],
+                    dilation: [1, 1],
                     groups: 1,
                 },
-                "dilation",
+                "output_padding (2, 0) must be < stride (2, 2)",
             ),
             (
                 TraceOp::ConvTranspose2d {
                     weight: base_weight(),
                     bias: None,
                     padding: [0, 0],
-                    output_padding: [1, 0],
-                    stride: [2, 2],
+                    output_padding: [0, 0],
+                    stride: [1, 1],
                     dilation: [1, 1],
-                    groups: 1,
+                    groups: 2,
                 },
-                "output_padding",
+                "groups=2 not supported",
             ),
         ];
         for (op, needle) in cases {
@@ -1021,7 +1565,7 @@ mod tests {
             let err = translate(&graph).expect_err("must refuse");
             assert!(
                 matches!(&err, NyError::UnsupportedOp(m) if m.contains(needle)),
-                "expected {needle} refusal, got {err:?}"
+                "expected refusal containing {needle:?}, got {err:?}"
             );
         }
     }
@@ -1056,7 +1600,8 @@ mod tests {
     }
 
     /// Embedding [1,1] → [1,1,4] decomposes into Linear (zeros weight,
-    /// midpoint bias) + Reshape, with NN's per-dimension midpoints.
+    /// midpoint bias) + EpsilonExpand (half-spread radii) + Reshape, with
+    /// NN's per-dimension midpoints.
     #[test]
     fn embedding_decomposes_to_midpoint_linear_reshape() {
         let graph = ComputationGraph::from_nodes(vec![
@@ -1080,6 +1625,7 @@ mod tests {
         ]);
         let model = translate(&graph).expect("Embedding translates");
         assert_eq!(count(&model, &LayerType::Linear), 1);
+        assert_eq!(count(&model, &LayerType::EpsilonExpand), 1);
         assert_eq!(count(&model, &LayerType::Reshape), 1);
 
         // Zeros weight [out_features=1*4, in_features=1].
@@ -1100,8 +1646,30 @@ mod tests {
             vec![3.0, 4.0, 5.0, 6.0]
         );
 
-        // Reshape targets the traced output shape.
+        // Half-spread radii: every dim spans 4.0, so eps = 2.0 (exact — no
+        // rounding step needed for these dyadic endpoints).
+        let eps = model
+            .weights
+            .get("layer0_trace_1_epsilons")
+            .expect("epsilon radii stored");
+        assert_eq!(
+            eps.iter().copied().collect::<Vec<f32>>(),
+            vec![2.0, 2.0, 2.0, 2.0]
+        );
+
+        // The widening sits between the Linear and the Reshape.
+        let expand = find(&model, &LayerType::EpsilonExpand);
+        assert_eq!(
+            expand.inputs,
+            vec![
+                "layer0_trace_1_emb_linear_out".to_string(),
+                "layer0_trace_1_epsilons".to_string(),
+            ]
+        );
         let rs = find(&model, &LayerType::Reshape);
+        assert_eq!(rs.inputs, vec!["layer0_trace_1_emb_eps_out".to_string()]);
+
+        // Reshape targets the traced output shape.
         assert_eq!(
             rs.attributes.get("shape"),
             Some(&AttributeValue::Ints(vec![1, 1, 4]))
@@ -1234,10 +1802,8 @@ mod tests {
         );
     }
 
-    /// Conv3d stays fail-closed: NN has no LayerSpec emission for it.
-    #[test]
-    fn conv3d_stays_refused() {
-        let graph = ComputationGraph::from_nodes(vec![
+    fn conv3d_graph() -> ComputationGraph {
+        ComputationGraph::from_nodes(vec![
             node(0, "x", TraceOp::Input, &[], &[1, 1, 2, 2, 2]),
             node(
                 1,
@@ -1253,11 +1819,177 @@ mod tests {
                 &[0],
                 &[1, 1, 1, 1, 1],
             ),
-        ]);
-        let err = translate(&graph).expect_err("Conv3d is unsupported");
+        ])
+    }
+
+    /// Conv3d LOWERS now — the refusal that stood here rested on a premise
+    /// that no longer holds.
+    ///
+    /// The old test asserted the message named a MISSING LAYER and pinned that
+    /// premise directly: `"Conv3d".parse::<LayerType>() == Unknown`, with the
+    /// note that it "starts failing the day a real Conv3d variant lands —
+    /// which is exactly when this refusal must be revisited." That day came.
+    /// The assertion is kept, inverted: `LayerType::Conv3d` exists, so the
+    /// translator must emit it rather than refuse.
+    #[test]
+    fn conv3d_lowers_now_that_the_layer_exists() {
+        assert_eq!(
+            "Conv3d".parse::<LayerType>(),
+            Ok(LayerType::Conv3d),
+            "the layer the old refusal said was missing now exists"
+        );
+
+        let model = translate(&conv3d_graph()).expect("Conv3d lowers");
+        let spec = model
+            .network
+            .layers
+            .iter()
+            .find(|l| l.layer_type == LayerType::Conv3d)
+            .expect("a Conv3d spec is emitted");
+        assert_eq!(spec.name, "layer0_trace_1");
+        assert_eq!(
+            spec.inputs,
+            vec!["layer0_trace_0_out", "layer0_trace_1_weight"]
+        );
+        assert_eq!(
+            spec.attributes.get("strides"),
+            Some(&AttributeValue::Ints(vec![1, 1, 1]))
+        );
+        // ONNX rank-3 pads: [d_b, h_b, w_b, d_e, h_e, w_e], symmetric by
+        // construction from the trace's one-per-axis padding.
+        assert_eq!(
+            spec.attributes.get("pads"),
+            Some(&AttributeValue::Ints(vec![0, 0, 0, 0, 0, 0]))
+        );
+        assert_eq!(
+            spec.attributes.get("dilations"),
+            Some(&AttributeValue::Ints(vec![1, 1, 1]))
+        );
+        assert_eq!(spec.attributes.get("group"), Some(&AttributeValue::Int(1)));
+
+        model
+            .build_graph_network(GraphNetworkOptions::default())
+            .expect("the Conv3d model builds a graph network");
+    }
+
+    /// The emitted Conv3d propagates IBP and its interval ENCLOSES the exact
+    /// convolution at a point input.
+    ///
+    /// Geometry: a `[1, 1, 2, 2, 2]` volume against an all-`0.1` `[1,1,2,2,2]`
+    /// kernel, so the single output cell is `0.1 * sum(input)` — a number the
+    /// test computes independently of the layer.
+    #[test]
+    fn conv3d_ibp_encloses_the_exact_convolution() {
+        let model = translate(&conv3d_graph()).expect("Conv3d lowers");
+        let network = model
+            .build_graph_network(GraphNetworkOptions::default())
+            .expect("Conv3d builds");
+
+        let values = [1.0_f32, -2.0, 3.0, 0.5, -1.5, 4.0, 0.25, -0.75];
+        let point =
+            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[1, 1, 2, 2, 2]), values.to_vec())
+                .unwrap();
+        let bounds = ny_tensor::BoundedTensor::new(point.clone(), point).expect("point bounds");
+        let out = network.propagate_ibp(&bounds).expect("Conv3d IBP");
+        assert_eq!(out.shape(), &[1, 1, 1, 1, 1]);
+
+        let expected: f32 = values.iter().map(|v| v * 0.1).sum();
+        let (lo, hi) = (
+            out.lower().as_slice().unwrap()[0],
+            out.upper().as_slice().unwrap()[0],
+        );
         assert!(
-            matches!(&err, NyError::UnsupportedOp(m) if m.contains("Conv3d")),
-            "error names the op: {err:?}"
+            lo <= expected + 1e-5 && expected - 1e-5 <= hi,
+            "exact convolution {expected} must be enclosed by [{lo}, {hi}]"
+        );
+
+        // Non-vacuous: a rounding-width interval, not [-inf, +inf].
+        assert!(
+            (hi - lo) < 1e-3,
+            "point box must give a tight interval, got [{lo}, {hi}]"
+        );
+    }
+
+    /// Dilation is THREADED THROUGH rather than refused (as Conv2d must) or
+    /// dropped (which would build a dilation-1 layer whose bounds do not
+    /// enclose the traced op). `Conv3dLayer::new_dilated` consumes it.
+    #[test]
+    fn conv3d_dilation_reaches_the_layer() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 1, 3, 3, 3]),
+            node(
+                1,
+                "c3",
+                TraceOp::Conv3d {
+                    weight: WeightPayload::f32(vec![0.1; 8], vec![1, 1, 2, 2, 2]),
+                    bias: Some(WeightPayload::f32(vec![0.5], vec![1])),
+                    padding: [1, 0, 0],
+                    stride: [1, 2, 1],
+                    dilation: [2, 1, 1],
+                    groups: 1,
+                },
+                &[0],
+                &[1, 1, 2, 1, 2],
+            ),
+        ]);
+        let model = translate(&graph).expect("dilated Conv3d lowers");
+        let spec = model
+            .network
+            .layers
+            .iter()
+            .find(|l| l.layer_type == LayerType::Conv3d)
+            .expect("a Conv3d spec is emitted");
+        assert_eq!(
+            spec.attributes.get("dilations"),
+            Some(&AttributeValue::Ints(vec![2, 1, 1])),
+            "dilation must survive to the layer"
+        );
+        assert_eq!(
+            spec.attributes.get("strides"),
+            Some(&AttributeValue::Ints(vec![1, 2, 1]))
+        );
+        assert_eq!(
+            spec.attributes.get("pads"),
+            Some(&AttributeValue::Ints(vec![1, 0, 0, 1, 0, 0])),
+            "per-axis padding mirrored into ONNX begin/end form"
+        );
+        assert_eq!(
+            spec.inputs,
+            vec![
+                "layer0_trace_0_out",
+                "layer0_trace_1_weight",
+                "layer0_trace_1_bias"
+            ],
+            "bias is wired as the third operand"
+        );
+    }
+
+    /// A kernel that is not rank 5 fails closed HERE, naming the op and the
+    /// shape, instead of surfacing as ny-build's bare `ShapeMismatch`.
+    #[test]
+    fn conv3d_refuses_a_non_rank5_kernel() {
+        let graph = ComputationGraph::from_nodes(vec![
+            node(0, "x", TraceOp::Input, &[], &[1, 1, 2, 2, 2]),
+            node(
+                1,
+                "c3",
+                TraceOp::Conv3d {
+                    weight: WeightPayload::f32(vec![0.1; 4], vec![1, 1, 2, 2]),
+                    bias: None,
+                    padding: [0, 0, 0],
+                    stride: [1, 1, 1],
+                    dilation: [1, 1, 1],
+                    groups: 1,
+                },
+                &[0],
+                &[1, 1, 1, 1, 1],
+            ),
+        ]);
+        let err = translate(&graph).expect_err("a rank-4 kernel is not a Conv3d kernel");
+        assert!(
+            matches!(&err, NyError::UnsupportedOp(m)
+                if m.contains("Conv3d") && m.contains("rank 5")),
+            "got {err:?}"
         );
     }
 }

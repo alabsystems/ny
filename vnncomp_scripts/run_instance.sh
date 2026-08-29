@@ -35,11 +35,12 @@ if [ -n "${NY_BIN:-}" ]; then
         echo "Error: explicit NY_BIN is not a regular executable: ${NY_BIN}" >&2
         exit 1
     fi
-    echo "NOTE: using explicit NY_BIN override; automatic NY provenance receipt validation is bypassed: ${NY_BIN}" >&2
+    ny_bin="${NY_BIN}"
+    echo "NOTE: using explicit NY_BIN override; automatic NY provenance receipt validation is bypassed: ${ny_bin}" >&2
 elif [ -f "${TOOL_DIR}/target/release/ny" ]; then
-    NY_BIN="${TOOL_DIR}/target/release/ny"
+    ny_bin="${TOOL_DIR}/target/release/ny"
 elif [ -f "${TOOL_DIR}/target/debug/ny" ]; then
-    NY_BIN="${TOOL_DIR}/target/debug/ny"
+    ny_bin="${TOOL_DIR}/target/debug/ny"
 else
     # No binary => genuine error. Write it to RESULTS_FILE (arg 5) if we have one.
     [ -n "${5:-}" ] && echo "error" > "$5"
@@ -53,11 +54,46 @@ if [ "${explicit_ny_bin}" = "0" ]; then
         echo "Error: NY receipt validator is missing: ${RECEIPT_HELPER}" >&2
         exit 1
     fi
-    if ! bash "${RECEIPT_HELPER}" validate "${NY_BIN}" "${TOOL_DIR}" >&2; then
+    if ! bash "${RECEIPT_HELPER}" validate "${ny_bin}" "${TOOL_DIR}" >&2; then
         [ -n "${5:-}" ] && echo "error" > "$5"
-        echo "Error: refusing stale or unproven automatic NY binary ${NY_BIN}." >&2
+        echo "Error: refusing stale or unproven automatic NY binary ${ny_bin}." >&2
         echo "  Rebuild with './vnncomp_scripts/build_submission_binary.sh'." >&2
         echo "  Developers may set NY_BIN explicitly to opt out for a controlled A/B." >&2
+        exit 1
+    fi
+fi
+
+# #binary-identity. Fail closed when a caller told us WHICH VERIFIER to expect
+# and this is not it.
+#
+# The receipt check above binds the binary to the current SOURCE state, which
+# is the right check for "is this build stale". It cannot answer the question
+# that poisoned 330 rows on 2026-08-21: "is this the same binary the row before
+# it used?" A sweep rebuilt mid-run passes the receipt check on BOTH sides,
+# because the rebuild regenerates the receipt. Only comparing the identity
+# across rows catches that, so a harness measuring more than one row captures
+# `ny --build-stamp` once and passes it back in NY_EXPECT_BUILD_ID.
+#
+# COST: this block runs ONLY when NY_EXPECT_BUILD_ID is set, and it uses
+# `--build-stamp` (compiled fields, no I/O) rather than `--build-id` (which
+# hashes the whole executable). The competition path is therefore byte-for-byte
+# unchanged in behaviour and unchanged in wall clock: `ny vnncomp` prints its
+# own `NY_BUILD_STAMP_V1 …` line to stderr for free at start-up, so the
+# per-instance log names its verifier without this script spending anything.
+if [ -n "${NY_EXPECT_BUILD_ID:-}" ]; then
+    NY_IDENTITY_LINE="$("${ny_bin}" --build-stamp 2>/dev/null | head -1)"
+    case "${NY_IDENTITY_LINE}" in
+        NY_BUILD_STAMP_V1\ *) ;;
+        *) NY_IDENTITY_LINE="NY_BUILD_STAMP_V1 unavailable (binary predates #binary-identity)" ;;
+    esac
+    echo "${NY_IDENTITY_LINE}" >&2
+    if [ "${NY_EXPECT_BUILD_ID}" != "${NY_IDENTITY_LINE}" ]; then
+        [ -n "${5:-}" ] && echo "error" > "$5"
+        echo "Error: the ny binary is not the one this measurement was sealed against." >&2
+        echo "  expected: ${NY_EXPECT_BUILD_ID}" >&2
+        echo "  found:    ${NY_IDENTITY_LINE}" >&2
+        echo "  binary:   ${ny_bin}" >&2
+        echo "  Rows measured by two different verifiers are not comparable. Refusing." >&2
         exit 1
     fi
 fi
@@ -80,25 +116,19 @@ WALL_TIMEOUT=$(( ${WALL_BUDGET:-0} + 10 ))
 # doesn't fight rayon's pool. Rayon itself uses all cores (correctness, not repro).
 export OMP_NUM_THREADS=1
 
+# The root scored wrapper preserved NY_BIN/NY_EXPECT_BUILD_ID only as shell
+# control-plane inputs. Do not leak those NY_* names into the verifier process;
+# every solver-policy NY_* name was already removed by that wrapper.
+if [ "${VNNCOMP_SCORED_ENV_CLOSED:-0}" = "1" ]; then
+    unset NY_BIN NY_EXPECT_BUILD_ID VNNCOMP_SCORED_ENV_CLOSED
+fi
+
 # NY_MARGIN_ROW_CONV_BWD_BLOCKED / NY_MARGIN_ROW_PARALLEL are deliberately NOT
 # exported: 1 has been the compiled default since 7b004fba (parallel frontier,
 # 07-18) and 2eaa6b13 (cache-blocked backward conv, 07-19), so exporting =1 was
 # a bit-exact no-op (MEASURED: margin_row/tests.rs asserts unset == "1" for both
 # blocked_backward_enabled_from_env and margin_row_frontier_from_env). The =0
 # serial kill switches in ny-propagate still work for developer A/Bs.
-
-# safenlp razor-thin SAT lane (#safenlp-upfront-attack, measured 2026-07-20):
-# force the upfront gradient falsification lane for safenlp only. Its 8 razor-thin
-# SAT rows fall to ~8 gradient steps in the upfront slice, which frees the whole
-# internal budget for the long-BaB UNSAT proofs (preset max_domains 50000) —
-# without this, SAT-vs-UNSAT is a measured zero-sum on the 20s budget. Category-
-# scoped: globally forcing the lane would tax every benchmark's budget. Attack-
-# only (every witness passes the unchanged trusted-ORT gate) => moat-safe.
-case "${2:-}" in
-    safenlp_2024)
-        export NY_UPFRONT_ATTACK=1
-        ;;
-esac
 
 # GPU capability hint (#vnncomp-gpu-available-lost): prepare_instance.sh only
 # validates inputs and locates the binary, and in any case its process environment
@@ -110,9 +140,9 @@ esac
 # GPU_AVAILABLE (0 or 1) still wins.
 
 if command -v timeout >/dev/null 2>&1; then
-    exec timeout "${WALL_TIMEOUT}" "${NY_BIN}" vnncomp "$@"
+    exec timeout "${WALL_TIMEOUT}" "${ny_bin}" vnncomp "$@"
 elif command -v gtimeout >/dev/null 2>&1; then
-    exec gtimeout "${WALL_TIMEOUT}" "${NY_BIN}" vnncomp "$@"
+    exec gtimeout "${WALL_TIMEOUT}" "${ny_bin}" vnncomp "$@"
 else
-    exec "${NY_BIN}" vnncomp "$@"
+    exec "${ny_bin}" vnncomp "$@"
 fi

@@ -42,6 +42,7 @@ attack:
 
 bab:
   batch_size: 64
+  cgan_reclaim: true
   crown_ibp_per_node_cap_secs: 150
   phase_budget:
     disjunctive_pgd_fraction: 0.10
@@ -70,6 +71,9 @@ bab:
   clip:
     relaxed: true
     relaxed_iterations: 20
+    # Mirrors production: the sound exact-domain input clip (abc's
+    # clip_input_domain). See production cgan_2023.yaml for the contract.
+    input_split_fresh_domain_clip: true
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100

@@ -12,8 +12,10 @@ impl Layer {
     pub fn layer_type(&self) -> &'static str {
         match self {
             Layer::Linear(_) => "Linear",
+            Layer::IntervalConst(ic) => ic.kind_name(),
             Layer::Conv1d(_) => "Conv1d",
             Layer::Conv2d(_) => "Conv2d",
+            Layer::Conv3d(_) => "Conv3d",
             Layer::ConvTranspose1d(_) => "ConvTranspose1d",
             Layer::ConvTranspose2d(_) => "ConvTranspose2d",
             Layer::AveragePool(_) => "AveragePool",
@@ -109,6 +111,7 @@ impl Layer {
             Layer::SkipMerge(_) => "SkipMerge",
             Layer::OpaqueSkip(_) => "OpaqueSkip",
             Layer::QdqPerturbation(_) => "QdqPerturbation",
+            Layer::EpsilonExpand(_) => "EpsilonExpand",
         }
     }
 
@@ -237,6 +240,17 @@ impl Layer {
             || matches!(
                 self,
                 Layer::Linear(_)
+                    // Interval-valued frozen constant: its backward RUNS the
+                    // Linear backward (which propagates the incoming err and
+                    // emits its own fresh gamma_n*S) and then ADDS the enclosure
+                    // term `(|A| + err_in)*R` on top. It therefore belongs here,
+                    // beside `Linear`, and it MUST NOT be an
+                    // `is_exact_linear_coeff_err_carrier`: that path OVERWRITES
+                    // the fresh err via `attach_err_from_carried`, which would
+                    // silently delete the enclosure and leave the MIDPOINT
+                    // product standing as if it were exact — the unsound point
+                    // fold, one layer down.
+                    | Layer::IntervalConst(_)
                     | Layer::Conv2d(_)
                     // f32-arithmetic ops whose backward emits BOTH a fresh γ_n·S
                     // (or per-coeff ULP) coefficient error AND a prop term that
@@ -368,7 +382,20 @@ impl Layer {
                     | Layer::ReduceMean(_)
                     | Layer::ReduceMax(_)
                     | Layer::ReduceMin(_)
+                    // CumSum HAS a real batched CROWN backward
+                    // (`CumsumLayer::propagate_linear_batched`, dispatched from
+                    // `layer_enum/dispatch.rs`): the grouped last-axis prefix/suffix
+                    // scan, with its own certified `γ_axislen·S` coefficient error.
+                    // It was missing from this allow-list, so a single CumSum node
+                    // disqualified an ENTIRE network from the batched path even
+                    // though every other layer was supported. Refusals inside the
+                    // backward (non-last-axis layout, shape-changing bounds) surface
+                    // as `UnsupportedOp`, and every caller of this gate treats that
+                    // as "fall back to the scalar CROWN path" — so listing CumSum
+                    // here fails OPEN to the previous behaviour, never to a verdict.
+                    | Layer::CumSum(_)
                     | Layer::QdqPerturbation(_)
+                    | Layer::EpsilonExpand(_)
             )
             // Fixed-style AdaIN supports batched CROWN; variable-style does not.
             || matches!(self, Layer::AdaIN1d(adain) if !adain.requires_style_inputs())
@@ -436,5 +463,58 @@ impl Layer {
                     | Layer::GroupNorm(_)
                     | Layer::AdaIN1d(_)
             )
+    }
+}
+
+#[cfg(test)]
+mod query_batched_gate_tests {
+    use ndarray::{ArrayD, IxDyn};
+    use ny_tensor::BoundedTensor;
+
+    use super::Layer;
+    use crate::bounds::BatchedLinearBounds;
+    use crate::layers::reduction::CumsumLayer;
+
+    /// The batched-CROWN allow-list must admit CumSum: its batched backward is
+    /// implemented and dispatched. Before this, one CumSum node disqualified a
+    /// whole network from the batched path.
+    #[test]
+    fn cumsum_is_in_the_batched_crown_allow_list() {
+        let layer = Layer::CumSum(CumsumLayer::new(-1, false, false));
+        assert!(
+            layer.supports_batched_crown(),
+            "CumSum has a real batched CROWN backward and must be gated in"
+        );
+        assert!(
+            layer.supports_batched_crown_with_conv2d(),
+            "CumSum is not one of the spatial-flattening exclusions"
+        );
+    }
+
+    /// Proof that the gate is not a lie: the dispatched batched backward really
+    /// runs for a last-axis CumSum and produces the exact suffix-scan
+    /// coefficients (`y_i = sum_{j>=i} x_j` => backward coeff row is the suffix
+    /// sum of the incoming row).
+    #[test]
+    fn cumsum_batched_backward_actually_dispatches() {
+        let layer = Layer::CumSum(CumsumLayer::new(-1, false, false));
+        let bounds = BatchedLinearBounds::identity(&[3]).expect("identity bounds");
+        let pre = BoundedTensor::new(
+            ArrayD::from_elem(IxDyn(&[3]), -1.0_f32),
+            ArrayD::from_elem(IxDyn(&[3]), 1.0_f32),
+        )
+        .expect("pre-activation bounds");
+
+        let out = layer
+            .propagate_crown_backward_batched(&bounds, Some(&pre), None)
+            .expect("CumSum batched CROWN backward must be implemented");
+        // Row 0 of the identity is e_0; the (non-reverse, inclusive) CumSum
+        // backward turns it into the suffix indicator [1, 0, 0] -> unchanged,
+        // while row 2 (e_2) becomes [1, 1, 1].
+        assert_eq!(out.lower_a().shape(), &[3, 3]);
+        assert_eq!(out.lower_a()[[2, 0]], 1.0);
+        assert_eq!(out.lower_a()[[2, 1]], 1.0);
+        assert_eq!(out.lower_a()[[2, 2]], 1.0);
+        assert_eq!(out.lower_a()[[0, 1]], 0.0);
     }
 }

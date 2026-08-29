@@ -72,6 +72,7 @@ ny-cert = { path = "../ny-cert" }
 ny-api = { path = "../ny-api", features = ["cert"] }
 ny-groundtruth = { path = "../ny-groundtruth" }
 ny-levers = { path = "../ny-levers" }
+ny-claims = { path = "../ny-claims" }
 # The falsification chassis (`docs/FALSIFICATION_PORTFOLIO_ARCHITECTURE_2026-08-18.md`).
 # The edge is ONE WAY and must stay one way: `ny-falsify` has no dependency of any
 # kind, so `VnncompResult` and `gate_sat_with_trusted_oracle` are not nameable from
@@ -94,7 +95,7 @@ ny-mip = { path = "../ny-mip", optional = true }
 # `ResolutionDag::validate` — the in-memory refutation certificate and its
 # independent RUP replay that the UNSAT direction is required to pass before
 # any `Verified` verdict is emitted.
-ay-sat = { version = "0.10.0", git = "https://github.com/alabsystems/ay.git", rev = "ac00c30a825721e7a6dd82043e43d01af35e7b60", default-features = false, features = ["unsat-cert"] }
+ay-sat = { version = "0.20.0", git = "https://github.com/alabsystems/ay.git", rev = "0ef4657b7ebca2855d9d044823a40825c8c300dd", default-features = false, features = ["unsat-cert"] }
 # Exact rational arithmetic for the graph-MIP pinned-column fold (inc5c) —
 # the same exact seam ny-mip already uses (`num_rational::BigRational`).
 num-rational = { workspace = true, optional = true }
@@ -112,6 +113,8 @@ serde_ignored.workspace = true
 serde_yaml.workspace = true
 tempfile.workspace = true
 sha2.workspace = true
+flate2 = "1.0"
+tar = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
@@ -133,6 +136,11 @@ blas-src.workspace = true
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 ny-accelerate = { path = "../ny-accelerate" }
 
+# #binary-identity: `build.rs` digests the build-relevant working-tree diff so
+# two dirty builds at the same commit report different versions.
+[build-dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
 ny-test-utils = { path = "../ny-test-utils" }
 # #flush-charge Lane B: the metaroom charged wall-clock acceptance test needs
@@ -141,6 +149,5 @@ ny-test-utils = { path = "../ny-test-utils" }
 # dev-only edge affects `cargo test -p ny-cli` builds exclusively).
 ny-gpu = { path = "../ny-gpu", features = ["gpu-tests"] }
 rand.workspace = true
-flate2 = "1.0"
 prost.workspace = true
 ntest.workspace = true

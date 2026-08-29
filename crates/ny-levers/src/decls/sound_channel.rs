@@ -254,17 +254,63 @@ Exact-\"1\" arming; anything else leaves the lane byte-for-byte as it is today."
         kind: LeverKind::Bool,
         default: DefaultSpec::Bool(false),
         bucket: Bucket::Debug,
-        moat: MoatRisk::None,
-        doc: "Retains the clip halfspace rows on `LayerGates::clip_rows` instead of dropping them. Exact `1` arms it; absence and every other value leave `clip_rows` at `None`, which is byte-identical to the struct's history for every existing consumer. Retention is PURE MEMORY as declared: nothing reads these rows yet, so the armed arm cannot change a bound or a verdict either — MoatRisk::None rather than Low, and the moment a consumer appears that classification must be revisited along with this doc.",
+        moat: MoatRisk::Low,
+        doc: "\
+Retains the clip halfspace rows on `LayerGates::clip_rows` instead of dropping \
+them. Exact `1` arms it; absence and every other value leave `clip_rows` at \
+`None`. RECLASSIFIED 2026-08-22 from MoatRisk::None: the declaration used to say \
+\"nothing reads these rows yet\", and that is no longer true. Two consumers now \
+exist — `clip::halfspaces_for_splits` and `clip::tighten_intermediate` — and both \
+BAIL OUT (`clip_rows.as_ref() else continue/return`) when retention is off, which \
+makes this the third gate whose absence silently voids any Clip-and-Verify \
+measurement: with it unset the whole mechanism refuses while still reading as \
+armed. Retention itself still changes no bound; what changed is that the rows are \
+now load-bearing for a path that does. \
+\
+The #closure-adaptive policy deliberately does NOT arm this: retention happens \
+ONCE at root build, so it would have to be bought up front on every row, and a \
+24-run matrix measured its consumers BIT-IDENTICAL to baseline (mean_rel_shrink \
+8.4e-16 to 1.6e-4) -- which does not pay for it. \
+\
+SOUNDNESS, and it holds identically at BOTH consumers: every halfspace is a \
+necessary condition of a split the domain has already fixed, so the constrained \
+set over-approximates the true subdomain; `halfspaces_for_splits` pays the \
+certified `sl_lo`/`sl_up` slack the root already paid, and \
+`tighten_intermediate` pays the same slack and commits `max`/`min` against the \
+stored interval, so it can only SHRINK. Both are therefore proof-losing, not \
+proof-manufacturing — CONDITIONAL on the retained rows being in the right frame, \
+which is not an argument but a checked precondition: `clip::frame_ok` \
+re-concretizes every retained row over the root box once per process and \
+disables the whole path on any disagreement.",
         provenance: Provenance::Unmeasured {
-            why_ok: "default-off, and the armed arm only retains rows no code                      path consumes; there is nothing yet to measure and nothing                      it can move",
+            why_ok: "default-off, and the armed arm's two consumers are themselves default-off \
+                     (NY_MARGIN_ROW_CLIP and NY_MARGIN_ROW_CLIP_INTERM), \
+                     so the shipped state retains nothing and consumes nothing; the armed arm \
+                     is bound-affecting and needs a moat run before any preset arms it",
         },
         owner: PROPAGATE,
-        readers: &[ReaderSite {
-            scope: PROPAGATE,
-            role: "retain clip halfspace rows for a future consumer; latched once per process",
-            site: "crates/ny-propagate/src/margin_row/root.rs:clip_rows_enabled",
-        }],
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "WRITER: retain the input-relative affine rows at root build; latched \
+                       once per process",
+                site: "crates/ny-propagate/src/margin_row/root.rs:clip_rows_enabled",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "CONSUMER: build a split's halfspace from the retained row; refuses the \
+                       split entirely when the layer retained nothing",
+                site: "crates/ny-propagate/src/margin_row/clip.rs:halfspaces_for_splits",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "CONSUMER: re-concretize the top-k unstable neurons over \
+                       `box INTERSECT halfspaces` and shrink their intervals; returns empty \
+                       when the layer retained nothing, which is what makes an unretained \
+                       clip measurement vacuous rather than negative",
+                site: "crates/ny-propagate/src/margin_row/clip.rs:tighten_intermediate",
+            },
+        ],
     };
 
     /// `NY_MARGIN_ROW_ALPHA_OPT` — the margin-row lane's own alpha optimization.
@@ -278,39 +324,75 @@ Exact-\"1\" arming; anything else leaves the lane byte-for-byte as it is today."
 Arms the margin-row lane's own alpha ascent. Exact `1` arms it; absence and every \
 other value leave it dark. It changes which relaxation the lane publishes a bound \
 from, so it is verdict-affecting on the authoritative margin-row route.",
-        provenance: Provenance::Unmeasured {
-            why_ok: "dark exact-one Debug opt-in landed with 043d7ff75; no armed-vs-unarmed \
-                     scored-row A/B is retained yet",
+        provenance: Provenance::Measured {
+            commit: "98acbe08cde8417fc8c1b1547c8d1c3595f1c0aa",
+            date: "2026-08-25",
+            artifact: "docs/ALPHA_OPT_MARGIN_ROW_ROOT_2026-08-18.md and the \
+                       retained cifar100 preset rationale",
+            delta: "on the current sound path, cifar100 idx_9502 changed from \
+                    timeout at root -0.197208 with alpha disabled to UNSAT 3/3 \
+                    at root -0.174755 with the shipped optimizer; the current \
+                    moat was UNSAT 9/9",
         },
         owner: PROPAGATE,
-        readers: &[ReaderSite {
-            scope: PROPAGATE,
-            role: "arm the lane-local alpha ascent",
-            site: "crates/ny-propagate/src/margin_row/alpha_opt.rs",
-        }],
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the complete root-alpha/rebake policy from the scored LeverSet",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the legacy layered process only for compatibility callers",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
     };
 
     /// `NY_MARGIN_ROW_ALPHA_ITERS` — iteration count for that ascent.
     pub MARGIN_ROW_ALPHA_ITERS = LeverDecl {
         name: "NY_MARGIN_ROW_ALPHA_ITERS",
         kind: LeverKind::UsizeTrimmed,
-        default: DefaultSpec::U64(8),
+        default: DefaultSpec::U64(20),
         bucket: Bucket::Debug,
         moat: MoatRisk::High,
         doc: "\
-Iterations for the margin-row alpha ascent. Whitespace is trimmed; absent or \
-malformed leaves 8, and the reader CLAMPS the resolved value to 1..=64, so values \
-outside that range are pulled to the nearest bound rather than rejected. Inert \
-unless NY_MARGIN_ROW_ALPHA_OPT is armed.",
-        provenance: Provenance::Unmeasured {
-            why_ok: "inert while its parent lever is dark, which is the shipped state",
+Iterations for the margin-row alpha ascent, default 20 — alpha-beta-CROWN's own \
+root-alpha iteration count. Whitespace is trimmed; absent or malformed leaves 20, \
+and the reader CLAMPS the resolved value to 1..=64, so values outside that range \
+are pulled to the nearest bound rather than rejected. The typed preset key is \
+`margin_row.alpha_iters` and the environment wins over it in both directions. \
+Inert unless NY_MARGIN_ROW_ALPHA_OPT is armed.
+
+WHY 20 AND NOT THE ORIGINAL 8. Measured 2026-08-24 on the six arm-C rows of \
+`docs/ABC_ROOT_GAP_ON_WINNABLE_ROWS_2026-08-24.md`: the ascent accepted 8 of 8 \
+iterations on EVERY row, `eta` never halved once, and the per-iteration gain \
+decayed by only ~4% per step. It did not converge and it did not overshoot — it \
+ran out of iterations while still climbing. The wall cap (NY_MARGIN_ROW_ALPHA_SECS, \
+further capped to 40% of the remaining deadline) is what actually binds at the \
+scored budget, so this number is an upper limit rather than a promise; \
+`[alpha-opt] done iters=` reports how many were really spent.",
+        provenance: Provenance::Measured {
+            commit: "98acbe08cde8417fc8c1b1547c8d1c3595f1c0aa",
+            date: "2026-08-25",
+            artifact: "docs/ALPHA_OPT_MARGIN_ROW_ROOT_2026-08-18.md",
+            delta: "the shipped 20-step cifar100 ascent saturated by iterations \
+                    11-12 while tinyimagenet reached only 9/20 at its wall cap; \
+                    this separates iteration saturation from budget starvation",
         },
         owner: PROPAGATE,
-        readers: &[ReaderSite {
-            scope: PROPAGATE,
-            role: "iteration count for the lane-local alpha ascent",
-            site: "crates/ny-propagate/src/margin_row/alpha_opt.rs:env_iters",
-        }],
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the standalone alpha iteration cap",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
     };
 
     /// `NY_MARGIN_ROW_ALPHA_SECS` — wall-clock slice for that ascent.
@@ -323,16 +405,183 @@ unless NY_MARGIN_ROW_ALPHA_OPT is armed.",
         doc: "\
 Seconds the margin-row alpha ascent may spend. Absent, malformed, non-finite and \
 non-positive values all leave 20.0. Inert unless NY_MARGIN_ROW_ALPHA_OPT is armed; \
-when armed it trades budget away from the rest of the lane.",
-        provenance: Provenance::Unmeasured {
-            why_ok: "inert while its parent lever is dark, which is the shipped state",
+when armed it trades budget away from the rest of the lane. Surrounding whitespace \
+is accepted, matching the original `raw.trim().parse::<f64>()` reader.",
+        provenance: Provenance::Measured {
+            commit: "98acbe08cde8417fc8c1b1547c8d1c3595f1c0aa",
+            date: "2026-08-25",
+            artifact: "docs/ALPHA_OPT_MARGIN_ROW_ROOT_2026-08-18.md",
+            delta: "the 20-second request left cifar100 converged but truncated \
+                    tinyimagenet at 9/20 iterations; tinyimagenet stayed dark \
+                    because that pre-tree wall cost displaced needed tree work",
         },
         owner: PROPAGATE,
-        readers: &[ReaderSite {
-            scope: PROPAGATE,
-            role: "wall-clock slice for the lane-local alpha ascent",
-            site: "crates/ny-propagate/src/margin_row/alpha_opt.rs:env_secs",
-        }],
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the standalone alpha wall request",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
+    };
+
+    /// `NY_MARGIN_ROW_ALPHA_LR` — Adam step for that ascent (#alpha-opt-adam).
+    pub MARGIN_ROW_ALPHA_LR = LeverDecl {
+        name: "NY_MARGIN_ROW_ALPHA_LR",
+        // Trimmed, finite, CLOSED at zero: zero is MEANINGFUL here — it selects
+        // the legacy normalized-supergradient step — so the reader keeps a
+        // `>= 0.0` filter rather than the `> 0.0` one the ETA levers use.
+        kind: LeverKind::F64ClosedTrimmed { min: 0.0, max: f64::MAX },
+        default: DefaultSpec::F64(0.1),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Adam step size for the margin-row ROOT alpha ascent, default 0.1. This is NY's \
+retained rate, not alpha-beta-CROWN's cifar100 `lr_alpha` (0.25). The raw \
+supergradient is first divided by its \
+own max, so this is denominated in the same units as the legacy `eta`: slope \
+travel of the DOMINANT neuron through the legal `[0, 1]` range in one iteration. \
+The difference is that Adam is scale-free PER COORDINATE, so every neuron with \
+gradient support moves ~lr, where the legacy rule moved a neuron at a tenth of \
+the peak gradient a tenth as far. Decays by 0.98 per iteration (abc's \
+`lr_decay`). Exactly `0` restores the legacy global-max-normalized step, which \
+is the control arm. Trimmed; absent, malformed, negative, `nan` and `inf` all \
+leave 0.1; the reader clamps to `[0, 1]`. The typed preset key is \
+`margin_row.alpha_lr` and the environment wins over it in both directions. It is \
+consumed by either the standalone root-alpha optimizer or the joint re-bake \
+optimizer; it is inert only when both parent mechanisms are dark.
+
+WHY IT EXISTS. Measured 2026-08-24, the legacy step moved only 76..278 of \
+thousands of unstable neurons and recovered +0.0061 of root bound against abc's \
++0.1218 — 20x too weak — while accepting 8 of 8 iterations with `eta` never \
+halving, i.e. failing by taking steps far too small rather than by pointing the \
+wrong way. High for its parents' reasons: armed it changes the certified bound \
+the authoritative margin-row lane publishes at the root, and the root is what \
+every BaB domain inherits.",
+        provenance: Provenance::Measured {
+            commit: "98acbe08cde8417fc8c1b1547c8d1c3595f1c0aa",
+            date: "2026-08-25",
+            artifact: "docs/ALPHA_OPT_MARGIN_ROW_ROOT_2026-08-18.md",
+            delta: "the coupled shipped vector (Adam LR=0.1 and K=8 steering) \
+                    produced median +0.0328 published root gain versus +0.0061 \
+                    for the legacy vector, and converted cifar100 idx_9502; \
+                    this retained comparison does not isolate LR from K",
+        },
+        owner: PROPAGATE,
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the shared standalone/rebake step size",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
+    };
+
+    /// `NY_MARGIN_ROW_ALPHA_COLS` — steering width for that ascent.
+    pub MARGIN_ROW_ALPHA_COLS = LeverDecl {
+        name: "NY_MARGIN_ROW_ALPHA_COLS",
+        kind: LeverKind::UsizeTrimmed,
+        default: DefaultSpec::U64(8),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+How many of the WORST class columns the margin-row root alpha ascent averages \
+its steering gradient over, default 8. Trimmed; absent or malformed leaves 8, \
+and the reader clamps to 1..=64. `1` reproduces the legacy single-worst-column \
+steering exactly. The typed preset key is `margin_row.alpha_cols` and the \
+environment wins over it in both directions. It is consumed by either the \
+standalone root-alpha optimizer or the joint re-bake optimizer; it is inert only \
+when both parent mechanisms are dark.
+
+WHY IT EXISTS. The frozen-frame objective is a MIN over the class columns that \
+survive the head frame (measured: 3 to 37 of them on the arm-C rows), so its \
+exact supergradient is the gradient at the argmin column alone — and a neuron \
+whose incoming coefficient is negative at THAT column has `vp = 0`, no gradient, \
+and can never move however much it would buy the others. Averaging the K worst \
+columns is the standard CVaR surrogate for a max-min. Tightness-only: the true \
+min is still what scores every iterate, so a bad K wastes passes and cannot \
+manufacture a proof. Each extra column costs one more single-column forward walk \
+(milliseconds) per iteration, not another certified backward pass.",
+        provenance: Provenance::Measured {
+            commit: "98acbe08cde8417fc8c1b1547c8d1c3595f1c0aa",
+            date: "2026-08-25",
+            artifact: "docs/ALPHA_OPT_MARGIN_ROW_ROOT_2026-08-18.md",
+            delta: "the coupled shipped vector used K=8 worst-column steering, \
+                    produced median +0.0328 published root gain, converted \
+                    cifar100 idx_9502, and preserved the 9/9 current moat; the \
+                    retained comparison does not isolate K from the Adam rate",
+        },
+        owner: PROPAGATE,
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the shared standalone/rebake steering width",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
+    };
+
+    /// `NY_MARGIN_ROW_ALPHA_GUARD` — published-frame revert guard.
+    pub MARGIN_ROW_ALPHA_GUARD = LeverDecl {
+        name: "NY_MARGIN_ROW_ALPHA_GUARD",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(true),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Score the margin-row root alpha ascent's commit through the UNCHANGED \
+`root_eval` and revert to the heuristic gates unless the PUBLISHED bound \
+strictly improves. Default ON. Exact `\"1\"` arms and exact `\"0\"` disarms in both \
+directions over the typed preset key `margin_row.alpha_guard`.
+
+WHY IT EXISTS, AND WHY IT DEFAULTS ON. The ascent is monotone on a FROZEN frame \
+— y-pack, head gates, m1 and m2v are built once under the heuristic gates and \
+held fixed while trunk alpha moves — but the lane publishes a different number, \
+which `root_eval` recomputes under whatever gates the root ends up carrying. \
+Soundness of the VALUES is not at issue (`alpha*y <= relu(y)` holds pointwise \
+for any `alpha in [0, 1]`, and `ms = max(alpha, s)` is re-derived on commit), so \
+this guard is not what makes the bound valid. It is what makes the bound \
+MONOTONE: with it, what the lane publishes is `max(binary, optimized)` chosen \
+between two separately certified lower bounds on the same margin — the \
+intersection of the two certificates — so arming the ascent cannot lose a banked \
+proof to a frozen-frame gain that does not transfer. Current-path measurements \
+retained in `docs/ALPHA_OPT_MARGIN_ROW_ROOT_2026-08-18.md` show median transfer \
+of 103.5% across nine rows, `idx_1298` at 69%, and zero guard reversions. That \
+observation does not make the check redundant: an unobserved negative transfer \
+would discard a banked bound. Costs two extra `root_eval` evaluations. Inert \
+unless NY_MARGIN_ROW_ALPHA_OPT is armed.",
+        provenance: Provenance::Guard {
+            protects: "the already-certified published root bound from a frozen-frame alpha \
+                       improvement that fails to transfer through root_eval",
+        },
+        owner: PROPAGATE,
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the standalone published-frame guard policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the compatibility process policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:RootAlphaRuntimePolicy::from_layered_process",
+            },
+        ],
     };
 
     /// `NY_MARGIN_ROW_K_ADAPT` — override the preset's adaptive-k choice.
@@ -347,20 +596,26 @@ when armed it trades budget away from the rest of the lane.",
         moat: MoatRisk::High,
         doc: "\
 Forces the margin-row adaptive-k width policy on (`1`) or off (`0`), overriding \
-the preset. Absent, malformed and every other value defer to the preset, so this \
-is a three-state override rather than a two-state gate — which is why the default \
-is Unset and the reader matches on the resolved VALUE rather than calling \
-`as_bool()`.",
+the preset. Absence defers to the preset; a malformed present value is rejected \
+and suppresses the preset to the declaration's unset/off fallback. This is why \
+the default is Unset and the reader uses the centralized layered resolver.",
         provenance: Provenance::Unmeasured {
             why_ok: "an explicit A/B override for a preset-chosen policy; the unset path is \
                      the shipped behaviour and is byte-identical",
         },
         owner: PROPAGATE,
-        readers: &[ReaderSite {
-            scope: PROPAGATE,
-            role: "three-state override of the preset adaptive-k choice",
-            site: "crates/ny-propagate/src/margin_row/bab.rs",
-        }],
+        readers: &[
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "freeze the scored effective and contextual adaptive-width policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:MarginRowWidthRuntimePolicy::from_levers",
+            },
+            ReaderSite {
+                scope: PROPAGATE,
+                role: "resolve the non-scored compatibility adaptive-width policy",
+                site: "crates/ny-propagate/src/margin_row/mod.rs:MarginRowWidthRuntimePolicy::from_layered_process",
+            },
+        ],
     };
 
     /// `NY_MARGIN_ROW_CLIP` — the margin-row Clip-Verify half.
@@ -427,6 +682,176 @@ Latched once per process; inert unless NY_MARGIN_ROW_CLIP_INTERM is armed.",
             scope: PROPAGATE,
             role: "per-layer re-concretization width for the Clip-Verify half",
             site: "crates/ny-propagate/src/margin_row/engine.rs:clip_interm_topk",
+        }],
+    };
+
+    /// `NY_RESNET_ERR_CONCRETIZE` — per-segment error concretization on the
+    /// SOUND GPU-resident ResNet CROWN walk.
+    pub RESNET_ERR_CONCRETIZE = LeverDecl {
+        name: "NY_RESNET_ERR_CONCRETIZE",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "Arms per-segment error concretization on the sound GPU-resident ResNet CROWN backward walk: after each segment the accumulated coefficient error is concretized against the frontier magnitudes instead of being carried forward as coefficient radii. Exact `1` arms it; absence and every other value leave it dark. MoatRisk::High, NOT the None a diagnostic probe would get. This sits on the CERTIFIED lane and changes WHERE the error budget is discharged, so it changes the published bound on any run that takes the sound resident ResNet path -- it is a bound-affecting knob that merely looks like a plumbing switch. It is also consulted by the main-bound AUTO-FALLBACK, so arming it changes which of two bounds the walk publishes rather than only how one is computed. DELIBERATELY UNCACHED (no OnceLock), for the same reason `NY_EFT_ERR`'s twin gates are: `crown_backward_sound_resident.rs` flips this mid-process with `ScopedEnvVar::set` in its own differential tests, and a latch would make those tests measure the pre-set value while reporting the post-set one. The chokepoint `read` performs a live `var_os` lookup per call, and all six readers are once per WALK, never per element. Its `_FINE` sibling (`NY_RESNET_ERR_CONCRETIZE_FINE`, per-ReLU rather than per-segment) is a separate raw reader and is NOT declared here; declaring it is the next increment of the same debt.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "dark exact-one Debug opt-in on a lane that is itself opt-in; the OFF arm                      is the shipped path and is byte-identical, and this declaration is a                      RATCHET migration of six pre-existing byte-identical raw readers -- it                      changes no behaviour, so there is nothing new to measure",
+        },
+        owner: GPU,
+        readers: &[ReaderSite {
+            scope: GPU,
+            role: "SIX readers in one file, all with the byte-identical exact-\"1\" parser,                    routed through one uncached chokepoint helper: the coefficient-egress                    gate, and five call sites that thread the same decision into the seeded                    resident ResNet walk",
+            site: "crates/ny-gpu/src/wgpu_device/ops/crown_backward_sound_resident.rs:\
+                   resnet_err_concretize_armed",
+        }],
+    };
+
+    /// `NY_RESNET_ERR_CONCRETIZE_FINE` — the PER-RELU refinement of the gate
+    /// above.
+    pub RESNET_ERR_CONCRETIZE_FINE = LeverDecl {
+        name: "NY_RESNET_ERR_CONCRETIZE_FINE",
+        kind: LeverKind::Bool,
+        default: DefaultSpec::Bool(false),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "Refines `NY_RESNET_ERR_CONCRETIZE` from per-SEGMENT to per-RELU: each branch's accumulated error is concretized at every ReLU against the node magnitudes. Exact `1` arms it; absence and every other value leave it dark. Additionally admissible only when the walk was handed non-empty `node_abs`, so an armed value can still resolve to no change — which is why it is declared separately from its parent rather than folded in: a merged declaration would put a decision on the receipt that the walk did not make. MoatRisk::High for the same reason as its parent: it is on the CERTIFIED lane and moves where the error budget is discharged, hence the published bound. DELIBERATELY UNCACHED, same `ScopedEnvVar` mid-process test contract.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "dark exact-one Debug opt-in, inert unless its parent gate is armed AND                      the walk carries node magnitudes; this declaration is a RATCHET                      migration of one pre-existing byte-identical raw reader and changes no                      behaviour",
+        },
+        owner: GPU,
+        readers: &[ReaderSite {
+            scope: GPU,
+            role: "per-ReLU error concretization gate on the sound resident ResNet walk",
+            site: "crates/ny-gpu/src/wgpu_device/ops/crown_backward_sound_resident.rs:\
+                   resnet_err_concretize_fine_armed",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLOSURE_ADAPTIVE` — three-state override of the
+    /// closure-driven runtime escalation policy.
+    pub MARGIN_ROW_CLOSURE_ADAPTIVE = LeverDecl {
+        name: "NY_MARGIN_ROW_CLOSURE_ADAPTIVE",
+        kind: LeverKind::Bool,
+        // Unset, NOT Bool(false): absence must fall through to the PRESET's
+        // choice (`margin_row.closure_adaptive`), exactly like
+        // NY_MARGIN_ROW_K_ADAPT. A Bool default here would silently override
+        // the preset with `false`.
+        default: DefaultSpec::Unset,
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Forces the margin-row closure-adaptive escalation policy on (`1`) or off (`0`), \
+overriding the preset. Absence defers to the preset; a malformed present value \
+is rejected and suppresses the preset to the declaration's unset/off fallback. The \
+policy measures the lane's OWN child-closure fraction over a trailing window of \
+expansions and, when it falls below the threshold, arms the existing tightening \
+mechanisms in cost order (beta split dual, then Clip-and-Verify intermediate \
+gates, then the Clip-and-Verify y-box). Every tier is sound independently of the \
+policy; the certified pass remains the only scorer. Ships DARK. Typed form is \
+the preset key `margin_row.closure_adaptive`.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "three-state override of a preset-chosen policy that itself ships dark; \
+                     the unset path is byte-identical to the shipped behaviour",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "three-state override of the preset closure-adaptive choice",
+            site: "crates/ny-propagate/src/margin_row/closure.rs:armed",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLOSURE_THRESH` — the closure fraction that triggers it.
+    pub MARGIN_ROW_CLOSURE_THRESH = LeverDecl {
+        name: "NY_MARGIN_ROW_CLOSURE_THRESH",
+        kind: LeverKind::F64Open { min: 0.0, max: 1.0 },
+        default: DefaultSpec::F64(0.40),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Child-closure fraction below which the closure-adaptive policy escalates. \
+Default 0.40, taken from alpha-beta-CROWN's own measured bands on the 16 \
+cifar100_2024 rows this lane fails: abc's LOSSES top out at 0.34 and its WINS \
+start at 0.50, and 0.40 sits strictly inside that empty band. Absent, malformed, \
+non-finite and out-of-range values all leave 0.40. Inert unless the policy is \
+armed.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert while its parent policy is dark, which is the shipped state",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "escalation threshold for the closure-adaptive policy",
+            site: "crates/ny-propagate/src/margin_row/closure.rs:threshold",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLOSURE_WARMUP` — expansions before the first decision.
+    pub MARGIN_ROW_CLOSURE_WARMUP = LeverDecl {
+        name: "NY_MARGIN_ROW_CLOSURE_WARMUP",
+        kind: LeverKind::U64,
+        default: DefaultSpec::U64(24),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Expansions the closure-adaptive policy observes before its FIRST decision. \
+Default 24 = 1.5x the smallest abc proof on the calibration rows (16 nodes), so a \
+row on a winning trajectory has already discharged a batch by then. Absent or \
+malformed leaves 24; the reader clamps to 1..=100000. Inert unless the policy is \
+armed.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert while its parent policy is dark, which is the shipped state",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "warm-up window for the closure-adaptive policy",
+            site: "crates/ny-propagate/src/margin_row/closure.rs:warmup",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLOSURE_WINDOW` — expansions per re-evaluation.
+    pub MARGIN_ROW_CLOSURE_WINDOW = LeverDecl {
+        name: "NY_MARGIN_ROW_CLOSURE_WINDOW",
+        kind: LeverKind::U64,
+        default: DefaultSpec::U64(16),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Expansions per observation window after the warm-up. Default 16 (about 32 \
+children, abc's batch scale). Absent or malformed leaves 16; the reader clamps to \
+1..=100000. Inert unless the policy is armed.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert while its parent policy is dark, which is the shipped state",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "observation window for the closure-adaptive policy",
+            site: "crates/ny-propagate/src/margin_row/closure.rs:window",
+        }],
+    };
+
+    /// `NY_MARGIN_ROW_CLOSURE_MAX_TIER` — cap for single-mechanism arms.
+    pub MARGIN_ROW_CLOSURE_MAX_TIER = LeverDecl {
+        name: "NY_MARGIN_ROW_CLOSURE_MAX_TIER",
+        kind: LeverKind::U64,
+        default: DefaultSpec::U64(3),
+        bucket: Bucket::Debug,
+        moat: MoatRisk::High,
+        doc: "\
+Highest tier the closure-adaptive ladder may reach: 0 observe-only, 1 beta, \
+2 + Clip-and-Verify intermediate gates, 3 + the Clip-and-Verify y-box. Exists so \
+a measurement can isolate one mechanism. Absent or malformed leaves 3; the reader \
+clamps to the top of the ladder. Inert unless the policy is armed.",
+        provenance: Provenance::Unmeasured {
+            why_ok: "inert while its parent policy is dark, which is the shipped state",
+        },
+        owner: PROPAGATE,
+        readers: &[ReaderSite {
+            scope: PROPAGATE,
+            role: "ladder cap for the closure-adaptive policy",
+            site: "crates/ny-propagate/src/margin_row/closure.rs:max_tier",
         }],
     };
 }

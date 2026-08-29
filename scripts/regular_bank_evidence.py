@@ -195,9 +195,18 @@ CLAIM_SCOPE = (
 FLIGHT_RECORD_CAPTURE_POLICY = (
     "validated-structured-row-metadata-or-explicit-missing-v1"
 )
+REQUIRED_FLIGHT_EVENT_ENV = "NY_MEASURE_REQUIRE_FLIGHT_EVENT"
 LEGACY_START_PROFILE = "legacy_without_build_coherence_or_flight_v1"
 BUILD_COHERENCE_START_PROFILE = "build_coherence_without_flight_v1"
 FLIGHT_START_PROFILE = "build_coherence_and_flight_v1"
+BUILD_ID_START_PROFILE = "build_coherence_and_binary_identity_without_flight_v1"
+FLIGHT_BUILD_ID_START_PROFILE = (
+    "build_coherence_binary_identity_and_flight_v1"
+)
+LEGACY_SINGLE_EXECUTION_START_PROFILE = (
+    "build_coherence_flight_and_single_execution_predicate_v1"
+)
+CURRENT_EXECUTION_START_PROFILE = "build_coherence_flight_and_execution_evidence_v1"
 
 START_KEYS = frozenset(
     {
@@ -265,6 +274,13 @@ MEASUREMENT_KEYS = LEGACY_MEASUREMENT_KEYS | {
     "flight_record_capture",
     "flight_record_file",
 }
+LEGACY_EXECUTION_MEASUREMENT_KEYS = MEASUREMENT_KEYS | {
+    "execution_evidence_profile"
+}
+CURRENT_EXECUTION_MEASUREMENT_KEYS = LEGACY_EXECUTION_MEASUREMENT_KEYS | {
+    "execution_predicate_assignment",
+    "search_space_contract",
+}
 LEGACY_SOLVER_BINARY_KEYS = frozenset(
     {
         "declared_build_features",
@@ -280,6 +296,8 @@ LEGACY_SOLVER_BINARY_KEYS = frozenset(
     }
 )
 SOLVER_BINARY_KEYS = LEGACY_SOLVER_BINARY_KEYS | {"build_coherence"}
+BINARY_ID_SOLVER_BINARY_KEYS = SOLVER_BINARY_KEYS | {"build_id"}
+CURRENT_EXECUTION_SOLVER_BINARY_KEYS = BINARY_ID_SOLVER_BINARY_KEYS
 COMPLETION_KEYS = frozenset(
     {
         "completed_successfully",
@@ -404,14 +422,23 @@ FLIGHT_RECORD_BASE_KEYS = frozenset(
         "schema_version",
     }
 )
+FLIGHT_RECORD_CURRENT_KEYS = FLIGHT_RECORD_BASE_KEYS | {
+    "ambient_env_schema",
+    "build_id",
+}
 FLIGHT_RECORD_OPTIONAL_KEYS = frozenset(
     {"load_avg_at_begin", "load_avg_at_end"}
 )
+FLIGHT_RECORD_PARTIAL_KEY = archive.FLIGHT_RECORD_PARTIAL_KEY
+FLIGHT_RECORD_STATUS_KEYS = archive.FLIGHT_RECORD_STATUS_KEYS
 FLIGHT_HOST_KEYS = frozenset(
     {"cpu_model", "hostname", "logical_cores", "ram_bytes"}
 )
 FLIGHT_EVENT_KEYS = frozenset({"method", "status"})
 FLIGHT_EVENT_OPTIONAL_KEYS = frozenset({"at_secs", "reason"})
+FLIGHT_AMBIENT_WORKER_KEYS = frozenset(
+    {"OMP_NUM_THREADS", "RAYON_NUM_THREADS", "RAYON_RS_NUM_CPUS"}
+)
 FLIGHT_V2_LEVER_RECEIPT_SCHEMA = "ny-levers/receipt/v1"
 FLIGHT_V2_LEVER_RECEIPT_KEYS = frozenset(
     {"env_overridden", "lever_count", "levers", "schema"}
@@ -1852,8 +1879,128 @@ def _validate_flight_capture_fields(measurement: dict[str, Any]) -> None:
         )
 
 
+def _required_flight_event_from_start(
+    start: dict[str, Any],
+) -> str | None:
+    """Recover one current typed predicate independently at promotion time."""
+
+    measurement = start.get("measurement")
+    profile = (
+        measurement.get("execution_evidence_profile")
+        if isinstance(measurement, dict)
+        else None
+    )
+    if profile is None:
+        return None
+    if profile not in {
+        provenance.LEGACY_EXECUTION_EVIDENCE_PROFILE,
+        provenance.LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        provenance.EXECUTION_EVIDENCE_PROFILE,
+        provenance.JOINT_EXECUTION_EVIDENCE_PROFILE,
+    }:
+        raise EvidenceError("start execution-evidence profile is unsupported")
+
+    environment = start.get("environment")
+    if not isinstance(environment, dict):
+        raise EvidenceError("start manifest environment section is invalid")
+    values = environment.get("values")
+    if not isinstance(values, dict):
+        raise EvidenceError("start manifest environment values are invalid")
+    raw = values.get(REQUIRED_FLIGHT_EVENT_ENV)
+    if not isinstance(raw, str):
+        raise EvidenceError(
+            "current execution-evidence profile requires a sealed execution "
+            "predicate"
+        )
+    try:
+        parsed = provenance.parse_execution_predicate_requirement(raw)
+    except provenance.ExecutionPredicateError as error:
+        raise EvidenceError(
+            f"sealed required flight event is not a current execution predicate: "
+            f"{error}"
+        ) from error
+    expected_requirement_schema = (
+        provenance.JOINT_EXECUTION_PREDICATE_SCHEMA
+        if profile in {
+            provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+            provenance.JOINT_EXECUTION_EVIDENCE_PROFILE,
+        }
+        else provenance.EXECUTION_PREDICATE_SCHEMA
+    )
+    if parsed.get("schema") != expected_requirement_schema:
+        raise EvidenceError(
+            "sealed execution predicate does not match its evidence profile"
+        )
+    typed_values = environment.get("typed_values")
+    if not isinstance(typed_values, dict) or typed_values.get(
+        REQUIRED_FLIGHT_EVENT_ENV
+    ) != parsed:
+        raise EvidenceError(
+            "sealed required flight event is not bound to its current typed "
+            "declaration"
+        )
+    return raw
+
+
+def _execution_predicate_assignment_from_start(
+    start: dict[str, Any],
+) -> object:
+    """Validate the exact causal treatment/prerequisite assignment."""
+    measurement = start.get("measurement")
+    profile = (
+        measurement.get("execution_evidence_profile")
+        if isinstance(measurement, dict)
+        else None
+    )
+    if profile == provenance.LEGACY_EXECUTION_EVIDENCE_PROFILE:
+        return None
+    assignment_schema_by_profile = {
+        provenance.LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE: (
+            provenance.LEGACY_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        ),
+        provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE: (
+            provenance.LEGACY_JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        ),
+        provenance.EXECUTION_EVIDENCE_PROFILE: (
+            provenance.EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        ),
+        provenance.JOINT_EXECUTION_EVIDENCE_PROFILE: (
+            provenance.JOINT_EXECUTION_PREDICATE_ASSIGNMENT_SCHEMA
+        ),
+    }
+    expected_assignment_schema = assignment_schema_by_profile.get(profile)
+    if expected_assignment_schema is None or not isinstance(measurement, dict):
+        raise EvidenceError("start execution-evidence profile is unsupported")
+    try:
+        search_space_contract = provenance.validate_start_search_space_contract(
+            start, reprobe_sealed_binary=False
+        )
+        preset_docs = provenance.execution_predicate_preset_docs_from_start(start)
+        validated = provenance.validate_execution_predicate_assignment(
+            measurement.get("execution_predicate_assignment"),
+            environment=start.get("environment"),
+            search_space_contract=search_space_contract,
+            preset_docs=preset_docs,
+            preset_expected=preset_docs is not None,
+        )
+        assignment = measurement.get("execution_predicate_assignment")
+        if (
+            not isinstance(assignment, dict)
+            or assignment.get("schema") != expected_assignment_schema
+        ):
+            raise provenance.ExecutionPredicateError(
+                "execution predicate assignment does not match its evidence profile"
+            )
+        return validated
+    except (provenance.ExecutionPredicateError, provenance.ProvenanceError) as error:
+        raise EvidenceError(
+            f"start execution-predicate assignment is invalid: {error}"
+        ) from error
+
+
 def validate_start_schema_profile(start: object) -> str:
-    """Accept only the three producer profiles that existed in chronological order."""
+    """Accept only complete producer profiles that existed in chronological order."""
 
     value = _require_exact_keys(start, START_KEYS, label="start manifest")
     measurement = value.get("measurement")
@@ -1874,6 +2021,22 @@ def validate_start_schema_profile(start: object) -> str:
             MEASUREMENT_KEYS,
             SOLVER_BINARY_KEYS,
         ): FLIGHT_START_PROFILE,
+        (
+            LEGACY_MEASUREMENT_KEYS,
+            BINARY_ID_SOLVER_BINARY_KEYS,
+        ): BUILD_ID_START_PROFILE,
+        (
+            MEASUREMENT_KEYS,
+            BINARY_ID_SOLVER_BINARY_KEYS,
+        ): FLIGHT_BUILD_ID_START_PROFILE,
+        (
+            LEGACY_EXECUTION_MEASUREMENT_KEYS,
+            CURRENT_EXECUTION_SOLVER_BINARY_KEYS,
+        ): LEGACY_SINGLE_EXECUTION_START_PROFILE,
+        (
+            CURRENT_EXECUTION_MEASUREMENT_KEYS,
+            CURRENT_EXECUTION_SOLVER_BINARY_KEYS,
+        ): CURRENT_EXECUTION_START_PROFILE,
     }
     profile = profiles.get(key_pair)
     if profile is None:
@@ -1883,8 +2046,45 @@ def validate_start_schema_profile(start: object) -> str:
         )
     if profile != LEGACY_START_PROFILE:
         _validate_build_coherence(solver)
-    if profile == FLIGHT_START_PROFILE:
+    if profile in {
+        FLIGHT_START_PROFILE,
+        FLIGHT_BUILD_ID_START_PROFILE,
+        LEGACY_SINGLE_EXECUTION_START_PROFILE,
+        CURRENT_EXECUTION_START_PROFILE,
+    }:
         _validate_flight_capture_fields(measurement)
+    if profile == LEGACY_SINGLE_EXECUTION_START_PROFILE:
+        if measurement.get("execution_evidence_profile") != (
+            provenance.LEGACY_EXECUTION_EVIDENCE_PROFILE
+        ):
+            raise EvidenceError("legacy scalar execution-evidence profile is invalid")
+    elif profile == CURRENT_EXECUTION_START_PROFILE and measurement.get(
+        "execution_evidence_profile"
+    ) not in {
+        provenance.LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        provenance.EXECUTION_EVIDENCE_PROFILE,
+        provenance.JOINT_EXECUTION_EVIDENCE_PROFILE,
+    }:
+        raise EvidenceError("start execution-evidence profile is unsupported")
+    if profile == CURRENT_EXECUTION_START_PROFILE:
+        _execution_predicate_assignment_from_start(value)
+    if profile in {
+        BUILD_ID_START_PROFILE,
+        FLIGHT_BUILD_ID_START_PROFILE,
+        LEGACY_SINGLE_EXECUTION_START_PROFILE,
+        CURRENT_EXECUTION_START_PROFILE,
+    }:
+        try:
+            provenance.validate_binary_build_id(
+                solver.get("build_id"),
+                expected_executable_sha256=solver.get("sha256"),
+                declared_features=solver.get("declared_build_features"),
+            )
+        except provenance.ProvenanceError as error:
+            raise EvidenceError(
+                f"start solver build identity is invalid: {error}"
+            ) from error
     return profile
 
 
@@ -2059,9 +2259,17 @@ def _flight_record_source_bytes(record: dict[str, Any]) -> bytes:
 
     ordered: dict[str, Any] = {
         "schema_version": record["schema_version"],
-        "backend_kind": record["backend_kind"],
-        "backend_summary": record["backend_summary"],
     }
+    if FLIGHT_RECORD_PARTIAL_KEY in record:
+        status = record[FLIGHT_RECORD_PARTIAL_KEY]
+        ordered[FLIGHT_RECORD_PARTIAL_KEY] = {
+            key: status[key]
+            for key in ("status", "reason", "flushed_at_secs")
+        }
+    if "build_id" in record:
+        ordered["build_id"] = record["build_id"]
+    ordered["backend_kind"] = record["backend_kind"]
+    ordered["backend_summary"] = record["backend_summary"]
     host = record["host"]
     ordered["host"] = {
         key: host[key]
@@ -2072,6 +2280,8 @@ def _flight_record_source_bytes(record: dict[str, Any]) -> bytes:
             ordered[key] = record[key]
     ordered["category"] = record["category"]
     ordered["budget_secs"] = record["budget_secs"]
+    if "ambient_env_schema" in record:
+        ordered["ambient_env_schema"] = record["ambient_env_schema"]
     ambient = record["ambient_env"]
     ordered["ambient_env"] = {key: ambient[key] for key in sorted(ambient)}
     if "levers" in record:
@@ -2107,8 +2317,16 @@ def _validate_flight_record(
     category: object,
     timeout_seconds: object,
     solver_verdict: object,
+    required_event: str | None,
+    execution_assignment: object,
+    expected_build_stamp: str | None,
 ) -> None:
     if value == {"status": "missing"}:
+        if required_event is not None:
+            raise EvidenceError(
+                "sealed required flight event cannot be verified because the "
+                "flight record is missing"
+            )
         return
     capture = _require_exact_keys(
         value,
@@ -2135,8 +2353,24 @@ def _validate_flight_record(
         or schema_version not in archive.SUPPORTED_FLIGHT_SCHEMA_VERSIONS
     ):
         raise EvidenceError("embedded flight-record schema is unsupported")
-    expected_record_keys = set(FLIGHT_RECORD_BASE_KEYS)
+    partial_v3 = (
+        schema_version == archive.FLIGHT_SCHEMA_VERSION
+        and FLIGHT_RECORD_PARTIAL_KEY in record
+    )
+    if FLIGHT_RECORD_PARTIAL_KEY in record and (
+        not partial_v3 or expected_build_stamp is None
+    ):
+        raise EvidenceError(
+            "embedded partial flight record is not a current build-bound v3 shape"
+        )
+    expected_record_keys = set(
+        FLIGHT_RECORD_CURRENT_KEYS
+        if expected_build_stamp is not None
+        else FLIGHT_RECORD_BASE_KEYS
+    )
     expected_record_keys.update(set(record) & FLIGHT_RECORD_OPTIONAL_KEYS)
+    if partial_v3:
+        expected_record_keys.add(FLIGHT_RECORD_PARTIAL_KEY)
     if schema_version == archive.FLIGHT_SCHEMA_VERSION or (
         schema_version == 2 and "levers" in record
     ):
@@ -2152,11 +2386,23 @@ def _validate_flight_record(
     host = _require_exact_keys(
         record.get("host"), FLIGHT_HOST_KEYS, label="embedded flight host"
     )
+    if expected_build_stamp is not None and record.get("build_id") != expected_build_stamp:
+        raise EvidenceError(
+            "embedded flight-record build stamp differs from the sealed solver identity"
+        )
     if (
         not isinstance(backend_kind, str)
         or not backend_kind
         or not isinstance(backend_summary, str)
         or not backend_summary
+        or (
+            expected_build_stamp is not None
+            and (
+                record.get("ambient_env_schema") != "ny-cli/ambient-env/v3"
+                or not isinstance(record.get("build_id"), str)
+                or not record.get("build_id")
+            )
+        )
         or not isinstance(host.get("hostname"), str)
         or not isinstance(host.get("cpu_model"), str)
         or type(host.get("logical_cores")) is not int
@@ -2196,7 +2442,7 @@ def _validate_flight_record(
         for name, setting in values.items()
         if isinstance(name, str)
         and isinstance(setting, str)
-        and (name.startswith("NY_") or name == "OMP_NUM_THREADS")
+        and (name.startswith("NY_") or name in FLIGHT_AMBIENT_WORKER_KEYS)
     }
     if ambient != expected_ambient:
         raise EvidenceError(
@@ -2207,6 +2453,15 @@ def _validate_flight_record(
             record.get("levers"), ambient_env=ambient
         ):
             raise EvidenceError("embedded flight-record lever receipt is invalid")
+        if partial_v3 and not archive._valid_partial_v3_flight_lifecycle(record):
+            raise EvidenceError(
+                "embedded partial flight-record lifecycle is invalid"
+            )
+        if partial_v3 and solver_verdict not in UNRESOLVED_LITERAL_VERDICTS:
+            raise EvidenceError(
+                "embedded partial flight record requires an unresolved solver "
+                "verdict (timeout/unknown/error)"
+            )
     elif "levers" in record and not _valid_v2_lever_receipt(
         record.get("levers"), ambient_env=ambient
     ):
@@ -2236,7 +2491,11 @@ def _validate_flight_record(
         if (
             not isinstance(method, str)
             or not method
-            or status not in {"ran", "skipped", "not_reached", "complete"}
+            or status not in (
+                {"ran", "skipped", "not_reached", "incomplete"}
+                if partial_v3
+                else {"ran", "skipped", "not_reached", "complete"}
+            )
             or ("reason" in event and not isinstance(reason, str))
             or ("at_secs" in event and (
                 isinstance(at_secs, bool)
@@ -2244,23 +2503,29 @@ def _validate_flight_record(
                 or not math.isfinite(float(at_secs))
                 or float(at_secs) < previous_at
             ))
-            or ((method == "run_complete") != (status == "complete"))
+            or (
+                ((method == "run_incomplete") != (status == "incomplete"))
+                if partial_v3
+                else ((method == "run_complete") != (status == "complete"))
+            )
         ):
             raise EvidenceError("embedded flight-record event is invalid")
         if "at_secs" in event:
             previous_at = float(at_secs)
-        if status == "complete":
+        if status in {"complete", "incomplete"}:
             terminal_count += 1
-            if (
-                index != len(raw_events) - 1
-                or reason != solver_verdict
-                or "at_secs" not in event
-            ):
+            if index != len(raw_events) - 1 or "at_secs" not in event:
+                raise EvidenceError(
+                    "embedded flight-record terminal verdict/order differs"
+                )
+            if not partial_v3 and reason != solver_verdict:
                 raise EvidenceError(
                     "embedded flight-record terminal verdict/order differs"
                 )
     if terminal_count != 1:
-        raise EvidenceError("embedded flight record has no unique terminal event")
+        raise EvidenceError(
+            "embedded flight record has no unique terminal lifecycle event"
+        )
 
     try:
         source = _flight_record_source_bytes(record)
@@ -2272,6 +2537,19 @@ def _validate_flight_record(
         raise EvidenceError(
             "embedded flight record differs from its captured source bytes"
         )
+    if required_event is not None:
+        try:
+            provenance.validate_execution_predicate_requirement(
+                record, required_event, assignment=execution_assignment
+            )
+        except (
+            provenance.ExecutionPredicateError,
+            provenance.ProvenanceError,
+        ) as error:
+            raise EvidenceError(
+                "sealed required flight event did not earn current execution "
+                f"credit: {error}"
+            ) from error
 
 
 def validate_flight_record_binding(
@@ -2283,25 +2561,66 @@ def validate_flight_record_binding(
     metadata_profile = validate_metadata_schema_profile(metadata)
     expected_metadata_profile = (
         FLIGHT_START_PROFILE
-        if start_profile == FLIGHT_START_PROFILE
+        if start_profile
+        in {
+            FLIGHT_START_PROFILE,
+            FLIGHT_BUILD_ID_START_PROFILE,
+            LEGACY_SINGLE_EXECUTION_START_PROFILE,
+            CURRENT_EXECUTION_START_PROFILE,
+        }
         else LEGACY_START_PROFILE
     )
     if metadata_profile != expected_metadata_profile:
         raise EvidenceError(
             "start and metadata producer profiles are inconsistent"
         )
-    if start_profile != FLIGHT_START_PROFILE:
+    if start_profile not in {
+        FLIGHT_START_PROFILE,
+        FLIGHT_BUILD_ID_START_PROFILE,
+        LEGACY_SINGLE_EXECUTION_START_PROFILE,
+        CURRENT_EXECUTION_START_PROFILE,
+    }:
         return start_profile
     assert isinstance(start, dict)
     assert isinstance(metadata, dict)
     measurement = start["measurement"]
     assert isinstance(measurement, dict)
+    required_event = (
+        _required_flight_event_from_start(start)
+        if start_profile
+        in {LEGACY_SINGLE_EXECUTION_START_PROFILE, CURRENT_EXECUTION_START_PROFILE}
+        else None
+    )
+    execution_assignment = (
+        _execution_predicate_assignment_from_start(start)
+        if start_profile == CURRENT_EXECUTION_START_PROFILE
+        else None
+    )
+    expected_build_stamp = None
+    if start_profile in {
+        FLIGHT_BUILD_ID_START_PROFILE,
+        LEGACY_SINGLE_EXECUTION_START_PROFILE,
+        CURRENT_EXECUTION_START_PROFILE,
+    }:
+        solver = start.get("solver_binary")
+        assert isinstance(solver, dict)
+        try:
+            expected_build_stamp = provenance.flight_build_stamp_for_binary_build_id(
+                solver.get("build_id")
+            )
+        except provenance.ProvenanceError as error:
+            raise EvidenceError(
+                f"start solver build identity is invalid: {error}"
+            ) from error
     _validate_flight_record(
         metadata.get("flight_record"),
         measurement=measurement,
         category=metadata.get("category"),
         timeout_seconds=metadata.get("timeout_seconds"),
         solver_verdict=metadata.get("solver_verdict"),
+        required_event=required_event,
+        execution_assignment=execution_assignment,
+        expected_build_stamp=expected_build_stamp,
     )
     return start_profile
 
@@ -2718,6 +3037,8 @@ def _validate_execution_binding(
     *,
     root: Path,
     start: dict[str, Any],
+    start_digest: str | None = None,
+    validation_session: dict[str, Any] | None = None,
 ) -> None:
     measurement = start.get("measurement")
     solver = start.get("solver_binary")
@@ -2739,6 +3060,55 @@ def _validate_execution_binding(
     assert isinstance(sealed_solver, dict)
     assert isinstance(sealed_configs, dict)
     assert isinstance(ay, dict)
+    if measurement.get("execution_evidence_profile") in {
+        provenance.LEGACY_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        provenance.LEGACY_JOINT_ASSIGNMENT_EXECUTION_EVIDENCE_PROFILE,
+        provenance.EXECUTION_EVIDENCE_PROFILE,
+        provenance.JOINT_EXECUTION_EVIDENCE_PROFILE,
+    }:
+        try:
+            contract = provenance.validate_start_search_space_contract(
+                start, reprobe_sealed_binary=False
+            )
+            cache_entry = {
+                "schema": "ny_regular_bank_search_space_reprobe_v1",
+                "start_manifest_sha256": start_digest,
+                "sealed_solver_sha256": sealed_solver.get("sha256"),
+                "registry": provenance._search_space_identity(contract),
+            }
+            if validation_session is None:
+                provenance.validate_start_search_space_contract(
+                    start, reprobe_sealed_binary=True
+                )
+            else:
+                if not isinstance(start_digest, str) or not _is_sha256(start_digest):
+                    raise EvidenceError(
+                        "current start digest is unavailable for registry reprobe caching"
+                    )
+                cache = validation_session.setdefault(
+                    "sealed_search_space_reprobe_cache", {}
+                )
+                if not isinstance(cache, dict):
+                    raise EvidenceError(
+                        "validation-session search-space cache is invalid"
+                    )
+                cache_key = provenance._identity_sha256(
+                    {"artifact_root": str(root), "start_manifest_sha256": start_digest}
+                )
+                known = cache.get(cache_key)
+                if known is None:
+                    provenance.validate_start_search_space_contract(
+                        start, reprobe_sealed_binary=True
+                    )
+                    cache[cache_key] = cache_entry
+                elif known != cache_entry:
+                    raise EvidenceError(
+                        "validation-session search-space cache binding differs"
+                    )
+        except provenance.ExecutionPredicateError as error:
+            raise EvidenceError(
+                f"sealed solver search-space contract validation failed: {error}"
+            ) from error
     sealed_ay = ay.get("sealed_executable")
     if not isinstance(sealed_ay, dict):
         raise EvidenceError("start sealed AY execution identity is missing")
@@ -2939,6 +3309,7 @@ def _load_start(
     instance_index: int,
     benchmark: PinnedOfficialBenchmark,
     exact_commit: str,
+    validation_session: dict[str, Any] | None = None,
 ) -> tuple[Path, dict[str, Any], str, int, dict[str, Any]]:
     if gap.EXACT_COMMIT_RE.fullmatch(exact_commit) is None:
         raise EvidenceError("exact commit must be exactly 40 lowercase hex digits")
@@ -2960,7 +3331,12 @@ def _load_start(
     )
     if not isinstance(measurement, dict) or not isinstance(benchmark_identity, dict):
         raise EvidenceError("start manifest lacks measurement or benchmark identity")
-    _validate_execution_binding(root=root, start=start)
+    _validate_execution_binding(
+        root=root,
+        start=start,
+        start_digest=digest,
+        validation_session=validation_session,
+    )
     if measurement.get("instance_index") != instance_index:
         raise EvidenceError(
             "requested instance index differs from the start manifest selection"
@@ -3417,7 +3793,26 @@ def _validate_row_artifacts(
     metadata: dict[str, Any],
     authoritative_cache: dict[str, tuple[AuthoritativeInput, bytes]] | None = None,
 ) -> dict[str, AuthoritativeInput]:
-    validate_flight_record_binding(start=start, metadata=metadata)
+    evidence_profile = validate_flight_record_binding(start=start, metadata=metadata)
+    if evidence_profile != CURRENT_EXECUTION_START_PROFILE:
+        raise EvidenceError(
+            "measurement evidence predates the required current execution-evidence "
+            "profile and is not promotion-eligible"
+        )
+    flight_capture = metadata.get("flight_record")
+    flight_record = (
+        flight_capture.get("record")
+        if isinstance(flight_capture, dict)
+        else None
+    )
+    if (
+        isinstance(flight_record, dict)
+        and FLIGHT_RECORD_PARTIAL_KEY in flight_record
+    ):
+        raise EvidenceError(
+            "partial hard-stop flight evidence remains readable execution-prefix "
+            "evidence but is not regular-bank promotion-eligible"
+        )
     if (
         metadata.get("schema") != "ny_measurement_result_v2"
         or metadata.get("schema_version") != 2
@@ -4376,6 +4771,7 @@ def validate_promotion_evidence(
         instance_index=instance_index,
         benchmark=pinned_benchmark,
         exact_commit=exact_commit,
+        validation_session=active_session,
     )
     containment_profile = _start_containment_profile(start)
     (

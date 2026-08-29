@@ -122,6 +122,25 @@ pub(in crate::commands::beta_crown) struct PhaseBudgetLedger {
     /// This flag never arms MIP on its own; explicit `bab`, a non-MIP build,
     /// `NY_GRAPH_MIP=0`, and zero-reservation policies remain disarmed.
     safenlp_shared_prefix_budget_repair: bool,
+    /// #safenlp-cycle — CONDITIONAL handoff for the SafeNLP full-cycle A/B
+    /// (`NY_SAFENLP_MIP_CYCLE=1`, resolved once at construction).
+    ///
+    /// The enforce_mip_handoff budget treatment drops [`Self::bab_deadline`]'s
+    /// half-total floor, cutting BaB to ~4.5s at the safenlp 15s internal tier
+    /// (measured: bab_end_s=4.497) — on EVERY row, including the banked ones
+    /// whose proofs come from the long BaB phase. Under the cycle gate the
+    /// handoff still BINDS (the lane receives a real deadline, so the MIP
+    /// slice is reachable) but BaB keeps its HISTORICAL floor-protected slice;
+    /// the MIP then fires only in the remaining reserved wall, where the
+    /// historical schedule ran nothing (the handoff "planned and never made").
+    safenlp_mip_cycle_conditional_handoff: bool,
+    /// #reserve-demand — a purely STATIC scan of the already-loaded model says
+    /// the post-BaB falsification lane cannot take a step on this net, so the
+    /// `post_bab_pgd_fraction` slice [`Self::bab_deadline`] carves out of the
+    /// scored budget has no spender. Sibling of
+    /// [`Self::with_static_mip_ineligibility`]; see
+    /// [`Self::post_bab_reserve_fraction`].
+    postbab_attack_statically_ineligible: bool,
 }
 
 impl PhaseBudgetLedger {
@@ -199,6 +218,14 @@ impl PhaseBudgetLedger {
             mip_reservation_armed,
             post_bab_wrapper_attack_enabled: None,
             safenlp_shared_prefix_budget_repair,
+            // #safenlp-cycle: resolved at construction (like the reservation
+            // gate above) so every deadline derived from one ledger agrees.
+            safenlp_mip_cycle_conditional_handoff:
+                super::super::dispatch::safenlp_mip_cycle_enabled(),
+            // #reserve-demand: fail SAFE — an unprobed ledger keeps the exact
+            // historical reservation. Only an affirmative static proof of
+            // ineligibility may move the BaB deadline.
+            postbab_attack_statically_ineligible: false,
         }
     }
 
@@ -261,6 +288,13 @@ impl PhaseBudgetLedger {
             mip_reservation_armed: self.mip_reservation_armed,
             post_bab_wrapper_attack_enabled: self.post_bab_wrapper_attack_enabled,
             safenlp_shared_prefix_budget_repair: self.safenlp_shared_prefix_budget_repair,
+            safenlp_mip_cycle_conditional_handoff: self.safenlp_mip_cycle_conditional_handoff,
+            // #reserve-demand: the nested ledger re-derives `bab_deadline` from
+            // its own total, so it must inherit the demand finding too —
+            // otherwise the child re-applies the fraction the parent dropped
+            // (this is the exact path that cut vit's graph-enter tier from 90 s
+            // to 81 s).
+            postbab_attack_statically_ineligible: self.postbab_attack_statically_ineligible,
         }
     }
 
@@ -300,6 +334,14 @@ impl PhaseBudgetLedger {
         self
     }
 
+    /// Test-only override for the #safenlp-cycle conditional handoff (env-free
+    /// tests; the production field is resolved once at construction).
+    #[cfg(test)]
+    pub(in crate::commands::beta_crown) fn with_safenlp_mip_cycle(mut self, armed: bool) -> Self {
+        self.safenlp_mip_cycle_conditional_handoff = armed;
+        self
+    }
+
     /// #deadlane — DISARM the Graph-MIP reservation when a purely STATIC scan of
     /// the model proves the escalation can never fire.
     ///
@@ -327,6 +369,61 @@ impl PhaseBudgetLedger {
             self.mip_reservation_armed = false;
         }
         self
+    }
+
+    /// #reserve-demand — DROP the post-BaB PGD reservation when a purely STATIC
+    /// scan of the model proves the lane that would spend it cannot take a step.
+    ///
+    /// Sibling of [`Self::with_static_mip_ineligibility`], and the same
+    /// argument: `post_bab_pgd_fraction` is subtracted from BaB's slice BEFORE
+    /// BaB runs, so it can only be justified by a capability that is known
+    /// before BaB. Gradient support is such a capability; a seed is not (the
+    /// verifier has not produced one yet). When the gradient is statically
+    /// absent, `#deadlane` hands the lane the window and it declines in
+    /// ~0.03 s, and the reserved seconds are discarded with the row still
+    /// undecided.
+    ///
+    /// This does NOT weaken deadline discipline and does not create wall time:
+    /// it moves the BaB deadline LATER inside the same scored budget, never past
+    /// [`Self::overall_deadline`], so the out-of-process watchdog still bounds
+    /// the run. `ineligible == false` leaves every formula byte-identical, and a
+    /// seed-driven lane still receives whatever wall remains after BaB.
+    pub(in crate::commands::beta_crown) fn with_static_postbab_attack_ineligibility(
+        mut self,
+        ineligible: bool,
+    ) -> Self {
+        self.postbab_attack_statically_ineligible = ineligible;
+        self
+    }
+
+    /// The post-BaB fraction that is actually subtracted from BaB's slice.
+    ///
+    /// DEMAND-SIZED (#reserve-demand): the configured fraction, unless the
+    /// policy opts out of demand sizing or the reserve has a statically proven
+    /// spender. Returns exactly `post_bab_pgd_fraction.clamp(0.0, 0.5)` in every
+    /// other case.
+    fn post_bab_reserve_fraction(&self) -> f32 {
+        let configured = self.policy.post_bab_pgd_fraction.clamp(0.0, 0.5);
+        if self.policy.demand_sized_post_bab_reserve && self.postbab_attack_statically_ineligible {
+            return 0.0;
+        }
+        configured
+    }
+
+    /// #disj-demand — is the disjunctive global PGD slice demand-zeroed on
+    /// this run?
+    ///
+    /// `true` only when the category preset armed
+    /// `demand_sized_disjunctive_pgd` AND the ledger's static probe
+    /// (`postbab_attack_statically_ineligible`, i.e.
+    /// `!GraphNetwork::supports_attack_point_gradient()`) proved that no
+    /// exact-gradient attack step can run on this net, so the phase could only
+    /// spend its slice on SPSA over point-IBP forwards. The caller
+    /// (`disjunctive.rs`) skips the phase entirely; the seconds flow to BaB
+    /// through the existing `ledger.remaining()` re-basing. Attack-scheduling
+    /// only — no verdict source is added or removed.
+    pub(in crate::commands::beta_crown) fn disjunctive_pgd_demand_zeroed(&self) -> bool {
+        self.policy.demand_sized_disjunctive_pgd && self.postbab_attack_statically_ineligible
     }
 
     /// The MIP slice the armed reservation carves out of the scored budget:
@@ -619,7 +716,7 @@ impl PhaseBudgetLedger {
     /// time rather than the original configured timeout (#4321).
     pub(in crate::commands::beta_crown) fn bab_deadline(&self) -> Option<Instant> {
         let total = self.total?;
-        let frac = self.policy.post_bab_pgd_fraction.clamp(0.0, 0.5);
+        let frac = self.post_bab_reserve_fraction();
         let mut bab = total.mul_f32(1.0 - frac);
         // FIX 2: with the Graph-MIP escalation armed, reserve its slice INSIDE
         // the scored budget so the escalation runs before the watchdog, not
@@ -630,7 +727,14 @@ impl PhaseBudgetLedger {
         if self.mip_reservation_armed {
             if let Some(reserved) = self.mip_reserved_slice() {
                 bab = bab.saturating_sub(reserved);
-                if !self.safenlp_shared_prefix_budget_repair {
+                // #safenlp-cycle: the CONDITIONAL handoff keeps BaB's
+                // historical floor-protected slice even while the handoff
+                // treatment is armed — the MIP fires only in the remaining
+                // reserved wall past that historical end, instead of the
+                // floor-drop that cut BaB to ~4.5s on every row.
+                if !self.safenlp_shared_prefix_budget_repair
+                    || self.safenlp_mip_cycle_conditional_handoff
+                {
                     bab = bab.max(total.mul_f32(0.5));
                 }
             }
@@ -640,10 +744,11 @@ impl PhaseBudgetLedger {
 
     /// BaB deadline for the default-dark SafeNLP shared-prefix experiment.
     ///
-    /// Same-LHS reduced verification historically receives no absolute
-    /// deadline and intentionally owns the full remaining wall clock (needed
-    /// by ACAS-Xu). Only the exact shared-prefix treatment may interrupt that
-    /// historical lane early enough to reach its reserved MIP slice.
+    /// Same-LHS reduced verification receives [`Self::overall_deadline`] as its
+    /// exact default authority and intentionally owns the full remaining wall
+    /// clock (needed by ACAS-Xu). Only the exact shared-prefix treatment may
+    /// substitute this earlier deadline so the prefix reaches its reserved MIP
+    /// slice.
     pub(in crate::commands::beta_crown) fn safenlp_shared_prefix_bab_deadline(
         &self,
     ) -> Option<Instant> {
@@ -700,9 +805,12 @@ impl PhaseBudgetLedger {
             "[budget] {label} total_s={} elapsed_s={} remaining_s={} \
              disj_pgd_end_s={} bab_end_s={} overall_end_s={} \
              initial_bounds_fraction={:.3} post_bab_pgd_fraction={:.3} \
+             post_bab_reserve_fraction={:.3} postbab_attack_statically_ineligible={} \
+             demand_sized_post_bab_reserve={} \
              disjunctive_pgd_fraction={:.3} disjunctive_pgd_cap_s={} \
+             disjunctive_pgd_demand_zeroed={} \
              mip_reservation_armed={} mip_reserved_s={} \
-             safenlp_shared_prefix_budget_repair={}",
+             safenlp_shared_prefix_budget_repair={} safenlp_mip_cycle={}",
             duration_field(self.total),
             duration_field(Some(elapsed)),
             duration_field(remaining),
@@ -711,11 +819,16 @@ impl PhaseBudgetLedger {
             duration_field(offset(self.overall_deadline())),
             self.policy.initial_bounds_fraction,
             self.policy.post_bab_pgd_fraction,
+            self.post_bab_reserve_fraction(),
+            self.postbab_attack_statically_ineligible,
+            self.policy.demand_sized_post_bab_reserve,
             self.policy.disjunctive_pgd_fraction,
             duration_field(pgd_cap),
+            self.disjunctive_pgd_demand_zeroed(),
             self.mip_reservation_armed,
             duration_field(mip_reserved),
             self.safenlp_shared_prefix_budget_repair,
+            self.safenlp_mip_cycle_conditional_handoff,
         )
     }
 
@@ -971,14 +1084,214 @@ mod tests {
         assert!(line.contains("safenlp_shared_prefix_budget_repair=false"));
     }
 
+    /// #reserve-demand — CONTAINMENT: the reserve is dropped only when a lane
+    /// that could spend it is statically proven absent, and the BaB deadline
+    /// still never passes the overall deadline.
+    #[test]
+    fn demand_sized_post_bab_reserve_returns_the_slice_to_bab_only_when_the_lane_is_dead() {
+        let policy = PhaseBudgetConfig {
+            post_bab_pgd_fraction: 0.10,
+            ..Default::default()
+        };
+
+        // Baseline: nothing probed => byte-identical to the historical formula.
+        let unprobed = PhaseBudgetLedger::new(100, policy.clone()).with_mip_reservation(false);
+        let unprobed_bab = unprobed
+            .bab_deadline()
+            .expect("bounded")
+            .duration_since(unprobed.start);
+        assert_eq!(
+            unprobed_bab,
+            Duration::from_secs(100).mul_f32(0.9),
+            "an unprobed ledger must keep the exact historical reservation"
+        );
+
+        // A lane that CAN run keeps its pre-paid slice.
+        let eligible = PhaseBudgetLedger::new(100, policy.clone())
+            .with_mip_reservation(false)
+            .with_static_postbab_attack_ineligibility(false);
+        assert_eq!(
+            eligible
+                .bab_deadline()
+                .expect("bounded")
+                .duration_since(eligible.start),
+            unprobed_bab,
+            "ineligible=false must leave every formula byte-identical"
+        );
+
+        // A statically dead lane hands the seconds back to BaB.
+        let dead = PhaseBudgetLedger::new(100, policy.clone())
+            .with_mip_reservation(false)
+            .with_static_postbab_attack_ineligibility(true);
+        let dead_bab = dead
+            .bab_deadline()
+            .expect("bounded")
+            .duration_since(dead.start);
+        assert_eq!(
+            dead_bab,
+            Duration::from_secs(100),
+            "a reserve with no statically possible spender must not be taken from BaB"
+        );
+        assert_eq!(
+            dead_bab,
+            dead.overall_deadline()
+                .expect("bounded")
+                .duration_since(dead.start),
+            "the recovered slice must stay INSIDE the scored budget: BaB may reach the \
+             overall deadline and must never pass it"
+        );
+
+        // The typed kill switch restores the historical subtraction exactly.
+        let killed = PhaseBudgetLedger::new(
+            100,
+            PhaseBudgetConfig {
+                demand_sized_post_bab_reserve: false,
+                ..policy
+            },
+        )
+        .with_mip_reservation(false)
+        .with_static_postbab_attack_ineligibility(true);
+        assert_eq!(
+            killed
+                .bab_deadline()
+                .expect("bounded")
+                .duration_since(killed.start),
+            unprobed_bab,
+            "demand_sized_post_bab_reserve=false must reproduce the historical formula \
+             even on a statically dead lane"
+        );
+    }
+
+    /// #reserve-demand — the NESTED ledger must inherit the finding.
+    ///
+    /// `disjunctive.rs` derives a child ledger from the parent's remaining wall
+    /// and the child re-derives its own `bab_deadline`. If the child did not
+    /// inherit, it would re-apply the fraction the parent dropped — which is the
+    /// exact path that cut vit_2023's graph-enter tier from 90 s to 81 s.
+    #[test]
+    fn nested_ledger_inherits_the_post_bab_demand_finding() {
+        let policy = PhaseBudgetConfig {
+            post_bab_pgd_fraction: 0.10,
+            ..Default::default()
+        };
+        let parent = PhaseBudgetLedger::new(100, policy)
+            .with_mip_reservation(false)
+            .with_static_postbab_attack_ineligibility(true);
+        let child = parent.child_with_timeout_secs(90);
+        let child_total = child.remaining().expect("bounded");
+        let child_bab = child
+            .bab_deadline()
+            .expect("bounded")
+            .duration_since(child.start);
+        assert!(
+            child_bab + Duration::from_millis(50) >= child_total,
+            "the child re-applied a reservation the parent had already dropped \
+             (child_bab={child_bab:?}, child_total={child_total:?})"
+        );
+    }
+
+    /// #reserve-demand — the lever must have its OWN observable. A telemetry
+    /// line that cannot distinguish "armed and did nothing" from "never armed"
+    /// makes every future null on this axis VOID rather than negative.
+    #[test]
+    fn budget_telemetry_names_the_demand_sized_reserve() {
+        let policy = PhaseBudgetConfig {
+            post_bab_pgd_fraction: 0.10,
+            ..Default::default()
+        };
+        let armed = PhaseBudgetLedger::new(100, policy.clone())
+            .with_mip_reservation(false)
+            .with_static_postbab_attack_ineligibility(true);
+        let line = armed.telemetry_line("graph-enter", armed.start);
+        assert!(
+            line.contains("post_bab_pgd_fraction=0.100"),
+            "the CONFIGURED fraction must still be reported: {line}"
+        );
+        assert!(
+            line.contains("post_bab_reserve_fraction=0.000"),
+            "the EFFECTIVE fraction must be reported separately: {line}"
+        );
+        assert!(
+            line.contains("postbab_attack_statically_ineligible=true"),
+            "the static finding must be reported: {line}"
+        );
+        assert!(
+            line.contains("demand_sized_post_bab_reserve=true"),
+            "the policy switch must be reported: {line}"
+        );
+        assert!(line.contains("bab_end_s=100.000"), "{line}");
+
+        let inert = PhaseBudgetLedger::new(100, policy)
+            .with_mip_reservation(false)
+            .with_static_postbab_attack_ineligibility(false);
+        let inert_line = inert.telemetry_line("graph-enter", inert.start);
+        assert!(
+            inert_line.contains("post_bab_reserve_fraction=0.100")
+                && inert_line.contains("postbab_attack_statically_ineligible=false")
+                && inert_line.contains("bab_end_s=90.000"),
+            "an eligible lane must read as untouched: {inert_line}"
+        );
+    }
+
+    /// #disj-demand: the demand-zeroing of the disjunctive attack slice needs
+    /// BOTH the preset arm AND the static ineligibility finding, and the
+    /// telemetry line names the decision so a run's schedule is auditable
+    /// without a rebuild.
+    #[test]
+    fn disjunctive_pgd_demand_zeroed_needs_arm_and_static_finding() {
+        let armed_policy = PhaseBudgetConfig {
+            demand_sized_disjunctive_pgd: true,
+            ..Default::default()
+        };
+
+        // Armed + statically ineligible: zeroed, and the telemetry says so.
+        let zeroed = PhaseBudgetLedger::new(100, armed_policy.clone())
+            .with_mip_reservation(false)
+            .with_static_postbab_attack_ineligibility(true);
+        assert!(zeroed.disjunctive_pgd_demand_zeroed());
+        let line = zeroed.telemetry_line("disjunctive-enter", zeroed.start);
+        assert!(
+            line.contains("disjunctive_pgd_demand_zeroed=true"),
+            "the zeroing decision must be reported: {line}"
+        );
+
+        // Armed + eligible net: the yaml alone must not remove the attack.
+        let eligible = PhaseBudgetLedger::new(100, armed_policy)
+            .with_mip_reservation(false)
+            .with_static_postbab_attack_ineligibility(false);
+        assert!(!eligible.disjunctive_pgd_demand_zeroed());
+        let eligible_line = eligible.telemetry_line("disjunctive-enter", eligible.start);
+        assert!(
+            eligible_line.contains("disjunctive_pgd_demand_zeroed=false"),
+            "an eligible net must read as untouched: {eligible_line}"
+        );
+
+        // Default policy + ineligible net: historical schedule (default OFF).
+        let default_policy = PhaseBudgetLedger::new(100, PhaseBudgetConfig::default())
+            .with_mip_reservation(false)
+            .with_static_postbab_attack_ineligibility(true);
+        assert!(!default_policy.disjunctive_pgd_demand_zeroed());
+
+        // The nested graph ledger must inherit the finding: the demand result
+        // survives `child_with_timeout_secs` exactly like #reserve-demand.
+        let child = zeroed.child_with_timeout_secs(90);
+        assert!(
+            child.disjunctive_pgd_demand_zeroed(),
+            "the nested ledger must not silently re-grant the zeroed slice"
+        );
+    }
+
     #[test]
     fn upfront_pgd_deadline_matches_current_attack_budget_behavior() {
         // Current behavior: attack_budget.rs line 12-17 → timeout / 5 = 0.20
         let ledger = PhaseBudgetLedger::new(150, PhaseBudgetConfig::default());
         let deadline = ledger.upfront_pgd_deadline().expect("bounded");
         let budget = deadline.duration_since(ledger.start);
-        // 150 * 0.20 = 30 seconds
-        assert_eq!(budget, Duration::from_secs(30));
+        // 150 * 0.20 = ~30 seconds. Mirror the implementation's mul_f32 on the
+        // expected side: under the trust-1.99 std mul_f32 routes through f64,
+        // so 0.20f32's true value no longer rounds back to the exact integer
+        // (150 * 0.20f32 = 30.000000447s).
+        assert_eq!(budget, Duration::from_secs(150).mul_f32(0.20));
     }
 
     #[test]
@@ -1182,8 +1495,11 @@ mod tests {
             .disjunctive_pgd_deadline()
             .expect("bounded")
             .saturating_duration_since(Instant::now());
+        // Upper bound mirrors mul_f32: 100 * 0.05f32 = 5.000000149s under the
+        // trust-1.99 f64-routed std, and in release the two Instant::now()
+        // calls can sit closer than that drift (debug masked it).
         assert!(
-            left > Duration::from_millis(4_500) && left <= Duration::from_secs(5),
+            left > Duration::from_millis(4_500) && left <= Duration::from_secs(100).mul_f32(0.05),
             "phase-start anchor must grant ~5s, got {left:?}"
         );
     }
@@ -1347,10 +1663,66 @@ mod tests {
         assert!(ledger.attack_phase_deadline(0.50).is_none());
     }
 
+    /// #wrong-cap GUARD. A multi-clause disjunction NEVER runs the upfront PGD
+    /// phase: `verify::verify_relational_constraints_with_ledger` routes
+    /// `has_multi_constraint_disjunction()` straight into
+    /// `disjunctive::verify_multi_clause_disjunction`, whose attack phase is
+    /// sized by [`PhaseBudgetLedger::disjunctive_pgd_deadline`]
+    /// (`disjunctive_pgd_fraction`, default 0.50) — and `verify/graph.rs`'s
+    /// upfront PGD is additionally skipped for `is_disjunction && !single_clause`.
+    /// So `upfront_pgd_fraction` (0.20) is not the governing cap there, and
+    /// dividing a measured disjunctive attack phase by `0.20 * total` reports a
+    /// spurious "2.5x overrun" for a phase that stopped exactly on its own
+    /// deadline.
+    ///
+    /// This is not hypothetical: it was filed as a HEAD regression against
+    /// relusplitter/cifar_biasfield rows 145 (60s) and 146 (180s). Measured at
+    /// 7cae6103 through `ny vnncomp` with the shipped preset
+    /// (`NY_PHASE_TELEMETRY=1`):
+    ///
+    /// | row | ledger total | disj_pgd_end | attack wall | vs own cap | vs 0.20 |
+    /// |-----|--------------|--------------|-------------|------------|---------|
+    /// | 145 | 51.0s        | 25.500s      | 25.49s      | 1.000x     | 2.50x   |
+    /// | 146 | 167.0s       | 83.500s      | 83.49s      | 1.000x     | 2.50x   |
+    ///
+    /// The phase landed within 10 ms of its governing deadline on both rows.
+    /// The 2.50x is just `0.50 / 0.20`. Pin the two caps apart so the next
+    /// reader cannot re-derive the same false positive.
+    #[test]
+    fn disjunctive_attack_cap_is_not_the_upfront_cap() {
+        let policy = PhaseBudgetConfig::default();
+        assert!((policy.upfront_pgd_fraction - 0.20).abs() < 1e-6);
+        assert!((policy.disjunctive_pgd_fraction - 0.50).abs() < 1e-6);
+
+        // A 167s ledger reproduces the measured relusplitter row-146 budget.
+        let ledger = PhaseBudgetLedger::new(167, policy);
+        let upfront = ledger
+            .upfront_pgd_deadline()
+            .expect("bounded")
+            .duration_since(ledger.start);
+        let disjunctive = ledger
+            .disjunctive_pgd_deadline()
+            .expect("bounded")
+            .duration_since(ledger.start);
+
+        assert_eq!(upfront, Duration::from_secs(167).mul_f32(0.20));
+        assert_eq!(disjunctive, Duration::from_secs(167).mul_f32(0.50));
+        // The two caps differ by exactly the fraction ratio, which is the
+        // entire "2.1x-2.4x overrun" the wrong-cap arithmetic produces.
+        let ratio = disjunctive.as_secs_f64() / upfront.as_secs_f64();
+        assert!(
+            (ratio - 2.5).abs() < 1e-6,
+            "the disjunctive cap is {ratio:.3}x the upfront cap; a measured \
+             disjunctive attack phase divided by the UPFRONT cap therefore \
+             reports ~2.5x even when enforcement is exact"
+        );
+    }
+
     #[test]
     fn disjunctive_pgd_deadline_none_cap_matches_fraction() {
         // With no absolute cap, the disjunctive deadline equals the plain
-        // fraction slice (0.20 * 200s = 40s).
+        // fraction slice (0.20 * 200s = ~40s; expected side mirrors mul_f32 —
+        // the trust-1.99 std routes it through f64, so 0.20f32 is inexact).
         let policy = PhaseBudgetConfig {
             disjunctive_pgd_fraction: 0.20,
             disjunctive_pgd_max_secs: None,
@@ -1361,7 +1733,7 @@ mod tests {
             .disjunctive_pgd_deadline()
             .expect("bounded")
             .duration_since(ledger.start);
-        assert_eq!(slice, Duration::from_secs(40));
+        assert_eq!(slice, Duration::from_secs(200).mul_f32(0.20));
     }
 
     #[test]
@@ -1396,9 +1768,11 @@ mod tests {
             let ledger = PhaseBudgetLedger::new(100, policy);
             let deadline = ledger.disjunctive_pgd_deadline().expect("bounded");
             if !from_phase_start {
+                // Expected side mirrors mul_f32 (0.20f32 inexact under the
+                // trust-1.99 f64-routed std).
                 assert_eq!(
                     deadline.duration_since(ledger.start),
-                    Duration::from_secs(20)
+                    Duration::from_secs(100).mul_f32(0.20)
                 );
             }
             assert!(deadline <= ledger.overall_deadline().expect("bounded"));
@@ -1460,7 +1834,8 @@ mod tests {
     #[test]
     fn disjunctive_pgd_deadline_cap_inactive_when_fraction_smaller() {
         // At a small budget the fraction slice is already under the cap, so the
-        // cap is a no-op (0.20 * 100s = 20s < 30s cap).
+        // cap is a no-op (0.20 * 100s = ~20s < 30s cap; expected side mirrors
+        // mul_f32 — inexact 0.20f32 under the trust-1.99 f64-routed std).
         let policy = PhaseBudgetConfig {
             disjunctive_pgd_fraction: 0.20,
             disjunctive_pgd_max_secs: Some(30),
@@ -1471,7 +1846,7 @@ mod tests {
             .disjunctive_pgd_deadline()
             .expect("bounded")
             .duration_since(ledger.start);
-        assert_eq!(slice, Duration::from_secs(20));
+        assert_eq!(slice, Duration::from_secs(100).mul_f32(0.20));
     }
 
     #[test]
@@ -1898,6 +2273,50 @@ mod tests {
         assert!(!bab_only.safenlp_shared_prefix_budget_repair);
         assert_eq!(bab_only.safenlp_shared_prefix_bab_deadline(), None);
         assert_eq!(bab_only.bab_deadline(), historical.bab_deadline());
+    }
+
+    /// #safenlp-cycle: the conditional handoff BINDS (the lane receives a real
+    /// deadline, so the MIP slice is reachable) while BaB keeps its HISTORICAL
+    /// floor-protected slice — not the enforce_mip_handoff floor-drop that cut
+    /// BaB to ~4.5s at the safenlp 15s internal tier.
+    #[test]
+    fn safenlp_mip_cycle_keeps_the_historical_bab_floor_while_the_handoff_binds() {
+        let policy = PhaseBudgetConfig {
+            mip_min_fraction: 0.65,
+            mip_min_secs: 8,
+            enforce_mip_handoff: true,
+            ..PhaseBudgetConfig::default()
+        };
+        let repaired = PhaseBudgetLedger::new(15, policy.clone())
+            .with_mip_reservation(true)
+            .with_safenlp_mip_cycle(false);
+        let mut cycle = PhaseBudgetLedger::new(15, policy.clone())
+            .with_mip_reservation(true)
+            .with_safenlp_mip_cycle(true);
+        cycle.start = repaired.start;
+        let mut historical = PhaseBudgetLedger::new(
+            15,
+            PhaseBudgetConfig {
+                enforce_mip_handoff: false,
+                ..policy
+            },
+        )
+        .with_mip_reservation(true)
+        .with_safenlp_mip_cycle(false);
+        historical.start = repaired.start;
+
+        // The handoff still binds under the cycle gate.
+        assert!(cycle.safenlp_shared_prefix_budget_repair);
+        assert!(cycle.safenlp_shared_prefix_bab_deadline().is_some());
+        // BaB keeps the exact historical floor-protected deadline (7.5s here),
+        // strictly later than the floor-dropped repair schedule (~4.5s).
+        assert_eq!(cycle.bab_deadline(), historical.bab_deadline());
+        assert!(cycle.bab_deadline() > repaired.bab_deadline());
+        // The MIP fires only in the remaining reserved wall past that
+        // historical end: 15s - 7.5s, with the repair's zero attack tail, is a
+        // 7s planned grant — still clearing the >=5s escalation gate the
+        // historical schedule (4s) could not.
+        assert_eq!(cycle.planned_mip_timeout_at_bab_deadline(), Some(7));
     }
 
     #[test]

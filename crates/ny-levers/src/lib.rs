@@ -59,6 +59,13 @@ mod registry;
 mod set;
 
 pub mod decls;
+/// PRESET-OVERRIDE CELLS: the storage half of a lever that has been PROMOTED
+/// from environment-only to a typed preset key, plus the resolvers that layer
+/// a cell under the environment through [`read_over_config`].
+///
+/// A lever with no cell written resolves exactly as it did before promotion,
+/// which is what makes a promotion commit byte-identical on shipped configs.
+pub mod gate;
 /// The SEARCH SPACE over levers: which knobs an automated search may move, what
 /// values survive the parser, and which combinations are provably inert.
 pub mod space;
@@ -67,8 +74,8 @@ pub use decl::{
     Bucket, DefaultSpec, LeverDecl, LeverKind, MoatRisk, Provenance, ReaderSite, Scope,
 };
 pub use env::{
-    read, read_over_config, read_over_config_with, read_presence, read_raw, read_with, LeverValue,
-    RawLeverInputs, ResolveError, Resolved, Source,
+    read, read_over_config, read_over_config_with, read_presence, read_raw, read_raw_os, read_with,
+    LeverValue, RawLeverInputs, ResolveError, Resolved, Source,
 };
 pub use registry::{collect, CollectError, LeverRegistry, Registry};
 pub use set::LeverSet;

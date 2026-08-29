@@ -20,10 +20,22 @@
 //!    leaks of the precision-limited lsnc instances.
 //!
 //! Telemetry (design §6.5, greppable tag `[f64-tail]`): every escalated
-//! domain logs `(gap_f32, gap_f64)` at INFO — `gap_f64 < -1e-9` on the
-//! residue names the instance relaxation-limited (more precision cannot
+//! domain logs `(gap_f32, gap_f64)` on STDERR (FIX B2 — the scored route
+//! swallows `tracing::info!`; see `tail_eprintln!`) — `gap_f64 < -1e-9` on
+//! the residue names the instance relaxation-limited (more precision cannot
 //! help); `gap_f64 >= 0` means the blocker was fp noise (and the domain
-//! verifies).
+//! verifies). `anchor_source=` tags where the pass got its per-node anchors
+//! (`warm-refined` = the same refined boxes the f32 pass used, `collected` =
+//! fresh `collect_intermediate_bounds`).
+//!
+//! # cgan endgame additions (design B, #cgan-f64-tail)
+//!
+//! A THIRD seam ([`F64TailHook`], survivor-polish site of the eager
+//! grouped-disjunctive lane), a config chokepoint
+//! ([`resolve_f64_tail_settings`]: typed preset key
+//! `bab.branching.input_split.f64_tail.*` beneath the env overrides), a
+//! shared per-run escalation budget ([`F64TailRunBudget`], FIX B5), and
+//! box-bundled warm anchors ([`F64TailAnchors`], FIX B4).
 //!
 //! # Alpha-tail escalation (docs/LSNC_ALPHA_TAIL_DESIGN.md, options A+B)
 //!
@@ -48,17 +60,15 @@
 //!   certified lower. Telemetry gains `micro_bab{children,verified,depth}`.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ndarray::{Array2, ArrayD};
 use ny_core::GemmEngine;
 use ny_tensor::{next_down_f32, BoundedTensor};
-use tracing::info;
 
 use crate::network::graph_crown_f64_tail::{
     alpha_tail_band, alpha_tail_depth, alpha_tail_enabled, alpha_tail_iters, alpha_tail_micro_band,
-    f64_tail_band, f64_tail_enabled, f64_tail_verify, f64_tail_verify_refreshed, AlphaTailEval,
-    F64TailOutcome,
+    f64_tail_verify, f64_tail_verify_refreshed, AlphaTailEval, F64TailOutcome,
 };
 use crate::GraphNetwork;
 
@@ -71,9 +81,324 @@ use super::shared::{build_child_input_owned, MultiObjInputDomain};
 /// inputs). Soundness never depends on the draws.
 const ALPHA_TAIL_SPSA_SEED: u64 = 0xA1FA_7A11;
 
+/// FIX B2 (#cgan-f64-tail, adversarial verdict): `[f64-tail]` telemetry goes
+/// to STDERR. The scored vnncomp entry point swallows `tracing::info!`
+/// (stated in-tree at `root_bounds.rs`; the ledger bought this lesson with a
+/// vacuous stacked A/B and again with the `best_gap` blindness), and
+/// `RUST_LOG` is not honoured by the scored binary, so `info!` lines can
+/// never satisfy R9 on the route that matters. Rate discipline mirrors
+/// `[disjunctive-trajectory]` / `[cgan-polish]`: verdict-bearing `verified`
+/// lines are ALWAYS printed; per-domain not-verified/declined and per-batch
+/// summary lines stop after `MAX_LINES` per process (a 900 s cgan run pops
+/// ~600-1300 domains — the cap keeps a pathological queue from flooding the
+/// log while leaving far more than any probe needs).
+macro_rules! tail_eprintln {
+    (always, $($arg:tt)*) => {
+        eprintln!($($arg)*)
+    };
+    ($($arg:tt)*) => {{
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static EMITTED: AtomicUsize = AtomicUsize::new(0);
+        const MAX_LINES: usize = 4000;
+        if EMITTED.fetch_add(1, Ordering::Relaxed) < MAX_LINES {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
 /// SB-style coefficient clamp for the micro-BaB split-dim score (mirrors the
 /// lane heuristic's `input_split_coeff_thresh` default, `config/defaults.rs`).
 const MICRO_SPLIT_COEFF_THRESH: f32 = 1e-3;
+
+// ---------------------------------------------------------------------------
+// Anchor parity (design B step B3 + FIX B4, #cgan-f64-tail).
+// ---------------------------------------------------------------------------
+
+/// Warm-refined per-node anchors BUNDLED WITH the child box they were
+/// computed for (FIX B4): the tail's relaxations are only valid when anchored
+/// on bounds that enclose THIS box — anchors from a smaller/sibling box are a
+/// false-VERIFY path. Fields are private and the ONLY constructor is
+/// [`F64TailAnchors::bundle_for`], called at the single site where
+/// `compute_warm_start_crown_bounds_with_refined_alpha` has just computed the
+/// node bounds FOR its own `input_bounds` argument — so cross-box reuse is
+/// unrepresentable: the escalation reads BOTH the box and the anchors out of
+/// one struct ([`F64TailHook::escalate_merge`] passes `self.child_input` as
+/// the verified box). A wider box than the queued (clipped) child is sound:
+/// verifying the superset verifies the subset, and its row lowers only merge
+/// monotonically.
+pub(crate) struct F64TailAnchors {
+    child_input: BoundedTensor,
+    node_bounds: HashMap<String, BoundedTensor>,
+}
+
+impl F64TailAnchors {
+    /// Bundle node bounds with the exact box they were computed for. The two
+    /// arguments MUST come from the same bound invocation (enforced by
+    /// construction discipline: the only production caller sits inside
+    /// `compute_warm_start_crown_bounds_with_refined_alpha`, which received
+    /// `input_bounds` and derived `node_bounds` from it in the same call).
+    pub(crate) fn bundle_for(
+        input_bounds: &BoundedTensor,
+        node_bounds: HashMap<String, BoundedTensor>,
+    ) -> Self {
+        Self {
+            child_input: input_bounds.clone(),
+            node_bounds,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config chokepoint (design B step B5, FIX B5): typed preset key
+// `bab.branching.input_split.f64_tail.{enabled, band, max_escalations}`
+// resolved ONCE against the legacy env gates, gating BOTH seams (the batch
+// seam and the survivor-polish hook). Env cannot fire in competition
+// (`run_instance.sh` exports no `NY_*`), so the shipped shape is the
+// typed key; the env names keep working for diagnostics and override in both
+// directions where they exist (`NY_F64_TAIL` 1/0, `NY_F64_TAIL_BAND`).
+// `max_escalations` is config-only (0 = unlimited — the legacy env-armed lsnc
+// behavior; adding a new raw env read would raise the ny-levers ratchet).
+// ---------------------------------------------------------------------------
+
+/// Effective f64-tail arming for one verifier run.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct F64TailSettings {
+    pub(crate) enabled: bool,
+    pub(crate) band: f32,
+    /// Shared across BOTH seams per run; 0 = unlimited.
+    pub(crate) max_escalations: usize,
+    /// Resolution provenance for the R9 line: `env` / `config` / `default`.
+    pub(crate) source: &'static str,
+}
+
+/// Resolve the run's f64-tail settings from the typed config + env overrides.
+pub(crate) fn resolve_f64_tail_settings(
+    config: &crate::beta_crown::config::BetaCrownConfig,
+) -> F64TailSettings {
+    use crate::network::graph_crown_f64_tail::{f64_tail_band_env, f64_tail_env_state};
+    let (enabled, source) = match f64_tail_env_state() {
+        Some(on) => (on, "env"),
+        None => match config.input_split_f64_tail_enabled {
+            Some(on) => (on, "config"),
+            None => (false, "default"),
+        },
+    };
+    let band = f64_tail_band_env()
+        .or(config.input_split_f64_tail_band)
+        .filter(|b| b.is_finite() && *b >= 0.0)
+        .unwrap_or(5e-3);
+    let max_escalations = config.input_split_f64_tail_max_escalations.unwrap_or(0);
+    F64TailSettings {
+        enabled,
+        band,
+        max_escalations,
+        source,
+    }
+}
+
+/// Per-run escalation budget shared by the batch seam and the polish hook
+/// (FIX B5: the cap gates BOTH seams). Not `Sync` on purpose: candidate
+/// selection happens on the coordinator thread before any rayon fan-out.
+pub(crate) struct F64TailRunBudget {
+    used: std::cell::Cell<usize>,
+}
+
+impl F64TailRunBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            used: std::cell::Cell::new(0),
+        }
+    }
+
+    /// How many escalations may still run under `cap` (0 = unlimited).
+    fn remaining(&self, cap: usize) -> usize {
+        if cap == 0 {
+            usize::MAX
+        } else {
+            cap.saturating_sub(self.used.get())
+        }
+    }
+
+    fn charge(&self, n: usize) {
+        self.used.set(self.used.get().saturating_add(n));
+    }
+
+    pub(crate) fn used(&self) -> usize {
+        self.used.get()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Survivor-polish-seam hook (design B step B4, #cgan-f64-tail).
+// ---------------------------------------------------------------------------
+
+/// Per-call wall slice for one hook escalation: the scalar f64 conv walk on a
+/// 32×32 ConvTranspose stack is estimated ~1-10 s/domain (design §2 B4); the
+/// slice bounds the worst case so a pathological domain cannot eat the run.
+/// With the shipped cap of 8 escalations, worst case ≈ 8×10 s ≈ 9% of a
+/// 900 s budget — the pre-registered wall-parity kill criterion owns that.
+const F64_TAIL_HOOK_CALL_SLICE: Duration = Duration::from_secs(10);
+
+/// Third injection point: certified f64 escalation AT the survivor-polish
+/// seam of the eager grouped-disjunctive lane. Bundles every dependency so
+/// `screen_disjunctive_child` needs a single optional reference; the shared
+/// [`F64TailRunBudget`] gates this seam AND the batch seam under one cap
+/// (FIX B5). Micro-BaB stays OFF here by construction (this hook calls the
+/// plain single-shot [`f64_tail_verify`] — depth 0).
+pub(crate) struct F64TailHook<'a> {
+    graph: &'a GraphNetwork,
+    spec_matrix: &'a Array2<f32>,
+    thresholds: &'a [f32],
+    clause_sizes: &'a [usize],
+    mul_binary_alphas: Option<&'a HashMap<String, Array2<f32>>>,
+    engine: Option<&'a dyn GemmEngine>,
+    deadline: Option<Instant>,
+    band: f32,
+    max_escalations: usize,
+    budget: &'a F64TailRunBudget,
+    call_slice: Duration,
+}
+
+impl<'a> F64TailHook<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        graph: &'a GraphNetwork,
+        spec_matrix: &'a Array2<f32>,
+        thresholds: &'a [f32],
+        clause_sizes: &'a [usize],
+        mul_binary_alphas: Option<&'a HashMap<String, Array2<f32>>>,
+        engine: Option<&'a dyn GemmEngine>,
+        deadline: Option<Instant>,
+        settings: F64TailSettings,
+        budget: &'a F64TailRunBudget,
+    ) -> Self {
+        Self {
+            graph,
+            spec_matrix,
+            thresholds,
+            clause_sizes,
+            mul_binary_alphas,
+            engine,
+            deadline,
+            band: settings.band,
+            max_escalations: settings.max_escalations,
+            budget,
+            call_slice: F64_TAIL_HOOK_CALL_SLICE,
+        }
+    }
+
+    /// #cgan-dark-tail FIX-1: tighten this hook's per-call wall slice with the
+    /// typed per-child cap (`bab.branching.input_split.child_bound_max_secs`).
+    ///
+    /// This seam was ALREADY capped — `escalate_merge` composes
+    /// `min(self.deadline, now + call_slice)` with a 10 s
+    /// [`F64_TAIL_HOOK_CALL_SLICE`] — so it is not the uncapped consumer FIX-1
+    /// targets. This only keeps it consistent when a preset asks for something
+    /// tighter: the slice can only SHRINK, and `None` (the shipped default)
+    /// leaves it byte-for-byte at 10 s.
+    ///
+    /// NOTE the SHAPE. The cap is a `Duration` applied per call, never a
+    /// pre-composed `Instant`. Composing an absolute deadline here would be a
+    /// bug: `new` runs once at BaB start, so `start + cap` would silently
+    /// disable the hook `cap` seconds into the run instead of capping each
+    /// call.
+    #[must_use]
+    pub(crate) fn with_child_bound_cap(mut self, cap: Option<Duration>) -> Self {
+        if let Some(cap) = cap {
+            self.call_slice = self.call_slice.min(cap);
+        }
+        self
+    }
+
+    /// Escalate one in-band survivor. On a certified `Verified`, merges the
+    /// per-row f64 lowers into `obj_bounds` through the EXISTING funnel
+    /// (`certified_fresh_rows` + monotonic `tighten_obj_lower_bounds` — never
+    /// hand-rolled) and returns `true`; every other outcome (out of band,
+    /// cap exhausted, deadline, NotVerified, Unsupported) leaves `obj_bounds`
+    /// byte-identical and returns `false`.
+    pub(crate) fn escalate_merge(
+        &self,
+        anchors: &F64TailAnchors,
+        obj_bounds: &mut Vec<(f32, f32)>,
+        gap_f32: f32,
+    ) -> bool {
+        if !gap_f32.is_finite() || gap_f32 < -self.band {
+            return false;
+        }
+        if self.budget.remaining(self.max_escalations) == 0 {
+            tail_eprintln!(
+                "[f64-tail] survivor-polish SKIPPED (escalation cap {} exhausted) gap_f32={:.6}",
+                self.max_escalations,
+                gap_f32
+            );
+            return false;
+        }
+        let now = Instant::now();
+        if self.deadline.is_some_and(|d| now >= d) {
+            return false;
+        }
+        let call_deadline = match self.deadline {
+            Some(d) => d.min(now + self.call_slice),
+            None => now + self.call_slice,
+        };
+        self.budget.charge(1);
+        let used = self.budget.used();
+        let outcome = f64_tail_verify(
+            self.graph,
+            anchors.child_input(),
+            self.spec_matrix,
+            self.thresholds,
+            self.clause_sizes,
+            self.mul_binary_alphas,
+            Some(anchors.node_bounds()),
+            self.engine,
+            Some(call_deadline),
+        );
+        match outcome {
+            F64TailOutcome::Verified { row_lowers } => {
+                tail_eprintln!(
+                    always,
+                    "[f64-tail] survivor-polish verified gap_f32={:.6} anchor_source=warm-refined escalations={}/{} (certified f64)",
+                    gap_f32,
+                    used,
+                    self.max_escalations
+                );
+                let fresh = certified_fresh_rows(obj_bounds, &row_lowers, self.thresholds);
+                *obj_bounds = tighten_obj_lower_bounds(obj_bounds, fresh);
+                true
+            }
+            F64TailOutcome::NotVerified { min_gap_f64 } => {
+                tail_eprintln!(
+                    "[f64-tail] survivor-polish not-verified gap_f32={:.6} gap_f64={:.3e} anchor_source=warm-refined escalations={}/{}",
+                    gap_f32,
+                    min_gap_f64,
+                    used,
+                    self.max_escalations
+                );
+                false
+            }
+            F64TailOutcome::Unsupported => {
+                tail_eprintln!(
+                    "[f64-tail] survivor-polish declined (unsupported) gap_f32={:.6} anchor_source=warm-refined escalations={}/{}",
+                    gap_f32,
+                    used,
+                    self.max_escalations
+                );
+                false
+            }
+        }
+    }
+}
+
+impl F64TailAnchors {
+    fn child_input(&self) -> &BoundedTensor {
+        &self.child_input
+    }
+
+    fn node_bounds(&self) -> &HashMap<String, BoundedTensor> {
+        &self.node_bounds
+    }
+}
 
 /// Cast a certified f64 lower bound DOWN into the f32 carrier: `f64 -> f32`
 /// round-to-nearest followed by one directed step, so the result is `<=` the
@@ -390,6 +715,18 @@ fn micro_bab_all_children_verified(
 /// With `NY_ALPHA_TAIL=1` the same seam runs the refreshed variant
 /// (per-domain alpha refresh + micro-BaB, module doc); with only
 /// `NY_F64_TAIL=1` the landed frozen-alpha path runs byte-identically.
+///
+/// #cgan-dark-tail FIX-1: `deadline` arrives as the ABSOLUTE BaB ceiling, so
+/// before the fix a single escalation here was entitled to the whole remaining
+/// budget — the same defect the per-child cap exists to close, on the other
+/// seam. The typed cap is re-resolved from the SAME `config` and composed by
+/// the SAME `disjunctive_multi_clause::child_bound_deadline` law, so both
+/// seams obey one rule (`None` = no cap = byte-identical). The
+/// fan-out is rayon-parallel, so one composed slice bounds every candidate's
+/// WALL time, which is what a per-child wall cap means for a parallel batch.
+/// MEASURED headroom: 363 escalations at a 0.1235 s mean / 5.68 s total, so a
+/// cap of seconds never binds here — this is a ceiling on the pathological
+/// case, not a schedule.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn f64_tail_escalate_batch(
     domains: &mut [MultiObjInputDomain],
@@ -400,17 +737,29 @@ pub(super) fn f64_tail_escalate_batch(
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
     engine: Option<&dyn GemmEngine>,
     deadline: Option<Instant>,
+    config: &crate::beta_crown::config::BetaCrownConfig,
+    budget: Option<&F64TailRunBudget>,
 ) {
+    // FIX B5: one config chokepoint gates this seam and the polish hook —
+    // typed key first, env override on top; the cap is shared via `budget`.
+    let settings = resolve_f64_tail_settings(config);
     let alpha_armed = alpha_tail_enabled();
-    if !f64_tail_enabled() && !alpha_armed {
+    if !settings.enabled && !alpha_armed {
         return;
     }
+    // #cgan-dark-tail FIX-1. Composed AFTER the gate so the dark path still
+    // reads nothing, and before candidate selection so every escalation below
+    // shares one slice.
+    let deadline = super::disjunctive_multi_clause::child_bound_deadline(
+        deadline,
+        super::disjunctive_multi_clause::resolve_child_bound_cap(config),
+    );
     let band = if alpha_armed {
         alpha_tail_band()
     } else {
-        f64_tail_band()
+        settings.band
     };
-    let candidates: Vec<(usize, f32)> = domains
+    let mut candidates: Vec<(usize, f32)> = domains
         .iter()
         .enumerate()
         .filter(|(_, domain)| !domain.needs_bounding)
@@ -425,6 +774,49 @@ pub(super) fn f64_tail_escalate_batch(
     if candidates.is_empty() {
         return;
     }
+    if let Some(budget) = budget {
+        let remaining = budget.remaining(settings.max_escalations);
+        if remaining == 0 {
+            tail_eprintln!(
+                "[f64-tail] batch-seam SKIPPED (escalation cap {} exhausted; {} in-band candidates)",
+                settings.max_escalations,
+                candidates.len()
+            );
+            return;
+        }
+        if candidates.len() > remaining {
+            // Spend the residual budget on the knife edge: closest-to-zero
+            // gaps first (selection only — every escalation stays certified).
+            candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+            candidates.truncate(remaining);
+        }
+        budget.charge(candidates.len());
+    }
+
+    // B0 discriminator (design B): `Unsupported` conflates the OP GAP with a
+    // deadline/anchor abort. Print the graph-level support verdict once per
+    // process so a probe can tell "the walker cannot do this graph" (the
+    // pre-B1/B2 state) from "a pass aborted" — and per-escalation wall time.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static PRINTED: AtomicBool = AtomicBool::new(false);
+        if !PRINTED.swap(true, Ordering::Relaxed) {
+            let census = crate::network::graph_crown_f64_tail::f64_tail_unsupported_census(graph);
+            let head: Vec<String> = census
+                .iter()
+                .take(8)
+                .map(|(n, t)| format!("{n}:{t}"))
+                .collect();
+            eprintln!(
+                "[f64-tail] batch-seam graph_supported={} spec_rows={} clauses={} unsupported={} [{}]",
+                census.is_empty(),
+                spec_matrix.nrows(),
+                clause_sizes.len(),
+                census.len(),
+                head.join(", ")
+            );
+        }
+    }
 
     // Rayon-parallel over the (immutable) escalated domains, mirroring the
     // rebound fallback's RayonTaskGuard discipline (`shared_specs.rs`).
@@ -433,11 +825,12 @@ pub(super) fn f64_tail_escalate_batch(
 
     if !alpha_armed {
         // Landed frozen-alpha path (byte-identical to the f64 tail as shipped).
-        let outcomes: Vec<(usize, f32, F64TailOutcome)> = candidates
+        let outcomes: Vec<(usize, f32, F64TailOutcome, f64)> = candidates
             .par_iter()
             .map(|&(idx, gap_f32)| {
                 let _rayon_task_guard = crate::faer_parallelism::RayonTaskGuard::new();
                 let domain = &domains_ro[idx];
+                let started = Instant::now();
                 let outcome = f64_tail_verify(
                     graph,
                     domain.input_bounds.as_ref(),
@@ -449,43 +842,44 @@ pub(super) fn f64_tail_escalate_batch(
                     engine,
                     deadline,
                 );
-                (idx, gap_f32, outcome)
+                (idx, gap_f32, outcome, started.elapsed().as_secs_f64())
             })
             .collect();
 
         let mut verified = 0usize;
-        for (idx, gap_f32, outcome) in outcomes {
+        for (idx, gap_f32, outcome, secs) in outcomes {
             let domain = &mut domains[idx];
             match outcome {
                 F64TailOutcome::Verified { row_lowers } => {
                     merge_certified_rows(domain, &row_lowers, thresholds, clause_sizes);
                     verified += 1;
-                    info!(
-                        "[f64-tail] batch-seam verified depth={} gap_f32={:.6} (certified f64)",
-                        domain.depth, gap_f32
+                    tail_eprintln!(always,
+                        "[f64-tail] batch-seam verified depth={} gap_f32={:.6} secs={:.2} anchor_source=collected (certified f64)",
+                        domain.depth, gap_f32, secs
                     );
                 }
                 F64TailOutcome::NotVerified { min_gap_f64 } => {
-                    info!(
-                        "[f64-tail] batch-seam not-verified depth={} gap_f32={:.6} gap_f64={:.3e}",
-                        domain.depth, gap_f32, min_gap_f64
+                    tail_eprintln!(
+                        "[f64-tail] batch-seam not-verified depth={} gap_f32={:.6} gap_f64={:.3e} secs={:.2} anchor_source=collected",
+                        domain.depth, gap_f32, min_gap_f64, secs
                     );
                 }
                 F64TailOutcome::Unsupported => {
-                    info!(
-                        "[f64-tail] batch-seam declined (unsupported) depth={} gap_f32={:.6}",
-                        domain.depth, gap_f32
+                    tail_eprintln!(
+                        "[f64-tail] batch-seam declined (unsupported) depth={} gap_f32={:.6} secs={:.2} anchor_source=collected",
+                        domain.depth, gap_f32, secs
                     );
                 }
             }
         }
-        if verified > 0 {
-            info!(
-                "[f64-tail] batch-seam escalated={} verified={}",
-                candidates.len(),
-                verified
-            );
-        }
+        // R9 engagement line: emitted whenever the seam escalated ANYTHING,
+        // not only on a verify — a probe run must be able to distinguish
+        // "seam fired and declined" from "seam never fired" (FIX B2).
+        tail_eprintln!(
+            "[f64-tail] batch-seam escalated={} verified={}",
+            candidates.len(),
+            verified
+        );
         return;
     }
 
@@ -562,8 +956,8 @@ pub(super) fn f64_tail_escalate_batch(
             F64TailOutcome::Verified { row_lowers } => {
                 merge_certified_rows(domain, &row_lowers, thresholds, clause_sizes);
                 verified += 1;
-                info!(
-                    "[f64-tail] batch-seam verified depth={} gap_f32={:.6} gap_f64={:.3e} gap_f64_refreshed={:.3e} (refreshed certified f64)",
+                tail_eprintln!(always,
+                    "[f64-tail] batch-seam verified depth={} gap_f32={:.6} gap_f64={:.3e} gap_f64_refreshed={:.3e} anchor_source=collected (refreshed certified f64)",
                     domain.depth, gap_f32, eval.gap_baseline, eval.gap_refreshed
                 );
             }
@@ -584,7 +978,7 @@ pub(super) fn f64_tail_escalate_batch(
                             clause_sizes,
                         );
                         verified += 1;
-                        info!(
+                        tail_eprintln!(
                             "[f64-tail] batch-seam verified depth={} gap_f32={:.6} gap_f64={:.3e} gap_f64_refreshed={:.3e}{} (certified f64 micro-BaB)",
                             domain.depth,
                             gap_f32,
@@ -593,7 +987,7 @@ pub(super) fn f64_tail_escalate_batch(
                             micro_stats.as_ref().map(&micro_tag).unwrap_or_default()
                         );
                     } else {
-                        info!(
+                        tail_eprintln!(
                             "[f64-tail] batch-seam micro-bab declined (witness fragmentation) depth={} gap_f32={:.6} gap_f64={:.3e} gap_f64_refreshed={:.3e}{}",
                             domain.depth,
                             gap_f32,
@@ -603,7 +997,7 @@ pub(super) fn f64_tail_escalate_batch(
                         );
                     }
                 } else {
-                    info!(
+                    tail_eprintln!(
                         "[f64-tail] batch-seam not-verified depth={} gap_f32={:.6} gap_f64={:.3e} gap_f64_refreshed={:.3e}{}",
                         domain.depth,
                         gap_f32,
@@ -614,20 +1008,19 @@ pub(super) fn f64_tail_escalate_batch(
                 }
             }
             F64TailOutcome::Unsupported => {
-                info!(
-                    "[f64-tail] batch-seam declined (unsupported) depth={} gap_f32={:.6}",
+                tail_eprintln!(
+                    "[f64-tail] batch-seam declined (unsupported) depth={} gap_f32={:.6} anchor_source=collected",
                     domain.depth, gap_f32
                 );
             }
         }
     }
-    if verified > 0 {
-        info!(
-            "[f64-tail] batch-seam escalated={} verified={} (alpha-tail)",
-            candidates.len(),
-            verified
-        );
-    }
+    // R9 engagement line (alpha-tail arm) — see the frozen-path twin above.
+    tail_eprintln!(
+        "[f64-tail] batch-seam escalated={} verified={} (alpha-tail)",
+        candidates.len(),
+        verified
+    );
 }
 
 /// Pop-side last chance (design §6.3 call site 2): one serial f64 pass for a
@@ -635,6 +1028,13 @@ pub(super) fn f64_tail_escalate_batch(
 /// band. Returns `true` ONLY on a certified f64 `Verified` — the caller then
 /// counts the domain verified instead of dropping it. Gate-off => `false`
 /// with no work (byte-identical control flow).
+///
+/// #cgan-dark-tail FIX-1: `deadline` is the ABSOLUTE BaB ceiling here too, and
+/// this seam is band-FREE — it escalates whatever is about to be dropped, at
+/// any gap — so it is the seam with the weakest prior on cost. The typed
+/// per-child cap now bounds it by the same composition law as the other two.
+/// "Rare and serial" was an assumption about the drop rate, not a measurement;
+/// the cap makes it not need to hold.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn f64_tail_last_chance(
     graph: &GraphNetwork,
@@ -645,11 +1045,24 @@ pub(super) fn f64_tail_last_chance(
     mul_binary_alphas: Option<&HashMap<String, Array2<f32>>>,
     engine: Option<&dyn GemmEngine>,
     deadline: Instant,
+    config: &crate::beta_crown::config::BetaCrownConfig,
 ) -> bool {
+    // Same chokepoint as the batch seam (FIX B5): typed key first, env
+    // override on top. The band is deliberately not applied here.
+    let settings = resolve_f64_tail_settings(config);
     let alpha_armed = alpha_tail_enabled();
-    if !f64_tail_enabled() && !alpha_armed {
+    if !settings.enabled && !alpha_armed {
         return false;
     }
+    // #cgan-dark-tail FIX-1: composed after the gate, so the dark path reads
+    // nothing. `None` cap yields the caller's ceiling verbatim; the helper
+    // never returns `None` when a ceiling was supplied, so the `unwrap_or` is
+    // unreachable defence rather than a fallback with meaning.
+    let deadline = super::disjunctive_multi_clause::child_bound_deadline(
+        Some(deadline),
+        super::disjunctive_multi_clause::resolve_child_bound_cap(config),
+    )
+    .unwrap_or(deadline);
     let gap_f32 = disjunctive_domain_priority(&domain.obj_bounds, thresholds, clause_sizes);
     if alpha_armed {
         // Refreshed serial pass, no micro-BaB (design §4.1.4: drain mode is
@@ -669,22 +1082,22 @@ pub(super) fn f64_tail_last_chance(
         );
         return match eval.outcome {
             F64TailOutcome::Verified { .. } => {
-                info!(
+                tail_eprintln!(always,
                     "[f64-tail] last-chance verified depth={} gap_f32={:.6} gap_f64={:.3e} gap_f64_refreshed={:.3e} (refreshed certified f64)",
                     domain.depth, gap_f32, eval.gap_baseline, eval.gap_refreshed
                 );
                 true
             }
             F64TailOutcome::NotVerified { .. } => {
-                info!(
+                tail_eprintln!(
                     "[f64-tail] last-chance not-verified depth={} gap_f32={:.6} gap_f64={:.3e} gap_f64_refreshed={:.3e}",
                     domain.depth, gap_f32, eval.gap_baseline, eval.gap_refreshed
                 );
                 false
             }
             F64TailOutcome::Unsupported => {
-                info!(
-                    "[f64-tail] last-chance declined (unsupported) depth={} gap_f32={:.6}",
+                tail_eprintln!(
+                    "[f64-tail] last-chance declined (unsupported) depth={} gap_f32={:.6} anchor_source=collected",
                     domain.depth, gap_f32
                 );
                 false
@@ -703,22 +1116,22 @@ pub(super) fn f64_tail_last_chance(
         Some(deadline),
     ) {
         F64TailOutcome::Verified { .. } => {
-            info!(
-                "[f64-tail] last-chance verified depth={} gap_f32={:.6} (certified f64)",
+            tail_eprintln!(always,
+                "[f64-tail] last-chance verified depth={} gap_f32={:.6} anchor_source=collected (certified f64)",
                 domain.depth, gap_f32
             );
             true
         }
         F64TailOutcome::NotVerified { min_gap_f64 } => {
-            info!(
-                "[f64-tail] last-chance not-verified depth={} gap_f32={:.6} gap_f64={:.3e}",
+            tail_eprintln!(
+                "[f64-tail] last-chance not-verified depth={} gap_f32={:.6} gap_f64={:.3e} anchor_source=collected",
                 domain.depth, gap_f32, min_gap_f64
             );
             false
         }
         F64TailOutcome::Unsupported => {
-            info!(
-                "[f64-tail] last-chance declined (unsupported) depth={} gap_f32={:.6}",
+            tail_eprintln!(
+                "[f64-tail] last-chance declined (unsupported) depth={} gap_f32={:.6} anchor_source=collected",
                 domain.depth, gap_f32
             );
             false

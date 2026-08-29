@@ -34,6 +34,11 @@ mod crown_pipelines_concretize;
 mod device;
 #[path = "wgpu_device/error_scope.rs"]
 mod error_scope;
+/// #margin-row-gpu-eft: dedicated-device executor for the margin-row certified
+/// GPU backward lane (implements `ny_core::MarginRowLaneGpu`; R2/R3 contract
+/// in the module docs). Deliberately NOT an op on the shared device.
+#[path = "wgpu_device/margin_row_lane.rs"]
+pub mod margin_row_lane;
 #[path = "wgpu_device/ops/mod.rs"]
 mod ops;
 #[path = "wgpu_device/shader_loading.rs"]
@@ -109,12 +114,12 @@ pub use self::ops::sound_authority::{
 pub(crate) use self::ops::sound_authority::{
     PRODUCTION_WGPU_CHARGED_VERDICT_AUTHORITY_ENABLED, PRODUCTION_WGPU_VERDICT_AUTHORITY_ENABLED,
 };
-// Certified Cut-CROWN C2 resident-lane dark hook (`NY_CUT_FOLD_RESIDENT`):
-// registry surface for experiment harnesses (default OFF; empty ⇒ zero-cost).
+// Certified Cut-CROWN C2 resident-lane quarantined registry hook:
+// registry surface for experiment harnesses (authority hard-OFF; empty ⇒ zero-cost).
 pub use self::ops::cut_fold_resident::{
     clear_resident_cut_fold, reset_resident_cut_fold_applied_count,
-    resident_cut_fold_applied_count, resident_cut_fold_capture_enabled, resident_cut_fold_enabled,
-    set_resident_cut_fold, take_resident_cut_fold_capture, ResidentCutFold, ResidentCutFoldCapture,
+    resident_cut_fold_applied_count, resident_cut_fold_capture_enabled, set_resident_cut_fold,
+    take_resident_cut_fold_capture, ResidentCutFold, ResidentCutFoldCapture,
 };
 use ny_core::{NyError, Result};
 

@@ -74,7 +74,7 @@ fn session_cache_key(path: &Path) -> Option<SessionCacheKey> {
 /// session configuration stays identical everywhere.
 #[cfg(feature = "ort")]
 fn build_session(model_bytes: &[u8]) -> Result<Session, DiffError> {
-    Ok(Session::builder()?.commit_from_memory(model_bytes)?)
+    Ok(crate::runtime::session_builder()?.commit_from_memory(model_bytes)?)
 }
 
 /// Return a shared committed session for the model at `path` (graph bytes
@@ -121,55 +121,186 @@ fn cached_session(
 #[cfg(feature = "ort")]
 pub struct OrtForward {
     session: std::sync::Arc<std::sync::Mutex<Session>>,
-    input_shape: Vec<usize>,
+    /// Declared activation inputs, in graph-declaration order: `(name, shape)`.
+    ///
+    /// A single-input graph keeps exactly the historical behaviour — one shape,
+    /// one POSITIONAL tensor — because that path gates every banked `sat` and
+    /// must stay bit-identical. A MULTI-input graph (`smart_turn_multimodal_2026`
+    /// declares `input_features` and `pixel_values`) splits the flat vector
+    /// across the declared tensors in the same declaration order VNN-LIB 2.0
+    /// uses to concatenate its `declare-input` tensors into `X_i`, and passes
+    /// them BY NAME.
+    inputs: Vec<(String, Vec<usize>)>,
+}
+
+/// Resolve declared activation inputs against the flat length the caller holds —
+/// the shared input-resolution behind every [`OrtForward`] constructor, so a
+/// surgeried in-memory model and the on-disk original split a flat vector
+/// identically. A single (or undeclared) input keeps the historical
+/// `[expected_len]` fallback; a multi-input graph must account for exactly
+/// `expected_len` concatenated elements in declaration order.
+#[cfg(feature = "ort")]
+fn resolve_declared_inputs(
+    declared: Vec<(String, Vec<usize>)>,
+    expected_len: usize,
+) -> Result<Vec<(String, Vec<usize>)>, DiffError> {
+    if declared.len() <= 1 {
+        // Single (or undeclared) input: the historical shape derivation
+        // verbatim, including its `[expected_len]` fallback.
+        let input_shape =
+            single_input_shape(declared.first().map(|(_, s)| s.as_slice()), expected_len);
+        let name = declared
+            .into_iter()
+            .next()
+            .map(|(name, _)| name)
+            .unwrap_or_default();
+        return Ok(vec![(name, input_shape)]);
+    }
+    let total: usize = declared
+        .iter()
+        .map(|(_, shape)| declared_shape_element_count(shape).unwrap_or(usize::MAX))
+        .try_fold(0usize, |acc, n| acc.checked_add(n))
+        .ok_or_else(|| {
+            DiffError::LoadError("ONNX graph input element count overflow".to_string())
+        })?;
+    if total != expected_len {
+        return Err(DiffError::LoadError(format!(
+            "ONNX graph declares {} activation inputs totalling {total} elements, \
+             but {expected_len} were supplied; refusing to guess the split",
+            declared.len()
+        )));
+    }
+    Ok(declared)
 }
 
 #[cfg(feature = "ort")]
 impl OrtForward {
     /// Build a reusable forward from a model path (gzip-aware) and the expected flat
-    /// input length, reading the input tensor shape straight from the ONNX protobuf.
+    /// input length, reading the input tensor shapes straight from the ONNX protobuf.
     ///
     /// The committed session is served from the process-global session cache
     /// (#ort-session-once) keyed by the model file identity — value-identical to
     /// rebuilding it, and shared across every ORT re-forward of the same model in
     /// an instance. `NY_ORT_SESSION_CACHE=0` reverts to a fresh session per call.
+    ///
+    /// For a graph with two or more activation inputs the concatenated element
+    /// count must equal `expected_len`; there is no flat-shape fallback, because
+    /// guessing a split would silently feed the model the wrong tensor.
     pub fn from_path(path: impl AsRef<Path>, expected_len: usize) -> Result<Self, DiffError> {
         let path = path.as_ref();
-        let (model_bytes, input_shape) = read_input_shape_maybe_gzip(path, expected_len)?;
+        let (model_bytes, declared) = read_input_shapes_maybe_gzip(path)?;
+        let inputs = resolve_declared_inputs(declared, expected_len)?;
         let session = cached_session(path, &model_bytes)?;
+        Ok(Self { session, inputs })
+    }
+
+    /// Build a reusable forward from IN-MEMORY model bytes (already gzip-decoded),
+    /// reading the activation inputs straight from the protobuf, optionally with
+    /// EVERY ONNX Runtime graph optimization disabled.
+    ///
+    /// Never served from the process-global session cache: callers hold surgeried
+    /// model bytes (a pre-saturation surrogate output, frozen inputs —
+    /// #flat-objective-surrogate) or need a second, independently configured
+    /// session over the same graph (the graph-free dual-optimization-level gate),
+    /// and neither may alias the default-config cached session.
+    ///
+    /// Input resolution is IDENTICAL to [`OrtForward::from_path`]: a single (or
+    /// undeclared) input keeps the historical `[expected_len]` fallback, a
+    /// multi-input graph must account for exactly `expected_len` concatenated
+    /// elements in declaration order.
+    pub fn from_model_bytes(
+        model_bytes: &[u8],
+        expected_len: usize,
+        disable_graph_optimizations: bool,
+    ) -> Result<Self, DiffError> {
+        let declared = declared_inputs_from_bytes(model_bytes)?;
+        let inputs = resolve_declared_inputs(declared, expected_len)?;
+        let mut builder = crate::runtime::session_builder()?;
+        if disable_graph_optimizations {
+            // `with_optimization_level` returns a RECOVERABLE error whose
+            // `recover()` would hand back the builder with optimizations still
+            // ON. For the dual-optimization-level gate that silent recovery is
+            // exactly wrong — a "Disable-level" session that actually runs the
+            // default level would rubber-stamp knife-edge candidates — so a
+            // refusal here must fail the construction, not fall through.
+            builder = builder
+                .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Disable)
+                .map_err(|e| {
+                    DiffError::LoadError(format!(
+                        "failed to disable ONNX Runtime graph optimizations: {e}"
+                    ))
+                })?;
+        }
+        let session = builder.commit_from_memory(model_bytes)?;
         Ok(Self {
-            session,
-            input_shape,
+            session: std::sync::Arc::new(std::sync::Mutex::new(session)),
+            inputs,
         })
     }
 
-    /// The flat input length this forward expects (product of the input shape).
+    /// [`OrtForward::from_path`], but with EVERY ONNX Runtime graph optimization
+    /// disabled (`GraphOptimizationLevel::Disable`) and no session caching.
+    ///
+    /// This exists for the graph-free falsification lane's dual-level acceptance
+    /// gate: on a QDQ int8 export the two optimization levels are two DIFFERENT
+    /// fused graphs that can land on different quantization codes for the same
+    /// input (measured on smart_turn_multimodal_2026: one witness read
+    /// Y = 0.6490 with optimizations off and Y = 0.5 EXACTLY with them on), so a
+    /// candidate that only violates under one level is a knife-edge, not a
+    /// counterexample.
+    pub fn from_path_no_graph_optimizations(
+        path: impl AsRef<Path>,
+        expected_len: usize,
+    ) -> Result<Self, DiffError> {
+        let (model_bytes, _declared) = read_input_shapes_maybe_gzip(path.as_ref())?;
+        Self::from_model_bytes(&model_bytes, expected_len, true)
+    }
+
+    /// The flat input length this forward expects (sum over declared inputs).
     pub fn input_len(&self) -> usize {
-        self.input_shape.iter().product()
+        self.inputs
+            .iter()
+            .map(|(_, shape)| shape.iter().product::<usize>())
+            .sum()
     }
 
     /// Run a single forward on a flat input, returning the flattened first output.
     ///
-    /// The input is reshaped to the declared `input_shape`; a length mismatch is a
+    /// The input is reshaped to the declared shape(s); a length mismatch is a
     /// hard error rather than a silent reshape.
     pub fn run(&mut self, flat_input: &[f32]) -> Result<Vec<f32>, DiffError> {
-        let expected: usize = self.input_shape.iter().product();
+        let expected = self.input_len();
         if flat_input.len() != expected {
             return Err(DiffError::LoadError(format!(
-                "OrtForward input length {} does not match declared shape {:?} ({} elements)",
+                "OrtForward input length {} does not match declared shape(s) {:?} ({} elements)",
                 flat_input.len(),
-                self.input_shape,
+                self.inputs.iter().map(|(_, s)| s).collect::<Vec<_>>(),
                 expected
             )));
         }
 
-        let input_tensor =
-            ort::value::TensorRef::from_array_view((self.input_shape.as_slice(), flat_input))?;
         // `Session::run` needs `&mut self`; the cached session is shared behind a
         // Mutex, so take the run lock (uncontended in the serial per-instance
         // flow). The output data is copied out before the guard drops.
         let mut session = self.session.lock().unwrap_or_else(|p| p.into_inner());
-        let outputs = session.run(ort::inputs![input_tensor])?;
+        let outputs = if self.inputs.len() == 1 {
+            let shape = &self.inputs[0].1;
+            let input_tensor =
+                ort::value::TensorRef::from_array_view((shape.as_slice(), flat_input))?;
+            session.run(ort::inputs![input_tensor])?
+        } else {
+            let mut named: Vec<(String, ort::session::SessionInputValue<'_>)> =
+                Vec::with_capacity(self.inputs.len());
+            let mut offset = 0usize;
+            for (name, shape) in &self.inputs {
+                let len: usize = shape.iter().product();
+                let slice = &flat_input[offset..offset + len];
+                offset += len;
+                let tensor = ort::value::TensorRef::from_array_view((shape.as_slice(), slice))?;
+                named.push((name.clone(), tensor.into()));
+            }
+            session.run(named)?
+        };
 
         let (_name, output) = outputs
             .iter()
@@ -177,6 +308,62 @@ impl OrtForward {
             .ok_or_else(|| DiffError::LoadError("ONNX Runtime returned no outputs".to_string()))?;
         let (_shape, data) = output.try_extract_tensor::<f32>()?;
         Ok(data.to_vec())
+    }
+
+    /// Run the forward and extract EVERY declared graph output: f32 tensors as
+    /// `Some((shape, values))`, any other dtype as `None` — the CALLER decides
+    /// whether partial coverage is usable.
+    ///
+    /// Exists for the constant-frontier capture (#flat-objective-surrogate):
+    /// the frontier of a frozen branch mixes the f32 embedding the fold wants
+    /// with int64 shape/index constants it must leave in place, and dtypes are
+    /// unknowable statically because intermediate tensors carry no value_info.
+    pub fn run_all_outputs_f32_lossy(
+        &mut self,
+        flat_input: &[f32],
+    ) -> Result<Vec<(String, Option<(Vec<usize>, Vec<f32>)>)>, DiffError> {
+        let expected = self.input_len();
+        if flat_input.len() != expected {
+            return Err(DiffError::LoadError(format!(
+                "OrtForward input length {} does not match declared shape(s) {:?} ({} elements)",
+                flat_input.len(),
+                self.inputs.iter().map(|(_, s)| s).collect::<Vec<_>>(),
+                expected
+            )));
+        }
+        let mut session = self.session.lock().unwrap_or_else(|p| p.into_inner());
+        let outputs = if self.inputs.len() == 1 {
+            let shape = &self.inputs[0].1;
+            let input_tensor =
+                ort::value::TensorRef::from_array_view((shape.as_slice(), flat_input))?;
+            session.run(ort::inputs![input_tensor])?
+        } else {
+            let mut named: Vec<(String, ort::session::SessionInputValue<'_>)> =
+                Vec::with_capacity(self.inputs.len());
+            let mut offset = 0usize;
+            for (name, shape) in &self.inputs {
+                let len: usize = shape.iter().product();
+                let slice = &flat_input[offset..offset + len];
+                offset += len;
+                let tensor = ort::value::TensorRef::from_array_view((shape.as_slice(), slice))?;
+                named.push((name.clone(), tensor.into()));
+            }
+            session.run(named)?
+        };
+        let mut extracted = Vec::new();
+        for (name, output) in outputs.iter() {
+            match output.try_extract_tensor::<f32>() {
+                Ok((shape, data)) => extracted.push((
+                    name.to_string(),
+                    Some((
+                        shape.iter().map(|&d| d.max(0) as usize).collect(),
+                        data.to_vec(),
+                    )),
+                )),
+                Err(_) => extracted.push((name.to_string(), None)),
+            }
+        }
+        Ok(extracted)
     }
 }
 
@@ -193,11 +380,33 @@ impl OrtForward {
         ort_unavailable()
     }
 
+    pub fn from_model_bytes(
+        _model_bytes: &[u8],
+        _expected_len: usize,
+        _disable_graph_optimizations: bool,
+    ) -> Result<Self, DiffError> {
+        ort_unavailable()
+    }
+
+    pub fn from_path_no_graph_optimizations(
+        _path: impl AsRef<Path>,
+        _expected_len: usize,
+    ) -> Result<Self, DiffError> {
+        ort_unavailable()
+    }
+
     pub fn input_len(&self) -> usize {
         self._input_shape.iter().product()
     }
 
     pub fn run(&mut self, _flat_input: &[f32]) -> Result<Vec<f32>, DiffError> {
+        ort_unavailable()
+    }
+
+    pub fn run_all_outputs_f32_lossy(
+        &mut self,
+        _flat_input: &[f32],
+    ) -> Result<Vec<(String, Option<(Vec<usize>, Vec<f32>)>)>, DiffError> {
         ort_unavailable()
     }
 }
@@ -211,7 +420,7 @@ pub fn run_inference(
     input: &ArrayD<f32>,
 ) -> Result<Vec<ArrayD<f32>>, DiffError> {
     // Create session
-    let mut session = Session::builder()?.commit_from_file(path.as_ref())?;
+    let mut session = crate::runtime::session_builder()?.commit_from_file(path.as_ref())?;
 
     // Convert input to ort tensor
     let input_shape: Vec<usize> = input.shape().to_vec();
@@ -255,7 +464,7 @@ pub fn run_inference_bytes(
     model_bytes: &[u8],
     input: &ArrayD<f32>,
 ) -> Result<Vec<ArrayD<f32>>, DiffError> {
-    let mut session = Session::builder()?.commit_from_memory(model_bytes)?;
+    let mut session = crate::runtime::session_builder()?.commit_from_memory(model_bytes)?;
 
     let input_shape: Vec<usize> = input.shape().to_vec();
     let input_data: Vec<f32> = input.iter().cloned().collect();
@@ -308,55 +517,100 @@ fn declared_shape_element_count(shape: &[usize]) -> Option<usize> {
     })
 }
 
-pub fn read_input_shape_maybe_gzip(
+/// Read ONNX model bytes (gzip-aware) and derive EVERY activation input's name
+/// and concrete shape directly from the protobuf.
+///
+/// Returns `(model_bytes, [(name, shape), ...])` in graph-declaration order,
+/// with initializers excluded and symbolic / dynamic / non-positive dims (e.g.
+/// a symbolic batch axis) resolved to `1` — the same conventions
+/// [`read_input_shape_maybe_gzip`] uses for its single input, and, like it,
+/// read WITHOUT ny's graph loader so a trusted forward stays independent of any
+/// graph-loading/op bug in the verifier's own model conversion.
+///
+/// Multi-input graphs exist on the 2026 board (`smart_turn_multimodal_2026`
+/// declares `input_features [1,80,800]` and `pixel_values [1,3,32,112,112]`),
+/// and the single-input reader silently returns only the first of them.
+pub fn read_input_shapes_maybe_gzip(
     path: impl AsRef<Path>,
-    expected_len: usize,
-) -> Result<(Vec<u8>, Vec<usize>), DiffError> {
+) -> Result<(Vec<u8>, Vec<(String, Vec<usize>)>), DiffError> {
     let model_bytes = crate::io::read_bytes_maybe_gzip(path.as_ref())
         .map_err(|e| DiffError::LoadError(format!("{e}")))?;
+    let declared = declared_inputs_from_bytes(&model_bytes)?;
+    Ok((model_bytes, declared))
+}
 
-    let model = onnx_proto::ModelProto::decode(model_bytes.as_slice())
+/// The shared decode behind both readers: every activation input's name and
+/// concrete shape, in graph-declaration order.
+///
+/// Initializers that also appear in `graph.input` (the legacy-opset spelling)
+/// are dropped; if that leaves nothing, the first declared input is kept, which
+/// is exactly the `or_else` the single-input reader has always applied.
+fn declared_inputs_from_bytes(model_bytes: &[u8]) -> Result<Vec<(String, Vec<usize>)>, DiffError> {
+    let model = onnx_proto::ModelProto::decode(model_bytes)
         .map_err(|e| DiffError::LoadError(format!("Failed to parse ONNX protobuf: {e}")))?;
     let graph = model
         .graph
         .as_ref()
         .ok_or_else(|| DiffError::LoadError("ONNX model has no graph".to_string()))?;
 
-    // Initializers can appear in `graph.input` in older opsets; the activation input
-    // is the first graph input that is not also an initializer.
     let initializer_names: std::collections::HashSet<&str> =
         graph.initializer.iter().map(|i| i.name.as_str()).collect();
-    let value_input = graph
+    let shape_of = |value_input: &onnx_proto::ValueInfoProto| -> (String, Vec<usize>) {
+        let shape = value_input
+            .r#type
+            .as_ref()
+            .and_then(|t| t.tensor_type.as_ref())
+            .and_then(|tt| tt.shape.as_ref())
+            .map(|s| {
+                s.dim
+                    .iter()
+                    .map(|d| match d.value {
+                        Some(onnx_proto::tensor_shape_proto::dimension::Value::DimValue(v))
+                            if v > 0 =>
+                        {
+                            v as usize
+                        }
+                        // Dynamic / symbolic / non-positive dim -> single example.
+                        _ => 1usize,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (value_input.name.clone(), shape)
+    };
+
+    let declared: Vec<(String, Vec<usize>)> = graph
         .input
         .iter()
-        .find(|i| !initializer_names.contains(i.name.as_str()))
-        .or_else(|| graph.input.first());
-
-    let shape: Vec<usize> = value_input
-        .and_then(|vi| vi.r#type.as_ref())
-        .and_then(|t| t.tensor_type.as_ref())
-        .and_then(|tt| tt.shape.as_ref())
-        .map(|s| {
-            s.dim
-                .iter()
-                .map(|d| match d.value {
-                    Some(onnx_proto::tensor_shape_proto::dimension::Value::DimValue(v))
-                        if v > 0 =>
-                    {
-                        v as usize
-                    }
-                    // Dynamic / symbolic / non-positive dim -> single example.
-                    _ => 1usize,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let declared = declared_shape_element_count(&shape);
-    if shape.is_empty() || declared != Some(expected_len) {
-        return Ok((model_bytes, vec![expected_len]));
+        .filter(|i| !initializer_names.contains(i.name.as_str()))
+        .map(&shape_of)
+        .collect();
+    if declared.is_empty() {
+        return Ok(graph.input.first().map(shape_of).into_iter().collect());
     }
+    Ok(declared)
+}
+
+pub fn read_input_shape_maybe_gzip(
+    path: impl AsRef<Path>,
+    expected_len: usize,
+) -> Result<(Vec<u8>, Vec<usize>), DiffError> {
+    let (model_bytes, declared) = read_input_shapes_maybe_gzip(path)?;
+    let shape = single_input_shape(declared.first().map(|(_, s)| s.as_slice()), expected_len);
     Ok((model_bytes, shape))
+}
+
+/// Resolve the FIRST activation input's shape against the flat length a caller
+/// actually holds. When the declared element count disagrees (or nothing is
+/// declared) a flat `[expected_len]` shape is returned so the witness can still
+/// be presented to ORT, which derives its tensor shape from the array shape and
+/// will reject a genuinely incompatible layout.
+fn single_input_shape(declared: Option<&[usize]>, expected_len: usize) -> Vec<usize> {
+    let shape = declared.unwrap_or_default().to_vec();
+    if shape.is_empty() || declared_shape_element_count(&shape) != Some(expected_len) {
+        return vec![expected_len];
+    }
+    shape
 }
 
 #[cfg(test)]
@@ -367,6 +621,80 @@ mod input_shape_tests {
     fn declared_element_count_overflow_falls_back() {
         assert_eq!(declared_shape_element_count(&[usize::MAX, 2]), None);
         assert_eq!(declared_shape_element_count(&[2, 3, 4]), Some(24));
+    }
+
+    /// A two-input graph, shaped like `smart_turn_multimodal_2026`: a symbolic
+    /// batch axis on both activation inputs and one initializer that also
+    /// appears in `graph.input` (the legacy-opset spelling).
+    fn two_input_model_bytes() -> Vec<u8> {
+        use crate::onnx_proto::{
+            tensor_shape_proto, GraphProto, ModelProto, TensorProto, TensorShapeProto,
+            TensorTypeProto, TypeProto, ValueInfoProto,
+        };
+        use prost::Message;
+
+        let value_info = |name: &str, dims: &[i64]| ValueInfoProto {
+            name: name.to_string(),
+            r#type: Some(TypeProto {
+                tensor_type: Some(TensorTypeProto {
+                    elem_type: 1,
+                    shape: Some(TensorShapeProto {
+                        dim: dims
+                            .iter()
+                            .map(|&d| tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimValue(d)),
+                            })
+                            .collect(),
+                    }),
+                }),
+            }),
+        };
+
+        let model = ModelProto {
+            graph: Some(GraphProto {
+                // Symbolic batch axis is spelled here as a non-positive dim.
+                input: vec![
+                    value_info("input_features", &[-1, 80, 800]),
+                    value_info("pixel_values", &[-1, 3, 32, 112, 112]),
+                    value_info("weight", &[4, 4]),
+                ],
+                initializer: vec![TensorProto {
+                    name: "weight".to_string(),
+                    ..TensorProto::default()
+                }],
+                ..GraphProto::default()
+            }),
+            ..ModelProto::default()
+        };
+        model.encode_to_vec()
+    }
+
+    #[test]
+    fn multi_input_reader_returns_every_activation_input_in_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("two_input.onnx");
+        std::fs::write(&path, two_input_model_bytes()).expect("write");
+
+        let (_bytes, declared) =
+            super::read_input_shapes_maybe_gzip(&path).expect("read input shapes");
+        assert_eq!(
+            declared,
+            vec![
+                ("input_features".to_string(), vec![1, 80, 800]),
+                ("pixel_values".to_string(), vec![1, 3, 32, 112, 112]),
+            ],
+            "initializers must be excluded and the symbolic batch axis resolved to 1"
+        );
+
+        // The single-input reader sees only the FIRST of them — the defect the
+        // multi-input reader exists to fix. It falls back to a flat shape here
+        // because 64000 != the concatenated 1268224.
+        let (_bytes, single) =
+            super::read_input_shape_maybe_gzip(&path, 1_268_224).expect("read single shape");
+        assert_eq!(single, vec![1_268_224]);
+        let (_bytes, single) =
+            super::read_input_shape_maybe_gzip(&path, 64_000).expect("read single shape");
+        assert_eq!(single, vec![1, 80, 800]);
     }
 }
 
@@ -452,7 +780,7 @@ pub fn run_inference_with_intermediates(
     let modified_bytes = expose_intermediate_outputs(&model_bytes)?;
 
     // Create session from modified model bytes
-    let mut session = Session::builder()?.commit_from_memory(&modified_bytes)?;
+    let mut session = crate::runtime::session_builder()?.commit_from_memory(&modified_bytes)?;
 
     let input_shape: Vec<usize> = input.shape().to_vec();
     let input_data: Vec<f32> = input.iter().cloned().collect();
@@ -511,7 +839,7 @@ pub fn run_inference_with_intermediates_bytes(
 ) -> Result<HashMap<String, ArrayD<f32>>, DiffError> {
     let modified_bytes = expose_intermediate_outputs(model_bytes)?;
 
-    let mut session = Session::builder()?.commit_from_memory(&modified_bytes)?;
+    let mut session = crate::runtime::session_builder()?.commit_from_memory(&modified_bytes)?;
 
     let input_shape: Vec<usize> = input.shape().to_vec();
     let input_data: Vec<f32> = input.iter().cloned().collect();
@@ -595,7 +923,7 @@ mod cache_tests {
         // child of `inference`) so the run path is byte-for-byte the real one.
         let mut fwd = OrtForward {
             session,
-            input_shape: shape,
+            inputs: vec![(String::new(), shape)],
         };
         fwd.run(&INPUT).expect("ort run")
     }

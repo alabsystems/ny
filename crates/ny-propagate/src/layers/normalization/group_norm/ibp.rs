@@ -48,11 +48,16 @@ impl GroupNormLayer {
                 "GroupNorm: zero-valued dimension in input shape".to_string(),
             ));
         }
-        if input.lower().iter().any(|x| !x.is_finite())
-            || input.upper().iter().any(|x| !x.is_finite())
-        {
+        // Category B per domain validation policy: NaN input bounds fail closed
+        // — NaN carries no bound information and would silently poison the
+        // normalization arithmetic (0/0, inf/inf). ±Inf endpoints are NOT an
+        // error: they are the conservative-bounds convention for "unbounded in
+        // that direction" (deep-stack IBP overflow saturation, dc9da0fde
+        // class) and are routed to the analytic fallback enclosure by
+        // `propagate_ibp` instead.
+        if input.lower().iter().any(|x| x.is_nan()) || input.upper().iter().any(|x| x.is_nan()) {
             return Err(NyError::NumericalInstability(
-                "GroupNorm IBP: non-finite input bounds".to_string(),
+                "GroupNorm IBP: NaN input bounds".to_string(),
             ));
         }
 
@@ -85,7 +90,12 @@ impl GroupNormLayer {
         Ok((num_channels, time_len))
     }
 
-    /// Fallback output bounds when input bounds are non-finite.
+    /// Fallback output bounds for a saturated (±inf, NaN-free) input box.
+    ///
+    /// The per-channel beta ± ny·sqrt(n-1) enclosure (n = group size) holds
+    /// for EVERY finite real input regardless of magnitude, so it is sound
+    /// whenever the incoming box merely lost its finite endpoints to
+    /// deep-stack IBP overflow.
     pub(super) fn fallback_output_bounds(&self, shape: &[usize]) -> Result<BoundedTensor> {
         let ndim = shape.len();
         let num_channels = shape[ndim - 2];
@@ -117,13 +127,13 @@ impl GroupNormLayer {
                 (f32::NEG_INFINITY, f32::INFINITY)
             } else if ny >= 0.0 {
                 (
-                    next_down_f32(beta - ny * z_max),
-                    next_up_f32(beta + ny * z_max),
+                    affine_fallback_down(beta, ny, -z_max),
+                    affine_fallback_up(beta, ny, z_max),
                 )
             } else {
                 (
-                    next_down_f32(beta + ny * z_max),
-                    next_up_f32(beta - ny * z_max),
+                    affine_fallback_down(beta, ny, z_max),
+                    affine_fallback_up(beta, ny, -z_max),
                 )
             };
             for batch_idx in 0..batch_size.max(1) {
@@ -347,9 +357,15 @@ impl GroupNormLayer {
                 (f32::NEG_INFINITY, f32::INFINITY)
             } else if g >= 0.0 {
                 // Directed rounding on overflow fallback bounds (#3344).
-                (next_down_f32(b - g * z_max), next_up_f32(b + g * z_max))
+                (
+                    affine_fallback_down(b, g, -z_max),
+                    affine_fallback_up(b, g, z_max),
+                )
             } else {
-                (next_down_f32(b + g * z_max), next_up_f32(b - g * z_max))
+                (
+                    affine_fallback_down(b, g, z_max),
+                    affine_fallback_up(b, g, -z_max),
+                )
             };
             for t in 0..time_len {
                 let idx = c_offset * time_len + t;
@@ -430,6 +446,20 @@ impl BoundPropagation for GroupNormLayer {
     fn propagate_ibp(&self, input: &BoundedTensor) -> Result<BoundedTensor> {
         self.validate_ibp_input(input)?;
 
+        // Deep-stack IBP overflow saturation (dc9da0fde class): a ±inf
+        // (NaN-free — NaN already failed closed in `validate_ibp_input`) input
+        // box is a legitimately saturated upstream interval, not an error. The
+        // true pre-activation values it encloses are finite reals, and the
+        // per-channel beta ± ny·sqrt(n-1) fallback enclosure holds for every
+        // finite real input regardless of magnitude — the same enclosure the
+        // internal mean-overflow route (`fill_overflow_bounds`) already uses
+        // when a large-but-finite input overflows the group-mean sum.
+        if input.lower().iter().any(|x| x.is_infinite())
+            || input.upper().iter().any(|x| x.is_infinite())
+        {
+            return self.fallback_output_bounds(input.shape());
+        }
+
         if self.forward_mode {
             self.propagate_ibp_forward_mode(input)
         } else {
@@ -455,4 +485,30 @@ impl BoundPropagation for GroupNormLayer {
     ) -> Result<LinearBounds> {
         GroupNormLayer::propagate_linear_with_bounds(self, bounds, pre_activation)
     }
+}
+
+/// `beta + gamma * z` rounded OUTWARD (`_up` / `_down`), computed in f64.
+///
+/// SOUNDNESS-CRITICAL — do not inline this back into f32. `f32 * f32` is
+/// EXACT in f64 (24 + 24 = 48 <= 53 mantissa bits), so the only rounding here
+/// is the f64 addition (<= 0.5 ulp of the TRUE sum) plus the final f32 cast,
+/// and the single directed f32 step dominates both.
+///
+/// Computing it in f32 is UNSOUND whenever `beta` cancels the product: the
+/// product's round-to-nearest error lives at the PRODUCT's magnitude while the
+/// one-ULP outward step lands at the (possibly hundreds of ULPs smaller) SUM's
+/// magnitude, so the step cannot cover it and the "bound" excludes reachable
+/// outputs. Found by adversarial review 2026-08-26; repro (InstanceNorm1d,
+/// T = 4, gamma = 1.1550927, beta = -2.0006793, eps = 1e-5): the f32 form
+/// returns an upper bound of 1e-45 while x = [1e5, 0, 0, 0] evaluates to
+/// 1.7408787e-8.
+#[inline]
+pub(super) fn affine_fallback_up(beta: f32, gamma: f32, z: f32) -> f32 {
+    next_up_f32((f64::from(beta) + f64::from(gamma) * f64::from(z)) as f32)
+}
+
+/// Downward-rounded mirror of [`affine_fallback_up`]; same f64 rationale.
+#[inline]
+pub(super) fn affine_fallback_down(beta: f32, gamma: f32, z: f32) -> f32 {
+    next_down_f32((f64::from(beta) + f64::from(gamma) * f64::from(z)) as f32)
 }

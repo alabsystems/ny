@@ -10,7 +10,9 @@ use ny_core::{NyError, Result};
 use ny_tensor::BoundedTensor;
 use tracing::{debug, info, warn};
 
-use crate::beta_crown::result::{BabVerificationStatus, BetaCrownResult};
+use crate::beta_crown::result::{
+    record_global_timeout_deadline_source, BabVerificationStatus, BetaCrownResult,
+};
 use crate::pgd_attack::PgdAttacker;
 use crate::Network;
 
@@ -43,6 +45,8 @@ impl BetaCrownVerifier {
             return Ok(original_result);
         }
 
+        let original_was_timeout = matches!(original_result.result, BabVerificationStatus::Timeout);
+
         info!(
             "Running PGD attack with {} restarts, {} steps",
             self.config.pgd_restarts, self.config.pgd_steps
@@ -65,6 +69,7 @@ impl BetaCrownVerifier {
             threshold,
             self.config.verify_upper_bound,
         )?;
+        let terminal_deadline_observed = attacker.deadline_exhausted();
 
         if attack_result.found_counterexample {
             info!(
@@ -108,12 +113,18 @@ impl BetaCrownVerifier {
                     threshold,
                     self.config.verify_upper_bound
                 );
+                if original_was_timeout && terminal_deadline_observed {
+                    record_global_timeout_deadline_source(deadline);
+                }
                 return Ok(original_result);
             }
 
             // Also verify input is within bounds (#2679 acceptance criterion).
             if !input_within_bounds(&cx_input, input) {
                 warn!("PGD counterexample is outside input bounds. Downgrading to Unknown.");
+                if original_was_timeout && terminal_deadline_observed {
+                    record_global_timeout_deadline_source(deadline);
+                }
                 return Ok(original_result);
             }
 
@@ -146,6 +157,10 @@ impl BetaCrownVerifier {
             "PGD attack completed {} restarts, no counterexample found. Best: {} vs threshold {}",
             attack_result.restarts_completed, attack_result.best_output_value, threshold
         );
+
+        if original_was_timeout && terminal_deadline_observed {
+            record_global_timeout_deadline_source(deadline);
+        }
 
         Ok(original_result)
     }

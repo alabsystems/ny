@@ -2,7 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
-use ndarray::{Array2, ArrayD};
+use ndarray::{Array2, ArrayD, ArrayViewD};
 use ny_core::{checked_shape_product, GemmEngine, NyError, Result};
 use ny_tensor::{next_down_f32, next_up_f32, BoundedTensor, RepairStrategy};
 use std::borrow::Cow;
@@ -13,9 +13,13 @@ use super::super::crown_helpers::{
     compute_conv_bias_f64, compute_conv_bias_f64_with_poll, detect_and_fix_nonfinite_rows,
     detect_and_fix_nonfinite_rows_with_poll, guard_nan_weights,
 };
+use super::ops_ibp_blocked::{
+    certified_conv_ibp_route, conv2d_ibp_forward_grouped_certified_f64_blocked_with_deadline,
+    ConvIbpBlockedRoute, CONV_IBP_BLOCK_MACS,
+};
 use super::ops_ibp_fwd::{
     conv2d_ibp_forward_grouped, conv2d_ibp_forward_grouped_certified_f64_with_deadline,
-    conv2d_ibp_forward_grouped_with_deadline,
+    conv2d_ibp_forward_grouped_with_deadline, ConvIbpForward,
 };
 use super::ops_ibp_gemm::propagate_ibp_via_gemm;
 use super::{
@@ -453,9 +457,54 @@ impl Conv2dLayer {
         BoundedTensor::new_repaired(lower, upper, RepairStrategy::Conservative)
     }
 
+    /// Dispatch ONE certified f64 finite-deadline window forward to the
+    /// selected kernel (#pollable-conv-ibp).
+    ///
+    /// The two kernels publish BYTE-IDENTICAL endpoints — same taps, same fold
+    /// order per output, same shared `γ_{K+2}` certificate and directed casts —
+    /// and return the SAME typed `DeadlineExceeded` on expiry. They differ only
+    /// in interpretation overhead and in poll granularity (per 4096 MACs vs per
+    /// MAC-budgeted output block). The blocked arm ships; `NY_CONV_IBP_BLOCKED=0`
+    /// restores the scalar oracle for an A/B, `=seq` its single-threaded form.
+    fn certified_f64_window_forward(
+        &self,
+        lower: ArrayViewD<'_, f32>,
+        upper: ArrayViewD<'_, f32>,
+        limit: Instant,
+    ) -> Result<ConvIbpForward> {
+        match certified_conv_ibp_route() {
+            ConvIbpBlockedRoute::Scalar => conv2d_ibp_forward_grouped_certified_f64_with_deadline(
+                lower,
+                upper,
+                &self.kernel,
+                self.bias.as_ref(),
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+                limit,
+            ),
+            route => conv2d_ibp_forward_grouped_certified_f64_blocked_with_deadline(
+                lower,
+                upper,
+                &self.kernel,
+                self.bias.as_ref(),
+                self.stride,
+                self.padding,
+                self.dilation,
+                self.groups,
+                limit,
+                CONV_IBP_BLOCK_MACS,
+                matches!(route, ConvIbpBlockedRoute::BlockedParallel),
+            ),
+        }
+    }
+
     /// Finite-deadline certified arm: the f64 dual-accumulator kernel
     /// [`conv2d_ibp_forward_grouped_certified_f64_with_deadline`] (which holds
-    /// the full error-bound derivation), applied per batch item for 4D inputs.
+    /// the full error-bound derivation) or its byte-identical blocked twin
+    /// (see [`Self::certified_f64_window_forward`]), applied per batch item for
+    /// 4D inputs.
     /// Bias is folded into the kernel's f64 accumulation (and its abs-sum), so
     /// no separate bias pass runs. Engine-free by construction; the output is
     /// repaired conservatively for consistency with the other IBP arms
@@ -478,15 +527,9 @@ impl Conv2dLayer {
                         got: vec![input.lower().shape()[0]],
                     });
                 }
-                let fwd = conv2d_ibp_forward_grouped_certified_f64_with_deadline(
+                let fwd = self.certified_f64_window_forward(
                     input.lower().view(),
                     input.upper().view(),
-                    &self.kernel,
-                    self.bias.as_ref(),
-                    self.stride,
-                    self.padding,
-                    self.dilation,
-                    self.groups,
                     limit,
                 )?;
                 let result = BoundedTensor::new_repaired(
@@ -517,17 +560,7 @@ impl Conv2dLayer {
                     check_ibp_deadline(deadline, "before a certified batch item")?;
                     let lower_b = input.lower().index_axis(ndarray::Axis(0), b);
                     let upper_b = input.upper().index_axis(ndarray::Axis(0), b);
-                    let fwd = conv2d_ibp_forward_grouped_certified_f64_with_deadline(
-                        lower_b,
-                        upper_b,
-                        &self.kernel,
-                        self.bias.as_ref(),
-                        self.stride,
-                        self.padding,
-                        self.dilation,
-                        self.groups,
-                        limit,
-                    )?;
+                    let fwd = self.certified_f64_window_forward(lower_b, upper_b, limit)?;
                     for oc in 0..out_c {
                         for oh in 0..out_h {
                             for ow in 0..out_w {

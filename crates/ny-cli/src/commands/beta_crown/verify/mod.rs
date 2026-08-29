@@ -30,6 +30,8 @@ mod graph;
 mod graph_pgd;
 mod graph_pgd_batched;
 mod graph_pgd_exact;
+mod graph_pgd_exact_vjp_evidence;
+mod graph_pgd_fast_gradient_evidence;
 mod graph_pgd_init;
 mod graph_pgd_vjp_batched;
 mod graph_pgd_vjp_batched_disj;
@@ -406,6 +408,8 @@ fn verify_relational_constraints_impl(
             let total_constraints = vnnlib.output_constraints.len();
             let mut graph = GraphNetwork::from_sequential(network)?;
             graph.set_use_patches_mode(graph_config.use_patches());
+            graph.set_chunk_wave_parallel_enabled(graph_config.chunk_wave_parallel_enabled);
+            graph.set_frozen_levers(graph_config.frozen_levers.clone());
             if !json {
                 println!(
                     "\n  Conjunctive property ({} constraints): upgrading to Graph multi-objective BaB",

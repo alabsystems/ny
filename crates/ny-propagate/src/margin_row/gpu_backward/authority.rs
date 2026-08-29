@@ -92,7 +92,7 @@ impl DeviceParityProof {
             Ok(()) => Ok(Self { lanes: host.len() }),
             Err(index) => {
                 // Soundness-adjacent: print the diverging lane, then latch.
-                eprintln!("[margin-row-gpu-eft] M1 parity mismatch at probe lane {index}");
+                eprintln!("[gpu-backward] M1 parity mismatch at probe lane {index}");
                 super::mark_channel_dead("M1 device/host EFT bit mismatch");
                 Err(Refusal::ChannelDead)
             }

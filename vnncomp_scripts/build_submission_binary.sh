@@ -523,6 +523,22 @@ PY
     return 0
 }
 
+# THIS LINE IS THE AUTHORITY ON "THE COMPETITION FEATURE SET".
+#
+# The scored tier is `mip,cuda`, and it is tried FIRST and unconditionally.
+# The lower tiers further down (`mip`, `cuda`, bare) are reachable only behind
+# NY_ALLOW_DEGRADED_BUILD=1 and are explicitly non-competition. Two other
+# places encode the same answer and must be kept consistent with it:
+# `submission_binary_receipt.sh` hard-requires `features=mip,cuda` for the
+# prebuilt package, and `scripts/measure_ny_scorecard.sh` refuses to measure a
+# binary whose `--build-info` is not `cuda=on mip=on`.
+#
+# A host that cannot run CUDA (the GB10 is wgpu/Vulkan) legitimately measures
+# with `--features mip` — but that is a DEVELOPMENT lane, not scored-tier
+# evidence, and it must be declared: `scripts/ny_binary_identity.sh
+# --expect-scored` refuses it unless NY_SCORED_FEATURES says otherwise. Which
+# tier a given binary actually is, is no longer a matter of remembering:
+# `ny --build-id` reports it (#binary-identity).
 built=""
 if run_submission_cargo_build "mip,cuda"; then
     built="mip,cuda"

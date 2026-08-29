@@ -94,12 +94,12 @@ fn json_matches_clean_schema_and_round_trips_via_serde() {
     if let Ok(dir) = std::env::var("NY_CERT_OUT_DIR") {
         std::fs::write(
             format!("{dir}/ny_relu1_entailment.json"),
-            serde_json::to_string_pretty(&ent).unwrap(),
+            ny_cert::json::to_string_pretty(&ent),
         )
         .unwrap();
         std::fs::write(
             format!("{dir}/ny_relu1_farkas.json"),
-            serde_json::to_string_pretty(&far).unwrap(),
+            ny_cert::json::to_string_pretty(&far),
         )
         .unwrap();
     }

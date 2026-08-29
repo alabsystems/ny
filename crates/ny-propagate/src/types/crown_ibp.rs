@@ -106,6 +106,35 @@ pub enum CrownIbpFallbackReason {
     /// Kept at the end of this serialized enum so adding it does not renumber
     /// any pre-existing variant in non-self-describing serde formats.
     PartialCrownRowsDeadlineExceeded,
+    /// The collector REFUSED this target because its weighted per-node share
+    /// fell BELOW the `MIN_PER_NODE_BUDGET_SECS` floor — the backward walk was
+    /// never started (#per-node-floor-label).
+    ///
+    /// This is a REFUSAL, not an overrun. It was previously recorded as
+    /// `PerNodeDeadlineExceeded`, the same reason a genuine mid-walk deadline
+    /// overrun produces, so every log and every provenance histogram read like
+    /// a timeout. On `lsnc_relu` quadrotor2d the collection window is 2.0-4.4 s
+    /// over 10 targets, the shares come out at 0.1-1.9 s against the 2.0 s
+    /// floor, and ny printed
+    /// `9/10 DEMANDED targets did not complete CROWN (PerNodeDeadlineExceeded=9)`
+    /// for nine targets that never executed a single backward step. That
+    /// mislabel hid the per-node cliff for weeks.
+    ///
+    /// The distinction is operational, not cosmetic: an overrun says "this walk
+    /// is too expensive for the time it had", a below-floor refusal says "the
+    /// COLLECTION WINDOW is too small to hand anybody a usable share" — the
+    /// first is answered by a bigger per-node cap, the second only by a bigger
+    /// window or a lower floor.
+    ///
+    /// TIME-CLASS, exactly like `PerNodeDeadlineExceeded` and `WalkCostRefused`:
+    /// the share depends on the live remaining window, so a re-run with more
+    /// budget can admit the walk. It therefore belongs in
+    /// `crown_ibp_result_is_complete`'s time-reason list and counts as a
+    /// degradation (never a structural skip) in summaries.
+    ///
+    /// Kept at the end of this serialized enum so adding it does not renumber
+    /// any pre-existing variant in non-self-describing serde formats.
+    PerNodeBudgetBelowFloor,
 }
 
 /// Preset-configurable overrides for CROWN-IBP collectors' per-node
@@ -129,6 +158,30 @@ pub struct CrownIbpPerNodeTimeBudget {
     /// adaptive remaining-budget cap described above.
     #[serde(default)]
     pub cap_secs: Option<f64>,
+    /// #target-cost-weight: price each candidate's scheduling weight by the
+    /// MACs of the backward walk it will actually run (`rows x prefix`)
+    /// instead of by its objective-row count alone.
+    ///
+    /// Rows alone is a cost proxy that is wrong by ~9.5x across cgan targets
+    /// (secs/row spans 27x), because a shallow 28,800-row target and a deep
+    /// 512-row target walk wildly different prefixes. `false` (the default)
+    /// keeps the historical row weights EXACTLY.
+    ///
+    /// SCHEDULING ONLY: it changes which targets get time, never what a
+    /// completed bound IS, and a declined target keeps its certified IBP
+    /// fallback exactly as today.
+    #[serde(default)]
+    pub prefix_cost_weighted: bool,
+    /// #target-cost-weight: maximum fraction of the REMAINING collection
+    /// window one non-final candidate may be granted.
+    ///
+    /// A single wide node took 54% of a 405 s cgan window under pure
+    /// proportional weighting. `None` (the default) applies no cap; values
+    /// outside `(0, 1)` are ignored in favour of no cap. Never applied to a
+    /// candidate that is the only remaining claimant, which would strand the
+    /// rest of the window for nobody.
+    #[serde(default)]
+    pub max_target_share_frac: Option<f64>,
 }
 
 /// Provenance tag for a bound returned by CROWN-IBP collection.

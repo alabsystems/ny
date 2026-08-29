@@ -128,7 +128,9 @@ impl RootTightenPhase {
 // Step 2: the context and the dispatch
 // ===========================================================================
 
-use crate::beta_crown::engine::graph::propagation::batched::interm_refine::root_joint_tighten_relu_preactivations_with_deadline_gpu;
+use crate::beta_crown::engine::graph::propagation::batched::interm_refine::{
+    root_joint_tighten_relu_preactivations_with_deadline_gpu, RootJointTightenReport,
+};
 use crate::network::GraphNetwork;
 // Imported by NAME so extracted bodies compile verbatim -- no path rewriting,
 // which is what corrupted a fully-qualified path on the previous attempt.
@@ -628,13 +630,16 @@ fn dense_head_tighten(ctx: &mut RootTightenCtx<'_>) -> PhaseOutput {
 const OBJECTIVE_INFLUENCE_SHARE: f64 = 0.15;
 
 /// Objective-directed row ranking is DEFAULT-ON: the scored entry point exports
-/// exactly one `NY_*` variable, so an env-gated improvement cannot fire in
+/// no `NY_*` variables, so an env-gated improvement cannot fire in
 /// competition however well it measures. `NY_ROOT_OBJECTIVE_DIRECTED_ROWS=0`
 /// exists to hold the A/B arm that produced the measurement, nothing else.
+///
+/// DELIVERY SEAM (#lever-reachability): because the shipped default is ON, the
+/// typed `bab.root_objective_directed_rows` key is a per-category KILL SWITCH
+/// rather than an opt-in — the A/B arm that only an environment variable could
+/// hold is now expressible in a preset. Env still wins in both directions.
 fn objective_directed_rows_enabled() -> bool {
-    ny_levers::read(&ny_levers::decls::comprehensive_rows::ROOT_OBJECTIVE_DIRECTED_ROWS)
-        .value
-        .as_bool()
+    crate::preset_gates::root_objective_directed_rows_enabled()
 }
 
 /// #joint-interm-grad: per-target `df/dl` weights for the objective-weighted
@@ -1226,16 +1231,51 @@ pub(super) fn root_joint_interm_alpha(
     bootstrap: &mut crate::beta_crown::engine::graph::shared::init::GraphBabBootstrap,
 ) -> usize {
     let mut root_joint_interm_tightened_targets = 0usize;
-    if std::env::var("NY_ROOT_JOINT_INTERM_ALPHA").ok().as_deref() == Some("1") {
-        let deadline_lane_requested = crate::sound_gpu_gate::root_joint_deadline_lane_requested();
+    let configured_master = crate::preset_gates::root_joint_interm_alpha_enabled();
+    let configured_deadline_ascent =
+        crate::preset_gates::root_joint_interm_alpha_deadline_ascent_enabled();
+    let configured_secs = crate::preset_gates::root_joint_interm_alpha_secs();
+    let configured_iters = crate::preset_gates::root_joint_interm_alpha_iters();
+    let configured_lr = crate::preset_gates::root_joint_interm_alpha_lr() as f32;
+    let configured_max_sel = crate::preset_gates::root_joint_interm_alpha_max_sel();
+    let configured_frozen_stop = crate::preset_gates::root_joint_interm_alpha_frozen_stop_enabled();
+    let configured_pure_chain = crate::preset_gates::root_joint_interm_alpha_pure_chain_enabled();
+    let configured_bn_gpu_extract = crate::preset_gates::bn_gpu_extract_enabled();
+    let configured_min_remaining_secs = crate::preset_gates::root_joint_min_remaining_secs();
+    let deadline_lane_requested = crate::sound_gpu_gate::root_joint_deadline_lane_requested();
+    debug_assert_eq!(
+        deadline_lane_requested,
+        configured_master && configured_deadline_ascent,
+        "the compound GPU admission must use the same governed answers as the receipt"
+    );
+    let configured_max_dim_override =
+        crate::preset_gates::root_joint_interm_alpha_max_dim_override();
+    let configured_max_dim = configured_max_dim_override.unwrap_or(if deadline_lane_requested {
+        32_768
+    } else {
+        2_048
+    });
+    let invocation_started = std::time::Instant::now();
+    let mut target_count = 0usize;
+    let mut available_budget = deadline
+        .map(|limit| limit.saturating_duration_since(invocation_started))
+        .unwrap_or_else(|| std::time::Duration::from_secs(configured_secs));
+    let mut effective_slice = std::time::Duration::ZERO;
+    let mut attempts = 0usize;
+    let mut work_report = RootJointTightenReport::default();
+    let mut outcome = if configured_master {
+        crate::execution_telemetry::RootJointIntermAlphaOutcome::ExecutionRefused
+    } else {
+        crate::execution_telemetry::RootJointIntermAlphaOutcome::MasterDisabled
+    };
+
+    if configured_master {
         let now = std::time::Instant::now();
-        let grace_cap = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(30);
+        let grace_cap = configured_secs;
         let global_remaining = deadline
             .map(|g| g.saturating_duration_since(now))
             .unwrap_or_else(|| std::time::Duration::from_secs(grace_cap));
+        available_budget = global_remaining;
         // #root-joint-admission (promotion prerequisite): the pass's measured
         // cost is ~+18s bab-start — free at the 700s research tier, FATAL on
         // scored 100s rows banked at 90-96s runtime (the tax alone flips them
@@ -1244,10 +1284,7 @@ pub(super) fn root_joint_interm_alpha(
         // NY_ROOT_JOINT_MIN_REMAINING_SECS (0 disables the floor; research
         // probes at 400-900s budgets are unaffected). Below the floor the
         // gate-ON path is byte-identical to gate-OFF (skip, no map change).
-        let min_remaining = std::env::var("NY_ROOT_JOINT_MIN_REMAINING_SECS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(240);
+        let min_remaining = configured_min_remaining_secs;
         let admitted = !(deadline.is_some()
             && global_remaining < std::time::Duration::from_secs(min_remaining));
         if !admitted {
@@ -1258,6 +1295,7 @@ pub(super) fn root_joint_interm_alpha(
         }
         // Reserve at least half the remaining budget for root-spec + BaB.
         let slice = std::time::Duration::from_secs(grace_cap).min(global_remaining.mul_f32(0.5));
+        effective_slice = slice;
         // #root-joint-demand-rank: with the sound-GPU deadline lane armed, the
         // measured 23.6s/2-target slice tightened only the legacy ≤2048-dim
         // scope (FC head + last residual block) while the tree kept running on
@@ -1272,6 +1310,7 @@ pub(super) fn root_joint_interm_alpha(
             crate::beta_crown::engine::graph::propagation::batched::interm_refine::
                 scoped_joint_alpha_targets(graph, &bootstrap.initial_node_bounds)
         };
+        target_count = targets.len();
         eprintln!(
             "[root-joint-interm-alpha] gate ON, targets={} slice={:.1}s{}",
             targets.len(),
@@ -1293,19 +1332,24 @@ pub(super) fn root_joint_interm_alpha(
                 slice.as_secs_f32()
             ));
         }
+        outcome = if !admitted {
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::AdmissionFloor
+        } else if !deadline_lane_requested {
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::DeadlineRouteDisabled
+        } else if slice < std::time::Duration::from_secs(2) {
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::SliceTooSmall
+        } else if targets.is_empty() {
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::NoTargets
+        } else {
+            crate::execution_telemetry::RootJointIntermAlphaOutcome::ExecutionRefused
+        };
         if admitted
             && deadline_lane_requested
             && slice >= std::time::Duration::from_secs(2)
             && !targets.is_empty()
         {
-            let iters = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_ITERS")
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .unwrap_or(100);
-            let lr = std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_LR")
-                .ok()
-                .and_then(|s| s.trim().parse::<f32>().ok())
-                .unwrap_or(0.1);
+            let iters = configured_iters;
+            let lr = configured_lr;
             let pass_deadline = now + slice;
             // #joint-interm-grad: harvest `df/dl` per target ONCE, before either
             // routing attempt, so both share it and neither pays twice. `None`
@@ -1340,10 +1384,14 @@ pub(super) fn root_joint_interm_alpha(
                     )
                 })
             });
-            root_joint_interm_tightened_targets = if let Some(n_tightened) = local {
+            let (report, terminal_outcome) = if let Some(report) = local {
                 // A completed local attempt, including a sound zero-result,
                 // owns this invocation. Never retry it on another backend.
-                n_tightened
+                attempts = 1;
+                (
+                    report,
+                    crate::execution_telemetry::RootJointIntermAlphaOutcome::Completed,
+                )
             } else {
                 let routed =
                     crate::sound_f64_gemm::with_engine_deadline(pass_deadline, |factory_engine| {
@@ -1362,30 +1410,48 @@ pub(super) fn root_joint_interm_alpha(
                         })
                     });
                 match routed {
-                    Ok(Some(Some(n_tightened))) => n_tightened,
+                    Ok(Some(Some(report))) => {
+                        attempts = 1;
+                        (
+                            report,
+                            crate::execution_telemetry::RootJointIntermAlphaOutcome::Completed,
+                        )
+                    }
                     Ok(Some(None)) => {
                         eprintln!(
                             "[root-joint-interm-alpha] sound CUDA factory engine lacks the exact \
                              bounded root-joint capability; skipping (sound no-op)"
                         );
-                        0
+                        (
+                            RootJointTightenReport::default(),
+                            crate::execution_telemetry::RootJointIntermAlphaOutcome::CapabilityUnavailable,
+                        )
                     }
                     Ok(None) => {
                         eprintln!(
                             "[root-joint-interm-alpha] sound CUDA factory unavailable; skipping \
                              (sound no-op)"
                         );
-                        0
+                        (
+                            RootJointTightenReport::default(),
+                            crate::execution_telemetry::RootJointIntermAlphaOutcome::CapabilityUnavailable,
+                        )
                     }
                     Err(error) => {
                         eprintln!(
                             "[root-joint-interm-alpha] sound CUDA factory admission refused: \
                              {error}; skipping (sound no-op)"
                         );
-                        0
+                        (
+                            RootJointTightenReport::default(),
+                            crate::execution_telemetry::RootJointIntermAlphaOutcome::ExecutionRefused,
+                        )
                     }
                 }
             };
+            work_report = report;
+            root_joint_interm_tightened_targets = report.tightened_count;
+            outcome = terminal_outcome;
             eprintln!(
                 "[root-joint-interm-alpha] done: {}/{} target(s) tightened",
                 root_joint_interm_tightened_targets,
@@ -1403,6 +1469,42 @@ pub(super) fn root_joint_interm_alpha(
             }
         }
     }
+    crate::execution_telemetry::record_root_joint_interm_alpha_invocation(
+        crate::execution_telemetry::RootJointIntermAlphaInvocation {
+            route: crate::execution_telemetry::RootJointIntermAlphaRoute::MultiObjective,
+            configured_master,
+            configured_max_dim_override,
+            configured_max_dim,
+            configured_secs,
+            configured_iters: u64::try_from(configured_iters).unwrap_or(u64::MAX),
+            configured_lr,
+            configured_max_sel: u64::try_from(configured_max_sel).unwrap_or(u64::MAX),
+            configured_frozen_stop,
+            configured_pure_chain,
+            configured_bn_gpu_extract,
+            configured_deadline_ascent,
+            configured_min_remaining_secs,
+            target_count,
+            available_budget,
+            effective_slice,
+            attempts,
+            tightened_count: root_joint_interm_tightened_targets,
+            outlier_tightened_count: 0,
+            target_attempts: work_report.target_attempts,
+            base_folds_completed: work_report.base_folds_completed,
+            effective_iters: work_report.effective_iters,
+            ascent_iterations_attempted: work_report.ascent_iterations_attempted,
+            max_ascent_iterations_attempted: work_report.max_ascent_iterations_attempted,
+            optimizer_steps: work_report.optimizer_steps,
+            ascent_folds_completed: work_report.ascent_folds_completed,
+            max_selected_rows: work_report.max_selected_rows,
+            selection_cap_bound_targets: work_report.selection_cap_bound_targets,
+            frozen_stop_targets: work_report.frozen_stop_targets,
+            pure_chain_targets: work_report.pure_chain_targets,
+            bn_extract_targets: work_report.bn_extract_targets,
+            outcome,
+        },
+    );
     root_joint_interm_tightened_targets
 }
 
@@ -1428,10 +1530,7 @@ impl RootTightenPhase {
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(120),
-            Self::RootJointIntermAlpha => std::env::var("NY_ROOT_JOINT_INTERM_ALPHA_SECS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(30),
+            Self::RootJointIntermAlpha => crate::preset_gates::root_joint_interm_alpha_secs(),
             Self::ComprehensiveGpuIntermCrown | Self::PhaseResidentCrown => 20,
             // The remaining phases are sub-second or their budget lives inside
             // a policy struct resolved at run time; no prediction is offered

@@ -27,6 +27,41 @@
 //! settled VIOLATION semantics the rows are used DIRECTLY (non-strict `Le`,
 //! `gamma >= 0`), so the [`crate::selfcheck::check_farkas`] `StrictRelation`/`Eq`
 //! rejects never fire and the refutation lands on a strictly-negative constant.
+//!
+//! # Status: QUARANTINED — no producer yet, by design
+//!
+//! **Nothing in this workspace constructs an [`InvpropAugmentedCertificate`].**
+//! The only code references outside this file are the `pub mod` / `pub use`
+//! lines in `lib.rs`; `certify_onnx`, `certify_onnx_diff`, ny-propagate and
+//! ny-cli never build one. (`alethe_emit.rs` and `examples/alethe_emit_carcara.rs`
+//! name "the invprop_cert test case" in comments, but hand-assemble the
+//! `FarkasCertificate` rather than going through this type.) Do not read this
+//! module as evidence that NY emits a checkable certificate for an
+//! INVPROP-tightened verdict — it does not.
+//!
+//! That is the *documented* state, not an oversight. INVPROP itself is live
+//! (`AlphaState::init_invprop_state` in ny-propagate's alpha-CROWN loop), so NY
+//! computes INVPROP-tightened bounds today and ships them with no replayable
+//! evidence. `docs/INVPROP_ASSUME_VIOLATION_DESIGN.md` §9 books that gap as
+//! **Stage 5 — Certificate integration**, and its §11 status entry says of this
+//! file, in as many words: "Production emit→check→verdict enforcement remains
+//! unimplemented."
+//!
+//! ## What would have to be true to use it
+//!
+//! 1. A harvest point: the alpha-CROWN loop finalizing an INVPROP-tightened
+//!    bound has both the clipped `gamma` vector and the output-constraint rows
+//!    in scope, and neither is carried out of the loop today.
+//! 2. Base premises in exact rationals: `base_premises` / `base_multipliers`
+//!    must come from the same exact-`Rat` CROWN pass `crown_deep` uses, not
+//!    from the f32 propagation path — the cert math has no float in it.
+//! 3. An emit site that fails the verdict closed when `check_farkas` rejects,
+//!    which is Stage 5's stated merge gate.
+//!
+//! The kernel side needs no new trusted code: [`InvpropAugmentedCertificate::to_farkas`]
+//! lowers to a shape [`crate::selfcheck::check_farkas`] already replays. Keeping
+//! the module costs one untrusted lowering and its moat tests; deleting it would
+//! discard the one piece of Stage 5 that is written and proven.
 
 use crate::rational::Rat;
 use crate::schema::{ConstraintKind, FarkasCertificate, LinearConstraint};

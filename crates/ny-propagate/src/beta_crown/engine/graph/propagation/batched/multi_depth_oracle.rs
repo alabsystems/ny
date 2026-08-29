@@ -438,37 +438,34 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use ndarray::{arr1, arr2};
-    use ny_core::{GemmEngine, NaiveCpuGemmEngine, Result};
+    use ny_core::NaiveCpuGemmEngine;
 
     use super::*;
     use crate::layers::binary_ops::AddLayer;
     use crate::layers::{Layer, LinearLayer, ReLULayer};
     use crate::{GraphNode, NETWORK_INPUT};
 
-    struct CountingCpuGemm {
-        calls: AtomicUsize,
-    }
-
-    impl CountingCpuGemm {
-        fn new() -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-            }
-        }
-
-        fn calls(&self) -> usize {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    impl GemmEngine for CountingCpuGemm {
-        fn gemm_f32(&self, m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            NaiveCpuGemmEngine.gemm_f32(m, k, n, a, b)
-        }
+    /// Count the Linear-node backward DISPATCHES one call performs on this
+    /// thread — the oracle's "one shared walk" observable.
+    ///
+    /// These tests used to count `gemm_f32` calls on an injected `GemmEngine`.
+    /// `backward_core`'s Linear arm no longer touches the engine (it runs the
+    /// certified f64 CPU contraction, `propagate_linear_pollable_cpu`), so that
+    /// counter now reads 0 for every traversal — including the traversals that
+    /// are supposed to be REFUSED before dispatch. An instrument whose only
+    /// possible reading is 0 proves nothing, and it silently took the
+    /// `assert_linear_bits_eq` checks below out of service: the count assert
+    /// fired first and the bit-parity comparisons were never reached.
+    ///
+    /// Node dispatches are also the more honest measure of the property under
+    /// test. What the oracle promises is that every node is walked ONCE for all
+    /// targets, not that some particular number of GEMMs is issued.
+    fn linear_dispatches<R>(call: impl FnOnce() -> R) -> (R, usize) {
+        use super::super::backward_core::linear_dispatches_on_thread;
+        let before = linear_dispatches_on_thread();
+        let result = call();
+        (result, linear_dispatches_on_thread() - before)
     }
 
     fn bounded(lower: &[f32], upper: &[f32]) -> BoundedTensor {
@@ -628,19 +625,10 @@ mod tests {
                 selected_neurons: &row,
             },
         ];
-        let engine = CountingCpuGemm::new();
-        let actual =
-            input_relative_with_engine(&graph, &targets, &cache, &input, None, None, &engine, None)
-                .expect("one DAG host walk");
-
-        // right is active for the deep target only; left handles both logical
-        // domains in the same two GEMMs. Separate replays would need six calls.
-        assert_eq!(engine.calls(), 4);
-        for (actual, node) in actual.iter().zip(["left", "sum"]) {
-            let scalar = super::super::backward_selected_input_relative_bounds_at_node(
+        let (actual, dispatches) = linear_dispatches(|| {
+            input_relative_with_engine(
                 &graph,
-                node,
-                &row,
+                &targets,
                 &cache,
                 &input,
                 None,
@@ -648,10 +636,44 @@ mod tests {
                 &NaiveCpuGemmEngine,
                 None,
             )
-            .expect("scalar DAG replay");
-            assert_linear_bits_eq(&actual.bounds, &scalar);
-            assert!(!actual.bounds.has_coeff_err());
-        }
+            .expect("one DAG host walk")
+        });
+
+        // ONE shared walk: `sum` fans its contribution out to both Linear
+        // inputs, so `left` (active for BOTH logical domains) and `right`
+        // (active for the deep target only) are each dispatched exactly once.
+        // Replaying the targets separately would walk `left` twice — once for
+        // its own shallow target and again underneath `sum` — for 3 dispatches.
+        assert_eq!(
+            dispatches, 2,
+            "the DAG oracle must dispatch each Linear node once for all targets"
+        );
+        // The replays are also the control for the count above: run them under
+        // the same probe and the saving has to be visible, not asserted from a
+        // hand-derived constant alone.
+        let ((), replay_dispatches) = linear_dispatches(|| {
+            for (actual, node) in actual.iter().zip(["left", "sum"]) {
+                let scalar = super::super::backward_selected_input_relative_bounds_at_node(
+                    &graph,
+                    node,
+                    &row,
+                    &cache,
+                    &input,
+                    None,
+                    None,
+                    &NaiveCpuGemmEngine,
+                    None,
+                )
+                .expect("scalar DAG replay");
+                assert_linear_bits_eq(&actual.bounds, &scalar);
+                assert!(!actual.bounds.has_coeff_err());
+            }
+        });
+        assert!(
+            dispatches < replay_dispatches,
+            "one shared walk must dispatch strictly fewer Linear nodes than \
+             replaying each target separately ({dispatches} vs {replay_dispatches})"
+        );
     }
 
     #[test]
@@ -671,44 +693,66 @@ mod tests {
                 selected_neurons: &deep_rows,
             },
         ];
-        let engine = CountingCpuGemm::new();
-        let actual =
-            input_relative_with_engine(&graph, &targets, &cache, &input, None, None, &engine, None)
-                .expect("multi-depth host walk");
+        let (actual, dispatches) = linear_dispatches(|| {
+            input_relative_with_engine(
+                &graph,
+                &targets,
+                &cache,
+                &input,
+                None,
+                None,
+                &NaiveCpuGemmEngine,
+                None,
+            )
+            .expect("multi-depth host walk")
+        });
 
-        // Three Linear nodes are visited once each, with one lower and one upper
-        // GEMM per node. Separate replays would visit linear0 twice (8 calls).
-        assert_eq!(engine.calls(), 6);
+        // linear2 / linear1 / linear0 are each visited once, with the shallow
+        // and deep targets riding the same walk as separate logical domains.
+        // Replaying separately would walk linear0 twice (4 dispatches).
+        assert_eq!(
+            dispatches, 3,
+            "heterogeneous target depths must share one walk, not one walk each"
+        );
         assert_eq!(actual.len(), 2);
         assert_eq!(actual[0].target_id, 17);
         assert_eq!(actual[1].target_id, 29);
         assert!(!actual[0].bounds.has_coeff_err());
         assert!(!actual[1].bounds.has_coeff_err());
 
-        let shallow = super::super::backward_selected_input_relative_bounds_at_node(
-            &graph,
-            "linear0",
-            &shallow_rows,
-            &cache,
-            &input,
-            None,
-            None,
-            &NaiveCpuGemmEngine,
-            None,
-        )
-        .expect("scalar shallow replay");
-        let deep = super::super::backward_selected_input_relative_bounds_at_node(
-            &graph,
-            "linear2",
-            &deep_rows,
-            &cache,
-            &input,
-            None,
-            None,
-            &NaiveCpuGemmEngine,
-            None,
-        )
-        .expect("scalar deep replay");
+        // The replays double as the control for the count above.
+        let ((shallow, deep), replay_dispatches) = linear_dispatches(|| {
+            let shallow = super::super::backward_selected_input_relative_bounds_at_node(
+                &graph,
+                "linear0",
+                &shallow_rows,
+                &cache,
+                &input,
+                None,
+                None,
+                &NaiveCpuGemmEngine,
+                None,
+            )
+            .expect("scalar shallow replay");
+            let deep = super::super::backward_selected_input_relative_bounds_at_node(
+                &graph,
+                "linear2",
+                &deep_rows,
+                &cache,
+                &input,
+                None,
+                None,
+                &NaiveCpuGemmEngine,
+                None,
+            )
+            .expect("scalar deep replay");
+            (shallow, deep)
+        });
+        assert!(
+            dispatches < replay_dispatches,
+            "one shared walk must dispatch strictly fewer Linear nodes than \
+             replaying each target separately ({dispatches} vs {replay_dispatches})"
+        );
         assert_linear_bits_eq(&actual[0].bounds, &shallow);
         assert_linear_bits_eq(&actual[1].bounds, &deep);
     }
@@ -730,12 +774,20 @@ mod tests {
                 selected_neurons: &invalid_rows,
             },
         ];
-        let engine = CountingCpuGemm::new();
-        assert!(input_relative_with_engine(
-            &graph, &targets, &cache, &input, None, None, &engine, None,
-        )
-        .is_none());
-        assert_eq!(engine.calls(), 0, "planning must be transactional");
+        let (result, dispatches) = linear_dispatches(|| {
+            input_relative_with_engine(
+                &graph,
+                &targets,
+                &cache,
+                &input,
+                None,
+                None,
+                &NaiveCpuGemmEngine,
+                None,
+            )
+        });
+        assert!(result.is_none());
+        assert_eq!(dispatches, 0, "planning must be transactional");
     }
 
     #[test]
@@ -749,30 +801,46 @@ mod tests {
                 selected_neurons: &row,
             })
             .collect();
-        let engine = CountingCpuGemm::new();
-        assert!(input_relative_with_engine(
-            &graph, &oversized, &cache, &input, None, None, &engine, None,
-        )
-        .is_none());
-        assert_eq!(engine.calls(), 0);
+        let (result, dispatches) = linear_dispatches(|| {
+            input_relative_with_engine(
+                &graph,
+                &oversized,
+                &cache,
+                &input,
+                None,
+                None,
+                &NaiveCpuGemmEngine,
+                None,
+            )
+        });
+        assert!(result.is_none());
+        assert_eq!(
+            dispatches, 0,
+            "an over-cap target set must refuse before any dispatch"
+        );
 
         let one = [HostMultiDepthTarget {
             target_id: 1usize,
             node_name: "linear0",
             selected_neurons: &row,
         }];
-        assert!(input_relative_with_engine(
-            &graph,
-            &one,
-            &cache,
-            &input,
-            None,
-            None,
-            &engine,
-            Some(Instant::now()),
-        )
-        .is_none());
-        assert_eq!(engine.calls(), 0);
+        let (result, dispatches) = linear_dispatches(|| {
+            input_relative_with_engine(
+                &graph,
+                &one,
+                &cache,
+                &input,
+                None,
+                None,
+                &NaiveCpuGemmEngine,
+                Some(Instant::now()),
+            )
+        });
+        assert!(result.is_none());
+        assert_eq!(
+            dispatches, 0,
+            "an expired deadline must refuse before any dispatch"
+        );
     }
 
     #[test]

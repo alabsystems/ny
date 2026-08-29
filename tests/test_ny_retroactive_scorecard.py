@@ -82,6 +82,89 @@ def _write_instances(
     return tmp_path / "benchmarks"
 
 
+def _write_complete_raw_official_fixture(
+    official_dir: Path,
+    *,
+    results_txt: Path | None = None,
+    rows_by_category: dict[str, list[tuple[str, str, str, str]]] | None = None,
+    include_extended: bool = False,
+) -> Path:
+    """Write a complete synthetic regular corpus with aligned occurrences."""
+    overrides = rows_by_category or {}
+    csv_lines: list[str] = []
+    result_lines: list[str] = []
+    participants = repr(scorecard.OFFICIAL_TOOLS)
+    for category in scorecard.REGULAR:
+        rows = overrides.get(
+            category,
+            [
+                (
+                    f"onnx/{category}.onnx",
+                    f"vnnlib/{category}.vnnlib",
+                    "unsat",
+                    "unsat",
+                )
+            ],
+        )
+        result_lines.extend(
+            [
+                f"Category 2025_{category}:",
+                f"  participating tools: {participants}",
+            ]
+        )
+        for index, (onnx, vnnlib, verdict, truth) in enumerate(rows):
+            csv_lines.append(
+                f"{category},{onnx},{vnnlib},0,{verdict},1\n"
+            )
+            marker = (
+                ", 'x (v)'"
+                if truth == "sat"
+                else (", 'x (h)'" if truth == "unsat" else "")
+            )
+            result_lines.extend(
+                [
+                    f"Row: ['{Path(onnx).stem}-{Path(vnnlib).stem}'{marker}]",
+                    f"True Result: {truth}",
+                    f"{index}: alpha_beta_crown score: "
+                    f"{10 if verdict in {'sat', 'unsat'} else 0},",
+                ]
+            )
+
+    for tool in scorecard.OFFICIAL_TOOLS:
+        tool_dir = official_dir / tool
+        tool_dir.mkdir(parents=True, exist_ok=True)
+        (tool_dir / "results.csv").write_text(
+            "".join(csv_lines), encoding="utf-8"
+        )
+
+    if results_txt is None:
+        results_txt = official_dir / "SCORING-ZERO-TOL" / "results.txt"
+    existing = (
+        results_txt.read_text(encoding="utf-8")
+        if results_txt.is_file()
+        else ""
+    )
+    if include_extended:
+        for category in scorecard.EXTENDED:
+            if f"Category 2025_{category}:" in existing:
+                continue
+            result_lines.extend(
+                [
+                    f"Category 2025_{category}:",
+                    "  participating tools: ['alpha_beta_crown']",
+                    f"Row: ['{category}-prop_0', 'x (h)']",
+                    "True Result: unsat",
+                    "0: alpha_beta_crown score: 10,",
+                ]
+            )
+    results_txt.parent.mkdir(parents=True, exist_ok=True)
+    results_txt.write_text(
+        "\n".join(result_lines) + "\n" + existing,
+        encoding="utf-8",
+    )
+    return results_txt
+
+
 def test_ny_measurement_rejects_over_budget_decision_from_exact_occurrence(
     tmp_path: Path,
 ) -> None:
@@ -284,6 +367,204 @@ def test_main_refuses_to_score_over_budget_ny_row(tmp_path: Path) -> None:
     assert result.returncode == 2
     assert "NY measurement budget validation failed" in result.stderr
     assert "refusing over-budget violated credit at 38.70s" in result.stderr
+
+
+def test_main_fails_closed_before_output_when_official_results_are_missing(
+    tmp_path: Path,
+) -> None:
+    official_dir = tmp_path / "official"
+    official_dir.mkdir()
+    measured_dir = tmp_path / "measured"
+    measured_dir.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--official",
+            str(official_dir),
+            "--measured",
+            str(measured_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "official result set is incomplete" in result.stderr
+    assert (
+        "absent or truncated inputs otherwise appear as zero scores"
+        in result.stderr
+    )
+    for tool in scorecard.OFFICIAL_TOOLS:
+        assert str(official_dir / tool / "results.csv") in result.stderr
+
+
+@pytest.mark.parametrize("replacement", [None, "not an official result report\n"])
+def test_main_fails_before_output_when_regular_results_txt_is_unusable(
+    tmp_path: Path, replacement: str | None
+) -> None:
+    official_dir = tmp_path / "official"
+    results_txt = _write_complete_raw_official_fixture(official_dir)
+    if replacement is None:
+        results_txt.unlink()
+    else:
+        results_txt.write_text(replacement, encoding="utf-8")
+    measured_dir = tmp_path / "measured"
+    measured_dir.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--official",
+            str(official_dir),
+            "--measured",
+            str(measured_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "official result set is incomplete or unusable" in result.stderr
+    assert (
+        str(results_txt) in result.stderr
+        or "no scored row coverage" in result.stderr
+    )
+
+
+def test_main_rejects_missing_explicit_results_txt_before_output(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "explicit-results.txt"
+
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--results-txt", str(missing)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "explicit --results-txt input is missing or unusable" in result.stderr
+    assert str(missing) in result.stderr
+
+
+def test_main_rejects_a_truncated_official_tool_csv_before_output(
+    tmp_path: Path,
+) -> None:
+    official_dir = tmp_path / "official"
+    _write_complete_raw_official_fixture(official_dir)
+    truncated = official_dir / "neuralsat" / "results.csv"
+    first_row = truncated.read_text(encoding="utf-8").splitlines()[0]
+    truncated.write_text(first_row + "\n", encoding="utf-8")
+    measured_dir = tmp_path / "measured"
+    measured_dir.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--official",
+            str(official_dir),
+            "--measured",
+            str(measured_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert (
+        "absent or truncated inputs otherwise appear as zero scores"
+        in result.stderr
+    )
+    assert str(truncated) in result.stderr
+    assert "incomplete participating coverage" in result.stderr
+
+
+@pytest.mark.parametrize("create_empty_dir", [False, True])
+def test_main_extended_requires_a_usable_measurement_directory_before_output(
+    tmp_path: Path, create_empty_dir: bool
+) -> None:
+    official_dir = tmp_path / "official"
+    _write_complete_raw_official_fixture(
+        official_dir,
+        include_extended=True,
+    )
+    ext_dir = tmp_path / "measured-ext"
+    if create_empty_dir:
+        ext_dir.mkdir()
+    measured_dir = tmp_path / "measured"
+    measured_dir.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--official",
+            str(official_dir),
+            "--measured",
+            str(measured_dir),
+            "--extended",
+            "--ext-measured",
+            str(ext_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "--extended requires complete official results" in result.stderr
+    assert str(ext_dir) in result.stderr
+
+
+def test_main_fails_closed_on_incomplete_published_artifact_set(
+    tmp_path: Path,
+) -> None:
+    official_dir = tmp_path / "official"
+    reference = official_dir / "alpha_beta_crown" / "results.csv"
+    reference.parent.mkdir(parents=True)
+    reference.write_text(
+        "acasxu_2023,onnx/a.onnx,vnnlib/a.vnnlib,0,unsat,1\n",
+        encoding="utf-8",
+    )
+    measured_dir = tmp_path / "measured"
+    measured_dir.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--official",
+            str(official_dir),
+            "--measured",
+            str(measured_dir),
+            "--official-artifacts",
+            "--ny-sat-status",
+            "unvalidated",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "complete published ZERO-TOL artifact set" in result.stderr
+    assert "SCORING-ZERO-TOL/results.txt" in result.stderr
+    assert "SCORING-ZERO-TOL/latex/longtable.tex" in result.stderr
+    assert "SCORING-ZERO-TOL/latex/scored.tex" in result.stderr
 
 
 def test_published_artifacts_map_ids_and_preserve_official_denominator(
@@ -1101,7 +1382,11 @@ def test_main_exits_nonzero_when_extended_bad_rows_exist(tmp_path: Path) -> None
         ny_csv_rows=["lsnc_relu,net.onnx,prop_0.vnnlib,unsat,1.0"],
     )
     official = tmp_path / "official"
-    official.mkdir()
+    _write_complete_raw_official_fixture(
+        official,
+        results_txt=results_txt,
+        include_extended=True,
+    )
     measured = tmp_path / "measured"
     measured.mkdir()
 
@@ -1358,15 +1643,17 @@ def test_raw_verdict_board_reports_unconfirmable_rows_it_silently_dropped(
         ],
     )
     official_dir = tmp_path / "official"
-    for tool in scorecard.OFFICIAL_TOOLS:
-        (official_dir / tool).mkdir(parents=True)
-        # Row a: the field holds it. Row b: every tool timed out, so the field
-        # established nothing at all.
-        (official_dir / tool / "results.csv").write_text(
-            "cora_2024,onnx/a.onnx,vnnlib/a.vnnlib,0,unsat,1\n"
-            "cora_2024,onnx/b.onnx,vnnlib/b.vnnlib,0,timeout,1\n",
-            encoding="utf-8",
-        )
+    # Row a: the field holds it. Row b: every tool timed out, so the field
+    # established nothing at all.
+    _write_complete_raw_official_fixture(
+        official_dir,
+        rows_by_category={
+            "cora_2024": [
+                ("onnx/a.onnx", "vnnlib/a.vnnlib", "unsat", "unsat"),
+                ("onnx/b.onnx", "vnnlib/b.vnnlib", "timeout", "-"),
+            ]
+        },
+    )
     measured_dir = tmp_path / "measured"
     measured_dir.mkdir()
     (measured_dir / "cora_2024.csv").write_text(

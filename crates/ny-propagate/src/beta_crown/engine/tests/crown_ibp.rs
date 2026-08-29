@@ -2,6 +2,7 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
 
+use super::super::bounds::SequentialCrownIbpRuntimePolicy;
 use super::prelude::*;
 use crate::tests::crown::helpers::MockGpuCrownEngine;
 use ny_test_utils::assert_bounded_tensor_close;
@@ -672,6 +673,132 @@ fn test_configured_sequential_carries_crown_ibp_per_node_time_budget() {
     );
 }
 
+#[test]
+fn test_configured_sequential_runtime_policy_uses_frozen_authority() {
+    use ny_levers::decls::crown_ibp_budget::{CROWN_HONEST_PROVENANCE, PATCHES_DEADLINE_FLAT_BIAS};
+
+    let frozen = |honest: &'static str, flat_bias: &'static str| {
+        Arc::new(ny_levers::LeverSet::freeze_with(
+            ny_levers::all(),
+            |name| match name {
+                value if value == CROWN_HONEST_PROVENANCE.name => Some(honest.to_owned()),
+                value if value == PATCHES_DEADLINE_FLAT_BIAS.name => Some(flat_bias.to_owned()),
+                _ => None,
+            },
+        ))
+    };
+
+    let _env_lock = ny_test_utils::env::lock_env();
+    {
+        let _live_honest_off =
+            ny_test_utils::env::ScopedEnvVar::set(CROWN_HONEST_PROVENANCE.name, "0");
+        let _live_flat_bias_off =
+            ny_test_utils::env::ScopedEnvVar::set(PATCHES_DEADLINE_FLAT_BIAS.name, "0");
+        let live = BetaCrownVerifier::default().sequential_crown_ibp_runtime_policy();
+        assert_eq!(
+            live,
+            SequentialCrownIbpRuntimePolicy {
+                honest_provenance_enabled: false,
+                patches_deadline_flat_bias_enabled: false,
+            },
+            "a verifier without frozen authority must retain live compatibility values"
+        );
+        let frozen_on = BetaCrownVerifier::new(BetaCrownConfig {
+            frozen_levers: Some(frozen("1", "1")),
+            ..Default::default()
+        });
+        assert_eq!(
+            frozen_on.sequential_crown_ibp_runtime_policy(),
+            SequentialCrownIbpRuntimePolicy {
+                honest_provenance_enabled: true,
+                patches_deadline_flat_bias_enabled: true,
+            },
+            "frozen-on controls must not be replaced by later live-off values"
+        );
+    }
+    {
+        let _live_honest_on =
+            ny_test_utils::env::ScopedEnvVar::set(CROWN_HONEST_PROVENANCE.name, "1");
+        let _live_flat_bias_on =
+            ny_test_utils::env::ScopedEnvVar::set(PATCHES_DEADLINE_FLAT_BIAS.name, "1");
+        let frozen_off = BetaCrownVerifier::new(BetaCrownConfig {
+            frozen_levers: Some(frozen("0", "0")),
+            ..Default::default()
+        });
+        assert_eq!(
+            frozen_off.sequential_crown_ibp_runtime_policy(),
+            SequentialCrownIbpRuntimePolicy {
+                honest_provenance_enabled: false,
+                patches_deadline_flat_bias_enabled: false,
+            },
+            "frozen-off controls must not be replaced by later live-on values"
+        );
+    }
+}
+
+#[ntest::timeout(10000)]
+#[test]
+fn test_configured_sequential_flat_bias_policy_reaches_fresh_and_precomputed_execution() {
+    let _env_lock = ny_test_utils::env::lock_env();
+    let _live_off = ny_test_utils::env::ScopedEnvVar::set(
+        ny_levers::decls::crown_ibp_budget::PATCHES_DEADLINE_FLAT_BIAS.name,
+        "0",
+    );
+
+    let kernel = ArrayD::from_shape_vec(IxDyn(&[1, 1, 2, 2]), vec![0.5_f32, -0.25, 0.75, 0.4])
+        .expect("kernel");
+    let conv = Conv2dLayer::with_input_shape(kernel, Some(arr1(&[0.1_f32])), (1, 1), (0, 0), 4, 4)
+        .expect("conv");
+    let mut network = Network::new();
+    network.add_layer(Layer::Conv2d(conv));
+    network.add_layer(Layer::ReLU(ReLULayer));
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[1, 4, 4]), -0.4_f32),
+        ArrayD::from_elem(IxDyn(&[1, 4, 4]), 0.7_f32),
+    )
+    .expect("input");
+    let frozen = Arc::new(ny_levers::LeverSet::freeze_with(ny_levers::all(), |name| {
+        (name == ny_levers::decls::crown_ibp_budget::PATCHES_DEADLINE_FLAT_BIAS.name)
+            .then(|| "1".to_owned())
+    }));
+    let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+        frozen_levers: Some(frozen),
+        ..Default::default()
+    });
+
+    let _ = crate::layers::convolution::conv2d::take_last_flat_bias_policy();
+    verifier
+        .collect_sequential_crown_ibp_bounds_with_status(
+            &network,
+            &input,
+            None,
+            Some(&NaiveCpuGemmEngine),
+            None,
+        )
+        .expect("fresh collection");
+    assert_eq!(
+        crate::layers::convolution::conv2d::take_last_flat_bias_policy(),
+        Some(true),
+        "fresh collection must execute with the frozen-on flat-bias policy"
+    );
+
+    let precomputed = network.collect_ibp_bounds(&input).expect("IBP bounds");
+    verifier
+        .collect_sequential_crown_ibp_bounds_with_status(
+            &network,
+            &input,
+            Some(precomputed),
+            Some(&NaiveCpuGemmEngine),
+            None,
+        )
+        .expect("precomputed collection");
+    assert_eq!(
+        crate::layers::convolution::conv2d::take_last_flat_bias_policy(),
+        Some(true),
+        "precomputed collection must execute with the frozen-on flat-bias policy"
+    );
+}
+
 /// #cgan-bn11-budget: the preset-configurable per-node CROWN-IBP time budget
 /// on `BetaCrownConfig` is stamped onto every engine-configured graph clone,
 /// so the collector's budget computation (`crown_tighten.rs`) sees the preset
@@ -696,10 +823,15 @@ fn test_configured_graph_carries_crown_ibp_per_node_time_budget() {
         !configured.forward_linear_deadline_fallback_to_ibp,
         "default graph must preserve the historical deadline fallback"
     );
+    assert!(
+        !configured.chunk_wave_parallel_enabled,
+        "default configured graph must retain the one-frontier memory guard"
+    );
 
     // cgan_2023-shaped config: cap 150 s, floor unset, direct IBP endgame.
     let verifier = BetaCrownVerifier::new(BetaCrownConfig {
         crown_ibp_per_node_cap_secs: Some(150.0),
+        chunk_wave_parallel_enabled: true,
         alpha_config: crate::AlphaCrownConfig {
             forward_linear_deadline_fallback_to_ibp: true,
             ..Default::default()
@@ -712,9 +844,12 @@ fn test_configured_graph_carries_crown_ibp_per_node_time_budget() {
         CrownIbpPerNodeTimeBudget {
             floor_secs: None,
             cap_secs: Some(150.0),
+        prefix_cost_weighted: false,
+            max_target_share_frac: None,
         },
     );
     assert!(configured.forward_linear_deadline_fallback_to_ibp);
+    assert!(configured.chunk_wave_parallel_enabled);
     // Clones (how BaB paths receive the graph) inherit the stamp.
     let cloned = configured.clone();
     assert_eq!(
@@ -722,4 +857,5 @@ fn test_configured_graph_carries_crown_ibp_per_node_time_budget() {
         configured.crown_ibp_per_node_time_budget,
     );
     assert!(cloned.forward_linear_deadline_fallback_to_ibp);
+    assert!(cloned.chunk_wave_parallel_enabled);
 }

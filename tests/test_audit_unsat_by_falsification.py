@@ -308,24 +308,67 @@ MIXED_ONLY = """
 ))
 """
 
+# X_1 is bounded in ONE arm only, so the disjunction leaves it free.  The full
+# oracle must still refuse this -- it is the shape the reduced-oracle fallback
+# exists for.
+HALF_BOUNDED = """
+(declare-const X_0 Real)
+(declare-const X_1 Real)
+(declare-const Y_0 Real)
+(assert (or
+  (and (>= X_0 0.0) (<= X_0 1.0) (>= X_1 0.0) (<= X_1 1.0) (>= Y_0 0.75))
+  (and (>= X_0 0.0) (<= X_0 1.0) (>= Y_0 9.0))
+))
+"""
 
-def test_a_spec_the_full_oracle_refuses_is_still_searched_and_reported_apart(
+
+def test_the_full_oracle_now_grades_the_nn4sys_mixed_disjunct_shape(
     tmp_path: Path,
 ) -> None:
     """nn4sys's shape: the input box exists ONLY inside a mixed (X, Y) disjunct.
 
-    ``_scan_property`` demands an input-only assertion per declared X_i, so the
-    full validator refuses the file outright -- which means (a) the box must be
-    recovered from the mixed arm or the row goes unsearched, and (b) a hit can
-    never be graded GENUINE-IN-BOX-CE, so it must land in its own status rather
-    than be quietly promoted or quietly dropped.
+    ``_scan_property`` used to demand an input-only assertion per declared X_i,
+    so it refused 77 of the 182 nn4sys specs before onnxruntime ever ran, and
+    every hit on them could only be reported as REFUTED-REDUCED.  The scan now
+    recognises a bound wherever it is stated, so this shape goes through the
+    FULL oracle and a hit is gradeable as GENUINE-IN-BOX-CE.
     """
     root = tmp_path / "benchmarks"
     _instance(root, "synthetic", "mixed", MIXED_ONLY, np.eye(1), np.zeros(1))
     record = _audit(root, "mixed", "unsat", tmp_path)
 
+    assert record["full_oracle_can_validate_this_spec"] is True
+    assert "full_oracle_refusal" not in record
+    assert record["status"] == audit.ST_REFUTED
+    assert record["oracle"]["verdict"] == "GENUINE-IN-BOX-CE"
+    assert record["oracle"]["is_counterexample"] is True
+    # The gate is not vacuous: the projection of the property onto X was
+    # evaluated, and it is what stood in for the absent input-only assertions.
+    assert "nested_domain_assertions=1" in record["oracle"]["detail"]
+
+
+def test_a_spec_the_full_oracle_still_refuses_is_searched_and_reported_apart(
+    tmp_path: Path,
+) -> None:
+    """A genuinely unbounded input keeps the separate, weaker status.
+
+    Widening the scan must not make every refusal disappear: an ``X_i`` pinned
+    in one arm of an ``or`` and free in another is free, and a hit against it
+    must land in its own status rather than be promoted to REFUTED.
+    """
+    root = tmp_path / "benchmarks"
+    _instance(
+        root,
+        "synthetic",
+        "half",
+        HALF_BOUNDED,
+        np.array([[1.0], [0.0]]),
+        np.zeros(1),
+    )
+    record = _audit(root, "half", "unsat", tmp_path)
+
     assert record["full_oracle_can_validate_this_spec"] is False
-    assert "input constraints do not reference X_0" in record["full_oracle_refusal"]
+    assert "input constraints do not reference X_1" in record["full_oracle_refusal"]
     assert record["status"] == audit.ST_REFUTED_REDUCED
     assert record["status"] != audit.ST_REFUTED
     assert record["oracle"]["is_counterexample"] is False

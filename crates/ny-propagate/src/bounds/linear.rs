@@ -912,6 +912,106 @@ impl LinearBounds {
         &mut self.upper_b
     }
 
+    // --- Row-atomic adoption (#merge-err-row) ---
+
+    /// Adopt `src`'s LOWER relaxation row `row` wholesale: coefficients, bias,
+    /// AND the certified coefficient-error row, in one step.
+    ///
+    /// # Why this exists as one method
+    ///
+    /// The certificate is `|lower_a[i,j] - true_coeff| <= lower_a_err[i,j]`,
+    /// and `lower_a_err = None` is the strongest possible claim ("these
+    /// coefficients are EXACT"). Writing a row through
+    /// [`lower_a_mut()`](Self::lower_a_mut) alone leaves the DESTINATION's
+    /// error row attached to the SOURCE's coefficients — two quantities with
+    /// no relation to each other. When the destination carried `None`, the
+    /// swap silently upgrades the source's approximate coefficients to
+    /// "exact", and `concretize_sound` then omits the
+    /// `sum_j err[i,j]*max(|l_j|,|u_j|)` penalty it owes. The published row is
+    /// finite, non-NaN and non-inverted — and need not contain the true range.
+    ///
+    /// Row-wise merges must therefore go through this method rather than
+    /// through the raw mutable accessors, so the coefficient row and its
+    /// certificate cannot drift apart.
+    ///
+    /// Returns an error on a shape mismatch rather than mutating partially.
+    pub(crate) fn adopt_lower_row_from(&mut self, src: &LinearBounds, row: usize) -> Result<()> {
+        self.check_row_adoption_shapes(src, row, "lower")?;
+        self.lower_a.row_mut(row).assign(&src.lower_a.row(row));
+        self.lower_b[row] = src.lower_b[row];
+        Self::adopt_err_row(
+            &mut self.lower_a_err,
+            src.lower_a_err.as_ref(),
+            row,
+            self.lower_a.nrows(),
+            self.lower_a.ncols(),
+        );
+        Ok(())
+    }
+
+    /// Adopt `src`'s UPPER relaxation row `row` wholesale. Mirror of
+    /// [`adopt_lower_row_from`](Self::adopt_lower_row_from); the same
+    /// certificate reasoning applies.
+    pub(crate) fn adopt_upper_row_from(&mut self, src: &LinearBounds, row: usize) -> Result<()> {
+        self.check_row_adoption_shapes(src, row, "upper")?;
+        self.upper_a.row_mut(row).assign(&src.upper_a.row(row));
+        self.upper_b[row] = src.upper_b[row];
+        Self::adopt_err_row(
+            &mut self.upper_a_err,
+            src.upper_a_err.as_ref(),
+            row,
+            self.upper_a.nrows(),
+            self.upper_a.ncols(),
+        );
+        Ok(())
+    }
+
+    fn check_row_adoption_shapes(&self, src: &LinearBounds, row: usize, side: &str) -> Result<()> {
+        if self.num_outputs() != src.num_outputs() || self.num_inputs() != src.num_inputs() {
+            return Err(NyError::InvalidSpec(format!(
+                "row adoption ({side}) shape mismatch: dst=({}x{}), src=({}x{})",
+                self.num_outputs(),
+                self.num_inputs(),
+                src.num_outputs(),
+                src.num_inputs(),
+            )));
+        }
+        if row >= self.num_outputs() {
+            return Err(NyError::InvalidSpec(format!(
+                "row adoption ({side}) row {row} out of range for {} outputs",
+                self.num_outputs()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Move the certificate for one row from `src_err` into `dst_err`,
+    /// materializing or clearing as needed so the row's error always matches
+    /// the row's coefficients.
+    ///
+    /// - src `Some`, dst `None`: dst's other rows really are exact, so
+    ///   materialize a zero matrix and write the source row into it.
+    /// - src `None`, dst `Some`: the source row is exact, so zero that row.
+    ///   (Never drop dst's OTHER rows' certificates.)
+    fn adopt_err_row(
+        dst_err: &mut Option<Array2<f32>>,
+        src_err: Option<&Array2<f32>>,
+        row: usize,
+        rows: usize,
+        cols: usize,
+    ) {
+        match (dst_err.as_mut(), src_err) {
+            (Some(dst), Some(src)) => dst.row_mut(row).assign(&src.row(row)),
+            (Some(dst), None) => dst.row_mut(row).fill(0.0),
+            (None, Some(src)) => {
+                let mut fresh = Array2::zeros((rows, cols));
+                fresh.row_mut(row).assign(&src.row(row));
+                *dst_err = Some(fresh);
+            }
+            (None, None) => {}
+        }
+    }
+
     // --- Certified coefficient-error accessors (#vnncomp-aw-soundness) ---
 
     /// Certified per-coefficient error on the lower relaxation coefficients.
@@ -1461,6 +1561,57 @@ impl LinearBounds {
                          bias: &mut Array1<f32>,
                          lower_side: bool| {
             let Some(e) = err.as_mut() else { return };
+            // Parallel row lane (#conv-fill-hoist): rows are independent (one
+            // certified sum, one bias nudge, one row-clear each), the fold
+            // order WITHIN a row is unchanged, and `certified_affine_sum_f32`
+            // receives the identical (err, mag) sequence — so values are
+            // byte-identical to the serial loop; only row completion order
+            // differs, which nothing observes. Measured at 6.2 s of the
+            // collection walk on `cifar_bias_field_46` before this lane.
+            // The slack probe accumulates into a THREAD-LOCAL, so a probe-
+            // armed run keeps the serial path (its accounting depends on
+            // single-threaded accumulation).
+            let e_flat_ok = e.as_slice_mut().is_some();
+            if !probe_on && e_flat_ok {
+                use rayon::prelude::*;
+                let e_flat = e.as_slice_mut().expect("checked contiguous");
+                let any_kept = std::sync::atomic::AtomicBool::new(false);
+                e_flat
+                    .par_chunks_mut(n_in)
+                    .zip(
+                        bias.as_slice_mut()
+                            .expect("Array1 is contiguous")
+                            .par_iter_mut(),
+                    )
+                    .for_each(|(e_row, bias_i)| {
+                        let p = certified_affine_sum_f32(
+                            0.0,
+                            e_row.iter().zip(mag.iter()).map(|(&err, &m)| (err, m)),
+                            OutwardDirection::Upper,
+                        );
+                        if p.is_finite() {
+                            if p != 0.0 {
+                                if lower_side {
+                                    *bias_i = ny_tensor::next_down_f32(next_down_f64(
+                                        *bias_i as f64 - p,
+                                    )
+                                        as f32);
+                                } else {
+                                    *bias_i = ny_tensor::next_up_f32(
+                                        next_up_f64(*bias_i as f64 + p) as f32,
+                                    );
+                                }
+                            }
+                            e_row.fill(0.0);
+                        } else {
+                            any_kept.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    });
+                if !any_kept.load(std::sync::atomic::Ordering::Relaxed) {
+                    *err = None;
+                }
+                return;
+            }
             let mut any_kept = false;
             for i in 0..n_out {
                 let p = certified_affine_sum_f32(

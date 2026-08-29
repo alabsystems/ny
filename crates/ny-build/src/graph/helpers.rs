@@ -39,6 +39,12 @@ pub(super) fn find_activation_inputs(
         .iter()
         .filter(|name| {
             weights.get(name).is_none()
+                // An interval-valued frozen constant is a CONSTANT, not an
+                // activation. It has no producer node (the const-folder consumed
+                // it), so leaving it in the activation list would turn a skipped
+                // layer into a dangling-tensor hard error instead of the sound
+                // unbounded skip it is meant to be.
+                && !weights.contains_interval(name)
                 && weights.get_integers(name).is_none()
                 && !constant_tensors.contains(*name)
                 && !evaluated_constants.contains_key(*name)

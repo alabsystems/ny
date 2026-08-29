@@ -8,7 +8,7 @@ use ndarray::{array, ArrayD, IxDyn};
 
 #[test]
 fn test_try_new_rejects_invalid_params_2551() {
-    for alpha in [0.0, -0.2, f32::NAN, f32::INFINITY] {
+    for alpha in [-0.2, f32::NAN, f32::INFINITY] {
         let err =
             HardSigmoidLayer::try_new(alpha, 0.5).expect_err("invalid alpha should be rejected");
         assert!(matches!(err, NyError::InvalidSpec(_)));
@@ -19,6 +19,15 @@ fn test_try_new_rejects_invalid_params_2551() {
             HardSigmoidLayer::try_new(0.2, beta).expect_err("invalid beta should be rejected");
         assert!(matches!(err, NyError::InvalidSpec(_)));
     }
+}
+
+/// alpha = 0 makes HardSigmoid the constant y = clamp(beta, 0, 1) — a
+/// well-defined function the CROWN relaxation already handles exactly, so the
+/// constructor admits it (the gate is aligned across constructor, IBP, CROWN).
+#[test]
+fn test_try_new_accepts_zero_alpha_constant_function() {
+    let layer = HardSigmoidLayer::try_new(0.0, 0.5).expect("alpha = 0 must be admitted");
+    assert_eq!(layer.alpha, 0.0);
 }
 
 // ── Relaxation function tests ──────────────────────────────────────
@@ -282,24 +291,30 @@ fn test_ibp_invalid_params_rejected() {
         ArrayD::from_elem(IxDyn(&[2]), 1.0_f32),
     )
     .unwrap();
-    // Negative alpha → inverted bounds
-    assert!(matches!(
-        HardSigmoidLayer {
-            alpha: -0.2,
-            beta: 0.5
-        }
-        .propagate_ibp(&input),
-        Err(NyError::InvalidSpec(_))
-    ));
-    // Zero alpha → degenerate
-    assert!(matches!(
-        HardSigmoidLayer {
-            alpha: 0.0,
-            beta: 0.5
-        }
-        .propagate_ibp(&input),
-        Err(NyError::InvalidSpec(_))
-    ));
+    // Negative alpha flips monotonicity → refused with an accurate message
+    let err = HardSigmoidLayer {
+        alpha: -0.2,
+        beta: 0.5,
+    }
+    .propagate_ibp(&input)
+    .expect_err("negative alpha must stay refused");
+    match err {
+        NyError::InvalidSpec(msg) => assert!(
+            msg.contains("monotonicity"),
+            "negative-alpha refusal must explain the monotonicity flip: {msg}"
+        ),
+        other => panic!("expected InvalidSpec, got {other:?}"),
+    }
+    // Zero alpha: constant function y = clamp(beta, 0, 1) — now admitted and
+    // computed exactly (aligned with the CROWN relaxation's alpha = 0 case).
+    let out = HardSigmoidLayer {
+        alpha: 0.0,
+        beta: 0.5,
+    }
+    .propagate_ibp(&input)
+    .expect("alpha = 0 is a constant function and must propagate");
+    assert_eq!(out.lower()[[0]], 0.5);
+    assert_eq!(out.upper()[[0]], 0.5);
     // NaN alpha
     assert!(matches!(
         HardSigmoidLayer {
@@ -321,9 +336,9 @@ fn test_ibp_invalid_params_rejected() {
 }
 
 #[test]
-fn test_ibp_non_finite_input_rejected() {
+fn test_ibp_nan_input_rejected() {
     let layer = HardSigmoidLayer::default_params();
-    // NaN in lower bounds
+    // NaN in lower bounds fails closed
     let nan_lower = BoundedTensor::new_unchecked(
         ArrayD::from_elem(IxDyn(&[2]), f32::NAN),
         ArrayD::from_elem(IxDyn(&[2]), 1.0_f32),
@@ -333,14 +348,66 @@ fn test_ibp_non_finite_input_rejected() {
         layer.propagate_ibp(&nan_lower),
         Err(NyError::NumericalInstability(_))
     ));
-    // Inf in upper bounds
-    let inf_upper = BoundedTensor::new_unchecked(
+    // NaN in upper bounds fails closed
+    let nan_upper = BoundedTensor::new_unchecked(
         ArrayD::from_elem(IxDyn(&[2]), -1.0_f32),
-        ArrayD::from_elem(IxDyn(&[2]), f32::INFINITY),
+        ArrayD::from_elem(IxDyn(&[2]), f32::NAN),
     )
     .unwrap();
     assert!(matches!(
-        layer.propagate_ibp(&inf_upper),
+        layer.propagate_ibp(&nan_upper),
         Err(NyError::NumericalInstability(_))
     ));
+}
+
+/// Saturation flow (dc9da0fde class): ±inf input endpoints are the deep-stack
+/// IBP overflow convention and must map to HardSigmoid's exact limits —
+/// HardSigmoid(-inf) = 0, HardSigmoid(+inf) = 1 — instead of aborting.
+/// Supersedes the Inf half of the pre-migration
+/// test_ibp_non_finite_input_rejected.
+#[test]
+fn test_ibp_saturated_input_flows_with_exact_limits() {
+    let layer = HardSigmoidLayer::default_params();
+
+    // Fully saturated box [-inf, +inf] → exactly [0, 1].
+    let input = BoundedTensor::new_allow_infinite(
+        ArrayD::from_elem(IxDyn(&[2]), f32::NEG_INFINITY),
+        ArrayD::from_elem(IxDyn(&[2]), f32::INFINITY),
+    )
+    .unwrap();
+    let out = layer
+        .propagate_ibp(&input)
+        .expect("saturated input must propagate, not error");
+    for &v in out.lower().iter() {
+        assert_eq!(v, 0.0, "HardSigmoid(-inf) limit is exactly 0");
+    }
+    for &v in out.upper().iter() {
+        assert_eq!(v, 1.0, "HardSigmoid(+inf) limit is exactly 1");
+    }
+
+    // Half-saturated box [-inf, 0] → [0, eval(0)] = [0, beta].
+    let input = BoundedTensor::new_allow_infinite(
+        ArrayD::from_elem(IxDyn(&[1]), f32::NEG_INFINITY),
+        ArrayD::from_elem(IxDyn(&[1]), 0.0_f32),
+    )
+    .unwrap();
+    let out = layer.propagate_ibp(&input).unwrap();
+    assert_eq!(out.lower()[[0]], 0.0);
+    assert!(
+        (out.upper()[[0]] - 0.5).abs() < 1e-6,
+        "eval(0) = beta = 0.5"
+    );
+
+    // alpha = 0 stays exact on a saturated box: constant clamp(beta, 0, 1)
+    // (the monotone endpoint mapping would compute 0·inf = NaN — the
+    // dedicated constant path must bypass it).
+    let layer = HardSigmoidLayer::try_new(0.0, 2.0).unwrap();
+    let input = BoundedTensor::new_allow_infinite(
+        ArrayD::from_elem(IxDyn(&[1]), f32::NEG_INFINITY),
+        ArrayD::from_elem(IxDyn(&[1]), f32::INFINITY),
+    )
+    .unwrap();
+    let out = layer.propagate_ibp(&input).unwrap();
+    assert_eq!(out.lower()[[0]], 1.0, "beta = 2 clamps to 1");
+    assert_eq!(out.upper()[[0]], 1.0);
 }

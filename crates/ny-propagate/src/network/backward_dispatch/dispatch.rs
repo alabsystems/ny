@@ -17,7 +17,7 @@ use super::helpers::{
     dispatch_conv_engine_aware, dispatch_propagate_linear, own_propagated_linear_with_deadline,
     preserve_structured_error, resolve_input_bounds,
 };
-use super::types::{BackwardDispatchResult, DispatchContext};
+use super::types::{BackwardDispatchResult, DispatchContext, NaryInputBounds};
 
 /// Whether the fused self-attention ternary CROWN backward is enabled. ON by
 /// default: the directional O(radius^2) McCormick margin makes it STRICTLY TIGHTER
@@ -335,11 +335,11 @@ fn merge_carried_err(
                 bias_lower: cbl,
                 bias_upper: cbu,
             },
-        ) if bounds.len() == cbounds.len() => {
-            for (b, c) in bounds.iter_mut().zip(cbounds.iter()) {
-                if let (Some(b), Some(c)) = (b.as_mut(), c.as_ref()) {
-                    b.attach_err_from_carried(c);
-                }
+        ) if bounds.slot_len() == cbounds.slot_len() => {
+            // Slot-index alignment between the real and error-carrying results
+            // of the SAME node dispatch — not a `node.inputs` pairing.
+            for (b, c) in bounds.zip_aligned_slots_mut(&cbounds) {
+                b.attach_err_from_carried(c);
             }
             fold_bias_err_outward(&mut bias_lower, &mut bias_upper, &cbl, &cbu);
             Nary {
@@ -377,7 +377,7 @@ fn merge_carried_err(
                     bias_lower,
                     bias_upper,
                 } => {
-                    for b in bounds.iter_mut().flatten() {
+                    for b in bounds.iter_dynamic_mut() {
                         b.discharge_coeff_err_to_conservative();
                     }
                     Nary {
@@ -439,6 +439,12 @@ fn dispatch_backward_layer_inner(
                 "Linear",
             )?;
             Ok(BackwardDispatchResult::Single(Box::new(new_lb)))
+        }
+        // === Interval-valued frozen constant ===
+        // The midpoint composition plus the `(|A| + err_in) * R` discharge into
+        // the certified coefficient-error channel; see `layers::interval_const`.
+        Layer::IntervalConst(ic) => {
+            dispatch_propagate_linear(ic, node_lb, ctx.node_name, ic.kind_name())
         }
         // === Transpose/Tile/Slice: need input_shape before dispatch (#3105) ===
         Layer::Transpose(t) => {
@@ -745,8 +751,11 @@ fn dispatch_backward_layer_inner(
                     ua,
                     Array1::zeros(bias_upper.len()),
                 )?;
-                let bounds: Vec<Option<LinearBounds>> =
-                    ctx.inputs.iter().map(|_| Some(zeroed.clone())).collect();
+                // One bound per DYNAMIC edge and no embedded constants, so
+                // ONNX order and dynamic order coincide here.
+                let bounds = NaryInputBounds::all_dynamic(
+                    ctx.inputs.iter().map(|_| zeroed.clone()).collect(),
+                );
                 Ok(BackwardDispatchResult::Nary {
                     bounds,
                     bias_lower,
@@ -897,8 +906,12 @@ fn dispatch_backward_layer_inner(
             )?;
             match adain.propagate_crown_ternary(node_lb, ctx.pre_activation, g_bounds, b_bounds) {
                 Ok((bounds, bias_lower, bias_upper)) => {
+                    // Ternary producers emit exactly three `Some`s for (x, g, b)
+                    // and the loader pins ternary nodes to exactly three dynamic
+                    // activation inputs (`ny-build/src/graph/inputs.rs`), so the
+                    // slot list is already dynamic-aligned.
                     Ok(BackwardDispatchResult::Nary {
-                        bounds,
+                        bounds: NaryInputBounds::from_onnx_order(bounds),
                         bias_lower,
                         bias_upper,
                     })
@@ -954,7 +967,8 @@ fn dispatch_backward_layer_inner(
             // ctx.pre_activation is the first input's (Q) bounds.
             match attn.propagate_crown_ternary(node_lb, ctx.pre_activation, k_bounds, v_bounds) {
                 Ok((bounds, bias_lower, bias_upper)) => Ok(BackwardDispatchResult::Nary {
-                    bounds,
+                    // Exactly three `Some`s for (Q, K, V); see the AdaIN note.
+                    bounds: NaryInputBounds::from_onnx_order(bounds),
                     bias_lower,
                     bias_upper,
                 }),
@@ -1029,12 +1043,17 @@ fn dispatch_backward_layer_inner(
         | Layer::Flatten(_) | Layer::Reshape(_) | Layer::Squeeze(_)
         | Layer::Unsqueeze(_) | Layer::Pad(_) | Layer::Resize(_)
         | Layer::QdqPerturbation(_)
+        | Layer::EpsilonExpand(_)
         // Pooling:
         | Layer::AveragePool(_) | Layer::MaxPool2d(_)
         // Positional encoding:
         | Layer::RoPE(_)
         // Special unary (trait handles rejection for data-dependent ops):
         | Layer::NonZero(_)
+        // Conv3d (IBP-only): no certified rank-3-spatial transposed convolution,
+        // so its `propagate_crown_backward` returns UnsupportedOp and this arm
+        // turns that into `Unsupported` -> the caller's sound IBP union.
+        | Layer::Conv3d(_)
         // Binary comparison (IBP-only, CROWN returns UnsupportedOp):
         | Layer::CompareTensor(_) => {
             match ctx

@@ -227,7 +227,9 @@ proptest! {
         let ny = ndarray::Array1::ones(3);
         let beta = ndarray::Array1::zeros(3);
 
-        let layernorm_layer = LayerNormLayer::new_forward_mode(ny.clone(), beta.clone(), 1e-5).unwrap();
+        let layernorm_layer = LayerNormLayer::new(ny.clone(), beta.clone(), 1e-5)
+            .unwrap()
+            .with_forward_mode(true);
         let output = layernorm_layer.propagate_ibp(&input).unwrap();
 
         // Test ALL 8 corners + center point (not just center).
@@ -284,7 +286,9 @@ proptest! {
         let ny = ndarray::Array1::ones(2);
         let beta = ndarray::Array1::zeros(2);
 
-        let layernorm_layer = LayerNormLayer::new_forward_mode(ny.clone(), beta.clone(), 1e-5).unwrap();
+        let layernorm_layer = LayerNormLayer::new(ny.clone(), beta.clone(), 1e-5)
+            .unwrap()
+            .with_forward_mode(true);
         let output = layernorm_layer.propagate_ibp(&input).unwrap();
 
         // Sample 5 points per dimension = 25 total
@@ -340,7 +344,9 @@ proptest! {
         let ny = ndarray::Array1::ones(4);
         let beta = ndarray::Array1::zeros(4);
 
-        let layer = LayerNormLayer::new_forward_mode(ny.clone(), beta.clone(), 1e-5).unwrap();
+        let layer = LayerNormLayer::new(ny.clone(), beta.clone(), 1e-5)
+            .unwrap()
+            .with_forward_mode(true);
         let output = layer.propagate_ibp(&input).unwrap();
 
         // Test all 16 corners
@@ -423,7 +429,9 @@ proptest! {
         let ny = ndarray::Array1::from(vec![g0, g1, g2, g3]);
         let beta = ndarray::Array1::zeros(4);
 
-        let layer = LayerNormLayer::new_forward_mode(ny.clone(), beta.clone(), 1e-5).unwrap();
+        let layer = LayerNormLayer::new(ny.clone(), beta.clone(), 1e-5)
+            .unwrap()
+            .with_forward_mode(true);
         let output = layer.propagate_ibp(&input).unwrap();
 
         // Test all 16 corners

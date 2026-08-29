@@ -40,4 +40,15 @@ bab:
   phase_budget:
     upfront_pgd_fraction: 0.0
     disjunctive_pgd_fraction: 0.05
+    # #disj-demand (measured 2026-08-26, official 100 s, evidence in
+    # reports/measured-2026/upfront5s_disj_demand_2026-08-26/): BOTH vit model
+    # families (ibp_3_3_8 AND pgd_2_3_16) are statically outside the
+    # exact-gradient fragment, so this 5% slice can only run SPSA over ~45 ms
+    # point-IBP forwards (~35 steps of a single restart per row). It consumed
+    # its full 4.75 s of the 95 s tier on every measured row and has produced
+    # ZERO sat in every campaign run; the 2026-08-25 independent adjudication
+    # searched ~1.9 M evals/row on the 21 retracted-unsat rows without finding
+    # one violation. Zero the slice and give BaB the seconds. Guarded by the
+    # static probe: a model with exact gradients keeps its attack even here.
+    demand_sized_disjunctive_pgd: true
     initial_bounds_fraction: 0.60

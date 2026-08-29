@@ -49,6 +49,8 @@ cd lean
 lake update
 lake exe cache get
 lake build NyProof
+lake build NyProof.AxiomAudit
+lake env lean NyProof/AxiomAudit.lean
 # => Build completed successfully.
 # Every theorem's `#print axioms` lists ONLY [propext, Classical.choice, Quot.sound]
 # and never `sorryAx` — the proofs are complete, not stubbed.
@@ -62,7 +64,7 @@ with the standard mathlib axiom base only.
 
 Clean's `Crownproof` library supplies the shared soundness and certificate
 checker modules at exact commit
-`a119ed0cfdafcb3eca4904253fdc51283e2ff0f8`. NY does not copy those sources.
+`9a9b16e44b9233d0c387839ea205a22fb77ac4bb`. NY does not copy those sources.
 The 67 NY-origin modules live under `lean/NyProof/` and import the Clean base as
 `Crownproof.*`. See `lean/PROVENANCE.md` for the complete retained/removed
 classification and authorship record.

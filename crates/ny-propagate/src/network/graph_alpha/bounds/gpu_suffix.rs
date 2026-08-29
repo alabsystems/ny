@@ -242,7 +242,9 @@ fn try_finish_target_gpu_suffix_with_plan(
     // is insufficient to authorize this shortcut.  Keep finite requests on the
     // CPU path, whose materialization/reduction kernels observe the same
     // absolute deadline.  The ordinary no-deadline GPU suffix is unchanged.
-    // #gpu-suffix-expiry set-mate: default-off, byte-identical unarmed.
+    // #gpu-suffix-expiry set-mate: decided by `PATCHES_FINITE_EXPIRY`, which
+    // SHIPS ARMED (`DefaultSpec::Bool(true)`) — refusal is by EXPIRY in every
+    // scored run; `NY_PATCHES_FINITE_EXPIRY=0` restores the presence refusal.
     if let Some(limit) = deadline {
         if Instant::now() >= limit {
             return Err(NyError::DeadlineExceeded(

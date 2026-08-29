@@ -51,6 +51,34 @@ pub enum LeverKind {
     ///
     /// See [`crate::read`] for why the chokepoint refuses `"true"`/`"yes"`.
     Bool,
+    /// An exact `"0"` / `"1"` override layered above contextual config.
+    ///
+    /// Unlike [`Self::Bool`], an unrecognized or non-Unicode value does not
+    /// suppress the lower config/default layer. It is preserved as ignored
+    /// input evidence while that lower layer remains authoritative. This is
+    /// the historical contract of selectors such as `NY_UPFRONT_ATTACK`:
+    /// exact `0` kills, exact `1` forces, and every near-miss means "no
+    /// override" rather than becoming a second kill switch.
+    BoolOverride,
+    /// Exact-`"0"` kill switch layered above contextual configuration.
+    ///
+    /// Only `"0"` owns the environment layer and resolves to false. Every
+    /// other Unicode or non-Unicode value is recorded as ignored input and
+    /// leaves the lower config/default layer authoritative. This is distinct
+    /// from [`Self::BoolOverride`]: legacy gates such as `NY_POSTBAB_ATTACK`
+    /// offered a rollback but never an environment force over a typed opt-out.
+    BoolKillOverride,
+    /// Historical margin-row truthy gate, after trimming surrounding
+    /// whitespace.
+    ///
+    /// Every Unicode environment token is admissible: `1`, `true`, and `on`
+    /// resolve to true; every other token resolves to false. A non-Unicode
+    /// value is ignored and leaves the lower typed-config/default layer in
+    /// charge, matching `std::env::var(...).map(...).unwrap_or(config)`.
+    /// This deliberately remains distinct from [`Self::Bool`]: narrowing a
+    /// migrated reader to exact `0`/`1` would silently change existing
+    /// research recipes and make its receipt disagree with its old decision.
+    TruthyTrimmed,
     /// A gate armed by the variable being SET, whatever its value.
     ///
     /// `NY_X=0`, `NY_X=`, and `NY_X=no` all arm a presence lever — that is the
@@ -68,6 +96,15 @@ pub enum LeverKind {
     Presence,
     /// Unsigned integer; a malformed value falls back to the default.
     U64,
+    /// Unsigned-integer environment override, parsed without trimming.
+    ///
+    /// An admissible environment value wins over contextual config. A
+    /// malformed, overflowing, or non-Unicode value is instead recorded as
+    /// ignored and leaves the lower config/default layer authoritative. This
+    /// is the historical contract of `NY_MARGIN_ROW_RESERVE_SECS`: its
+    /// `std::env::var`/`parse::<u64>()` pair treated every parse failure as if
+    /// no environment override had been supplied.
+    U64Override,
     /// Unsigned integer after trimming surrounding whitespace.
     ///
     /// This preserves legacy readers that use `trim().parse::<u64>()`. It is
@@ -81,6 +118,71 @@ pub enum LeverKind {
     /// because accepting whitespace is part of a lever's public parser, not a
     /// harmless convenience that every integer reader may silently acquire.
     UsizeTrimmed,
+    /// Platform-sized unsigned integer after trimming, with every Unicode
+    /// token owning the environment layer.
+    ///
+    /// Valid Unicode values, including zero, resolve from the environment.
+    /// Malformed or overflowing Unicode input suppresses contextual config and
+    /// resolves to the declaration default, while non-Unicode input is ignored
+    /// and leaves config/default authoritative. This asymmetric contract
+    /// preserves readers built from `std::env::var(...).ok().map(|raw| {
+    /// raw.trim().parse::<usize>().ok() })`: Unicode presence chooses the
+    /// optional result, but bytes that `var` cannot decode are indistinguishable
+    /// from absence.
+    UsizeTrimmedUnicodeOwned,
+    /// Platform-sized unsigned integer environment override after trimming
+    /// surrounding whitespace, restricted to values greater than or equal to
+    /// `min`.
+    ///
+    /// This is the override-style counterpart to [`Self::UsizeTrimmed`]. An
+    /// admissible environment value wins over contextual config, but a
+    /// malformed, overflowing, non-Unicode, or below-minimum value is recorded
+    /// as ignored and leaves the lower config/default layer authoritative.
+    /// That fallthrough is the historical contract of margin-row branch-width
+    /// selectors: zero and parse failures mean "no environment override", not
+    /// "suppress the typed preset". `min` is deliberately an environment-only
+    /// admission floor: typed config may carry any platform `usize`, including
+    /// a zero sentinel whose consuming policy restores its built-in default.
+    UsizeTrimmedOverride {
+        /// Inclusive environment-admission lower bound.
+        min: usize,
+    },
+    /// Platform-sized unsigned integer environment override without trimming,
+    /// restricted to values greater than or equal to `min`.
+    ///
+    /// An admissible environment value wins over contextual config. Whitespace,
+    /// malformed, overflowing, non-Unicode, or below-minimum input is recorded
+    /// as ignored and preserves the lower layer. As with
+    /// [`Self::UsizeTrimmedOverride`], `min` constrains only the legacy
+    /// environment parser; typed config may carry any platform `usize`.
+    UsizeOverride {
+        /// Inclusive environment-admission lower bound.
+        min: usize,
+    },
+    /// Platform-sized unsigned integer without trimming, restricted to values
+    /// greater than or equal to `min`.
+    ///
+    /// This is the exact shape of legacy readers that call
+    /// `str::parse::<usize>()` directly and then apply a lower-bound filter.
+    /// It is separate from [`Self::U64`] because values wider than `usize`
+    /// must be rejected on 32-bit targets, and separate from
+    /// [`Self::UsizeTrimmed`] because surrounding whitespace is inadmissible.
+    Usize {
+        /// Inclusive lower bound.
+        min: usize,
+    },
+    /// Finite positive `f32`, parsed without trimming.
+    ///
+    /// The parsed value is stored losslessly in [`crate::LeverValue::F64`].
+    /// Keeping an explicit `f32` parser matters: a token above `f32::MAX`, or
+    /// one whose exponent underflows to zero in `f32`, was rejected by the
+    /// historical reader even though an `f64` parser would accept it.
+    F32Positive,
+    /// Finite non-negative `f32`, parsed without trimming.
+    ///
+    /// Unlike [`Self::F32Positive`], both `0` and `-0` are admissible. This
+    /// preserves legacy numeric kill switches whose predicate was `v >= 0.0`.
+    F32NonNegative,
     /// Finite `f64` restricted to the OPEN interval `(min, max)`.
     ///
     /// Open on both ends because that is what the in-tree fraction readers
@@ -88,6 +190,31 @@ pub enum LeverKind {
     /// `is_finite() && (0.0..0.9).contains(v) && v > 0.0`, which is exactly
     /// `F64Open { min: 0.0, max: 0.9 }`.
     F64Open {
+        /// Exclusive lower bound.
+        min: f64,
+        /// Exclusive upper bound.
+        max: f64,
+    },
+    /// Finite untrimmed `f64` in `(min, max)`, with Unicode-owned layering.
+    ///
+    /// Every present Unicode token owns the override layer: an inadmissible
+    /// token suppresses contextual config and resolves to the declaration
+    /// default. A present non-Unicode token cannot be observed by the legacy
+    /// `std::env::var(...).ok()` reader, so it is ignored and leaves the lower
+    /// layer authoritative. This deliberately asymmetric contract preserves
+    /// `NY_MARGIN_ROW_RESERVE_MAX_FRAC`'s typed-ceiling kill switch.
+    F64OpenUnicodeOwned {
+        /// Exclusive lower bound.
+        min: f64,
+        /// Exclusive upper bound.
+        max: f64,
+    },
+    /// Finite untrimmed `f64` override restricted to `(min, max)`.
+    ///
+    /// Invalid Unicode and non-Unicode environment values are recorded as
+    /// ignored and leave contextual config/default authoritative. It is the
+    /// floating-point counterpart to [`Self::U64Override`].
+    F64OpenOverride {
         /// Exclusive lower bound.
         min: f64,
         /// Exclusive upper bound.
@@ -107,10 +234,38 @@ pub enum LeverKind {
         /// Inclusive upper bound.
         max: f64,
     },
-    /// Finite, non-negative seconds.
+    /// Finite, non-negative seconds after trimming surrounding whitespace.
+    ///
+    /// This is the historical grammar of `NY_MARGIN_ROW_ALPHA_SECS`, whose
+    /// reader used `raw.trim().parse::<f64>()` before applying its positive
+    /// effective-value filter. Keeping the trim in the kind makes the frozen
+    /// receipt agree with that reader for tokens such as `" 12.5 "`.
     Secs,
+    /// Every Unicode token is a Boolean answer after trimming: exactly `"1"`
+    /// is true and every other token is false.
+    ///
+    /// Thus malformed, empty, and truthy-looking Unicode values are not
+    /// rejections; they are explicit false overrides that suppress contextual
+    /// config. A non-Unicode value is ignored and leaves the lower layer in
+    /// charge, matching `std::env::var(...).map(|s| s.trim() == "1")`.
+    TrimmedExactOne,
     /// One of a fixed set of strings; anything else falls back to the default.
     Enum(&'static [&'static str]),
+    /// An enum whose legacy environment parser is narrower than its typed
+    /// configuration surface.
+    ///
+    /// This preserves readers such as `NY_MO_KFSB_REDUCE`: the historical
+    /// environment override accepts only exact `min|max`, while the existing
+    /// typed `bab.branching.reduceop` field also admits `mean`. Environment
+    /// values are parsed against `env_members`; contextual configuration is
+    /// validated against `config_members`. A present environment token outside
+    /// `env_members` remains a rejection and suppresses the config layer.
+    LayeredEnum {
+        /// Exact strings accepted from the process environment.
+        env_members: &'static [&'static str],
+        /// Strings accepted from typed configuration.
+        config_members: &'static [&'static str],
+    },
     /// Free-form text (paths, comma lists) taken verbatim.
     Text,
 }

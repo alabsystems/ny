@@ -129,23 +129,43 @@ pub(crate) enum F64TailOutcome {
 
 static F64_TAIL_MODE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
-/// Whether the f64 tail pass is enabled. Default OFF; opt-in `NY_F64_TAIL=1`.
+/// Tri-state env override for the f64 tail gate (#cgan-f64-tail B5 layering):
+/// `NY_F64_TAIL=1` => `Some(true)`, `=0` or any other PRESENT value =>
+/// `Some(false)` (the legacy "anything but exact 1 is off" reading), absent =>
+/// `None` (the typed preset key `bab.branching.input_split.f64_tail.enabled`
+/// decides — resolved at `input_split::f64_tail::resolve_f64_tail_settings`).
+/// Cached; the `cfg(test)` [`force_f64_tail`] override takes precedence.
+pub(crate) fn f64_tail_env_state() -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    match F64_TAIL_MODE.load(Ordering::Relaxed) {
+        0 => Some(false),
+        1 => Some(true),
+        2 => None,
+        _ => {
+            let state = match std::env::var("NY_F64_TAIL").ok().as_deref() {
+                Some("1") => Some(true),
+                Some(_) => Some(false),
+                None => None,
+            };
+            let cache = match state {
+                Some(false) => 0,
+                Some(true) => 1,
+                None => 2,
+            };
+            F64_TAIL_MODE.store(cache, Ordering::Relaxed);
+            state
+        }
+    }
+}
+
+/// Whether the f64 tail pass is env-armed. Default OFF; opt-in `NY_F64_TAIL=1`.
 ///
 /// Parity class: the pass is ADDITIVE (only `Verified` changes anything and
 /// only by monotonically raising certified lower bounds); with the gate off
 /// the hooks are byte-identical no-ops. Parity test:
 /// `input_split::f64_tail::tests::gate_off_is_byte_identical`.
 pub(crate) fn f64_tail_enabled() -> bool {
-    use std::sync::atomic::Ordering;
-    match F64_TAIL_MODE.load(Ordering::Relaxed) {
-        0 => false,
-        1 => true,
-        _ => {
-            let on = matches!(std::env::var("NY_F64_TAIL").ok().as_deref(), Some("1"));
-            F64_TAIL_MODE.store(i8::from(on), Ordering::Relaxed);
-            on
-        }
-    }
+    f64_tail_env_state() == Some(true)
 }
 
 /// Test-only override for the gate: `Some(true|false)` forces ON/OFF, `None`
@@ -161,17 +181,19 @@ pub(crate) fn force_f64_tail(mode: Option<bool>) {
     F64_TAIL_MODE.store(v, Ordering::Relaxed);
 }
 
-/// Guard band for the batch-seam escalation trigger (design §6.1): a
-/// still-unverified domain is eligible iff its grouped f32 gap is
-/// `>= -band`. Env `NY_F64_TAIL_BAND`, default `5e-3` (covers the measured
-/// −0.004 plateau of `state_35` with margin; caps wasted f64 work).
-pub(crate) fn f64_tail_band() -> f32 {
+/// Env layer of the escalation guard band (design §6.1): a still-unverified
+/// domain is eligible iff its grouped f32 gap is `>= -band`.
+/// `NY_F64_TAIL_BAND` when set+valid, else `None` — the typed preset key
+/// (`...f64_tail.band`) and the 5e-3 legacy default layer beneath it at
+/// `resolve_f64_tail_settings` (covers the measured −0.004 plateau of
+/// `state_35` with margin; caps wasted f64 work).
+pub(crate) fn f64_tail_band_env() -> Option<f32> {
     match std::env::var("NY_F64_TAIL_BAND")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
     {
-        Some(band) if band.is_finite() && band >= 0.0 => band,
-        _ => 5e-3,
+        Some(band) if band.is_finite() && band >= 0.0 => Some(band),
+        _ => None,
     }
 }
 
@@ -363,6 +385,29 @@ fn f64_tail_supports_layer(layer: &Layer) -> bool {
         // is a conv DAG, so the walk declined at the first conv and the certified
         // f64 replay was unreachable exactly where it is worth the most.
         Layer::Conv2d(conv) => conv.dilation == (1, 1) && conv.input_shape.is_some(),
+        // #cgan-f64-tail (design B, step B1): ConvTranspose2d — the op that made
+        // the whole cgan graph decline (4 ConvTranspose nodes in the loaded
+        // cGAN_imgSz32_nCh_1 DAG). Same certified-envelope accounting as
+        // Conv2d: a transposed conv IS a linear map. FIX B6:
+        // `ConvTranspose2dLayer` has no `groups` field; the kernel-rank/shape
+        // guard below plus the arm's own width checks are the Decline surface.
+        // `output_padding >= stride` is already refused at construction
+        // (`conv2d/types.rs::new_full`) — the arm re-checks it as defense in
+        // depth. NOTE: the LOADER leaves `input_shape: None` on DAG graphs
+        // (measured — census test `cgan_row2_loaded_graph_census`), so unlike
+        // the Conv2d gate the arm derives (in_h, in_w) from the PARENT's
+        // anchored shape; `input_shape` is only a cross-check when present.
+        Layer::ConvTranspose2d(conv) => {
+            conv.dilation == (1, 1)
+                && conv.kernel.ndim() == 4
+                && conv.output_padding.0 < conv.stride.0
+                && conv.output_padding.1 < conv.stride.1
+        }
+        // #cgan-f64-tail (design B, step B2): BatchNorm — channel-affine with
+        // CERTIFIED precompute-error radii. The arm charges the model error
+        // through a separate ABSOLUTE accumulator (FIX B1); a layer whose
+        // affine vectors fail validation declines here (fail-closed).
+        Layer::BatchNorm(bn) => bn.validate_affine_parameters().is_ok(),
         Layer::Linear(_)
         | Layer::ReLU(_)
         | Layer::MulBinary(_)
@@ -432,6 +477,31 @@ pub(crate) fn graph_supports_f64_tail(graph: &GraphNetwork) -> bool {
         }),
         Err(_) => false,
     }
+}
+
+/// Diagnostic census (#cgan-f64-tail B0, R9): the output-ancestor nodes the
+/// certified walker cannot walk, as `(node_name, layer_type)` pairs — empty
+/// means the graph is fully supported. Read-only; used by the batch-seam
+/// engagement telemetry and by offline load-path probes so "declined
+/// (unsupported)" always names the ACTUAL op gap instead of guessing from
+/// the raw onnx census (folds/decompositions change the loaded layer set).
+pub fn f64_tail_unsupported_census(graph: &GraphNetwork) -> Vec<(String, String)> {
+    let Ok(needed) = graph.output_ancestors() else {
+        return vec![("<exec-order>".to_string(), "<unresolvable>".to_string())];
+    };
+    let mut out = Vec::new();
+    for name in &needed {
+        match graph.node(name) {
+            Some(node) => {
+                if !f64_tail_supports_layer(node.layer()) {
+                    out.push((name.to_string(), node.layer().layer_type().to_string()));
+                }
+            }
+            None => out.push((name.to_string(), "<missing-node>".to_string())),
+        }
+    }
+    out.sort();
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +592,22 @@ struct RowWalk {
     /// Latched when any coefficient/bias/anchor goes non-finite: the row
     /// poisons to `-inf` (fail closed), never to a bound.
     poisoned: bool,
+    /// ABSOLUTE (un-gamma'd) model-error accumulator (FIX B1, #cgan-f64-tail).
+    ///
+    /// BatchNorm's `scale_err`/`bias_err` are MODEL errors — the stored f32
+    /// affine deviates from the exact-real one by up to those radii
+    /// (`batch_norm/types.rs`, incl. catastrophic cancellation in `bias_err`)
+    /// — not rounding masses. Routing them through the gamma-scaled shadow
+    /// (`env_units`) would charge ~1e-11 of the true deviation: an ~11-order
+    /// under-charge at the exact knife-edge population this pass exists to
+    /// verify. Every BN step therefore adds
+    /// `Σ_j s_j·(scale_err[c(j)]·max(|anchor_lo_j|,|anchor_hi_j|) + bias_err[c(j)])`
+    /// here (`s_j >= |a_j|` by the shadow invariant; anchors are the BN
+    /// INPUT's certified box), and [`certified_row_lower`] subtracts
+    /// `certify_up(model_abs, rel)` from the certified lower DIRECTLY —
+    /// value-space, full magnitude, no gamma. Zero when the walk crosses no
+    /// BN with nonzero radii, keeping every non-BN row bit-identical.
+    model_abs: f64,
 }
 
 impl RowWalk {
@@ -535,6 +621,7 @@ impl RowWalk {
             env_units: 0.0,
             n_acc: 0,
             poisoned: false,
+            model_abs: 0.0,
         }
     }
 
@@ -667,7 +754,11 @@ fn certified_row_lower(
     }
     walk.n_acc += ctx.input_lo.len() + 16;
 
-    if !sum_l.is_finite() || !s_conc.is_finite() || !walk.env_units.is_finite() {
+    if !sum_l.is_finite()
+        || !s_conc.is_finite()
+        || !walk.env_units.is_finite()
+        || !walk.model_abs.is_finite()
+    {
         return Ok(f64::NEG_INFINITY);
     }
 
@@ -691,7 +782,16 @@ fn certified_row_lower(
     let env_base = walk.env_units + walk.bias_abs + s_conc;
     let rel = (2.0 * gamma).clamp(2.0 * UNIT, 0.25);
     let env = certify_up(gamma * env_base, rel);
-    let l_cert = next_down(sum_l - env);
+    let mut l_cert = next_down(sum_l - env);
+    // FIX B1 (#cgan-f64-tail): BatchNorm precompute (MODEL) errors are charged
+    // ABSOLUTELY — full magnitude, value-space, never through gamma. The
+    // `certify_up(·, rel)` widening covers the RN under-statement of the
+    // nonneg accumulation itself (Higham §3.5, same argument as `env`).
+    // `model_abs == 0.0` (every non-BN graph) leaves `l_cert` bit-identical.
+    if walk.model_abs > 0.0 {
+        let model = certify_up(walk.model_abs, rel);
+        l_cert = next_down(l_cert - model);
+    }
     if l_cert.is_nan() {
         return Ok(f64::NEG_INFINITY);
     }
@@ -1105,6 +1205,213 @@ fn backward_node_inner(
                             }
                         }
                     }
+                }
+            }
+            walk.push(ctx, parent, back_a, back_s)
+        }
+
+        // #cgan-f64-tail step B1: one-row ConvTranspose2d backward in f64.
+        // The forward is the scatter
+        //   y[oc, iy*sh + ki - ph, ix*sw + kj - pw] += x[ic, iy, ix]·K[ic,oc,ki,kj]
+        // (reference loop `ops_transpose_fwd.rs`, dilation 1 — non-unit
+        // dilation declines in the support gate AND here), so the backward for
+        // one output coefficient gathers every (ic, iy, ix, ki, kj) with
+        // `iy·sh + ki - ph == oy` — i.e. `ty = oy + ph - ki` must be a
+        // nonnegative multiple of `sh` with `iy = ty/sh < in_h` (mirrored for
+        // x). Same certified-envelope accounting as the Conv2d arm: signed row
+        // through K, ABS shadow through |K|, bias per output coefficient.
+        // `output_padding` only changes `out_h/out_w` (it adds high-edge
+        // positions; whether such a position receives taps falls out of the
+        // same gather test) — the shape check below is what an arm that
+        // dropped it would fail (teeth: point-box exactness oracle).
+        Layer::ConvTranspose2d(conv) => {
+            let parent = unary()?;
+            let p_width = ctx.width_of(parent)?;
+            if conv.dilation != (1, 1) {
+                return Err(Decline);
+            }
+            let ks = conv.kernel.shape();
+            if ks.len() != 4 {
+                return Err(Decline);
+            }
+            // ONNX ConvTranspose kernel layout: (in_c, out_c, kh, kw) —
+            // NOT Conv2d's (out_c, in_c/g, kh, kw) (`conv2d/types.rs:1158`).
+            let (in_c, out_c, kh, kw) = (ks[0], ks[1], ks[2], ks[3]);
+            // Input spatial dims: the layer's own `input_shape` when baked,
+            // else DERIVED from the parent's anchored shape (the loader
+            // leaves DAG ConvTranspose `input_shape` as `None` — measured).
+            // Accepted parent layouts: [C,H,W] or [1,C,H,W] with C == in_c;
+            // the `p_width == in_c*ihw` check below re-validates whichever
+            // source supplied the dims (fail-closed on any disagreement).
+            let (in_h, in_w) = match conv.input_shape {
+                Some(hw) => hw,
+                None => {
+                    let ps = ctx.shape_of(parent)?;
+                    let r = ps.len();
+                    if r < 3
+                        || ps[r - 3] != in_c
+                        || (r > 3 && ps[..r - 3].iter().product::<usize>() != 1)
+                    {
+                        return Err(Decline);
+                    }
+                    (ps[r - 2], ps[r - 1])
+                }
+            };
+            let (sh, sw) = conv.stride;
+            let (ph, pw) = conv.padding;
+            let (oph, opw) = conv.output_padding;
+            if sh == 0 || sw == 0 || oph >= sh || opw >= sw {
+                return Err(Decline);
+            }
+            // out = (in-1)·stride + kernel + output_padding − 2·padding
+            // (dilation 1; matches `conv2d_transpose_forward`'s expanded−2p).
+            let out_h = in_h
+                .checked_sub(1)
+                .and_then(|v| v.checked_mul(sh))
+                .and_then(|v| v.checked_add(kh))
+                .and_then(|v| v.checked_add(oph))
+                .and_then(|v| v.checked_sub(2 * ph))
+                .ok_or(Decline)?;
+            let out_w = in_w
+                .checked_sub(1)
+                .and_then(|v| v.checked_mul(sw))
+                .and_then(|v| v.checked_add(kw))
+                .and_then(|v| v.checked_add(opw))
+                .and_then(|v| v.checked_sub(2 * pw))
+                .ok_or(Decline)?;
+            let ohw = out_h * out_w;
+            let ihw = in_h * in_w;
+            if out_h == 0 || out_w == 0 || width != out_c * ohw || p_width != in_c * ihw {
+                return Err(Decline);
+            }
+
+            let mut back_a = vec![0.0f64; p_width];
+            let mut back_s = vec![0.0f64; p_width];
+            for oc in 0..out_c {
+                for oy in 0..out_h {
+                    for ox in 0..out_w {
+                        let o = oc * ohw + oy * out_w + ox;
+                        let (ai, si) = (a[o], s[o]);
+                        if ai == 0.0 && si == 0.0 {
+                            continue;
+                        }
+                        for ki in 0..kh {
+                            let ty = oy as isize + ph as isize - ki as isize;
+                            if ty < 0 {
+                                continue;
+                            }
+                            let ty = ty as usize;
+                            if !ty.is_multiple_of(sh) {
+                                continue;
+                            }
+                            let iy = ty / sh;
+                            if iy >= in_h {
+                                continue;
+                            }
+                            for kj in 0..kw {
+                                let tx = ox as isize + pw as isize - kj as isize;
+                                if tx < 0 {
+                                    continue;
+                                }
+                                let tx = tx as usize;
+                                if !tx.is_multiple_of(sw) {
+                                    continue;
+                                }
+                                let ix = tx / sw;
+                                if ix >= in_w {
+                                    continue;
+                                }
+                                for ic in 0..in_c {
+                                    let w = f64::from(conv.kernel[[ic, oc, ki, kj]]);
+                                    if !w.is_finite() {
+                                        walk.poisoned = true;
+                                        return Ok(());
+                                    }
+                                    let idx = ic * ihw + iy * in_w + ix;
+                                    back_a[idx] += ai * w;
+                                    back_s[idx] += si * w.abs();
+                                }
+                            }
+                        }
+                        if let Some(bias) = conv.bias.as_ref() {
+                            let bb = f64::from(bias[oc]);
+                            if !bb.is_finite() {
+                                walk.poisoned = true;
+                                return Ok(());
+                            }
+                            walk.add_bias(ai, si, bb);
+                        }
+                    }
+                }
+            }
+            walk.push(ctx, parent, back_a, back_s)
+        }
+
+        // #cgan-f64-tail step B2: BatchNorm backward — exact channel affine
+        // `y = scale·x + bias` on the STORED f32 parameters (exact in f64),
+        // PLUS the certified precompute-error charge against the REAL affine
+        // (FIX B1): the model deviation `|scale−scale_real| <= scale_err`,
+        // `|bias−bias_real| <= bias_err` is charged into the ABSOLUTE
+        // `model_abs` accumulator, weighted by the BN INPUT's certified
+        // anchor range — NOT into the gamma-scaled shadow (an ~1e11
+        // under-charge at the knife edge). Channel layout resolves through the
+        // authenticated `expanded_affine_parameters` helper (the shape-aware
+        // source of truth; duplicating its heuristic here could pick the
+        // batch axis).
+        Layer::BatchNorm(bn) => {
+            let parent = unary()?;
+            if ctx.width_of(parent)? != width {
+                return Err(Decline);
+            }
+            let out_shape = ctx.shape_of(name)?.to_vec();
+            let Ok((scale, bias, scale_err, bias_err)) =
+                bn.expanded_affine_parameters(&out_shape, width)
+            else {
+                return Err(Decline);
+            };
+            if scale.len() != width {
+                return Err(Decline);
+            }
+            let (pl, pu) = ctx.anchor_of(parent)?;
+            if pl.len() != width {
+                return Err(Decline);
+            }
+            let mut back_a = vec![0.0f64; width];
+            let mut back_s = vec![0.0f64; width];
+            for j in 0..width {
+                let (aj, sj) = (a[j], s[j]);
+                if aj == 0.0 && sj == 0.0 {
+                    continue;
+                }
+                let sc = f64::from(scale[j]);
+                let bb = f64::from(bias[j]);
+                let es = f64::from(scale_err[j]);
+                let eb = f64::from(bias_err[j]);
+                // `neg_cmp_op_on_partial_ord` is allowed deliberately: the
+                // negated form is the point. `!(es >= 0.0)` rejects NaN, which
+                // is exactly the value this guard exists to catch; the lint's
+                // suggested `es < 0.0` is FALSE for NaN and would let a poisoned
+                // error term through into the bound. Only the two error terms
+                // use it — the scale and bias go through `is_finite`.
+                #[allow(clippy::neg_cmp_op_on_partial_ord)]
+                if !sc.is_finite() || !bb.is_finite() || !(es >= 0.0) || !(eb >= 0.0) {
+                    walk.poisoned = true;
+                    return Ok(());
+                }
+                back_a[j] = aj * sc;
+                back_s[j] = sj * sc.abs();
+                walk.add_bias(aj, sj, bb);
+                if es > 0.0 || eb > 0.0 {
+                    let (l, u) = (pl[j], pu[j]);
+                    if !l.is_finite() || !u.is_finite() {
+                        walk.poisoned = true;
+                        return Ok(());
+                    }
+                    // |Σ_j a_j·(s̃_j−s_j)·x_j + a_j·(b̃_j−b_j)|
+                    //   <= Σ_j |a_j|·(scale_err_j·max(|l_j|,|u_j|) + bias_err_j)
+                    // for every real affine in the certified radii; s_j >= |a_j|
+                    // by the shadow invariant, so charging s_j is conservative.
+                    walk.model_abs += sj * (es * l.abs().max(u.abs()) + eb);
                 }
             }
             walk.push(ctx, parent, back_a, back_s)

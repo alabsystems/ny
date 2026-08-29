@@ -1162,7 +1162,7 @@ fn main() {
         let ent = entailment_to_json(&entailment)?;
         std::fs::write(
             format!("{out_dir}/entailment.json"),
-            serde_json::to_string(&ent).unwrap(),
+            ny_cert::json::to_string(&ent),
         )
         .unwrap();
         Ok(())
@@ -1230,7 +1230,7 @@ fn main() {
             let far = farkas_to_json(&farkas)?;
             std::fs::write(
                 format!("{out_dir}/farkas.json"),
-                serde_json::to_string(&far).unwrap(),
+                ny_cert::json::to_string(&far),
             )
             .unwrap();
             Ok(())

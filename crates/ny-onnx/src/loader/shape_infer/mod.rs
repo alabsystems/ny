@@ -75,7 +75,7 @@ fn normalize_model_for_ort(model: &mut onnx_proto::ModelProto) {
 fn create_ort_session_from_memory_with_timeout(bytes: Vec<u8>) -> Result<Session> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = Session::builder()
+        let result = crate::runtime::session_builder()
             .map_err(|e| NyError::ModelLoad(format!("ONNX Runtime init failed: {e}")))
             .and_then(|mut builder| {
                 builder.commit_from_memory(&bytes).map_err(|e| {
@@ -112,7 +112,7 @@ fn create_ort_session_from_memory_with_timeout(bytes: Vec<u8>) -> Result<Session
 fn create_ort_session_from_file_with_timeout(path: std::path::PathBuf) -> Result<Session> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = Session::builder()
+        let result = crate::runtime::session_builder()
             .map_err(|e| NyError::ModelLoad(format!("ONNX Runtime init failed: {e}")))
             .and_then(|mut builder| {
                 builder.commit_from_file(&path).map_err(|e| {

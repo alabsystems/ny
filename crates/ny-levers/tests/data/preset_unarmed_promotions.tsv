@@ -1,0 +1,156 @@
+# PRESET UNARMED-PROMOTION FRONTIER — typed preset keys that exist, are
+# delivered, and that NO shipped yaml sets.
+#
+# Columns:  preset-key <TAB> NY_* axis name <TAB> count <TAB> registry class <TAB> note
+#
+# PROMOTION IS NOT ARMING. A typed preset key makes a mechanism DELIVERABLE on a
+# scored run; it does not put a value down the wire. `margin_row.tableau_f32`
+# was implemented, correct, declared, bridged, reachability-pinned — and set by
+# no yaml at all, so it was worth exactly zero in competition until somebody
+# happened to look. It is now armed by `configs/vnncomp25/tinyimagenet_2024.yaml`
+# and is therefore absent from this file. Everything below is in the state
+# tableau_f32 was in.
+#
+# That is deliberate for most of these: `reachability_ratchet.rs` took the
+# env-only debt to zero by PROMOTING levers in bulk, and the batch was required
+# to be byte-identical on every scored run, so every promoted key had to ship
+# unarmed. This file is the receipt for that promise AND the standing list of
+# built capability nobody is using.
+#
+# Adding a promotion adds a line here (one line, deliberate). Arming a key
+# REMOVES its line, in the commit that carries the measurement justifying it.
+# SCOPE: this census iterates `ny_levers::space::axes()` — the SEARCHABLE list
+# only. Eight axes in `UNSAFE_AXES` also carry `Deliver::PresetKey` (the
+# margin_row reserve/release/thread family among them) and are deliberately
+# absent here: an unsafe axis is excluded from search by design, so its
+# unarmed state is not debt. A text scan of space.rs that sweeps every
+# `Axis {}` block counts them anyway and inflates this file by exactly 8 —
+# that happened once, on 2026-08-27, and the ratchet's STALE rows caught it.
+# Regenerate this file ONLY from the ratchet's own failure output, never from
+# an out-of-band parse of space.rs.
+#
+# The registry class column is re-checked against `ny_levers::space::axes()` on
+# every run, so a quiet reclassification out of `verdict-affecting` fails too.
+attack.bnn_attack_cap_secs	NY_BNN_ATTACK_CAP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.bnn_attack_fraction	NY_BNN_ATTACK_FRAC	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.bnn_sign_space_minimal_move	NY_BNN_SIGN_SPACE_MINIMAL_MOVE	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.bnn_sign_space_trust_region	NY_BNN_SIGN_SPACE_TRUST_REGION	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.falsify_portfolio	NY_FALSIFY_PORTFOLIO	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.falsify_portfolio_secs	NY_FALSIFY_PORTFOLIO_SECONDS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.lane_budget_allocator	NY_LANE_BUDGET_ALLOCATOR	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.lane_budget_frame	NY_LANE_BUDGET_FRAME	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.lane_value_scheduler	NY_LANE_VALUE_SCHEDULER	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_exact_batched	NY_PGD_EXACT_BATCHED	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_exploit	NY_PGD_EXPLOIT	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_fast_grad	NY_PGD_FAST_GRAD	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_hinge_tau	NY_PGD_HINGE_TAU	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_lane_window	NY_PGD_LANE_WINDOW	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_legacy_lanes	NY_PGD_LEGACY_LANES	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_odi_eta	NY_PGD_ODI_ETA	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_odi_steps	NY_PGD_ODI_STEPS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_vjp_batch	NY_PGD_VJP_BATCH	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_vjp_k	NY_PGD_VJP_K	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pgd_vjp_steps	NY_PGD_VJP_STEPS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.pre_softmax_objective	NY_ATTACK_PRE_SOFTMAX_OBJECTIVE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.upfront_attack_auto_cap_secs	NY_UPFRONT_ATTACK_AUTO_CAP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.upfront_attack_cap_secs	NY_UPFRONT_ATTACK_CAP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+attack.upfront_attack_fraction	NY_UPFRONT_ATTACK_FRAC	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.alpha_crown.alpha_zero_yield_frac	NY_ALPHA_ZERO_YIELD_FRAC	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.bab_resnet_wide	NY_BAB_RESNET_WIDE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.bab_resnet_wide_subgroup	NY_BAB_RESNET_WIDE_SUBGROUP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.bn_gpu_extract	NY_BN_GPU_EXTRACT	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.branching.input_split.nested_deadline	NY_INPUT_SPLIT_NESTED_DEADLINE	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.cgan_polish	NY_CGAN_POLISH	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.cgan_stacked_backward	NY_CGAN_STACKED_BACKWARD	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.cgan_stacked_budget_mb	NY_CGAN_STACKED_BUDGET_MB	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.clip_host_mean_la	NY_CLIP_HOST_MEAN_LA	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.clip_interm_certified	NY_CLIP_INTERM_CERTIFIED	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.conv_ibp_blocked	NY_CONV_IBP_BLOCKED	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.cpu_compute_engine	NY_CPU_COMPUTE_ENGINE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.crown_ibp_per_node_floor_secs	NY_PER_NODE_FLOOR_SECS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.crown_partial_finite_expiry	NY_CROWN_PARTIAL_FINITE_EXPIRY	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.graph_mip_leaf_sat	NY_GRAPH_MIP_LEAF_SAT	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.kfsb_sim_share	NY_KFSB_SIM_SHARE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.mo_alpha_heuristic	NY_MO_ALPHA_HEURISTIC	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.mo_alpha_step	NY_MO_ALPHA_STEP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.mo_beta_spsa	NY_MO_BETA_SPSA	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.mo_gpu_chunk_deadline	NY_MO_GPU_CHUNK_DEADLINE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.nn4sys_ctx_group	NY_NN4SYS_CTX_GROUP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.no_walk_record_admission	NY_NO_WALK_RECORD_ADMISSION	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.patches_finite_expiry	NY_PATCHES_FINITE_EXPIRY	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.phase_budget.post_bab_reserve_secs	NY_POSTBAB_RESERVE_SECS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.pollable_faer	NY_POLLABLE_FAER	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.resnet_err_concretize	NY_RESNET_ERR_CONCRETIZE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.resnet_err_concretize_fine	NY_RESNET_ERR_CONCRETIZE_FINE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_alpha_frac	NY_ROOT_ALPHA_FRAC	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_bab_reserve_frac	NY_BAB_RESERVE_FRAC	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_comprehensive_gpu_interm_rows	NY_ROOT_COMP_GPU_INTERM_ROWS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_comprehensive_gpu_interm_secs	NY_ROOT_COMP_GPU_INTERM_SECS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_cpu_parallel_interm_crown	NY_ROOT_CPU_PARALLEL_INTERM_CROWN	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha	NY_ROOT_JOINT_INTERM_ALPHA	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha_deadline_ascent	NY_ROOT_JOINT_INTERM_ALPHA_DEADLINE_ASCENT	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha_frozen_stop	NY_ROOT_JOINT_INTERM_ALPHA_FROZEN_STOP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha_iters	NY_ROOT_JOINT_INTERM_ALPHA_ITERS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha_lr	NY_ROOT_JOINT_INTERM_ALPHA_LR	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha_max_dim	NY_ROOT_JOINT_INTERM_ALPHA_MAX_DIM	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha_max_sel	NY_ROOT_JOINT_INTERM_ALPHA_MAX_SEL	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha_pure_chain	NY_ROOT_JOINT_INTERM_ALPHA_PURE_CHAIN	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_interm_alpha_secs	NY_ROOT_JOINT_INTERM_ALPHA_SECS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_joint_min_remaining_secs	NY_ROOT_JOINT_MIN_REMAINING_SECS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_objective_directed_rows	NY_ROOT_OBJECTIVE_DIRECTED_ROWS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_phase_resident_crown	NY_ROOT_PHASE_RESIDENT_CROWN	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_spec_frac	NY_ROOT_SPEC_FRAC	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.root_wide_demanded_interm_crown	NY_ROOT_WIDE_DEMANDED_INTERM_CROWN	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.safenlp_mip_cycle	NY_SAFENLP_MIP_CYCLE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.seq_weighted_budget	NY_SEQ_WEIGHTED_BUDGET	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.sweep_class_mib	NY_SWEEP_CLASS_MIB	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.sweep_class_rows	NY_SWEEP_CLASS_ROWS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+bab.true_grad_gpu_replay	NY_TRUE_GRAD_GPU_REPLAY	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.alpha_cols	NY_MARGIN_ROW_ALPHA_COLS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.alpha_guard	NY_MARGIN_ROW_ALPHA_GUARD	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.alpha_iters	NY_MARGIN_ROW_ALPHA_ITERS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.alpha_lr	NY_MARGIN_ROW_ALPHA_LR	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.alpha_secs	NY_MARGIN_ROW_ALPHA_SECS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.beta	NY_MARGIN_ROW_BETA	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.beta_columns	NY_MARGIN_ROW_BETA_COLS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.beta_eta	NY_MARGIN_ROW_BETA_ETA	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.beta_heads	NY_MARGIN_ROW_BETA_HEADS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.beta_iters	NY_MARGIN_ROW_BETA_ITERS	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.beta_lambda	NY_MARGIN_ROW_BETA_LAMBDA	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.beta_per_column	NY_MARGIN_ROW_BETA_PERCOL	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.beta_polyak	NY_MARGIN_ROW_BETA_POLYAK	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.bi_chunk	NY_MARGIN_ROW_BI_CHUNK	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.bi_chunk_secs	NY_MARGIN_ROW_BI_CHUNK_SECS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.bi_topk	NY_MARGIN_ROW_BI_TOPK	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.branch_reduce_max	NY_MARGIN_ROW_BRANCH_REDUCE_MAX	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.clip	NY_MARGIN_ROW_CLIP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.clip_interm	NY_MARGIN_ROW_CLIP_INTERM	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.clip_rows	NY_MARGIN_ROW_CLIP_ROWS	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.clip_topk	NY_MARGIN_ROW_CLIP_TOPK	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.closure_adaptive	NY_MARGIN_ROW_CLOSURE_ADAPTIVE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.closure_max_tier	NY_MARGIN_ROW_CLOSURE_MAX_TIER	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.closure_thresh	NY_MARGIN_ROW_CLOSURE_THRESH	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.closure_warmup	NY_MARGIN_ROW_CLOSURE_WARMUP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.closure_window	NY_MARGIN_ROW_CLOSURE_WINDOW	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.column_retire	NY_MARGIN_ROW_COL_RETIRE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.domain_alpha	NY_MARGIN_ROW_DOMAIN_ALPHA	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.domain_alpha_eta	NY_MARGIN_ROW_DOMAIN_ALPHA_ETA	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.domain_alpha_gap	NY_MARGIN_ROW_DOMAIN_ALPHA_GAP	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default (0 = unlimited, the unscheduled baseline arm) on every scored run.
+margin_row.domain_alpha_iters	NY_MARGIN_ROW_DOMAIN_ALPHA_ITERS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.domain_alpha_min_depth	NY_MARGIN_ROW_DOMAIN_ALPHA_MIN_DEPTH	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default (0, the unscheduled baseline arm) on every scored run.
+margin_row.domain_alpha_stride	NY_MARGIN_ROW_DOMAIN_ALPHA_STRIDE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default (1, the unscheduled baseline arm) on every scored run.
+margin_row.epoch_attempts	NY_EPOCH_ATTEMPTS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.epoch_depth	NY_EPOCH_DEPTH	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.epoch_retain	NY_EPOCH_RETAIN	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.epoch_tier0	NY_EPOCH_TIER0	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.epoch_universe	NY_EPOCH_UNIVERSE	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.gpu	NY_MARGIN_ROW_GPU	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.gpu_backward	NY_MARGIN_ROW_GPU_BACKWARD	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.gpu_batch	NY_MARGIN_ROW_GPU_BATCH	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.k_adaptive	NY_MARGIN_ROW_K_ADAPT	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.lru	NY_MARGIN_ROW_LRU	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.parallel	NY_MARGIN_ROW_PARALLEL	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.parallel_prebuild	NY_MARGIN_ROW_PARALLEL_PREBUILD	1	safe-to-search	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.rebake	NY_MARGIN_ROW_REBAKE	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.rebake_rounds	NY_MARGIN_ROW_REBAKE_ROUNDS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.
+margin_row.rebake_secs	NY_MARGIN_ROW_REBAKE_SECS	1	verdict-affecting	promoted and deliverable; no shipped yaml sets this key, so the mechanism resolves at its declaration default on every scored run.

@@ -109,6 +109,14 @@ pub struct ParamSpace {
     /// Free-dimension ceiling. **Per strategy, never shared** — letting the LP
     /// lane inherit the STE lane's 32768 free-unit cap took
     /// `model_30_idx_1703_eps_15` from 1.3 s to 139.4 s for 0 accepted flips.
+    ///
+    /// Read at BOTH seams (#falsify-ceiling-authority): `admit` refuses a spec
+    /// above the strategy's own constant, and each `search` re-checks the box
+    /// it is actually handed against THIS value before spending an oracle call.
+    /// The second read is what makes a NARROWED per-slice ceiling bind; without
+    /// it the field was threaded all the way into [`crate::Budget`] and
+    /// consulted by nobody, so only the private constant ever applied — the same
+    /// unconsulted-state shape as the regression quoted above.
     pub free_dims_ceiling: usize,
     /// Hard cap on points this strategy may construct.
     pub max_points: usize,

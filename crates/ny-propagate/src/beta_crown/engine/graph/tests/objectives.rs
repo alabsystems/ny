@@ -978,6 +978,7 @@ fn test_multi_objective_beta_opt_past_deadline_bails_promptly_3109() {
         &mut beta_state,
         &targets,
         false,
+        false, // relu_split_route: pinned stored-alpha behavior
         &seed_caches,
         false,
     );
@@ -1218,6 +1219,7 @@ fn test_multi_objective_beta_baseline_only_returns_standard_and_skips_gradient_p
                 &mut returned_beta,
                 &targets,
                 false,
+                false, // relu_split_route: pinned stored-alpha behavior
                 &seed_caches,
                 true,
             )
@@ -1289,6 +1291,7 @@ fn test_multi_objective_beta_baseline_only_returns_standard_and_skips_gradient_p
                 &mut control_beta,
                 &targets,
                 false,
+                false, // relu_split_route: pinned stored-alpha behavior
                 &seed_caches,
                 false,
             )

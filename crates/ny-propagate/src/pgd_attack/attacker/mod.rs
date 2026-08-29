@@ -23,6 +23,7 @@ use ny_core::{GemmEngine, GpuIbpModelPlan, NyError, Result};
 use ny_tensor::BoundedTensor;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use super::config::PgdConfig;
@@ -145,6 +146,10 @@ pub struct PgdAttacker<'a> {
     /// `engine` wrapped in [`FastMathEngine`]; what the eval paths actually use.
     fast_engine: Option<FastMathEngine<'a>>,
     model_plan: Mutex<Option<CachedGpuIbpPlanEntry>>,
+    /// Latched only when an attack loop itself polls an expired deadline.
+    /// Callers use this as strict timeout provenance; merely returning after a
+    /// deadline without observing it does not set the latch.
+    deadline_exhausted: AtomicBool,
 }
 
 impl PgdAttacker<'static> {
@@ -155,6 +160,7 @@ impl PgdAttacker<'static> {
             engine: None,
             fast_engine: None,
             model_plan: Mutex::new(None),
+            deadline_exhausted: AtomicBool::new(false),
         }
     }
 }
@@ -167,6 +173,7 @@ impl<'a> PgdAttacker<'a> {
             engine,
             fast_engine: engine.map(FastMathEngine),
             model_plan: Mutex::new(None),
+            deadline_exhausted: AtomicBool::new(false),
         }
     }
 
@@ -188,6 +195,20 @@ impl<'a> PgdAttacker<'a> {
     /// Access the configuration.
     pub(super) fn config(&self) -> &PgdConfig {
         &self.config
+    }
+
+    /// Poll the configured deadline and latch an exact observation of expiry.
+    pub(super) fn past_deadline(&self) -> bool {
+        let exhausted = self.config.past_deadline();
+        if exhausted {
+            self.deadline_exhausted.store(true, Ordering::Relaxed);
+        }
+        exhausted
+    }
+
+    /// Whether this attacker actually observed its deadline as expired.
+    pub(crate) fn deadline_exhausted(&self) -> bool {
+        self.deadline_exhausted.load(Ordering::Relaxed)
     }
 
     /// Create a seeded RNG for a restart.

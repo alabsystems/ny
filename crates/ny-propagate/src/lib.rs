@@ -51,18 +51,29 @@ pub(crate) mod batched_constraint_store;
 /// at the crate root for convenience. Internal arithmetic helpers (`safe_add_for_bounds`,
 /// `interval_mul_for_bounds`, etc.) are accessible here for verification proofs.
 pub mod bounds;
+/// #cgan-reclaim gate (docs/CGAN_BUDGET_RECLAIM_2026-08-20.md): one lever
+/// arming the cross-mode collection-cache serve, the crown-partial expiry
+/// retention pair, and the sequential CROWN-IBP expiry salvage together.
+pub(crate) mod cgan_reclaim;
+/// #cgan-reclaim typed preset bridge. `run_instance.sh` exports no
+/// `NY_*`, so the env half of the gate cannot fire in competition; this is the
+/// only production admission path for the set.
+pub use cgan_reclaim::set_cgan_reclaim_preset;
 pub(crate) mod clip_interm_domain;
 /// NaN-safe comparison utilities for f32 sorting (#2981 Slice 3).
 pub(crate) mod cmp_utils;
 pub(crate) mod complete_clip;
 /// Multi-network bound composition for system-level verification (#3517).
 pub mod composition;
+pub(crate) mod crown_backward_cap;
 /// Domain clipping strategies and configuration for tightening input bounds.
 /// Certified sparse-input double-double zonotope forward pass (`#dd-zonotope`).
 pub mod dd_zonotope;
 pub mod domain_clip;
 pub mod faer_parallelism;
 pub(crate) mod invprop;
+pub(crate) mod joint_bilinear;
+pub use joint_bilinear::set_joint_bilinear_preset;
 pub(crate) mod l2_lever_gate;
 pub(crate) mod relaxed_clip;
 pub(crate) mod sdp_crown;
@@ -133,6 +144,12 @@ pub(crate) mod pgd_attack;
 pub(crate) mod phase_telemetry;
 /// Convenient re-exports of commonly used types.
 pub mod prelude;
+/// #lever-reachability: the TYPED PRESET ROUTE for this crate's
+/// verdict-affecting gates. `run_instance.sh` exports no `NY_*`, so an
+/// env-only gate is dead code on a scored run; each cell here is the delivery
+/// half of one promoted lever. Empty cells resolve exactly as before, so a
+/// build that ships no preset key is byte-identical.
+pub mod preset_gates;
 /// Probabilistic bounds via Monte Carlo sampling with CROWN certificates (#3921).
 pub mod probabilistic;
 mod random;
@@ -176,7 +193,8 @@ pub use batched_constraint_store::BatchedConstraintBuffer;
 pub use beta_crown::{
     reset_bab_frontier_export, take_bab_frontier_seeds, BabFrontierSeed, BabVerificationStatus,
     BatchedSpecBackwardResult, BetaCrownConfig, BetaCrownResult, BetaCrownVerifier,
-    BranchingHeuristic, ConjunctiveProofObjectiveProvenance, ConjunctiveProofObjectives, ConvMode,
+    BranchingHeuristic, ChildBoundCalibrationConfig, ConjunctiveProofObjectiveProvenance,
+    ConjunctiveProofObjectives, ConvMode,
     DenseSpecReboundMode, DenseSpecStageTiming, DepthTwoBranchLookaheadConfig,
     DepthTwoBranchLookaheadMode, DomainSpecCrownResult, GraphDomainBatchCallerLane,
     GraphDomainBatchMetricsSink, GraphDomainBatchRecord, GraphPrecomputedBounds, InputClipType,
@@ -354,9 +372,9 @@ pub(crate) use layers::*;
 pub(crate) use network::AttentionGraphBuilder;
 pub use pgd_attack::gama;
 pub use pgd_attack::{
-    auto_alpha, project_to_bounds, project_to_bounds_in_place, AdamClippingParams, PgdAlphaMode,
-    PgdAttacker, PgdConfig, PgdInitialization, PgdOptimizer, PgdResult, PgdStepState,
-    GAMA_LAMBDA_DEFAULT,
+    auto_alpha, project_to_bounds, project_to_bounds_in_place, AdamClippingParams,
+    ExactVjpPgdConfig, PgdAlphaMode, PgdAttacker, PgdConfig, PgdInitialization, PgdOptimizer,
+    PgdResult, PgdStepState, GAMA_LAMBDA_DEFAULT,
 };
 pub use sound_gpu_gate::{is_sound_gpu_crown_required, set_sound_gpu_crown_required};
 #[allow(unused_imports)]

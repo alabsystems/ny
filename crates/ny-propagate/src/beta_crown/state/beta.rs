@@ -173,6 +173,39 @@ impl BetaState {
         Ok(Self::from_parts(entries, None))
     }
 
+    /// [`Self::from_history`] warm-started from the PARENT domain's optimized
+    /// β values (#bab-warm-start, the verified=0 root-cause fix of 2026-08-21).
+    ///
+    /// Every inherited constraint keeps the β the parent's joint optimizer
+    /// reached; only the NEW split constraint starts at 0.0. Cold-starting all
+    /// entries (the historical behavior) threw the accumulated Lagrangian
+    /// strength away at every split — with plain SGD at `lr_beta = 0.01` and
+    /// 15 iterations per child, β could never accumulate down the tree, so
+    /// per-domain bounds hovered at root quality regardless of depth (measured
+    /// on `mnist_fc 256x4`: ZERO domains verified at depth 22-31).
+    ///
+    /// SOUNDNESS: β initialization only chooses the optimizer's starting
+    /// point. Every β ≥ 0 yields a valid Lagrangian relaxation bound, and the
+    /// optimization loop keeps its best-of-iterations; sign is re-derived from
+    /// the constraint direction exactly as in `from_history`. Optimizer
+    /// side-state (`slow_weights`) is deliberately NOT carried: it maps 1:1 to
+    /// entry order and is rebuilt lazily.
+    pub fn from_history_warm(history: &SplitHistory, parent: &Self) -> Result<Self> {
+        let entries = history
+            .constraints
+            .iter()
+            .map(|c| {
+                let sign = if c.is_active { 1.0 } else { -1.0 };
+                let value = parent
+                    .entry_index
+                    .get(&(c.layer_idx, c.neuron_idx))
+                    .map_or(0.0, |&idx| parent.entries[idx].value);
+                BetaEntry::new(c.layer_idx, c.neuron_idx, value, sign)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self::from_parts(entries, None))
+    }
+
     fn from_parts(entries: Vec<BetaEntry>, slow_weights: Option<Vec<f32>>) -> Self {
         let mut state = Self {
             entries,

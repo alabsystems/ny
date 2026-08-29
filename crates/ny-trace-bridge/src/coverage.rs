@@ -40,18 +40,80 @@
 //!   (never an identity) — verification succeeds only if nothing downstream
 //!   depends on that value.
 //! - [`BridgeSoundness::Unsupported`] — the op's output *shape, routing, or
-//!   source-coordinate mapping* depends on tensor **values** (`Topk`,
-//!   `Argmax`/`Argmin`, `ArgSort`, `Scatter*`, `IndexPut`, `MoeGating`,
-//!   `WhereCond`, resampling), required semantics are absent from the wire
-//!   format (`ToDtype` source dtype, `RepeatInterleave` counts), or no current
-//!   lowering preserves them (`Fract`, general `Powf`).
-//!   The bridge must **refuse** these rather than emit a vacuous/incorrect
-//!   layer (sound by construction); they are handled by graph segmentation
-//!   upstream, not by direct translation.
+//!   source-coordinate mapping* depends on tensor **values** (`Scatter`,
+//!   `IndexPut`, `MoeGating`, `GridSample` — though the last three rows below
+//!   spell out why two of those are context-free residues and one is not),
+//!   required semantics are absent from
+//!   the *serialized op itself*, or no current lowering preserves them. The
+//!   bridge must **refuse** these rather than emit a vacuous/incorrect layer
+//!   (sound by construction); they are handled by graph segmentation
+//!   upstream, not by direct translation. The two "absent semantics" rows are
+//!   worth spelling out, because neither is a claim that the op is
+//!   intrinsically unlowerable:
+//!
+//!   - `ToDtype` — the *source* dtype is not part of the op, so this
+//!     context-free taxonomy cannot tell a lowerable cast from a lossy one
+//!     and keeps the whole variant `Unsupported`. `translate` is not
+//!     context-free: it resolves the producer's recorded dtype
+//!     graph-contextually and lowers three families — the exact
+//!     `F32 -> F32` identity, the lossless `U8`/`Bool -> F32` embedding, and
+//!     `F32 -> I32`/`I64` as the guarded round-toward-zero `Trunc` (the same
+//!     layer ny-onnx emits for the identical ONNX `Cast`, carrying a
+//!     finite/in-range proof obligation) — refusing every other resolved
+//!     combination.
+//!   - `Scatter` and `IndexPut` — both *overwrite*, so their duplicate
+//!     destinations are last-writer-nondeterministic and a sound lowering must
+//!     enclose the union of the candidate writes, which requires knowing which
+//!     destinations collide. That is a property of the INDEX OPERAND rather
+//!     than of the variant, so this context-free taxonomy has to assume the
+//!     runtime case and keeps both variants `Unsupported`. `translate` lowers a
+//!     translate-time-constant index to `ScatterND` — whose duplicate min/max
+//!     combine IS that union — and refuses only the runtime index. (They differ
+//!     only in the index's shape: `Scatter`'s names a destination per element,
+//!     `IndexPut`'s is 1-D and names one per slice.) Their additive siblings
+//!     `ScatterAdd` / `IndexAdd` are NOT in this bucket: accumulation is
+//!     order-independent and has a sound rule for runtime indices too, so they
+//!     classify `SoundButLoose`.
+//!   - `GridSample` — refused twice over, which is why it is not merely the
+//!     "value-dependent coordinates" row it looks like. A runtime grid is the
+//!     structural case (the output-to-input map is a runtime value). A
+//!     translate-time-CONSTANT grid is refused as well, on arithmetic grounds:
+//!     grid sampling is not separable, so a constant resampling matrix must
+//!     fold `fl(cy * cx)` into one coefficient where nn's kernel evaluates
+//!     `fl(fl(v * cy) * cx)` — up to 2 ULP apart, wider than the tightest sound
+//!     interval a `Linear` layer can produce for one product, so nn's own value
+//!     can fall outside the emitted bounds. Unlike `Scatter`/`IndexPut`, then,
+//!     this row is NOT a context-free residue: no operand context rescues it.
+//!     `ResizeBilinear` is lowered precisely because its per-axis
+//!     factorization lets the matrix carry nn's coefficients verbatim.
+//!
+//!   `Topk` used to be in this bucket, for the wire's missing `largest` /
+//!   `sorted` flags. It has LEFT: nn-core serializes both now, so the traced
+//!   values tensor names exactly one of the four functions and the taxonomy
+//!   classifies on the flags — `sorted = true` is exact (monotone order
+//!   statistics), `sorted = false` is sound-but-loose (the hull over the k
+//!   selected values). `translate` still emits only `largest && sorted`, the
+//!   one combination `TopkLayer` models, but the other three are now
+//!   MISSING-LAYER refusals rather than unreadable-wire refusals — hence
+//!   degradable.
+//!
+//!   `Powf` appears in this bucket only as a fail-closed RESIDUE: every
+//!   finite exponent within the f64->f32 narrowing cap classifies `Sound`
+//!   above, and only non-finite / beyond-cap exponents fall through.
 //!
 //! [`coverage`] reports the four buckets over a canonical const list of every
 //! variant's name, and the `tests` module asserts that list partitions all 123
 //! variants — pinning the catalogue against silent drift from the enum.
+//!
+//! ## Refusal classes
+//!
+//! The [`Unsupported`](BridgeSoundness::Unsupported) / everything-else split is
+//! also the line a PERMISSIVE translation must respect, so it is exposed
+//! directly as [`RefusalClass`] via [`refusal_class`]: an `Unsupported` op's
+//! refusal is a [`RefusalClass::Soundness`] refusal that stays hard in every
+//! mode, while a refusal of any other op is [`RefusalClass::Unported`] and may
+//! be degraded to the vacuous `OpaqueSkip` carrier when the caller opts in.
+//! See [`crate::translate::UnportedOpPolicy`].
 
 use serde::{Deserialize, Serialize};
 
@@ -124,6 +186,10 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::Cat { .. }
         | TraceOp::Expand { .. }
         | TraceOp::Flip { .. }
+        // Roll: chained per-(shift, dim) `2 x Slice(tail, head) + Concat`
+        // rotations, byte-matching nn's own narrow/narrow/cat evaluation
+        // (including the `((s % n) + n) % n` normalization and the
+        // size-0 / zero-shift skips). Pure reindexing => IBP is exact.
         | TraceOp::Roll { .. }
         | TraceOp::Unfold { .. }
         | TraceOp::SliceSet { .. }
@@ -139,6 +205,33 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::ConstantPadNd { .. }
         | TraceOp::Arange { .. }
         | TraceOp::Dropout
+        // RepeatInterleave: pure selection driven by TRANSLATE-TIME-CONSTANT
+        // counts (the wire records them as input 1, a ConstantWeight whose
+        // payload the translator reads). All-ones lowers to an `Add + 0`
+        // identity, a uniform count to Reshape+Tile+Reshape, and the general
+        // case to Slice-per-run + Concat — every one a pure reindexing, so
+        // IBP is exact. Like `Gather`, the CONDITIONAL refusals stay inside
+        // `translate` (absent or non-constant counts => data-dependent output
+        // shape; fan-in beyond the decomposition cap), which is exactly the
+        // narrower-than-taxonomy contract the module docs describe.
+        | TraceOp::RepeatInterleave { .. }
+        // Sort: lowered to the sorted VALUES tensor (nn traces only the
+        // values on both its CPU and GPU paths). Order statistics are
+        // monotone per coordinate, so the interval image is exact and — the
+        // load-bearing part — TIE-AGNOSTIC: which of two equal elements the
+        // unspecified `sort_unstable` order picks cannot change the value
+        // sequence. (Contrast `ArgSort`, whose INDICES are tie-sensitive.)
+        | TraceOp::Sort { .. }
+        // Topk with `sorted = true`: the p-th order statistic is monotone in
+        // every input, so bounding it by the p-th order statistic of each
+        // bound lane is EXACT — whichever end of the lane `largest` names.
+        // `largest = true` is what `translate` emits today (`TopkLayer` models
+        // that one); `largest = false` is exact by the mirror-image argument
+        // and refused only for the missing k-smallest layer, which is why it
+        // classifies here rather than as `Unsupported` — the trace is
+        // unambiguous, so a permissive caller may degrade it. `sorted = false`
+        // falls to `SoundButLoose` below.
+        | TraceOp::Topk { sorted: true, .. }
         | TraceOp::Neg => Exact,
 
         // -- Exact: sign-aware affine arithmetic ------------------------------
@@ -156,11 +249,19 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::Linear { .. }
         | TraceOp::Conv1d { .. }
         | TraceOp::Conv2d { .. }
+        // Conv3d: an affine map like its lower-rank siblings, and no longer a
+        // classification that outruns the translator — `ny_core::LayerType`
+        // has a `Conv3d` variant, ny-propagate has `Conv3dLayer`, ny-build has
+        // the convert arm, and `translate` emits the spec. IBP-only: the
+        // layer's CROWN backward fails closed, so a Conv3d node degrades the
+        // network to IBP at that node (an ENCLOSURE question, not a
+        // classification one — the affine map itself is reproduced exactly).
         | TraceOp::Conv3d { .. }
         | TraceOp::ConvTranspose1d { .. }
         | TraceOp::ConvTranspose2d { .. }
-        | TraceOp::Embedding { .. }
         | TraceOp::QLinear { .. }
+        // Cumsum: native `CumsumLayer` (#3919) — monotone => exact IBP with
+        // outward rounding, O(T) CROWN backward, no size cap.
         | TraceOp::Cumsum { .. } => Exact,
 
         // -- Sound: monotone / piecewise activations & relaxed multiplies -----
@@ -196,13 +297,36 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::MaxPool2d { .. }
         | TraceOp::AdaptiveMaxPool2d { .. } => Sound,
 
-        TraceOp::Powf { exponent } if [0.0, 0.5, 1.0, 2.0, -1.0, -0.5].contains(exponent) => Sound,
+        // Powf: exact special cases (identity/sqrt/sqr/recip) plus the
+        // general `PowConstantLayer` lowering — sound (fail-closed on invalid
+        // domains) for every finite exponent within the f64->f32 narrowing
+        // cap shared with `translate` ([`crate::translate::MAX_POW_EXPONENT_ABS`]).
+        TraceOp::Powf { exponent }
+            if exponent.is_finite()
+                && exponent.abs() <= crate::translate::MAX_POW_EXPONENT_ABS =>
+        {
+            Sound
+        }
 
         // Comparisons: lowered to Compare/CompareTensor layers whose
         // {0,1}-interval IBP is exact off the threshold and the [0,1] hull
         // across it — sound, and as tight as intervals allow (IBP-only; a
         // step has no useful CROWN linear relaxation).
         TraceOp::Compare { .. } | TraceOp::CompareTensor { .. } => Sound,
+
+        // Index-producing selection: `Argmax` / `Argmin` / `ArgSort` lower to
+        // the native index layers, whose IBP is EXACT wherever the input
+        // intervals are strictly separated (the winner — or the whole
+        // permutation — is then determined for every point in the box) and
+        // falls back to the sound `[0, n-1]` index hull wherever they
+        // overlap. Not `Exact`, precisely because of that overlap fallback.
+        //
+        // The index values themselves are modeled as exact f32 integers,
+        // widened OUTWARD by two endpoints above 2²⁴ where consecutive
+        // integers stop being representable (ny-propagate
+        // `reduction/selection.rs::index_interval`) — never snapped to a
+        // wrong integer.
+        TraceOp::Argmax { .. } | TraceOp::Argmin { .. } | TraceOp::ArgSort { .. } => Sound,
 
         // -- SoundButLoose: normalisation, attention, reductions, transcend. --
         // Correct over-approximations whose interval relaxations widen quickly:
@@ -225,9 +349,23 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::BatchNorm { .. }
         | TraceOp::Softmax { .. }
         | TraceOp::LogSoftmax { .. }
+        // Sdpa / SdpaCausal: emitted as ONE native `SelfAttention` layer
+        // (not a MatMul + Softmax decomposition) — the softmax interval
+        // relaxation is what keeps them loose, decomposition or not.
         | TraceOp::Sdpa { .. }
         | TraceOp::SdpaCausal { .. }
         | TraceOp::RotaryEmbedding { .. }
+        // MultiHeadAttention: the attention MATH has the same sound-but-loose
+        // relaxation as Sdpa — and `translate` now actually emits it. The
+        // WIRE-FORMAT gap that used to force an unconditional refusal here
+        // (no projection weights on the wire) is closed: nn-core serializes
+        // `scale` and all four projections, so the composite lowers to those
+        // four Linears around the same native fused layer `Sdpa` emits.
+        // Masked, RoPE-fused and grouped-query nodes are still refused for
+        // MISSING LAYERS rather than missing wire fields, which is why the
+        // variant classifies here and the refusals stay degradable.
+        // (Consumers triage against `translate`, not this taxonomy, for what
+        // actually lowers today — see the module docs.)
         | TraceOp::MultiHeadAttention { .. }
         | TraceOp::Lstm { .. }
         | TraceOp::AvgPool1d { .. }
@@ -235,7 +373,72 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         | TraceOp::AdaptiveAvgPool1d { .. }
         | TraceOp::AdaptiveAvgPool2d { .. }
         | TraceOp::KokoroFused(_)
-        | TraceOp::Upsample2d { .. } => SoundButLoose,
+        // Fract: Sub(x, Floor(x)) — NN's floor convention (range [0, 1)),
+        // NOT the trunc identity, which differs by 1 for every negative
+        // non-integer and produced a non-enclosing bound. Exact within one
+        // unit period, loose across period boundaries (the Sub decorrelates
+        // x from floor(x)).
+        | TraceOp::Fract
+        // Embedding: index-agnostic vocabulary-hull surrogate (midpoint
+        // Linear + per-dim EpsilonExpand) — a correct enclosure of every
+        // row, deliberately loose (independent of the actual index).
+        | TraceOp::Embedding { .. }
+        // WhereCond: a 3-input conditional select lowered to the native
+        // `Where` layer, whose IBP is the UNION HULL of the two branches
+        // wherever the condition interval straddles (and the selected branch
+        // exactly wherever the condition's sign is decidable). A correct
+        // over-approximation, deliberately loose across the straddle, and
+        // IBP-only — a select has no useful CROWN linear relaxation.
+        | TraceOp::WhereCond
+        // Upsample2d: `Nearest` is a pure reindex (Reshape + Tile + Reshape);
+        // `Bilinear` is now lowered too, to the SAME separated constant-Linear
+        // resampler `ResizeBilinear` uses, because `align_corners` rides the
+        // wire and pins which of nn's two coordinate maps ran. The variant sits
+        // in this bucket for the bilinear passes' cross-axis decorrelation (see
+        // ResizeBilinear below) and for `Bicubic`, which has no nn kernel to
+        // replicate and so is refused — degradably, since nothing can record it.
+        | TraceOp::Upsample2d { .. }
+        // ResizeBilinear: a CONSTANT row-stochastic linear map. `target_h` /
+        // `target_w` ride the wire and nn's `resize_bilinear` has exactly one
+        // coordinate convention (half-pixel + clamp; no align_corners knob
+        // exists on that path), so the source cells and interpolation weights
+        // are fully determined at translate time. Lowered to a separated pair
+        // of constant `Linear` resampling matrices, which IBP propagates
+        // exactly per pass; "loose" only because chaining the two passes
+        // decorrelates the shared source cells.
+        | TraceOp::ResizeBilinear { .. }
+        // ScatterAdd / IndexAdd: additive indexed accumulation, lowered to
+        // ny-propagate's `ScatterAddLayer` / `IndexAddLayer`. Unlike the
+        // overwriting `Scatter`, these are sound for EVERY index — constant or
+        // runtime — which is why they classify here rather than as a
+        // context-free residue:
+        //
+        //   - Duplicate destinations are not ambiguous. `+=` over the reals is
+        //     associative and commutative, so a cell named by several index
+        //     entries receives the SUM of the contributions under every visit
+        //     order: one value, no union needed.
+        //   - A constant index gives the EXACT interval image (accumulate the
+        //     lower bounds into the lower output, the upper into the upper).
+        //   - A runtime index never has to be read: the layers' dynamic rule
+        //     widens `data` by the total possible additive contribution of
+        //     `src` (the sum of its negative lower bounds below, of its
+        //     positive upper bounds above). Every index assignment routes each
+        //     src element to exactly one cell, so every realizable output lies
+        //     in that hull.
+        //
+        // "Loose" names that dynamic case — and the constant case's own
+        // decorrelation when `data` and `src` share upstream variables. NN's
+        // `Add(x, 0)` identity lowering, which the old refusal cited, was
+        // never sound and is not what the bridge emits.
+        | TraceOp::ScatterAdd { .. }
+        | TraceOp::IndexAdd { .. }
+        // Topk with `sorted = false`: the k selected values in an UNSPECIFIED
+        // order, so output position j may hold any of them and a sound bound
+        // must be the hull over all k — correct, but strictly looser than the
+        // per-position order statistic the sorted form gets. No layer emits
+        // that hull today, so `translate` refuses it; the refusal is
+        // degradable, because the wire says unambiguously which function ran.
+        | TraceOp::Topk { sorted: false, .. } => SoundButLoose,
 
         // `Custom` — the explicit opaque escape hatch — is the maximally
         // loose case: lowered to the graph builder's OpaqueSkip substitution,
@@ -248,23 +451,66 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
         // Refuse any op whose required routing/parameters are value-dependent
         // or absent from the serialized trace, and any op without a semantics-
         // preserving lowering.
-        TraceOp::Topk { .. }
-        | TraceOp::Argmax { .. }
-        | TraceOp::Argmin { .. }
-        | TraceOp::ArgSort { .. }
-        | TraceOp::Sort { .. }
+
+        // Value-dependent write routing / gating: the destination indices (or
+        // expert assignment) are runtime values, so no static layer encloses
+        // the result and nn's identity passthrough is not a sound
+        // over-approximation.
+        //
+        // `Scatter` and `IndexPut` are CONTEXT-FREE RESIDUES of that rule,
+        // exactly like `ToDtype` below — not a claim that either op is
+        // unlowerable. Both OVERWRITE, so their duplicate destinations are
+        // last-writer-nondeterministic (nn's CPU `scatter_loop` walks src
+        // row-major while `scatter_gpu` races parallel writes; `index_put` is
+        // documented last-write-wins, and nn-import emits it for
+        // `aten.index_put` with `accumulate = false`, which PyTorch documents
+        // as nondeterministic on duplicates). A sound lowering must therefore
+        // enclose the UNION of the candidate writes, which in turn requires
+        // knowing which destinations collide. Whether that is knowable is a
+        // property of the INDEX OPERAND, not of the variant: `translate` is not
+        // context-free and lowers a translate-time-constant index of EITHER op
+        // to `ScatterND` (whose duplicate min/max combine IS that union),
+        // refusing only the runtime index this taxonomy has to assume.
+        //
+        // NOT here any more: `ScatterAdd` / `IndexAdd`, whose accumulation is
+        // order-independent AND has a sound dynamic-index rule — see the
+        // SoundButLoose arm.
         | TraceOp::Scatter { .. }
-        | TraceOp::ScatterAdd { .. }
-        | TraceOp::IndexAdd { .. }
         | TraceOp::IndexPut { .. }
         | TraceOp::MoeGating { .. }
-        | TraceOp::WhereCond
+        // ToDtype: context-free refusal — the op records only its TARGET
+        // dtype, so this classifier cannot distinguish the identity and
+        // lossless-embedding casts `translate` lowers (`F32 -> F32`,
+        // `U8`/`Bool -> F32`) from the lossy ones it refuses. See the module
+        // docs; `translate` resolves the source dtype from the producer node.
         | TraceOp::ToDtype { .. }
+        // Powf: fail-closed RESIDUE only. Every finite exponent within
+        // `MAX_POW_EXPONENT_ABS` classified `Sound` in the guarded arm above;
+        // this arm catches NaN / +-inf / beyond-cap exponents, where the
+        // f64 -> f32 narrowing could flip the integrality or parity that
+        // `PowConstantLayer`'s sign-aware branches key on.
         | TraceOp::Powf { .. }
-        | TraceOp::Fract
-        | TraceOp::RepeatInterleave { .. }
-        | TraceOp::ResizeBilinear { .. }
+        // GridSample: unlike `ResizeBilinear` (now lowered — see the
+        // SoundButLoose arm), its source coordinates come from the `grid`
+        // TENSOR OPERAND, so the output-to-input map is generally a function of
+        // a runtime value and no static layer encloses it. Its serialized
+        // conventions (`padding_mode`, `align_corners`) are complete, so the
+        // refusal is never about conventions.
+        //
+        // And unlike `Scatter`/`IndexPut` above, this is NOT a context-free
+        // residue: a translate-time-CONSTANT grid does not rescue it either.
+        // Grid sampling is not separable (`ix` and `iy` vary independently per
+        // output cell), so a constant resampling matrix has to carry the
+        // product `fl(cy * cx)` as one coefficient while nn's kernel evaluates
+        // `fl(fl(v * cy) * cx)` — up to 2 ULP apart, where the tightest sound
+        // interval a Linear layer can give for a single product spans 1 ULP
+        // either side. nn's own value can then fall OUTSIDE the emitted bounds:
+        // a silent non-enclosure, not a looseness. `translate` refuses both
+        // cases with distinct messages; the witness is pinned in
+        // `ops_pad_resample::tests::grid_sample_single_matrix_lowering_would_not_enclose_nn`.
         | TraceOp::GridSample { .. }
+        // SegmentBoundary is a pipeline marker rather than a computation
+        // (upstream segmentation consumes it).
         | TraceOp::SegmentBoundary { .. } => Unsupported,
     }
 }
@@ -278,6 +524,85 @@ pub fn trace_op_soundness(op: &TraceOp) -> BridgeSoundness {
 #[must_use]
 pub fn is_translatable(op: &TraceOp) -> bool {
     trace_op_soundness(op).is_translatable()
+}
+
+/// Why [`crate::translate`] refused a node — and, decisively, whether a
+/// PERMISSIVE translation is allowed to degrade it to the vacuous
+/// `OpaqueSkip` carrier instead of failing the whole graph.
+///
+/// The two classes look identical at the `NyError::UnsupportedOp` boundary,
+/// which is exactly why they are separated here rather than by inspecting
+/// error text. See [`crate::translate::UnportedOpPolicy`] for the policy that
+/// consumes this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalClass {
+    /// A sound lowering EXISTS in principle; the bridge simply has not ported
+    /// this op (or this configuration of it) yet.
+    ///
+    /// Degradable: substituting `[-inf, +inf]` for the node loses all
+    /// precision there but is a genuine over-approximation of whatever the op
+    /// computes, so a permissive caller may opt into it.
+    Unported,
+    /// The op is refused for SOUNDNESS: its output shape, write routing, or
+    /// source-coordinate mapping is a function of tensor VALUES; or the
+    /// serialized op is semantically ambiguous; or its endpoint's rounding
+    /// behaviour is unmodeled (a lossy `ToDtype`, a beyond-cap `Powf`).
+    ///
+    /// `Topk` used to be the headline example of the "ambiguous wire" case and
+    /// is deliberately no longer here: nn serializes `largest`/`sorted`, so its
+    /// remaining refusals are missing-layer refusals and DO degrade.
+    ///
+    /// NOT degradable, in either mode. `OpaqueSkip` would be sound for the
+    /// node's own value, but these refusals report that the TRACE cannot be
+    /// read unambiguously in the first place — the ambiguity is not confined
+    /// to one node's bounds, and hiding it behind a warning is exactly the
+    /// silent-degradation failure the bridge is built to prevent.
+    Soundness,
+}
+
+impl RefusalClass {
+    /// Whether a permissive translation may substitute the vacuous
+    /// `OpaqueSkip` carrier for a node refused with this class.
+    #[must_use]
+    pub const fn is_degradable(self) -> bool {
+        matches!(self, Self::Unported)
+    }
+
+    /// Short, stable lowercase label (matches the serde representation).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unported => "unported",
+            Self::Soundness => "soundness",
+        }
+    }
+}
+
+/// Classify a refusal of `op` into the two classes a permissive translation
+/// must tell apart.
+///
+/// The soundness taxonomy already draws exactly this line:
+/// [`BridgeSoundness::Unsupported`] is precisely the bucket of ops that must
+/// ALWAYS be refused, so it maps to [`RefusalClass::Soundness`] and every other
+/// bucket — ops for which a sound lowering exists but may not be implemented —
+/// maps to [`RefusalClass::Unported`]. Deriving the class from the taxonomy
+/// rather than restating it means a newly classified `TraceOp` variant (which
+/// the exhaustive match in [`trace_op_soundness`] forces someone to classify)
+/// automatically lands on the right side of the permissive boundary.
+///
+/// Note the context-free residues named in the module docs land on the SAFE
+/// side by construction: `ToDtype`, `Scatter` and a beyond-cap `Powf` classify
+/// `Unsupported`, so a refusal of one of them stays hard even in permissive
+/// mode — which is the intended behaviour for all three, since each refusal is
+/// about semantics the bridge cannot read rather than a missing port.
+#[must_use]
+pub fn refusal_class(op: &TraceOp) -> RefusalClass {
+    if trace_op_soundness(op).is_translatable() {
+        RefusalClass::Unported
+    } else {
+        RefusalClass::Soundness
+    }
 }
 
 /// A bucketed summary of every [`TraceOp`]'s bridge soundness.
@@ -308,6 +633,32 @@ impl CoverageReport {
     #[must_use]
     pub fn translatable(&self) -> usize {
         self.exact.len() + self.sound.len() + self.loose.len()
+    }
+}
+
+/// A representative fused `MultiHeadAttention` node: maskless, RoPE-free,
+/// non-GQA self-attention — the shape `translate` lowers.
+///
+/// Shared by the catalogue and the refusal-class tests so the twelve-field
+/// payload is spelled out once.
+fn mha_witness() -> TraceOp {
+    let w = || crate::schema::WeightPayload::f32(vec![0.0], vec![1]);
+    TraceOp::MultiHeadAttention {
+        num_heads: 2,
+        num_kv_heads: 2,
+        head_dim: 2,
+        scale: 0.5,
+        q_weight: w(),
+        q_bias: None,
+        k_weight: w(),
+        k_bias: None,
+        v_weight: w(),
+        v_bias: None,
+        out_weight: w(),
+        out_bias: None,
+        rope: None,
+        cross_attention: false,
+        has_mask: false,
     }
 }
 
@@ -523,14 +874,7 @@ fn canonical_trace_ops() -> Vec<(&'static str, TraceOp)> {
                 sin_cache: w(),
             },
         ),
-        (
-            "MultiHeadAttention",
-            TraceOp::MultiHeadAttention {
-                num_heads: 1,
-                num_kv_heads: 1,
-                head_dim: 8,
-            },
-        ),
+        ("MultiHeadAttention", mha_witness()),
         ("Embedding", TraceOp::Embedding { weight: w() }),
         (
             "Lstm",
@@ -628,6 +972,7 @@ fn canonical_trace_ops() -> Vec<(&'static str, TraceOp)> {
                 mode: TraceUpsampleMode::Nearest,
                 scale_h: 2.0,
                 scale_w: 2.0,
+                align_corners: false,
             },
         ),
         (
@@ -653,7 +998,15 @@ fn canonical_trace_ops() -> Vec<(&'static str, TraceOp)> {
                 bias: ow(),
             },
         ),
-        ("Topk", TraceOp::Topk { k: 1, dim: 0 }),
+        (
+            "Topk",
+            TraceOp::Topk {
+                k: 1,
+                dim: 0,
+                largest: true,
+                sorted: true,
+            },
+        ),
         ("Argmax", TraceOp::Argmax { dim: 0 }),
         ("Argmin", TraceOp::Argmin { dim: 0 }),
         (
@@ -806,7 +1159,7 @@ pub fn coverage() -> CoverageReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::DType;
+    use crate::schema::{DType, WeightPayload};
     use std::collections::BTreeSet;
 
     /// The number of `TraceOp` variants, pinned identically to `schema`.
@@ -895,33 +1248,140 @@ mod tests {
         }
     }
 
+    /// The permissive boundary is derived from the taxonomy, not restated
+    /// alongside it: for EVERY variant, `Unsupported` <=> a non-degradable
+    /// `Soundness` refusal. A newly added variant is forced through the
+    /// exhaustive match in `trace_op_soundness`, so it lands on the right side
+    /// of this line automatically.
+    #[test]
+    fn refusal_class_partitions_the_catalogue_by_translatability() {
+        for (name, op) in canonical_trace_ops() {
+            let class = refusal_class(&op);
+            assert_eq!(
+                class == RefusalClass::Soundness,
+                trace_op_soundness(&op) == BridgeSoundness::Unsupported,
+                "refusal class disagrees with the soundness bucket for {name}"
+            );
+            assert_eq!(
+                class.is_degradable(),
+                is_translatable(&op),
+                "only an op with a sound lowering in principle may be degraded ({name})"
+            );
+        }
+    }
+
+    /// The ops the permissive translate mode must NEVER degrade, named
+    /// explicitly so a reclassification cannot quietly open the gate:
+    /// data-dependent routing/coordinates, unmodeled cast and exponent
+    /// endpoints, and the pipeline marker.
+    ///
+    /// `Topk` used to head this list for its ambiguous wire semantics and is
+    /// deliberately gone — the flags are serialized now, so its remaining
+    /// refusals are missing-layer refusals and DO degrade
+    /// (`topk_is_classified_by_the_flags_now_that_the_wire_carries_them`).
+    #[test]
+    fn soundness_refusals_are_never_degradable() {
+        for op in [
+            TraceOp::Scatter { dim: 0 },
+            TraceOp::IndexPut { dim: 0 },
+            TraceOp::MoeGating {
+                num_experts: 2,
+                top_k: 1,
+            },
+            TraceOp::GridSample {
+                padding_mode: crate::schema::GridSamplePaddingMode::Zeros,
+                align_corners: false,
+            },
+            TraceOp::ToDtype {
+                target_dtype: DType::F16,
+            },
+            TraceOp::Powf {
+                exponent: f64::INFINITY,
+            },
+            TraceOp::SegmentBoundary {
+                reason: "boundary".to_string(),
+                input_bounds: None,
+            },
+        ] {
+            assert_eq!(
+                refusal_class(&op),
+                RefusalClass::Soundness,
+                "{op:?} must stay a hard refusal in every translate mode"
+            );
+            assert!(!refusal_class(&op).is_degradable(), "{op:?}");
+        }
+    }
+
+    /// A representative unported-but-lowerable op is degradable — the case the
+    /// permissive mode exists for. `Custom` is degradable too, which is merely
+    /// consistent: it already lowers to the same carrier unconditionally.
+    #[test]
+    fn unported_but_lowerable_ops_are_degradable() {
+        for op in [
+            TraceOp::Conv3d {
+                weight: WeightPayload::f32(vec![0.0], vec![1]),
+                bias: None,
+                padding: [0, 0, 0],
+                stride: [1, 1, 1],
+                dilation: [1, 1, 1],
+                groups: 1,
+            },
+            mha_witness(),
+            TraceOp::Custom {
+                name: "opaque".to_string(),
+            },
+        ] {
+            assert_eq!(refusal_class(&op), RefusalClass::Unported, "{op:?}");
+            assert!(refusal_class(&op).is_degradable(), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn refusal_class_labels_round_trip_json() {
+        for class in [RefusalClass::Unported, RefusalClass::Soundness] {
+            let json = serde_json::to_string(&class).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", class.as_str()));
+            let back: RefusalClass = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, class);
+        }
+    }
+
     #[test]
     fn data_dependent_ops_are_unsupported() {
-        // The roadmap-pinned data-dependent / opaque set MUST be Unsupported so
-        // the bridge refuses them (sound by construction).
+        // The roadmap-pinned data-dependent / semantics-absent set MUST be
+        // Unsupported so the bridge refuses them (sound by construction).
+        //
+        // NOT in this list any more, deliberately: `Argmax` / `Argmin` /
+        // `ArgSort` / `Sort` (statically shaped selection with sound index /
+        // exact value semantics), `WhereCond` (union-hull select),
+        // `RepeatInterleave` (translate-time-constant counts), and
+        // `ResizeBilinear` (constant resampling matrices — see
+        // `resize_bilinear_is_a_constant_map_grid_sample_is_not`). `Topk` has
+        // ALSO left: nn serializes `largest`/`sorted`, so the wire names one
+        // function and the variant classifies on the flags — see
+        // `topk_is_classified_by_the_flags_now_that_the_wire_carries_them`.
+        //
+        // `ScatterAdd` / `IndexAdd` also left: their accumulation is
+        // order-independent and their dynamic-index rule never reads the index
+        // at all, so they are sound for EVERY index. `Scatter` and `IndexPut`
+        // stay, but as context-free residues — see
+        // `scatter_overwrite_refusal_is_context_free_its_additive_siblings_are_not`.
+        // `GridSample` stays and is NOT a residue: no operand context rescues
+        // it — see `grid_sample_is_refused_even_when_its_grid_is_constant`.
         let must_be_unsupported = [
-            TraceOp::Topk { k: 1, dim: 0 },
-            TraceOp::Argmax { dim: 0 },
-            TraceOp::Argmin { dim: 0 },
-            TraceOp::ArgSort {
-                dim: 0,
-                descending: false,
-            },
             TraceOp::Scatter { dim: 0 },
-            TraceOp::ScatterAdd { dim: 0 },
             TraceOp::IndexPut { dim: 0 },
             TraceOp::MoeGating {
                 num_experts: 1,
                 top_k: 1,
             },
-            TraceOp::WhereCond,
-            TraceOp::ResizeBilinear {
-                target_h: 2,
-                target_w: 2,
-            },
             TraceOp::GridSample {
                 padding_mode: crate::schema::GridSamplePaddingMode::Zeros,
                 align_corners: false,
+            },
+            TraceOp::SegmentBoundary {
+                reason: "x".into(),
+                input_bounds: None,
             },
         ];
         for op in must_be_unsupported {
@@ -932,6 +1392,238 @@ mod tests {
             );
             assert!(!is_translatable(&op));
         }
+    }
+
+    /// The scatter family splits on WHETHER DUPLICATE DESTINATIONS ARE
+    /// AMBIGUOUS, not on the word "scatter".
+    ///
+    /// `Scatter` and `IndexPut` overwrite, so a cell named twice keeps
+    /// whichever write landed last — an order the wire does not fix (nn's CPU
+    /// `scatter_loop` walks src row-major while `scatter_gpu` races parallel
+    /// writes; `index_put` is documented last-write-wins, and nn-import emits
+    /// it for `aten.index_put` with `accumulate = false`, which PyTorch
+    /// documents as nondeterministic on duplicates). Enclosing that needs the
+    /// collision pattern, which is a property of the index operand, so this
+    /// context-free taxonomy must assume the runtime case (the `ToDtype`
+    /// precedent: `translate` is not context-free and does lower the
+    /// constant-index instance of BOTH).
+    ///
+    /// `ScatterAdd` / `IndexAdd` accumulate, and `+=` is associative and
+    /// commutative — a cell named twice receives the SUM under every order.
+    /// Their dynamic-index rule never reads the index at all, so no operand
+    /// context is needed for them to be sound.
+    #[test]
+    fn scatter_overwrite_refusal_is_context_free_its_additive_siblings_are_not() {
+        for overwrite in [TraceOp::Scatter { dim: 0 }, TraceOp::IndexPut { dim: 0 }] {
+            assert_eq!(
+                trace_op_soundness(&overwrite),
+                BridgeSoundness::Unsupported,
+                "{overwrite:?} overwrites and its duplicate-write order is unfixed, so the \
+                 context-free taxonomy must assume a runtime index"
+            );
+        }
+        for additive in [TraceOp::ScatterAdd { dim: 0 }, TraceOp::IndexAdd { dim: 0 }] {
+            assert_eq!(
+                trace_op_soundness(&additive),
+                BridgeSoundness::SoundButLoose,
+                "{additive:?} accumulates, so duplicate destinations sum deterministically and \
+                 even a runtime index has a sound (loose) rule"
+            );
+            assert!(is_translatable(&additive));
+        }
+    }
+
+    /// The resampling pair splits on WHERE the source coordinates come from,
+    /// not on how hard interpolation is: `ResizeBilinear`'s come from
+    /// serialized target extents (a constant map, lowerable), `GridSample`'s
+    /// come from a tensor operand that is generally a runtime value
+    /// (value-dependent, refused). See
+    /// `grid_sample_is_refused_even_when_its_grid_is_constant` for the second,
+    /// independent reason that keeps the row `Unsupported` when it is not.
+    #[test]
+    fn resize_bilinear_is_a_constant_map_grid_sample_is_not() {
+        let resize = TraceOp::ResizeBilinear {
+            target_h: 7,
+            target_w: 3,
+        };
+        assert_eq!(trace_op_soundness(&resize), BridgeSoundness::SoundButLoose);
+        assert!(is_translatable(&resize));
+
+        for align_corners in [false, true] {
+            for padding_mode in [
+                crate::schema::GridSamplePaddingMode::Zeros,
+                crate::schema::GridSamplePaddingMode::Border,
+            ] {
+                // Both convention flags ARE serialized — the refusal is not
+                // about conventions, so no flag combination rescues it.
+                let grid = TraceOp::GridSample {
+                    padding_mode,
+                    align_corners,
+                };
+                assert_eq!(trace_op_soundness(&grid), BridgeSoundness::Unsupported);
+                assert!(!is_translatable(&grid));
+            }
+        }
+    }
+
+    /// `GridSample` keeps its `Unsupported` row for a reason NO operand
+    /// context can lift, which is what separates it from the `Scatter` /
+    /// `IndexPut` / `ToDtype` residues one arm above.
+    ///
+    /// Those three are refused here only because this classifier cannot see
+    /// the operand; `translate` can, and lowers their favourable cases.
+    /// `GridSample` has a favourable-looking case too — a translate-time
+    /// constant grid — and `translate` refuses it anyway: grid sampling is not
+    /// separable, so a constant resampling matrix must fold `fl(cy * cx)` into
+    /// one coefficient where nn's kernel evaluates `fl(fl(v * cy) * cx)`, up to
+    /// 2 ULP away from what any sound `Linear` layer would bound. The witness
+    /// lives with the lowering it disqualifies
+    /// (`translate::ops_pad_resample::tests::grid_sample_single_matrix_lowering_would_not_enclose_nn`);
+    /// this test pins the CLASSIFICATION consequence, so nobody reclassifies
+    /// the row by reasoning "the grid could be constant".
+    #[test]
+    fn grid_sample_is_refused_even_when_its_grid_is_constant() {
+        let grid = TraceOp::GridSample {
+            padding_mode: crate::schema::GridSamplePaddingMode::Zeros,
+            align_corners: false,
+        };
+        assert_eq!(trace_op_soundness(&grid), BridgeSoundness::Unsupported);
+        assert_eq!(refusal_class(&grid), RefusalClass::Soundness);
+
+        // The contrast, asserted rather than described: its residue neighbours
+        // sit in the same bucket for a reason `translate` DOES lift, and their
+        // constant-index lowerings are exercised in
+        // `translate::ops_misc::tests`.
+        for residue in [TraceOp::Scatter { dim: 0 }, TraceOp::IndexPut { dim: 0 }] {
+            assert_eq!(
+                trace_op_soundness(&residue),
+                BridgeSoundness::Unsupported,
+                "{residue:?} shares the bucket — but not the reason"
+            );
+        }
+    }
+
+    /// The selection family is no longer a blanket refusal: the index
+    /// producers are `Sound` (exact under interval separation, `[0, n-1]`
+    /// hull otherwise) and `Sort`'s VALUES tensor is `Exact` (monotone,
+    /// tie-agnostic order statistics).
+    #[test]
+    fn selection_family_is_classified_by_what_it_emits() {
+        for op in [
+            TraceOp::Argmax { dim: 0 },
+            TraceOp::Argmin { dim: 0 },
+            TraceOp::ArgSort {
+                dim: 0,
+                descending: true,
+            },
+        ] {
+            assert_eq!(
+                trace_op_soundness(&op),
+                BridgeSoundness::Sound,
+                "{op:?} emits indices: exact when separated, [0, n-1] hull otherwise"
+            );
+            assert!(is_translatable(&op));
+        }
+
+        let sort = TraceOp::Sort {
+            dim: 0,
+            descending: false,
+        };
+        assert_eq!(
+            trace_op_soundness(&sort),
+            BridgeSoundness::Exact,
+            "Sort emits the values tensor: order statistics are monotone and tie-agnostic"
+        );
+        assert!(is_translatable(&sort));
+    }
+
+    /// `Topk` is no longer the one refused selection op, and the taxonomy now
+    /// reads the FLAGS rather than shrugging at the variant.
+    ///
+    /// The predecessor of this test asserted `Topk` was `Unsupported` for every
+    /// payload, because the wire withheld `largest`/`sorted` and no payload
+    /// could rescue it. nn serializes both now, so:
+    ///
+    /// * `sorted = true` is `Exact` — the p-th order statistic is monotone in
+    ///   every input, so bounding it by the p-th order statistic of each bound
+    ///   lane is attained at the box corners, whichever end `largest` names.
+    /// * `sorted = false` is `SoundButLoose` — an unspecified output order
+    ///   needs the hull over all k selected values.
+    ///
+    /// Neither is `Unsupported`, so BOTH are degradable: `translate` still
+    /// emits only `largest && sorted` (the one function `TopkLayer` models),
+    /// but the other three are missing-LAYER refusals over an unambiguous
+    /// wire, which a permissive caller may skip.
+    #[test]
+    fn topk_is_classified_by_the_flags_now_that_the_wire_carries_them() {
+        for (k, dim) in [(1usize, 0usize), (3, 1), (8, 2)] {
+            for largest in [true, false] {
+                let sorted_op = TraceOp::Topk {
+                    k,
+                    dim,
+                    largest,
+                    sorted: true,
+                };
+                assert_eq!(
+                    trace_op_soundness(&sorted_op),
+                    BridgeSoundness::Exact,
+                    "monotone order statistics: {sorted_op:?}"
+                );
+
+                let unsorted_op = TraceOp::Topk {
+                    k,
+                    dim,
+                    largest,
+                    sorted: false,
+                };
+                assert_eq!(
+                    trace_op_soundness(&unsorted_op),
+                    BridgeSoundness::SoundButLoose,
+                    "unspecified order needs the hull over k: {unsorted_op:?}"
+                );
+
+                // The decisive consequence: neither is a soundness refusal any
+                // more, so permissive mode may degrade a Topk it cannot lower.
+                for op in [sorted_op, unsorted_op] {
+                    assert!(is_translatable(&op), "{op:?}");
+                    assert_eq!(refusal_class(&op), RefusalClass::Unported, "{op:?}");
+                    assert!(refusal_class(&op).is_degradable(), "{op:?}");
+                }
+            }
+        }
+
+        // Its statically-shaped selection siblings stay translatable.
+        assert!(is_translatable(&TraceOp::Argmax { dim: 0 }));
+        assert!(is_translatable(&TraceOp::Sort {
+            dim: 0,
+            descending: false
+        }));
+    }
+
+    /// `WhereCond` lowers to the native `Where` layer's union-hull IBP — a
+    /// correct but knowingly loose over-approximation, not a refusal.
+    #[test]
+    fn where_cond_is_sound_but_loose() {
+        let op = TraceOp::WhereCond;
+        assert_eq!(trace_op_soundness(&op), BridgeSoundness::SoundButLoose);
+        assert!(is_translatable(&op));
+    }
+
+    /// `RepeatInterleave` is pure selection from translate-time-constant
+    /// counts, so it classifies `Exact` — its remaining refusals are
+    /// conditional and live in `translate`, exactly like `Gather`'s.
+    #[test]
+    fn repeat_interleave_is_exact_like_gather() {
+        assert_eq!(
+            trace_op_soundness(&TraceOp::RepeatInterleave { dim: 0 }),
+            BridgeSoundness::Exact
+        );
+        assert_eq!(
+            trace_op_soundness(&TraceOp::Gather { dim: 0 }),
+            BridgeSoundness::Exact,
+            "the precedent this classification follows"
+        );
+        assert!(is_translatable(&TraceOp::RepeatInterleave { dim: 0 }));
     }
 
     #[test]
@@ -957,12 +1649,22 @@ mod tests {
         }
     }
 
+    /// The `Powf` Unsupported arm is a fail-closed RESIDUE over exponents the
+    /// f64 -> f32 narrowing could misrepresent — not a claim that `Powf` is
+    /// unlowerable. Finite in-cap exponents classify `Sound` below.
     #[test]
     fn semantics_losing_misc_lowerings_are_unsupported() {
         for op in [
-            TraceOp::Powf { exponent: 3.0 },
-            TraceOp::Fract,
-            TraceOp::RepeatInterleave { dim: 0 },
+            TraceOp::Powf { exponent: f64::NAN },
+            TraceOp::Powf {
+                exponent: f64::INFINITY,
+            },
+            TraceOp::Powf {
+                exponent: f64::NEG_INFINITY,
+            },
+            TraceOp::Powf {
+                exponent: 16_777_218.0,
+            },
         ] {
             assert_eq!(
                 trace_op_soundness(&op),
@@ -972,7 +1674,7 @@ mod tests {
             assert!(!is_translatable(&op));
         }
 
-        for exponent in [0.0, 0.5, 1.0, 2.0, -1.0, -0.5] {
+        for exponent in [0.0, 0.5, 1.0, 2.0, -1.0, -0.5, 3.0, -2.0, 1.0 / 3.0] {
             let op = TraceOp::Powf { exponent };
             assert_eq!(trace_op_soundness(&op), BridgeSoundness::Sound);
             assert!(is_translatable(&op));
@@ -1001,7 +1703,7 @@ mod tests {
             TraceOp::Add,
             TraceOp::Sub,
             TraceOp::Linear {
-                weight: crate::schema::WeightPayload::f32(vec![0.0], vec![1]),
+                weight: WeightPayload::f32(vec![0.0], vec![1]),
                 bias: None,
             },
         ] {
@@ -1016,8 +1718,8 @@ mod tests {
             TraceOp::Sdpa { scale: 1.0 },
             TraceOp::LayerNorm {
                 eps: 1e-5,
-                weight: crate::schema::WeightPayload::f32(vec![0.0], vec![1]),
-                bias: crate::schema::WeightPayload::f32(vec![0.0], vec![1]),
+                weight: WeightPayload::f32(vec![0.0], vec![1]),
+                bias: WeightPayload::f32(vec![0.0], vec![1]),
             },
             TraceOp::Exp,
             TraceOp::Div,

@@ -134,40 +134,55 @@ fn test_logsumexp_layer_enum_dispatch() {
 
 // ==================== Domain validation tests ====================
 // Per domain validation policy (designs/2026-02-07-domain-validation-policy.md):
-// LogSumExp is Category B — defined for all finite inputs, but non-finite
-// inputs indicate upstream numerical issues and must return NumericalInstability.
+// LogSumExp is Category B — NaN input bounds fail closed. ±Inf endpoints are
+// the deep-stack IBP overflow saturation convention (dc9da0fde class) and
+// propagate as the exact extended-real limits: a -inf element among finite
+// ones contributes exp(-inf) = 0, a +inf element makes the reduction +inf,
+// and an all-(-inf) slice reduces to -inf.
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_logsumexp_ibp_rejects_infinity_in_lower() {
+fn test_logsumexp_ibp_neg_inf_in_lower_contributes_zero() {
     let lower = ArrayD::from_shape_vec(IxDyn(&[1, 3]), vec![f32::NEG_INFINITY, 1.0, 2.0]).unwrap();
     let upper = ArrayD::from_elem(IxDyn(&[1, 3]), 5.0f32);
     let input = BoundedTensor::new_unchecked(lower, upper).unwrap();
 
     let layer = LogSumExpLayer::new(vec![-1], true);
-    let result = layer.propagate_ibp(&input);
-    assert!(result.is_err(), "Should reject -inf in lower bounds");
-    let err_msg = format!("{}", result.unwrap_err());
+    let result = layer
+        .propagate_ibp(&input)
+        .expect("-inf lower endpoint must propagate as the exp(-inf) = 0 limit");
+    // Lower: LSE(-inf, 1, 2) = ln(e^1 + e^2) — the -inf term drops out exactly.
+    let expected = ((1.0f64).exp() + (2.0f64).exp()).ln() as f32;
     assert!(
-        err_msg.contains("non-finite"),
-        "Error should mention non-finite: {err_msg}"
+        (result.lower()[[0, 0]] - expected).abs() < 1e-4,
+        "LSE(-inf, 1, 2) = {expected}, got {}",
+        result.lower()[[0, 0]]
     );
+    // Upper: the ordinary finite LSE(5, 5, 5).
+    assert!(result.upper()[[0, 0]].is_finite());
 }
 
 #[ntest::timeout(10000)]
 #[test]
-fn test_logsumexp_ibp_rejects_infinity_in_upper() {
+fn test_logsumexp_ibp_pos_inf_in_upper_saturates_to_inf() {
     let lower = ArrayD::from_elem(IxDyn(&[1, 3]), 0.0f32);
     let upper = ArrayD::from_shape_vec(IxDyn(&[1, 3]), vec![1.0, f32::INFINITY, 3.0]).unwrap();
     let input = BoundedTensor::new_unchecked(lower, upper).unwrap();
 
     let layer = LogSumExpLayer::new(vec![-1], true);
-    let result = layer.propagate_ibp(&input);
-    assert!(result.is_err(), "Should reject +inf in upper bounds");
-    let err_msg = format!("{}", result.unwrap_err());
+    let result = layer
+        .propagate_ibp(&input)
+        .expect("+inf upper endpoint must propagate as the LSE(.., +inf, ..) = +inf limit");
     assert!(
-        err_msg.contains("non-finite"),
-        "Error should mention non-finite: {err_msg}"
+        result.upper()[[0, 0]].is_infinite() && result.upper()[[0, 0]].is_sign_positive(),
+        "LSE with a +inf element is +inf, got {}",
+        result.upper()[[0, 0]]
+    );
+    // Lower: the ordinary finite LSE(0, 0, 0) = ln(3).
+    assert!(
+        (result.lower()[[0, 0]] - (3.0f32).ln()).abs() < 1e-4,
+        "LSE(0, 0, 0) = ln 3, got {}",
+        result.lower()[[0, 0]]
     );
 }
 

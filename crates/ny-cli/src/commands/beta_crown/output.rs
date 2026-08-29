@@ -12,7 +12,11 @@ use ny_propagate::{
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-#[cfg(feature = "mip")]
+// NOT `#[cfg(feature = "mip")]`: `CapturedDeadlinePlan::configured_timeout` and
+// `record_captured_deadline_plan` both name `Duration` unconditionally, so
+// gating this import breaks every build without `mip` -- which is the default
+// feature set. The gate that would have caught it (`cargo clippy --all-features`)
+// turns `mip` ON, so the break was invisible to the lane that introduced it.
 use std::time::Duration;
 
 use super::AppliedTerminalPeel;
@@ -35,6 +39,20 @@ pub(crate) enum CapturedTerminalIngress {
     None,
     #[cfg_attr(not(feature = "mip"), allow(dead_code))]
     RequireSafeNlpMarkedMarginSharedBinaryPrefix,
+}
+
+/// Inner verifier deadline plan captured at the exact clock anchor used by
+/// `handle_beta_crown_command`.
+///
+/// The VNN-COMP wrapper uses this only as execution evidence for a fixed
+/// post-BaB reserve. `configured_deadline_strictly_won` is false on ties: if an
+/// independently frozen outer authority would stop the verifier at the same
+/// instant, removing the reserve would not buy it another clock tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapturedDeadlinePlan {
+    pub(crate) configured_timeout: Duration,
+    pub(crate) configured_deadline_strictly_won: bool,
+    pub(crate) configured_deadline_caused_terminal_timeout: bool,
 }
 
 thread_local! {
@@ -62,6 +80,18 @@ thread_local! {
     /// ambient environment variables, category names, or log text.
     static CAPTURE_TERMINAL_INGRESS: Cell<CapturedTerminalIngress> =
         const { Cell::new(CapturedTerminalIngress::None) };
+
+    /// Deadline provenance for the active in-process capture. It is populated
+    /// only after model/setup routing has resolved the verifier's real clock
+    /// anchor and all competing absolute authorities.
+    static CAPTURE_DEADLINE_PLAN: Cell<Option<CapturedDeadlinePlan>> =
+        const { Cell::new(None) };
+
+    /// Exact configured instant retained only inside the producer. The outer
+    /// wrapper receives the Boolean causal result, never reconstructs this
+    /// instant from its earlier call clock.
+    static CAPTURE_CONFIGURED_DEADLINE: Cell<Option<std::time::Instant>> =
+        const { Cell::new(None) };
 }
 
 /// Begin capturing the competition JSON verdict on this thread.
@@ -72,12 +102,16 @@ thread_local! {
 pub(crate) fn begin_capture() {
     CAPTURE_SINK.with(|sink| *sink.borrow_mut() = Some(String::new()));
     CAPTURE_TERMINAL_INGRESS.with(|ingress| ingress.set(CapturedTerminalIngress::None));
+    CAPTURE_DEADLINE_PLAN.with(|plan| plan.set(None));
+    CAPTURE_CONFIGURED_DEADLINE.with(|deadline| deadline.set(None));
 }
 
 /// Stop capturing on this thread, discarding any buffered verdict.
 pub(crate) fn end_capture() {
     CAPTURE_SINK.with(|sink| *sink.borrow_mut() = None);
     CAPTURE_TERMINAL_INGRESS.with(|ingress| ingress.set(CapturedTerminalIngress::None));
+    CAPTURE_DEADLINE_PLAN.with(|plan| plan.set(None));
+    CAPTURE_CONFIGURED_DEADLINE.with(|deadline| deadline.set(None));
 }
 
 /// Take the captured competition JSON verdict, if capture is active and a verdict
@@ -110,6 +144,54 @@ pub(super) fn mark_captured_safenlp_marked_margin_terminal() {
 /// still invoke [`end_capture`] so every thread-local field is reset together.
 pub(crate) fn take_captured_terminal_ingress() -> CapturedTerminalIngress {
     CAPTURE_TERMINAL_INGRESS.with(Cell::take)
+}
+
+/// Record the real configured-timeout authority for the active capture.
+/// Standalone CLI calls do not capture and therefore retain no extra state.
+pub(super) fn record_captured_deadline_plan(
+    configured_timeout: Duration,
+    configured_deadline: Option<std::time::Instant>,
+    configured_deadline_strictly_won: bool,
+) {
+    if is_capturing() {
+        CAPTURE_DEADLINE_PLAN.with(|plan| {
+            plan.set(Some(CapturedDeadlinePlan {
+                configured_timeout,
+                configured_deadline_strictly_won,
+                configured_deadline_caused_terminal_timeout: false,
+            }));
+        });
+        CAPTURE_CONFIGURED_DEADLINE.with(|deadline| deadline.set(configured_deadline));
+    }
+}
+
+/// Mark a terminal timeout only from typed engine provenance identifying the
+/// exact deadline it observed. Late publication gates and naturally completed
+/// results never call this function: crossing a wall during unwind does not
+/// prove that removing the reserve would have bought more verifier work.
+pub(crate) fn mark_captured_timeout_at_deadline(deadline: Option<std::time::Instant>) {
+    let Some(deadline) = deadline else {
+        return;
+    };
+    let configured = CAPTURE_CONFIGURED_DEADLINE.with(Cell::get);
+    if configured != Some(deadline) || std::time::Instant::now() < deadline {
+        return;
+    }
+    CAPTURE_DEADLINE_PLAN.with(|plan| {
+        let Some(mut captured) = plan.get() else {
+            return;
+        };
+        if captured.configured_deadline_strictly_won {
+            captured.configured_deadline_caused_terminal_timeout = true;
+            plan.set(Some(captured));
+        }
+    });
+}
+
+/// Take deadline provenance for this in-process invocation.
+pub(crate) fn take_captured_deadline_plan() -> Option<CapturedDeadlinePlan> {
+    CAPTURE_CONFIGURED_DEADLINE.with(Cell::take);
+    CAPTURE_DEADLINE_PLAN.with(Cell::take)
 }
 
 /// Returns `true` when the competition JSON verdict should be captured rather than
@@ -221,6 +303,7 @@ struct EffectiveAlphaProjection {
     fix_interm_bounds: bool,
     cgan_sparse_target_complete_root: bool,
     cgan_complete_crown_ibp_root: bool,
+    cgan_narrow_target_max_rows: Option<usize>,
     full_conv_alpha: bool,
     adaptive_skip: bool,
     adaptive_skip_depth_threshold: usize,
@@ -382,22 +465,23 @@ impl RuntimeTreatmentGates {
                 })
                 .unwrap_or(false)
         };
-        let childsim = exactly_one("NY_BRANCH_KFSB_CHILDSIM");
-        let kfsb_multi_env_override = match std::env::var("NY_MO_KFSB").ok().as_deref() {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ if childsim => Some(true),
-            _ => None,
-        };
-        let wave_candidates = std::env::var("NY_MO_KFSB_K")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(if childsim { 2 } else { config.fsb_candidates });
-        let wave_reduce_op = match std::env::var("NY_MO_KFSB_REDUCE").ok().as_deref() {
-            Some("max") => KfsbReduceOp::Max,
-            Some("min") => KfsbReduceOp::Min,
-            _ => config.kfsb_reduce_op,
-        };
+        // Use the same governed cross-lever resolver as the engine. In
+        // particular, a present malformed canonical master is an explicit
+        // false override (and receipt rejection), while the legacy compound
+        // childsim switch is eligible only when the canonical name is absent.
+        let kfsb_gate = ny_levers::decls::kfsb::resolve_gate(config.use_kfsb_multi_branching);
+        let kfsb_multi_env_override = kfsb_gate.env_override;
+        let configured_wave_candidates = config
+            .kfsb_multi_candidates
+            .unwrap_or(config.fsb_candidates);
+        let wave_candidates =
+            ny_levers::decls::kfsb::resolve_candidate_count(configured_wave_candidates, kfsb_gate);
+        let configured_wave_reduce_op =
+            config.kfsb_multi_reduce_op.unwrap_or(config.kfsb_reduce_op);
+        let wave_reduce_op =
+            kfsb_reduce_op_from_governed(ny_levers::decls::kfsb::resolve_reduce_policy(
+                governed_kfsb_reduce_policy(configured_wave_reduce_op),
+            ));
         let root_sparse_gate = match std::env::var_os("NY_ROOT_SPARSE_INTERM_CROWN") {
             None => "absent",
             Some(value) if value == "1" => "enable",
@@ -413,6 +497,9 @@ impl RuntimeTreatmentGates {
         let adaptive_depth_shadow_env_armed = exactly_one("NY_MO_ADAPTIVE_DEPTH_SHADOW");
         let adaptive_depth_select_env_armed = exactly_one("NY_MO_ADAPTIVE_DEPTH_SELECT");
         let adaptive_depth_commit_env_armed = exactly_one("NY_MO_ADAPTIVE_DEPTH_COMMIT");
+        // Historical field name: this is diagnostic overlap, not an execution
+        // veto. Typed depth-two policy has priority after 53a80d0b1, while the
+        // legacy advice observers remain separately visible in the receipt.
         let depth_two_lookahead_legacy_observer_conflict = adaptive_depth_shadow_env_armed
             || adaptive_depth_select_env_armed
             || adaptive_depth_commit_env_armed
@@ -543,19 +630,15 @@ impl EffectiveTreatmentProjection {
             BranchingHeuristic::Kfsb | BranchingHeuristic::KfsbInterceptOnly
         );
         let depth_two = config.depth_two_branch_lookahead;
-        let depth_two_lookahead_round_zero_supported = depth_two.enabled_at_round(0)
-            && matches!(config.branching_heuristic, BranchingHeuristic::Kfsb)
-            && !config.verify_upper_bound
-            && !gates.depth_two_lookahead_legacy_observer_conflict
-            && gates.wave_reduce_op == KfsbReduceOp::Min
-            && gates.wave_candidates > 0;
+        let depth_two_lookahead_round_zero_supported = config
+            .depth_two_lookahead_supported_at_round(0, gates.wave_candidates, gates.wave_reduce_op);
         let typed_depth_two_select = depth_two_lookahead_round_zero_supported
             && depth_two.mode == DepthTwoBranchLookaheadMode::Select;
         let wave_kfsb_armed = gates
             .kfsb_multi_env_override
             .unwrap_or(config.use_kfsb_multi_branching || typed_depth_two_select)
             && kfsb_heuristic
-            && config.fsb_candidates > 0;
+            && gates.wave_candidates > 0;
         let top_level_output_constraint_matrix = config
             .alpha_config
             .output_constraints
@@ -636,6 +719,7 @@ impl EffectiveTreatmentProjection {
                     .alpha_config
                     .cgan_sparse_target_complete_root,
                 cgan_complete_crown_ibp_root: config.alpha_config.cgan_complete_crown_ibp_root,
+                cgan_narrow_target_max_rows: config.alpha_config.cgan_narrow_target_max_rows,
                 full_conv_alpha: config.alpha_config.full_conv_alpha,
                 adaptive_skip: config.alpha_config.adaptive_skip,
                 adaptive_skip_depth_threshold: config.alpha_config.adaptive_skip_depth_threshold,
@@ -767,6 +851,22 @@ fn kfsb_reduce_op_name(op: KfsbReduceOp) -> &'static str {
         KfsbReduceOp::Min => "min",
         KfsbReduceOp::Max => "max",
         KfsbReduceOp::Mean => "mean",
+    }
+}
+
+fn governed_kfsb_reduce_policy(op: KfsbReduceOp) -> ny_levers::decls::kfsb::KfsbReducePolicy {
+    match op {
+        KfsbReduceOp::Min => ny_levers::decls::kfsb::KfsbReducePolicy::Min,
+        KfsbReduceOp::Max => ny_levers::decls::kfsb::KfsbReducePolicy::Max,
+        KfsbReduceOp::Mean => ny_levers::decls::kfsb::KfsbReducePolicy::Mean,
+    }
+}
+
+fn kfsb_reduce_op_from_governed(policy: ny_levers::decls::kfsb::KfsbReducePolicy) -> KfsbReduceOp {
+    match policy {
+        ny_levers::decls::kfsb::KfsbReducePolicy::Min => KfsbReduceOp::Min,
+        ny_levers::decls::kfsb::KfsbReducePolicy::Max => KfsbReduceOp::Max,
+        ny_levers::decls::kfsb::KfsbReducePolicy::Mean => KfsbReduceOp::Mean,
     }
 }
 
@@ -1598,8 +1698,10 @@ mod tests {
             adaptive_microbatch_controller: false,
             kfsb_multi_env_override: None,
             kfsb_cert_reuse_armed: config.kfsb_cert_reuse,
-            wave_candidates: config.fsb_candidates,
-            wave_reduce_op: config.kfsb_reduce_op,
+            wave_candidates: config
+                .kfsb_multi_candidates
+                .unwrap_or(config.fsb_candidates),
+            wave_reduce_op: config.kfsb_multi_reduce_op.unwrap_or(config.kfsb_reduce_op),
             scorer_fix: false,
             competing_branch_experiment: false,
             final_alpha_bound_only: false,
@@ -1964,6 +2066,63 @@ mod tests {
             .exact_c
             .stop_reasons
             .insert("iteration_limit".to_string(), 1);
+        observations.root_joint_interm_alpha.observed = true;
+        observations.root_joint_interm_alpha.invocations = 1;
+        observations.root_joint_interm_alpha.input_split_invocations = 1;
+        observations.root_joint_interm_alpha.configured_master = Some(true);
+        observations
+            .root_joint_interm_alpha
+            .configured_max_dim_override = Some(32_768);
+        observations
+            .root_joint_interm_alpha
+            .input_split_configured_max_dim = Some(32_768);
+        observations.root_joint_interm_alpha.configured_secs = Some(30);
+        observations.root_joint_interm_alpha.configured_iters = Some(100);
+        observations.root_joint_interm_alpha.configured_lr_bits = Some(0.1f32.to_bits());
+        observations
+            .root_joint_interm_alpha
+            .configured_deadline_ascent = Some(true);
+        observations
+            .root_joint_interm_alpha
+            .configured_min_remaining_secs = Some(240);
+        observations.root_joint_interm_alpha.configured_max_sel = Some(32);
+        observations.root_joint_interm_alpha.configured_frozen_stop = Some(true);
+        observations.root_joint_interm_alpha.configured_pure_chain = Some(true);
+        observations
+            .root_joint_interm_alpha
+            .configured_bn_gpu_extract = Some(true);
+        observations.root_joint_interm_alpha.max_effective_iters = 100;
+        observations.root_joint_interm_alpha.target_count = 3;
+        observations.root_joint_interm_alpha.available_budget_ms = 60_000;
+        observations.root_joint_interm_alpha.effective_slice_ms = 30_000;
+        observations
+            .root_joint_interm_alpha
+            .configured_slice_work_invocations = 1;
+        observations
+            .root_joint_interm_alpha
+            .configured_iters_binding_invocations = 1;
+        observations.root_joint_interm_alpha.work_started = 1;
+        observations.root_joint_interm_alpha.attempts = 1;
+        observations.root_joint_interm_alpha.completed = 1;
+        observations.root_joint_interm_alpha.tightened_count = 2;
+        observations.root_joint_interm_alpha.outlier_tightened_count = 1;
+        observations.root_joint_interm_alpha.target_attempts = 3;
+        observations.root_joint_interm_alpha.base_folds_completed = 3;
+        observations
+            .root_joint_interm_alpha
+            .ascent_iterations_attempted = 100;
+        observations
+            .root_joint_interm_alpha
+            .max_ascent_iterations_attempted = 100;
+        observations.root_joint_interm_alpha.optimizer_steps = 100;
+        observations.root_joint_interm_alpha.ascent_folds_completed = 100;
+        observations.root_joint_interm_alpha.max_selected_rows = 32;
+        observations
+            .root_joint_interm_alpha
+            .selection_cap_bound_targets = 1;
+        observations.root_joint_interm_alpha.frozen_stop_targets = 1;
+        observations.root_joint_interm_alpha.pure_chain_targets = 1;
+        observations.root_joint_interm_alpha.bn_extract_targets = 1;
         let rendered = format_competition_json_with_observations(payload, &observations)
             .expect("competition JSON serializes");
         let rendered: serde_json::Value =
@@ -1981,7 +2140,7 @@ mod tests {
         );
         assert_eq!(
             rendered["execution_observations"]["schema"],
-            "ny_beta_crown_execution_observations_v5"
+            "ny_beta_crown_execution_observations_v8"
         );
         assert_eq!(
             rendered["execution_observations"]["exact_c"]["selected_iteration_limit"],
@@ -1998,6 +2157,75 @@ mod tests {
         assert_eq!(
             rendered["execution_observations"]["exact_c"]["multiplicative_weights_requested"],
             false
+        );
+        assert_eq!(
+            rendered["execution_observations"]["mo_kfsb"]["schema"],
+            "ny_beta_crown_mo_kfsb_observations_v1"
+        );
+        assert_eq!(
+            rendered["execution_observations"]["mo_kfsb"]["observed"], false,
+            "an unvisited selector seam must serialize an honest closed default"
+        );
+        assert_eq!(
+            rendered["execution_observations"]["mo_alpha_step"]["schema"],
+            "ny_beta_crown_mo_alpha_step_observations_v1"
+        );
+        assert_eq!(
+            rendered["execution_observations"]["mo_alpha_step"]["observed"], false,
+            "an unvisited optimizer seam must serialize an honest closed default"
+        );
+        assert_eq!(
+            rendered["execution_observations"]["mo_alpha_step"]["schedule_period"],
+            4
+        );
+        assert_eq!(
+            rendered["execution_observations"]["mo_alpha_step"]["alpha_round_remainder"],
+            3
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]["schema"],
+            "ny_beta_crown_root_joint_interm_alpha_observations_v1"
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]
+                ["configured_max_dim_override"],
+            32_768
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]["configured_lr_bits"],
+            0.1f32.to_bits()
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]["attempts"],
+            1
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]["tightened_count"],
+            2
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]
+                ["outlier_tightened_count"],
+            1
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]["base_folds_completed"],
+            3
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]
+                ["max_ascent_iterations_attempted"],
+            100
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]
+                ["configured_iters_binding_invocations"],
+            1
+        );
+        assert_eq!(
+            rendered["execution_observations"]["root_joint_interm_alpha"]
+                ["selection_cap_bound_targets"],
+            1
         );
         assert_eq!(
             rendered["effective_config"]["clip"]["input_split_fresh_domain_clip_configured"],
@@ -2081,6 +2309,147 @@ mod tests {
         );
         let killed_json = serde_json::to_value(&killed).expect("projection serializes");
         assert_eq!(killed_json["branching"]["wave_kfsb_armed"], false);
+
+        let mut invalid_config = config;
+        invalid_config.depth_two_branch_lookahead.candidates = 16;
+        let invalid = EffectiveTreatmentProjection::from_resolved_with_gates(
+            &invalid_config,
+            true,
+            false,
+            true,
+            false,
+            true,
+            false,
+            CompleteVerifierArg::Auto,
+            BackendArg::Wgpu,
+            "cpu".to_string(),
+            Some(false),
+            treatment_gates(&invalid_config),
+        );
+        let invalid_json = serde_json::to_value(&invalid).expect("projection serializes");
+        assert_eq!(
+            invalid_json["branching"]["depth_two_lookahead_round_zero_supported"], false,
+            "unchecked invalid typed policy must fail closed in the receipt"
+        );
+        assert_eq!(invalid_json["branching"]["wave_kfsb_armed"], false);
+    }
+
+    #[test]
+    fn effective_treatment_kfsb_projection_matches_canonical_presence_and_legacy_compound_rule() {
+        let config = BetaCrownConfig {
+            branching_heuristic: BranchingHeuristic::Kfsb,
+            fsb_candidates: 7,
+            kfsb_reduce_op: KfsbReduceOp::Max,
+            kfsb_multi_candidates: Some(5),
+            kfsb_multi_reduce_op: Some(KfsbReduceOp::Mean),
+            use_kfsb_multi_branching: true,
+            ..BetaCrownConfig::default()
+        };
+        let render = |gates| {
+            let projection = EffectiveTreatmentProjection::from_resolved_with_gates(
+                &config,
+                true,
+                false,
+                true,
+                false,
+                true,
+                false,
+                CompleteVerifierArg::Auto,
+                BackendArg::Wgpu,
+                "cpu".to_string(),
+                Some(false),
+                gates,
+            );
+            serde_json::to_value(&projection).expect("projection serializes")
+        };
+
+        ny_test_utils::env::with_env_edits(|env| {
+            for name in [
+                "NY_MO_KFSB",
+                "NY_BRANCH_KFSB_CHILDSIM",
+                "NY_MO_KFSB_K",
+                "NY_MO_KFSB_REDUCE",
+            ] {
+                env.remove(name);
+            }
+
+            env.set("NY_BRANCH_KFSB_CHILDSIM", "1");
+            let legacy = RuntimeTreatmentGates::capture(&config);
+            assert_eq!(legacy.kfsb_multi_env_override, Some(true));
+            assert_eq!(legacy.wave_candidates, 2);
+            let legacy_json = render(legacy);
+            assert_eq!(legacy_json["branching"]["wave_kfsb_armed"], true);
+            assert_eq!(legacy_json["branching"]["effective_wave_candidates"], 2);
+
+            env.set("NY_MO_KFSB", "0");
+            let canonical_zero = RuntimeTreatmentGates::capture(&config);
+            assert_eq!(canonical_zero.kfsb_multi_env_override, Some(false));
+            assert_eq!(
+                canonical_zero.wave_candidates, 5,
+                "a present canonical master must suppress legacy implicit k=2"
+            );
+            let zero_json = render(canonical_zero);
+            assert_eq!(zero_json["branching"]["wave_kfsb_armed"], false);
+            assert_eq!(zero_json["branching"]["effective_wave_candidates"], 5);
+
+            env.set("NY_MO_KFSB", "true");
+            let rejected = RuntimeTreatmentGates::capture(&config);
+            assert_eq!(
+                rejected.kfsb_multi_env_override,
+                Some(false),
+                "a malformed present canonical master must suppress typed config"
+            );
+            assert_eq!(rejected.wave_candidates, 5);
+            let rejected_json = render(rejected);
+            assert_eq!(rejected_json["branching"]["wave_kfsb_armed"], false);
+            assert_eq!(rejected_json["branching"]["kfsb_multi_env_override"], false);
+
+            env.remove("NY_MO_KFSB");
+            env.set("NY_MO_KFSB_K", "6");
+            let explicit_k = RuntimeTreatmentGates::capture(&config);
+            assert_eq!(
+                explicit_k.wave_candidates, 6,
+                "exact environment value must win over the dedicated wave width"
+            );
+
+            env.set("NY_MO_KFSB_K", "0");
+            let zero_k = RuntimeTreatmentGates::capture(&config);
+            assert_eq!(zero_k.wave_candidates, 0);
+            let zero_k_json = render(zero_k);
+            assert_eq!(
+                zero_k_json["branching"]["wave_kfsb_armed"], false,
+                "the receipt must apply the effective candidate override when reporting admission"
+            );
+
+            env.set("NY_MO_KFSB_K", "5 ");
+            let rejected_k = RuntimeTreatmentGates::capture(&config);
+            assert_eq!(
+                rejected_k.wave_candidates, 8,
+                "a malformed present K must suppress configured seven to the declaration default"
+            );
+
+            env.remove("NY_MO_KFSB_K");
+            env.set("NY_MO_KFSB_REDUCE", "min");
+            assert_eq!(
+                RuntimeTreatmentGates::capture(&config).wave_reduce_op,
+                KfsbReduceOp::Min,
+                "exact min must override configured Max"
+            );
+            env.set("NY_MO_KFSB_REDUCE", "mean");
+            assert_eq!(
+                RuntimeTreatmentGates::capture(&config).wave_reduce_op,
+                KfsbReduceOp::Min,
+                "environment mean is outside the historical min|max parser and must fail conservative"
+            );
+            env.remove("NY_MO_KFSB_REDUCE");
+            assert_eq!(
+                RuntimeTreatmentGates::capture(&config).wave_reduce_op,
+                KfsbReduceOp::Mean,
+                "absence must preserve the dedicated wave reduce policy"
+            );
+            assert_eq!(config.fsb_candidates, 7);
+            assert_eq!(config.kfsb_reduce_op, KfsbReduceOp::Max);
+        });
     }
 
     #[test]
@@ -2130,9 +2499,12 @@ mod tests {
                     true
                 );
                 assert_eq!(
-                    json["branching"]["depth_two_lookahead_round_zero_supported"],
-                    false,
-                    "legacy COMMIT must conflict with the typed depth-two lane just as the solver does"
+                    json["branching"]["depth_two_lookahead_round_zero_supported"], true,
+                    "advice-only legacy observers must not veto typed depth-two authority"
+                );
+                assert_eq!(
+                    json["branching"]["wave_kfsb_armed"], true,
+                    "receipt arming must match the typed-priority engine"
                 );
             },
         );

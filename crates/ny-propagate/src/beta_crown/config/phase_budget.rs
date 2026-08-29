@@ -35,12 +35,42 @@ pub struct PhaseBudgetConfig {
     ///
     /// Default: `0.20` (warmup gets 20% of BaB timeout).
     /// On a 100s timeout with 10% PGD reservation: warmup gets 18s.
+    ///
+    /// NOT THE CONTROLLING CAP ON THE MULTI-OBJECTIVE GRAPH ROOT PATH. There,
+    /// `multi_objective::root::evaluate_root` deliberately sets
+    /// `initial_deadline = Some(bab_deadline)` — the mandatory foundational
+    /// node-bounds sweep must reach every node, and capping it at this fraction
+    /// choked conv-heavy DAGs (yolo, tinyimagenet) into "deadline exceeded
+    /// before node 'Conv_0'" with most of the budget unused (#4321). The
+    /// `[phase] multiobj-budget` telemetry line prints this fraction beside the
+    /// window actually selected precisely so the two are not confused.
+    ///
+    /// MEASURED consequence (relusplitter/cifar_biasfield, 7cae6103, shipped
+    /// preset through `ny vnncomp`, disjunctive attack suppressed so the whole
+    /// window was available): row 146 got `effective-bab=118.500s` with this
+    /// fraction at 0.200 (nominally a 23.7s warmup) and the bootstrap ran
+    /// `graph-bab-bootstrap start t=0.0s` → `end t=118.5s` — 100% of the
+    /// window, of which one CROWN-IBP DAG collection was 103.6s and still
+    /// reverted 8/9 demanded targets to IBP on per-node deadlines. That is the
+    /// #4321 design decision working as written, not a cap-enforcement bug; do
+    /// not "fix" it by dividing the measured warmup by `0.20 * total`.
     pub initial_bounds_fraction: f32,
 
     /// Fraction of total timeout allocated to upfront PGD attack.
     ///
     /// Current behavior: `0.20` (upfront PGD gets 20% of timeout).
     /// Source: `verify/attack_budget.rs:12-17` → `timeout / 5`.
+    ///
+    /// SCOPE: this caps the UPFRONT PGD phase only — `verify/graph.rs`'s
+    /// pre-α-CROWN attack, `verify/sequential.rs`, and the MIP-only warm-start
+    /// precheck. It does NOT govern a multi-clause disjunction: those route to
+    /// `disjunctive::verify_multi_clause_disjunction`, whose attack phase is
+    /// sized by [`Self::disjunctive_pgd_fraction`] (0.50), and `graph.rs` skips
+    /// its upfront attack for `is_disjunction && !single_clause` anyway.
+    /// Measuring a disjunctive attack phase against THIS fraction reports a
+    /// spurious `0.50 / 0.20 = 2.5x` "overrun" — see the `#wrong-cap` guard test
+    /// `disjunctive_attack_cap_is_not_the_upfront_cap` in
+    /// `ny-cli/src/commands/beta_crown/verify/phase_budget.rs`.
     pub upfront_pgd_fraction: f32,
 
     /// Fraction of total timeout allocated to reduced verification
@@ -116,7 +146,60 @@ pub struct PhaseBudgetConfig {
     /// On a 100s timeout: BaB gets 90s, post-BaB PGD gets 10s.
     ///
     /// Part of #2206 acceptance criterion 3.
+    ///
+    /// #reserve-demand: this fraction is a REQUEST, not an entitlement. The
+    /// caller ledger drops it when a purely static scan proves the lane that
+    /// would spend it cannot take a step on this net — see
+    /// [`Self::demand_sized_post_bab_reserve`].
     pub post_bab_pgd_fraction: f32,
+
+    /// #reserve-demand — size the post-BaB reservation from the lane that
+    /// actually follows BaB, instead of always subtracting the constant
+    /// [`Self::post_bab_pgd_fraction`].
+    ///
+    /// A reserve carved out BEFORE BaB can only be justified by a capability
+    /// that is known BEFORE BaB. The post-BaB falsification lane needs either a
+    /// network gradient (statically decidable: the exact-gradient fragment) or a
+    /// seed the verifier has not produced yet. When the gradient is statically
+    /// absent, the pre-payment buys nothing: the lane is handed the window and
+    /// declines in ~0.03 s (`#deadlane`), and the seconds are simply discarded
+    /// with the verdict still undecided. Measured on vit_2023 at the official
+    /// 100 s budget: BaB stopped at 81.0 s of a 95 s internal tier, the 14 s
+    /// tail was refused by both consumers, and the row published `timeout`
+    /// while its own ledger still read `remaining_s=14.198`.
+    ///
+    /// This never grants time: it only declines to TAKE time from BaB, and the
+    /// BaB deadline still moves no later than `overall_deadline`. A lane that
+    /// can run is unaffected — the seed-driven stages still receive whatever
+    /// wall remains after BaB, they are simply not pre-paid.
+    ///
+    /// `false` restores the historical unconditional subtraction exactly.
+    pub demand_sized_post_bab_reserve: bool,
+
+    /// #disj-demand — zero the disjunctive global PGD slice when the net is
+    /// STATICALLY outside the exact-gradient fragment, i.e. when the same
+    /// static probe that drives [`Self::demand_sized_post_bab_reserve`]
+    /// (`GraphNetwork::supports_attack_point_gradient`) says no exact-gradient
+    /// attack step can ever run on this net.
+    ///
+    /// On such a net the disjunctive attack phase cannot use its exact-VJP
+    /// lanes; it degrades to SPSA over point-IBP forward evaluations. MEASURED
+    /// on vit_2023 (both `ibp_3_3_8` and `pgd_2_3_16` are outside the
+    /// fragment) at the official 100 s budget: the phase consumes its full
+    /// `disjunctive_pgd_fraction` slice (4.75 s of a 95 s tier, ~45 ms per
+    /// point-IBP eval ⇒ ~35 SPSA steps) and has NEVER produced a
+    /// counterexample on the family — zero `sat` in every campaign run, and
+    /// the 2026-08-25 independent adjudication searched ~1.9 M evaluations per
+    /// row without finding a violation. Zeroing the slice hands those seconds
+    /// to BaB, which re-bases on `ledger.remaining()`.
+    ///
+    /// Default `false` (historical schedule, byte-identical everywhere): the
+    /// SPSA fallback is a REAL searcher and other gradient-ineligible
+    /// categories (ml4acopf_2024 has a banked 256 s `sat`) may depend on it,
+    /// so a category must arm this through its own measured preset. On a net
+    /// INSIDE the fragment the flag is inert even when armed — the static
+    /// probe, not the yaml, is what zeroes the slice.
+    pub demand_sized_disjunctive_pgd: bool,
 
     /// Fraction of the REMAINING budget granted to the single adaptive
     /// attack-phase extension (#attack-extend) when the disjunctive attack was
@@ -422,6 +505,14 @@ impl Default for PhaseBudgetConfig {
             mip_crown_ibp_max_secs: 2.0,
             min_clause_secs: 1,
             post_bab_pgd_fraction: 0.10,
+            // #reserve-demand: default ON. Byte-identical on every net inside
+            // the exact-gradient fragment; only a net whose post-BaB lane is
+            // statically dead keeps the seconds in BaB.
+            demand_sized_post_bab_reserve: true,
+            // #disj-demand: default OFF — the SPSA fallback the zeroing removes
+            // is a real searcher (ml4acopf's banked 256 s sat is on a
+            // gradient-ineligible net). Categories arm it per measured preset.
+            demand_sized_disjunctive_pgd: false,
             attack_extension_fraction: 0.15,
             disjunctive_pgd_max_secs: None,
             disjunctive_pgd_min_secs: None,
@@ -562,6 +653,9 @@ mod tests {
         assert!((cfg.reduced_verification_fraction - 0.40).abs() < 1e-6);
         // disjunctive.rs: 50% for PGD
         assert!((cfg.disjunctive_pgd_fraction - 0.50).abs() < 1e-6);
+        // #disj-demand: historical schedule by default — the SPSA fallback is a
+        // real searcher, so demand-zeroing the disjunctive slice is per-preset.
+        assert!(!cfg.demand_sized_disjunctive_pgd);
         // disjunctive.rs: 20% for precheck
         assert!((cfg.disjunctive_precheck_fraction - 0.20).abs() < 1e-6);
         // mod.rs: timeout/4 minimum for MIP

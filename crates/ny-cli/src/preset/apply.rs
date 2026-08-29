@@ -8,7 +8,7 @@ use super::{
     resolve_branching, AlphaCrownPreset, BetaCrownPreset, ClipPreset, CutsPreset, NyPgdOrderCompat,
     PhaseBudgetPreset, PresetConfig,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use ny_propagate::{
     AlphaCrownConfig, BetaCrownConfig, InputClipType, KfsbReduceOp, PgdAlphaMode,
     PgdInitialization, PgdOptimizer, PhaseBudgetConfig, ATOMIC_ROOT_C_MARGIN_MAX_ITERATIONS,
@@ -138,6 +138,14 @@ pub(crate) fn validate_preset(preset: &PresetConfig) -> Result<()> {
 }
 
 fn apply_preset_values(config: &mut BetaCrownConfig, preset: &PresetConfig) -> Result<()> {
+    // #parameter-governance: every search-space axis that claims a typed
+    // delivery route must pass its declaration's config validator before this
+    // function mutates even a disposable `BetaCrownConfig`.  The runtime gate
+    // resolvers deliberately fail closed to their declaration defaults, but a
+    // typo'd or out-of-range PRESET must not reach a scored run labelled as a
+    // treatment while silently executing that fallback.
+    validate_delivered_lever_values(preset)?;
+
     // Resolve the scheduling contract before mutating config. This matters for
     // VNN-COMP's fail-closed preset snapshot: invalid scheduling must not leave
     // a partially applied verifier configuration.
@@ -208,6 +216,203 @@ fn apply_preset_values(config: &mut BetaCrownConfig, preset: &PresetConfig) -> R
     // node; bilinear alphas are [4,m,n,k] per MatMul node) — there is no
     // per-spec-row alpha dimension anywhere to share, so the request IS honoured.
     Ok(())
+}
+
+/// Validate the typed layer for every compiled `Deliver::PresetKey` axis.
+///
+/// This is driven by `ny_levers::space`, the same delivery map used by search
+/// and the early flight receipt, rather than by another list of promoted keys.
+/// `serde_yaml::Value` is intentional: unlike JSON's value serializer it keeps
+/// NaN and infinities as numbers, so the declaration can reject them instead of
+/// collapsing `Some(NaN)` into the same `null` representation as `None`.
+fn validate_delivered_lever_values(preset: &PresetConfig) -> Result<()> {
+    // #interval-carrier-preset-quarantine. This field predates the typed-route
+    // quarantine and is deliberately left in the deserializer so an old research YAML fails
+    // with an explicit safety explanation instead of an opaque unknown-key
+    // error. It is NOT a delivery route: the corresponding axis is Unsafe +
+    // EnvOnly because this bound path has produced false `unsat` on the live
+    // graph walk. Accepting `Some(false)` would be equally misleading—the
+    // presence of this key claims a governed scored treatment that no longer
+    // exists.
+    if preset.solver.const_matmul_interval.is_some() {
+        bail!(
+            "solver.const_matmul_interval is quarantined and cannot be delivered by a preset; \
+             NY_CONST_MATMUL_INTERVAL is Unsafe + EnvOnly after the interval carrier exposed a \
+             live false-proof propagation path. Remove the key. Audited armed research must use \
+             the explicit environment gate so it cannot enter a scored preset."
+        );
+    }
+
+    let serialized = serde_yaml::to_value(preset)
+        .context("serialize frozen preset for governed-lever validation")?;
+
+    for axis in ny_levers::space::axes()
+        .iter()
+        .chain(ny_levers::space::unsafe_axes())
+    {
+        let ny_levers::space::Deliver::PresetKey(key) = axis.deliver else {
+            continue;
+        };
+        let raw = key
+            .split('.')
+            .try_fold(&serialized, |node, part| node.get(part))
+            .with_context(|| {
+                format!(
+                    "compiled lever {} names missing preset delivery key {key}",
+                    axis.name
+                )
+            })?;
+        if raw.is_null() {
+            continue;
+        }
+
+        let decl = ny_levers::all().get(axis.name).with_context(|| {
+            format!(
+                "compiled preset delivery {key} names undeclared lever {}",
+                axis.name
+            )
+        })?;
+
+        // The legacy environment selector is deliberately free-form Text:
+        // unknown tokens historically select the parallel baseline. The typed
+        // search/shipping surface is narrower. Rejecting a typo HERE preserves
+        // the legacy parser while preventing `conv_ibp_blocked: seqq` from being
+        // recorded as a treatment that actually ran the baseline.
+        if decl.name == ny_levers::decls::conv_ibp_blocked::CONV_IBP_BLOCKED.name {
+            let Some(token) = raw.as_str() else {
+                bail!(
+                    "preset delivery `{key}` for {} must be one of `0`, `1`, or `seq`",
+                    decl.name
+                );
+            };
+            if !matches!(token, "0" | "1" | "seq") {
+                bail!(
+                    "preset delivery `{key}` for {} has noncanonical token {token:?}; \
+                     expected one of `0`, `1`, or `seq`",
+                    decl.name
+                );
+            }
+        }
+
+        // The legacy environment grammar uses `1` and friendly truthy tokens
+        // for ALL available workers, accepts arbitrary usize widths, and maps
+        // malformed text to serial. It therefore remains a free-form Text
+        // declaration. The typed treatment surface must be narrower: these
+        // canonical tokens are the exact search domain, and excluding `1`
+        // prevents a preset that appears to request one worker from actually
+        // selecting every worker.
+        if decl.name == ny_levers::decls::margin_row::MARGIN_ROW_PARALLEL.name {
+            let Some(token) = raw.as_str() else {
+                bail!(
+                    "preset delivery `{key}` for {} must be one of `0`, `2`, `4`, `8`, or `16`",
+                    decl.name
+                );
+            };
+            if !matches!(token, "0" | "2" | "4" | "8" | "16") {
+                bail!(
+                    "preset delivery `{key}` for {} has noncanonical token {token:?}; \
+                     expected one of `0`, `2`, `4`, `8`, or `16` (legacy `1` means all workers)",
+                    decl.name
+                );
+            }
+        }
+
+        // These two typed fields predate registry delivery and historically
+        // decline out-of-range values to their lower scheduler layer. Preserve
+        // that contract while validating every admitted value against the
+        // declaration, and widen the parsed f32 exactly instead of
+        // round-tripping it through serde's generic numeric representation.
+        let value = if std::ptr::eq(
+            decl,
+            &raw const ny_levers::decls::margin_row::MARGIN_ROW_RESERVE_MAX_FRAC,
+        ) {
+            let Some(value) = preset.margin_row.reserve_max_frac else {
+                continue;
+            };
+            if !value.is_finite() || value <= 0.0 || value >= 1.0 {
+                continue;
+            }
+            ny_levers::LeverValue::F64(f64::from(value))
+        } else if std::ptr::eq(
+            decl,
+            &raw const ny_levers::decls::margin_row::MARGIN_ROW_ADAPTIVE_RELEASE_FRAC,
+        ) {
+            let Some(value) = preset.margin_row.release_frac else {
+                continue;
+            };
+            if !value.is_finite() || value <= 0.0 || value >= 1.0 {
+                continue;
+            }
+            ny_levers::LeverValue::F64(f64::from(value))
+        } else {
+            delivered_lever_value(key, decl, raw)?
+        };
+        ny_levers::read_over_config_with(decl, |_| None, Some(value)).map_err(|_| {
+            anyhow::anyhow!(
+                "preset delivery `{key}` value {raw:?} is not admissible for {} ({:?})",
+                decl.name,
+                decl.kind
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Project one serialized typed preset field into the declaration's value
+/// vocabulary. Type mismatch is a preset-authority error, not an absent key.
+fn delivered_lever_value(
+    key: &str,
+    decl: &'static ny_levers::LeverDecl,
+    raw: &serde_yaml::Value,
+) -> Result<ny_levers::LeverValue> {
+    use ny_levers::{LeverKind, LeverValue};
+
+    let projected = match decl.kind {
+        LeverKind::Bool
+        | LeverKind::BoolOverride
+        | LeverKind::BoolKillOverride
+        | LeverKind::TruthyTrimmed
+        | LeverKind::TrimmedExactOne
+        | LeverKind::Presence => raw.as_bool().map(LeverValue::Bool),
+        LeverKind::U64
+        | LeverKind::U64Override
+        | LeverKind::U64Trimmed
+        | LeverKind::UsizeTrimmed
+        | LeverKind::UsizeTrimmedUnicodeOwned
+        | LeverKind::UsizeTrimmedOverride { .. }
+        | LeverKind::UsizeOverride { .. }
+        | LeverKind::Usize { .. } => raw.as_u64().map(LeverValue::U64),
+        LeverKind::F32Positive | LeverKind::F32NonNegative => raw
+            .as_f64()
+            .map(|value| LeverValue::F64(f64::from(value as f32))),
+        LeverKind::F64Open { .. }
+        | LeverKind::F64OpenOverride { .. }
+        | LeverKind::F64OpenUnicodeOwned { .. }
+        | LeverKind::F64ClosedTrimmed { .. } => raw.as_f64().map(LeverValue::F64),
+        LeverKind::Secs => raw.as_f64().map(LeverValue::Secs),
+        LeverKind::Enum(_) | LeverKind::LayeredEnum { .. } => {
+            raw.as_str().map(|text| LeverValue::Text(text.to_owned()))
+        }
+        LeverKind::Text => raw
+            .as_str()
+            .map(str::to_owned)
+            // Legacy raw-predicate declarations retain Text parsing while the
+            // typed surface is intentionally Boolean. Project that canonical
+            // answer to the exact token the read-site predicate represents.
+            .or_else(|| {
+                raw.as_bool()
+                    .map(|on| if on { "1" } else { "0" }.to_owned())
+            })
+            .map(LeverValue::Text),
+    };
+
+    projected.with_context(|| {
+        format!(
+            "preset delivery `{key}` value {raw:?} has the wrong type for {} ({:?})",
+            decl.name, decl.kind
+        )
+    })
 }
 
 /// Effective typed `alpha_zero_yield_frac` supplied by one validated preset.
@@ -393,6 +598,18 @@ fn apply_solver_and_bab_settings(
     if let Some(cap_secs) = bab.crown_ibp_per_node_cap_secs {
         config.crown_ibp_per_node_cap_secs = Some(cap_secs);
     }
+    if let Some(prefix_cost_weighted) = bab.crown_ibp_prefix_cost_weighted {
+        config.crown_ibp_prefix_cost_weighted = prefix_cost_weighted;
+    }
+    if let Some(frac) = bab.crown_ibp_max_target_share_frac {
+        if !frac.is_finite() || frac <= 0.0 || frac >= 1.0 {
+            bail!(
+                "bab.crown_ibp_max_target_share_frac must be a finite fraction in (0, 1), got {}",
+                frac
+            );
+        }
+        config.crown_ibp_max_target_share_frac = Some(frac);
+    }
 
     Ok(())
 }
@@ -408,6 +625,12 @@ fn apply_branching_preset(config: &mut BetaCrownConfig, preset: &PresetConfig) -
     }
     if let Some(ref reduceop) = branching.reduceop {
         config.kfsb_reduce_op = parse_reduce_op(reduceop)?;
+    }
+    if let Some(candidates) = branching.kfsb_multi_candidates {
+        config.kfsb_multi_candidates = Some(candidates);
+    }
+    if let Some(ref reduceop) = branching.kfsb_multi_reduceop {
+        config.kfsb_multi_reduce_op = Some(parse_reduce_op(reduceop)?);
     }
     if let Some(kfsb_multi) = branching.kfsb_multi {
         // #kfsb-multi: preset-scoped opt-in for the wave-batched selector.
@@ -449,6 +672,48 @@ fn apply_branching_preset(config: &mut BetaCrownConfig, preset: &PresetConfig) -
     if let Some(stacked_rebound) = branching.input_split.stacked_rebound {
         config.input_split_stacked_rebound = stacked_rebound;
     }
+    if let Some(nested_deadline) = branching.input_split.nested_deadline {
+        // #dist-shift-5291: typed nested-deadline authority; env
+        // NY_INPUT_SPLIT_NESTED_DEADLINE still overrides in both directions
+        // at the shared_specs.rs chokepoint.
+        config.input_split_nested_deadline = Some(nested_deadline);
+    }
+    if let Some(child_bound_max_secs) = branching.input_split.child_bound_max_secs {
+        // #cgan-dark-tail FIX-1: typed per-child bound wall cap. Config-only
+        // (no env override — a new raw env read would raise the ny-levers
+        // ratchet). Absent leaves `None` = NO CAP = today's behaviour.
+        config.input_split_child_bound_max_secs = Some(child_bound_max_secs);
+    }
+    if let Some(calibration) = &branching.input_split.child_bound_calibration {
+        // #cost-observer: typed self-calibrating per-child allowance. Config-only
+        // (no env override — a new raw env read would raise the ny-levers
+        // ratchet). Absent leaves `None`, i.e. the constant above governs.
+        // Every field is optional; unnamed fields take the SlicePolicy default.
+        config.input_split_child_bound_calibration =
+            Some(ny_propagate::ChildBoundCalibrationConfig {
+                headroom: calibration.headroom,
+                max_share_of_remaining: calibration.max_share_of_remaining,
+                probe_share: calibration.probe_share,
+                min_samples: calibration.min_samples,
+                window: calibration.window,
+                growth: calibration.growth,
+            });
+    }
+    if let Some(f64_tail) = &branching.input_split.f64_tail {
+        // #cgan-f64-tail: typed f64-tail escalation authority; the env levers
+        // NY_F64_TAIL / NY_F64_TAIL_BAND still override at the ny-propagate
+        // `resolve_f64_tail_settings` chokepoint (both directions for the
+        // gate; band env wins when set+valid).
+        if let Some(enabled) = f64_tail.enabled {
+            config.input_split_f64_tail_enabled = Some(enabled);
+        }
+        if let Some(band) = f64_tail.band {
+            config.input_split_f64_tail_band = Some(band);
+        }
+        if let Some(max_escalations) = f64_tail.max_escalations {
+            config.input_split_f64_tail_max_escalations = Some(max_escalations);
+        }
+    }
     if let Some(warm_parallel) = branching.input_split.warm_parallel {
         config.input_split_warm_parallel = warm_parallel;
     }
@@ -488,6 +753,39 @@ fn apply_attack_preset(
     }
     if let Some(pgd_steps) = preset.attack.pgd_steps {
         config.pgd_steps = pgd_steps;
+    }
+    if let Some(value) = preset.attack.pgd_exact_batched {
+        config.pgd_exact_vjp.prefer_exact_batched = value;
+    }
+    if let Some(value) = preset.attack.pgd_fast_grad {
+        config.pgd_exact_vjp.fast_gradient = value;
+    }
+    if let Some(value) = preset.attack.pgd_vjp_batch {
+        config.pgd_exact_vjp.batch_enabled = value;
+    }
+    if let Some(value) = preset.attack.pgd_vjp_k {
+        config.pgd_exact_vjp.batch_width = Some(value);
+    }
+    if let Some(value) = preset.attack.pgd_legacy_lanes {
+        config.pgd_exact_vjp.legacy_lanes = value;
+    }
+    if let Some(value) = preset.attack.pgd_odi_steps {
+        config.pgd_exact_vjp.odi_steps = value;
+    }
+    if let Some(value) = preset.attack.pgd_odi_eta {
+        config.pgd_exact_vjp.odi_eta = value;
+    }
+    if let Some(value) = preset.attack.pgd_vjp_steps {
+        config.pgd_exact_vjp.wave_steps = Some(value);
+    }
+    if let Some(value) = preset.attack.pgd_lane_window {
+        config.pgd_exact_vjp.lane_window = value;
+    }
+    if let Some(value) = preset.attack.pgd_exploit {
+        config.pgd_exact_vjp.exploit = value;
+    }
+    if let Some(value) = preset.attack.pgd_hinge_tau {
+        config.pgd_exact_vjp.hinge_tau = value;
     }
     if let Some(schedule) = initial_pgd_schedule {
         config.enable_pgd_attack = !matches!(schedule, ResolvedInitialPgdSchedule::Disabled);
@@ -615,6 +913,9 @@ fn apply_alpha_preset(config: &mut AlphaCrownConfig, preset: &AlphaCrownPreset) 
     }
     if let Some(enabled) = preset.cgan_sparse_target_complete_root {
         config.cgan_sparse_target_complete_root = enabled;
+    }
+    if let Some(max_rows) = preset.cgan_narrow_target_max_rows {
+        config.cgan_narrow_target_max_rows = Some(max_rows);
     }
     if let Some(enabled) = preset.cgan_complete_crown_ibp_root {
         config.cgan_complete_crown_ibp_root = enabled;
@@ -795,9 +1096,15 @@ fn apply_phase_budget_preset(pb: &mut PhaseBudgetConfig, preset: &PhaseBudgetPre
     if let Some(v) = preset.post_bab_pgd_fraction {
         pb.post_bab_pgd_fraction = v;
     }
-    // `vnncomp_post_bab_attack` belongs to the outer competition wrapper, not
-    // the reusable engine schedule. The VNN-COMP router consumes it directly
-    // from its immutable PresetConfig snapshot.
+    if let Some(v) = preset.demand_sized_post_bab_reserve {
+        pb.demand_sized_post_bab_reserve = v;
+    }
+    if let Some(v) = preset.demand_sized_disjunctive_pgd {
+        pb.demand_sized_disjunctive_pgd = v;
+    }
+    // `vnncomp_post_bab_attack` and `post_bab_reserve_secs` belong to the outer
+    // competition wrapper, not the reusable engine schedule. The VNN-COMP
+    // router consumes them directly from its immutable PresetConfig snapshot.
     if let Some(v) = preset.attack_extension_fraction {
         pb.attack_extension_fraction = v;
     }

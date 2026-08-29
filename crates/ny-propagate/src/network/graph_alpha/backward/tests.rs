@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::bounds::patches::{PatchGeometry, PatchesData, PatchesLinearBounds};
+use crate::layers::binary_ops::ConcatLayer;
 use crate::layers::{LinearLayer, ReLULayer, SigmoidLayer};
 use crate::network::core::GraphNode;
 use ndarray::{arr1, arr2, Array1, ArrayD, IxDyn};
@@ -1131,5 +1132,287 @@ fn dag_alpha_backward_scatters_published_margin_rows() {
             full.lower()[[i]] > out_ibp.lower()[[i]] || full.upper()[[i]] < out_ibp.upper()[[i]]
         }),
         "CROWN must beat IBP on a referenced row"
+    );
+}
+
+// ========================================================================
+// #gpu-suffix-frontier — FALSE PROOF regression (soundness)
+// ========================================================================
+
+/// Build the branching DAG that exposed the truncating GPU-suffix shortcut:
+///
+/// ```text
+///            ┌────────────► passthru (Linear, identity 2→2) ──┐
+///   input(2)─┤                                                ├─► cat (Concat) → 4 outputs
+///            └─► linear1 (2→2) ─► relu1 (ReLU) ───────────────┘
+/// ```
+///
+/// Reverse execution order visits `cat`, then `relu1`, then `linear1`. At
+/// `linear1` the remaining chain to NETWORK_INPUT is unary and GPU-extractable,
+/// so the suffix shortcut is eligible — but the `passthru` branch is STILL
+/// PENDING in the accumulator. Truncating the walk there abandons `passthru`,
+/// leaving its two output rows with zero coefficients and zero bias; they
+/// concretize to +/-(fp residue) and are published as a certified bound.
+///
+/// This is the in-tree analogue of the ONNX reproduction
+/// `Concat(Slice(X,0:2), Relu(Gemm(X)))`, on which stock `ny` certified
+/// `Y_0 ∈ [-1.883552e-32, +1.883552e-32]` for a row whose true range is
+/// [-0.7, +0.7] — a false SAFE verdict, `mode: Sound`, no levers set.
+fn build_branching_graph_for_gpu_suffix() -> (GraphNetwork, BoundedTensor) {
+    let mut graph = GraphNetwork::new();
+
+    // Branch A: identity passthrough straight off the network input.
+    let wi = arr2(&[[1.0_f32, 0.0], [0.0, 1.0]]);
+    graph.add_node(GraphNode::from_input(
+        "passthru",
+        Layer::Linear(LinearLayer::new(wi, None).expect("valid passthru")),
+    ));
+
+    // Branch B: the GPU-extractable unary chain.
+    let w1 = arr2(&[[1.0_f32, -0.5], [0.3, 0.8]]);
+    let b1 = arr1(&[0.1_f32, -0.2]);
+    graph.add_node(GraphNode::from_input(
+        "linear1",
+        Layer::Linear(LinearLayer::new(w1, Some(b1)).expect("valid Linear1")),
+    ));
+    graph.add_node(GraphNode::new(
+        "relu1",
+        Layer::ReLU(ReLULayer),
+        vec!["linear1".to_string()],
+    ));
+
+    graph.add_node(GraphNode::new(
+        "cat",
+        Layer::Concat(ConcatLayer::new(0)),
+        vec!["passthru".to_string(), "relu1".to_string()],
+    ));
+    graph.set_output("cat");
+
+    let input = BoundedTensor::new(
+        ArrayD::from_elem(IxDyn(&[2]), -0.7_f32),
+        ArrayD::from_elem(IxDyn(&[2]), 0.7_f32),
+    )
+    .expect("valid input");
+
+    (graph, input)
+}
+
+fn run_branching_graph_backward(engine: Option<&dyn GemmEngine>, context: &str) -> BoundedTensor {
+    let (graph, input) = build_branching_graph_for_gpu_suffix();
+    let ibp_bounds = graph
+        .collect_node_bounds(&input)
+        .expect("IBP forward should succeed");
+    let exec_order = graph.exec_order().expect("exec_order").to_vec();
+    let relu_pre = graph
+        .relu_preactivation_bounds("relu1", &input, &ibp_bounds, context)
+        .expect("ReLU pre-activation bounds");
+    let mut alpha_state = GraphAlphaState::new();
+    alpha_state
+        .add_relu_node("relu1", relu_pre, false)
+        .expect("alpha init");
+    let relu_name_to_idx: HashMap<String, usize> = [("relu1".to_string(), 0)].into_iter().collect();
+    let mut gradients = vec![Array1::<f32>::zeros(2)];
+    let mut gradients_upper = vec![Array1::<f32>::zeros(2)];
+
+    graph
+        .dag_alpha_bound_pass_with_engine(
+            &input,
+            &ibp_bounds,
+            &exec_order,
+            4,
+            2,
+            &relu_name_to_idx,
+            &alpha_state,
+            None,
+            engine,
+            None,
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| {
+            let _ = (&mut gradients, &mut gradients_upper);
+            panic!("{context} branching backward failed: {e}")
+        })
+}
+
+/// The truncating GPU-suffix shortcut MUST NOT fire while a sibling branch is
+/// still pending in the accumulator.
+///
+/// Deleting the `sole_carrier_witness` guard in
+/// `dag_alpha_backward_pass_core` makes this test fail: the shortcut fires
+/// (`seeded_call_count() == 1`) and the scripted device bounds replace the real
+/// ones, exactly as the false proof did.
+#[ntest::timeout(10000)]
+#[test]
+fn gpu_suffix_shortcut_refuses_with_a_pending_sibling_branch() {
+    let _gate = crate::sound_gpu_gate::test_lock::lock_gate();
+
+    let cpu_bounds = run_branching_graph_backward(None, "branching-cpu-baseline");
+
+    // A scripted device that would return an obviously-collapsed answer. If the
+    // shortcut fires, these near-zero rows become the published bound.
+    let engine = BackwardGpuSuffixEngine::new(vec![-1.0e-32; 4], vec![1.0e-32; 4]);
+    let gpu_bounds = run_branching_graph_backward(Some(&engine), "branching-gpu");
+
+    assert_eq!(
+        engine.seeded_call_count(),
+        0,
+        "GPU suffix must NOT truncate the walk while the `passthru` branch is \
+         still pending — that abandons the branch and publishes a false bound"
+    );
+
+    let cpu_lower: Vec<f32> = cpu_bounds.lower().iter().copied().collect();
+    let gpu_lower: Vec<f32> = gpu_bounds.lower().iter().copied().collect();
+    let cpu_upper: Vec<f32> = cpu_bounds.upper().iter().copied().collect();
+    let gpu_upper: Vec<f32> = gpu_bounds.upper().iter().copied().collect();
+    // Engine presence may perturb the last ULP (the mock routes general GEMM
+    // through NaiveCpuGemmEngine), but must never change the bound's magnitude.
+    for (i, (g, c)) in gpu_lower.iter().zip(&cpu_lower).enumerate() {
+        assert!(
+            (g - c).abs() <= 1e-5 * c.abs().max(1.0),
+            "row {i} lower diverged with an engine present: {g} vs {c}"
+        );
+    }
+    for (i, (g, c)) in gpu_upper.iter().zip(&cpu_upper).enumerate() {
+        assert!(
+            (g - c).abs() <= 1e-5 * c.abs().max(1.0),
+            "row {i} upper diverged with an engine present: {g} vs {c}"
+        );
+    }
+    // And specifically: the scripted 1e-32 device answer must NOT be published.
+    for (i, (g, c)) in gpu_lower.iter().zip(&cpu_lower).enumerate() {
+        if c.abs() > 1e-3 {
+            assert!(
+                g.abs() > 1e-3,
+                "row {i} collapsed to {g}: the truncating shortcut published the \
+                 device answer over the real relation"
+            );
+        }
+    }
+
+    // The identity passthrough rows must retain the FULL input range. This is
+    // the assertion the false proof violated by 31 orders of magnitude.
+    for row in 0..2 {
+        assert!(
+            cpu_lower[row] <= -0.69 && cpu_upper[row] >= 0.69,
+            "passthru row {row} collapsed to [{}, {}]; the identity branch must \
+             preserve the input box [-0.7, +0.7]",
+            cpu_lower[row],
+            cpu_upper[row]
+        );
+    }
+}
+
+/// The witness is issued ONLY when the frontier is provably empty.
+#[test]
+fn sole_carrier_witness_is_refused_when_a_branch_is_pending() {
+    use crate::network::CrownMergeAccumulator;
+
+    let empty = CrownMergeAccumulator::new();
+    assert!(
+        empty.sole_carrier_witness(false).is_some(),
+        "an empty frontier with nothing accumulated to the input is the sole-carrier case"
+    );
+    assert!(
+        empty.sole_carrier_witness(true).is_none(),
+        "coefficients already accumulated to NETWORK_INPUT would be dropped by a \
+         truncating shortcut"
+    );
+}
+
+// ========================================================================
+// #gpu-suffix-coeff-err — the device seed cannot carry a certified enclosure
+// ========================================================================
+
+/// The GPU-suffix seam REFUSES a relation that carries certified coefficient
+/// error, because `GpuCrownSeed` has no field to transport it.
+///
+/// This test fails if the refusal is deleted: seeding from an err-carrying
+/// relation would hand the device a midpoint A/b as though it were exact.
+#[test]
+fn gpu_suffix_seed_refuses_a_relation_carrying_certified_coeff_err() {
+    use super::gpu_suffix::gpu_suffix_seed_is_err_free;
+    use crate::bounds::LinearBounds;
+    use ndarray::Array2;
+
+    let mut lb = LinearBounds::identity(2);
+    assert!(
+        gpu_suffix_seed_is_err_free(&lb),
+        "an exact relation carries no certified error and may be seeded"
+    );
+
+    // Attach a certified per-coefficient error, exactly as `Linear`/`Conv2d`/
+    // `IntervalConst` backward do via `set_coeff_err`.
+    let err = Array2::<f32>::from_elem((2, 2), 1.0e-3);
+    lb.set_coeff_err(err.clone(), err);
+    assert!(
+        lb.has_coeff_err(),
+        "precondition: the relation now carries a certified enclosure"
+    );
+    assert!(
+        !gpu_suffix_seed_is_err_free(&lb),
+        "the GPU suffix MUST refuse an err-carrying relation — `GpuCrownSeed` \
+         has no channel for it, so seeding would silently drop the enclosure \
+         and publish a bound tighter than the relation justifies"
+    );
+}
+
+/// Ratchet: every host-side `GpuCrownSeed` construction in `ny-propagate`.
+///
+/// `GpuCrownSeed` has no certified-coefficient-error field. Any site that
+/// builds one from a `LinearBounds` therefore DROPS that channel unless it
+/// checks first. This list is the audited surface; adding a construction
+/// without adding it here fails the build, so the next site cannot join the
+/// unsafe set silently.
+///
+/// To change this number you must state, for the new site, which it is:
+///   ACCOUNTS  — it charges the error into the seed's bias, with a test that
+///               fails if the charge is removed; or
+///   REFUSES   — it fail-closes via `gpu_suffix_seed_is_err_free` (or an
+///               equivalent `has_coeff_err` check) with a test that hits it; or
+///   UNREACHED — it provably cannot receive an err-carrying relation.
+#[test]
+fn host_side_gpu_crown_seed_construction_sites_are_pinned() {
+    use std::path::Path;
+
+    fn walk(dir: &Path, out: &mut Vec<(String, usize)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let count = text.matches("GpuCrownSeed {").count();
+                if count > 0 {
+                    let name = path
+                        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((name, count));
+                }
+            }
+        }
+    }
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    walk(&src, &mut found);
+    found.sort();
+    let total: usize = found.iter().map(|(_, c)| *c).sum();
+
+    // Measured at the #gpu-suffix-frontier / #gpu-suffix-coeff-err audit.
+    // 26 production sites + the literal in this test's own matcher.
+    const PINNED_TOTAL: usize = 27;
+    assert_eq!(
+        total, PINNED_TOTAL,
+        "host-side `GpuCrownSeed` construction count changed (pinned {PINNED_TOTAL}, found \
+         {total}). `GpuCrownSeed` cannot transport `LinearBounds::lower_a_err`/`upper_a_err`, so \
+         each site must be ACCOUNTS / REFUSES / UNREACHED before this number moves.\nSites: {found:#?}"
     );
 }

@@ -252,25 +252,63 @@ fn record_complete_clip_decision_capture(
     }
 }
 
-/// Master gate ENV override (kill switch): `NY_MO_KFSB=1` force-ARMS the
-/// wave-batched kFSB selector on the multi-objective lane, `NY_MO_KFSB=0`
-/// force-DISARMS it. The self-contained alias `NY_BRANCH_KFSB_CHILDSIM=1` also
-/// force-ARMS (so the child-sim scoring at the selector actually runs). Any
-/// other value (or unset, no childsim) ⇒ `None`, so the gate falls back to
-/// `config.use_kfsb_multi_branching` (the preset opt-in). The env thus
-/// overrides the preset in EITHER direction, preserving the A/B kill switch.
-fn kfsb_multi_env_override() -> Option<bool> {
-    match std::env::var("NY_MO_KFSB").ok().as_deref() {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
-        _ if kfsb_childsim_gate_enabled() => Some(true),
-        _ => None,
+/// Governed master resolution plus the lossless canonical disposition needed
+/// by execution telemetry. The canonical environment is resolved once; its
+/// source distinguishes exact disable from malformed/rejected input without a
+/// second environment read. The legacy compound switch remains absence-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KfsbMultiGateReceipt {
+    gate: ny_levers::decls::kfsb::KfsbGateResolution,
+    canonical_master: crate::execution_telemetry::MoKfsbCanonicalMaster,
+}
+
+fn kfsb_multi_gate_receipt_from_resolved(
+    canonical: &ny_levers::Resolved,
+    legacy: Option<&ny_levers::Resolved>,
+) -> KfsbMultiGateReceipt {
+    let canonical_master = match canonical.source {
+        ny_levers::Source::Default | ny_levers::Source::Config => {
+            crate::execution_telemetry::MoKfsbCanonicalMaster::Absent
+        }
+        ny_levers::Source::LegacyEnv if canonical.value.as_bool() => {
+            crate::execution_telemetry::MoKfsbCanonicalMaster::ExactEnable
+        }
+        ny_levers::Source::LegacyEnv => {
+            crate::execution_telemetry::MoKfsbCanonicalMaster::ExactDisable
+        }
+        ny_levers::Source::LegacyEnvRejected => {
+            crate::execution_telemetry::MoKfsbCanonicalMaster::Rejected
+        }
+    };
+    KfsbMultiGateReceipt {
+        gate: ny_levers::decls::kfsb::resolve_gate_from_resolved(canonical, legacy),
+        canonical_master,
     }
 }
 
-/// #branch-kfsb-childsim: a self-contained single switch for the wave-batched
+fn kfsb_multi_gate_receipt(config_armed: bool) -> KfsbMultiGateReceipt {
+    let canonical = ny_levers::read_over_config(
+        &ny_levers::decls::kfsb::MO_KFSB,
+        Some(ny_levers::LeverValue::Bool(config_armed)),
+    )
+    .expect("a Bool kFSB config value must satisfy its Bool declaration");
+    let legacy = matches!(
+        canonical.source,
+        ny_levers::Source::Default | ny_levers::Source::Config
+    )
+    .then(|| ny_levers::read(&ny_levers::decls::kfsb::BRANCH_KFSB_CHILDSIM));
+    kfsb_multi_gate_receipt_from_resolved(&canonical, legacy.as_ref())
+}
+
+#[cfg(test)]
+fn kfsb_multi_gate_resolution(config_armed: bool) -> ny_levers::decls::kfsb::KfsbGateResolution {
+    kfsb_multi_gate_receipt(config_armed).gate
+}
+
+/// #branch-kfsb-childsim: a legacy compound switch for the wave-batched
 /// kFSB CHILD-SIMULATION branch selector. `NY_BRANCH_KFSB_CHILDSIM=1` arms the
-/// exact same lane as `NY_MO_KFSB=1` — it scores each candidate split by the
+/// same lane as `NY_MO_KFSB=1` only when that canonical environment variable
+/// is absent — it scores each candidate split by the
 /// ACTUAL bound on BOTH children (simulated in one wave-batched backward) and
 /// picks the argmax worst-child bound, instead of the objective-blind intercept
 /// `(-l·u)/(u-l)` proxy the default `select_graph_branch_multi` falls back to
@@ -289,25 +327,206 @@ fn kfsb_multi_env_override() -> Option<bool> {
 /// default-off certificate-reuse policy may additionally publish a
 /// strictly-authorized scalar lower proof as documented at
 /// [`apply_kfsb_reusable_lower_certificate`].
-fn kfsb_childsim_gate_enabled() -> bool {
-    std::env::var("NY_BRANCH_KFSB_CHILDSIM").ok().as_deref() == Some("1")
+/// Resolve the candidate budget once using the selector's historical
+/// precedence. The dedicated wave field inherits the ordinary FSB/kFSB width
+/// when absent, preserving shipped presets without coupling new search arms to
+/// ordinary branching. Typed gate checks call this only after the policy has
+/// already passed its default-off round gate, so an omitted typed policy does
+/// not add any environment reads to the legacy path.
+fn kfsb_multi_configured_candidate_count(config: &crate::beta_crown::BetaCrownConfig) -> usize {
+    config
+        .kfsb_multi_candidates
+        .unwrap_or(config.fsb_candidates)
 }
 
-/// Resolve the candidate budget once using the selector's historical
-/// precedence. Typed gate checks call this only after the policy has already
-/// passed its default-off round gate, so an omitted typed policy does not add
-/// any environment reads to the legacy path.
-fn kfsb_multi_candidate_count(configured: usize) -> usize {
-    std::env::var("NY_MO_KFSB_K")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            if kfsb_childsim_gate_enabled() {
-                2
-            } else {
-                configured
+fn kfsb_multi_candidate_count_with_gate(
+    config: &crate::beta_crown::BetaCrownConfig,
+    gate: ny_levers::decls::kfsb::KfsbGateResolution,
+) -> usize {
+    let configured = kfsb_multi_configured_candidate_count(config);
+    ny_levers::decls::kfsb::resolve_candidate_count(configured, gate)
+}
+
+#[cfg(test)]
+fn kfsb_multi_candidate_count(config: &crate::beta_crown::BetaCrownConfig) -> usize {
+    kfsb_multi_candidate_count_with_gate(config, kfsb_multi_gate_resolution(false))
+}
+
+/// One immutable policy decision consumed by both selector admission and its
+/// execution receipt. Round-varying typed Select is kept distinct from the
+/// run-common configured master; `lower_master` is their exact OR before the
+/// canonical and absence-only legacy layers are applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::beta_crown::engine::graph) struct KfsbMultiWavePolicy {
+    pub(in crate::beta_crown::engine::graph) canonical_master:
+        crate::execution_telemetry::MoKfsbCanonicalMaster,
+    pub(in crate::beta_crown::engine::graph) legacy_childsim: bool,
+    pub(in crate::beta_crown::engine::graph) configured_master: bool,
+    pub(in crate::beta_crown::engine::graph) configured_candidates: usize,
+    pub(in crate::beta_crown::engine::graph) effective_candidates: usize,
+    /// Present here only when historical typed admission itself required a
+    /// reducer read. Otherwise the caller captures the pair inside an executed
+    /// selector closure, or after publication for an active OFF receipt.
+    pub(in crate::beta_crown::engine::graph) configured_reduce_op:
+        Option<crate::beta_crown::KfsbReduceOp>,
+    pub(in crate::beta_crown::engine::graph) effective_reduce_op:
+        Option<crate::beta_crown::KfsbReduceOp>,
+    pub(in crate::beta_crown::engine::graph) heuristic_eligible: bool,
+    pub(in crate::beta_crown::engine::graph) typed_select: bool,
+    pub(in crate::beta_crown::engine::graph) lower_master: bool,
+    pub(in crate::beta_crown::engine::graph) effective_master: bool,
+    pub(in crate::beta_crown::engine::graph) wave_enabled: bool,
+}
+
+#[cfg(test)]
+mod kfsb_multi_gate_resolution_tests {
+    fn resolved_candidate(raw: Option<&str>, configured: usize) -> ny_levers::Resolved {
+        let raw = raw.map(str::to_owned);
+        ny_levers::read_over_config_with(
+            &ny_levers::decls::kfsb::MO_KFSB_K,
+            move |_| raw,
+            Some(ny_levers::LeverValue::U64(configured as u64)),
+        )
+        .expect("candidate config")
+    }
+
+    fn resolved_gate(
+        canonical_raw: Option<&str>,
+        config_armed: bool,
+        legacy_raw: Option<&str>,
+    ) -> (
+        ny_levers::decls::kfsb::KfsbGateResolution,
+        ny_levers::Resolved,
+    ) {
+        let canonical_raw = canonical_raw.map(str::to_owned);
+        let canonical = ny_levers::read_over_config_with(
+            &ny_levers::decls::kfsb::MO_KFSB,
+            move |_| canonical_raw,
+            Some(ny_levers::LeverValue::Bool(config_armed)),
+        )
+        .expect("Bool test config");
+        let legacy_raw = legacy_raw.map(str::to_owned);
+        let legacy =
+            ny_levers::read_with(&ny_levers::decls::kfsb::BRANCH_KFSB_CHILDSIM, move |_| {
+                legacy_raw
+            });
+        let gate = ny_levers::decls::kfsb::resolve_gate_from_resolved(&canonical, Some(&legacy));
+        (gate, canonical)
+    }
+
+    #[test]
+    fn canonical_master_layers_exact_env_over_typed_config() {
+        assert_eq!(
+            resolved_gate(None, false, None).0,
+            ny_levers::decls::kfsb::KfsbGateResolution {
+                armed: false,
+                env_override: None,
+                legacy_childsim: false,
             }
-        })
+        );
+        assert_eq!(
+            resolved_gate(None, true, None).0,
+            ny_levers::decls::kfsb::KfsbGateResolution {
+                armed: true,
+                env_override: None,
+                legacy_childsim: false,
+            }
+        );
+        assert!(resolved_gate(Some("1"), false, None).0.armed);
+        assert!(
+            !resolved_gate(Some("0"), true, Some("1")).0.armed,
+            "canonical exact 0 must disarm typed config and suppress legacy childsim"
+        );
+    }
+
+    #[test]
+    fn canonical_receipt_preserves_absent_enable_disable_and_rejection() {
+        let state = |raw: Option<&str>, config_armed: bool| {
+            let canonical = resolved_gate(raw, config_armed, Some("1")).1;
+            super::kfsb_multi_gate_receipt_from_resolved(&canonical, None).canonical_master
+        };
+        assert_eq!(
+            state(None, true),
+            crate::execution_telemetry::MoKfsbCanonicalMaster::Absent
+        );
+        assert_eq!(
+            state(Some("1"), false),
+            crate::execution_telemetry::MoKfsbCanonicalMaster::ExactEnable
+        );
+        assert_eq!(
+            state(Some("0"), true),
+            crate::execution_telemetry::MoKfsbCanonicalMaster::ExactDisable
+        );
+        assert_eq!(
+            state(Some("true"), true),
+            crate::execution_telemetry::MoKfsbCanonicalMaster::Rejected
+        );
+    }
+
+    #[test]
+    fn malformed_present_canonical_suppresses_config_and_legacy_to_dark_default() {
+        for malformed in ["true", "01", " 1", ""] {
+            let (gate, canonical) = resolved_gate(Some(malformed), true, Some("1"));
+            assert_eq!(
+                gate,
+                ny_levers::decls::kfsb::KfsbGateResolution {
+                    armed: false,
+                    env_override: Some(false),
+                    legacy_childsim: false,
+                },
+                "{malformed:?}"
+            );
+            assert_eq!(
+                canonical.source,
+                ny_levers::Source::LegacyEnvRejected,
+                "{malformed:?}"
+            );
+            assert_eq!(canonical.rejected_raw.as_deref(), Some(malformed));
+        }
+    }
+
+    #[test]
+    fn legacy_childsim_is_absence_only_and_keeps_its_candidate_count_side_effect() {
+        let legacy = resolved_gate(None, false, Some("1")).0;
+        assert_eq!(
+            legacy,
+            ny_levers::decls::kfsb::KfsbGateResolution {
+                armed: true,
+                env_override: Some(true),
+                legacy_childsim: true,
+            }
+        );
+        assert_eq!(
+            ny_levers::decls::kfsb::resolve_candidate_count_from_resolved(
+                &resolved_candidate(None, 7),
+                legacy,
+            ),
+            2
+        );
+        assert_eq!(
+            ny_levers::decls::kfsb::resolve_candidate_count_from_resolved(
+                &resolved_candidate(Some("5"), 7),
+                legacy,
+            ),
+            5,
+            "an explicit candidate override still owns the legacy default"
+        );
+
+        for canonical in ["0", "1", "malformed"] {
+            let gate = resolved_gate(Some(canonical), false, Some("1")).0;
+            assert!(
+                !gate.legacy_childsim,
+                "present canonical {canonical:?} must suppress the legacy compound behavior"
+            );
+            assert_eq!(
+                ny_levers::decls::kfsb::resolve_candidate_count_from_resolved(
+                    &resolved_candidate(None, 7),
+                    gate,
+                ),
+                7
+            );
+        }
+    }
 }
 
 /// Stratified layer quota (`NY_KFSB_LAYER_QUOTA=1`, dark): additionally admit
@@ -423,29 +642,76 @@ fn kfsb_winner_probe_domains() -> usize {
 
 /// Effective reduce op for the wave-batched multi-objective kFSB lane.
 ///
-/// Match αβ-CROWN by honoring the configured `bab.branching.reduceop`; the
-/// VNN-COMP CIFAR-100 and TinyImageNet presets both select `Max`. The optional
+/// Match αβ-CROWN by honoring the dedicated wave policy, falling back to
+/// configured `bab.branching.reduceop` for shipped presets. The VNN-COMP
+/// CIFAR-100 and TinyImageNet presets both select `Max`. The optional
 /// `NY_MO_KFSB_REDUCE=min|max` override remains available for controlled A/B
-/// measurements. Unknown override values leave the configured policy intact.
+/// measurements. A present unknown value is now a governed receipt rejection
+/// and fails to the conservative declaration default `Min`.
+#[cfg(test)]
 pub(super) fn resolve_kfsb_multi_reduce_op(
     configured: crate::beta_crown::KfsbReduceOp,
     env_override: Option<&str>,
 ) -> crate::beta_crown::KfsbReduceOp {
-    match env_override {
-        Some("max") => crate::beta_crown::KfsbReduceOp::Max,
-        Some("min") => crate::beta_crown::KfsbReduceOp::Min,
-        _ => configured,
+    let raw = env_override.map(str::to_owned);
+    let resolved = ny_levers::read_over_config_with(
+        &ny_levers::decls::kfsb::MO_KFSB_REDUCE,
+        move |_| raw,
+        Some(ny_levers::LeverValue::Text(
+            governed_kfsb_reduce_policy(configured).as_str().to_owned(),
+        )),
+    )
+    .expect("closed kFSB reduction config");
+    runtime_kfsb_reduce_policy(ny_levers::decls::kfsb::resolve_reduce_policy_from_resolved(
+        &resolved,
+    ))
+}
+
+fn governed_kfsb_reduce_policy(
+    configured: crate::beta_crown::KfsbReduceOp,
+) -> ny_levers::decls::kfsb::KfsbReducePolicy {
+    match configured {
+        crate::beta_crown::KfsbReduceOp::Min => ny_levers::decls::kfsb::KfsbReducePolicy::Min,
+        crate::beta_crown::KfsbReduceOp::Max => ny_levers::decls::kfsb::KfsbReducePolicy::Max,
+        crate::beta_crown::KfsbReduceOp::Mean => ny_levers::decls::kfsb::KfsbReducePolicy::Mean,
     }
 }
 
-/// The lane's effective reduce op, reading the `NY_MO_KFSB_REDUCE` A/B env.
-fn kfsb_multi_reduce_op(
-    configured: crate::beta_crown::KfsbReduceOp,
+fn runtime_kfsb_reduce_policy(
+    resolved: ny_levers::decls::kfsb::KfsbReducePolicy,
 ) -> crate::beta_crown::KfsbReduceOp {
-    resolve_kfsb_multi_reduce_op(
-        configured,
-        std::env::var("NY_MO_KFSB_REDUCE").ok().as_deref(),
-    )
+    match resolved {
+        ny_levers::decls::kfsb::KfsbReducePolicy::Min => crate::beta_crown::KfsbReduceOp::Min,
+        ny_levers::decls::kfsb::KfsbReducePolicy::Max => crate::beta_crown::KfsbReduceOp::Max,
+        ny_levers::decls::kfsb::KfsbReducePolicy::Mean => crate::beta_crown::KfsbReduceOp::Mean,
+    }
+}
+
+fn kfsb_multi_configured_reduce_op(
+    config: &crate::beta_crown::BetaCrownConfig,
+) -> crate::beta_crown::KfsbReduceOp {
+    config.kfsb_multi_reduce_op.unwrap_or(config.kfsb_reduce_op)
+}
+
+fn kfsb_multi_reduce_policy(
+    config: &crate::beta_crown::BetaCrownConfig,
+) -> (
+    crate::beta_crown::KfsbReduceOp,
+    crate::beta_crown::KfsbReduceOp,
+) {
+    let configured = kfsb_multi_configured_reduce_op(config);
+    let effective = runtime_kfsb_reduce_policy(ny_levers::decls::kfsb::resolve_reduce_policy(
+        governed_kfsb_reduce_policy(configured),
+    ));
+    (configured, effective)
+}
+
+/// The lane's effective governed `NY_MO_KFSB_REDUCE` policy.
+#[cfg(test)]
+fn kfsb_multi_reduce_op(
+    config: &crate::beta_crown::BetaCrownConfig,
+) -> crate::beta_crown::KfsbReduceOp {
+    kfsb_multi_reduce_policy(config).1
 }
 
 /// Chunk width for the simulation's batched backward calls
@@ -3684,44 +3950,26 @@ pub(super) fn pick_kfsb_candidate_subset_original_order(
 }
 
 impl BetaCrownVerifier {
-    #[inline]
-    fn depth_two_lookahead_supported_at_round(
-        &self,
-        bab_round: usize,
-        candidate_count: usize,
-    ) -> bool {
-        self.config
-            .depth_two_branch_lookahead
-            .enabled_at_round(bab_round)
-            && depth_two_lookahead_policy_supported(self.config.depth_two_branch_lookahead)
-            && matches!(self.config.branching_heuristic, BranchingHeuristic::Kfsb)
-            // The shared historical prep chooses its objective by raw lower
-            // bound. Reinterpreting it in upper mode would violate Off/Shadow
-            // identity, so phase 1 fails closed until a separate typed prep
-            // exists for direction-normalized `-upper`.
-            && !self.config.verify_upper_bound
-            && kfsb_multi_reduce_op(self.config.kfsb_reduce_op)
-                == crate::beta_crown::KfsbReduceOp::Min
-            && candidate_count > 0
-    }
-
     /// Whether the wave-batched kFSB selector should run for this config:
-    /// ARMED (env `NY_MO_KFSB` override, else `config.use_kfsb_multi_branching`)
-    /// AND a kFSB heuristic AND a nonzero candidate budget.
+    /// ARMED (layered canonical `NY_MO_KFSB` over
+    /// `config.use_kfsb_multi_branching`, with legacy childsim fallback only
+    /// while the canonical environment variable is absent) AND a kFSB
+    /// heuristic AND a nonzero candidate budget.
     ///
     /// Tri-state arming: `NY_MO_KFSB=1` forces on, `NY_MO_KFSB=0` forces off
-    /// (kill switch), and when the env is unset the preset field
+    /// (kill switch), a malformed present token fails to the declared dark
+    /// default, and when the env is unset the preset field
     /// `use_kfsb_multi_branching` decides (default false ⇒ byte-identical to the
     /// pre-#kfsb-multi advisory path everywhere it is not a cifar100 preset).
     #[cfg(test)]
     pub(in crate::beta_crown::engine::graph) fn kfsb_multi_wave_enabled(&self) -> bool {
-        let armed = kfsb_multi_env_override().unwrap_or(self.config.use_kfsb_multi_branching);
-        armed
+        let candidates = kfsb_multi_candidate_count(&self.config);
+        kfsb_multi_gate_resolution(self.config.use_kfsb_multi_branching).armed
             && matches!(
                 self.config.branching_heuristic,
                 BranchingHeuristic::Kfsb | BranchingHeuristic::KfsbInterceptOnly
             )
-            && self.config.fsb_candidates > 0
+            && candidates > 0
     }
 
     /// Precompute DomainClipper objectives for the final leaves that will
@@ -4023,33 +4271,94 @@ impl BetaCrownVerifier {
         );
     }
 
-    /// Round-aware arming for the typed experiment. The legacy gate above is
-    /// unchanged; an explicit `NY_MO_KFSB=0` remains a kill switch for both.
-    pub(in crate::beta_crown::engine::graph) fn kfsb_multi_wave_enabled_at_round(
+    /// Resolve the round-aware selector policy once for both admission and its
+    /// execution receipt. An explicit `NY_MO_KFSB=0` (or a malformed present
+    /// canonical token) remains a kill switch for both the preset master and
+    /// typed depth-two Select.
+    pub(in crate::beta_crown::engine::graph) fn kfsb_multi_wave_policy_at_round(
         &self,
         bab_round: usize,
-    ) -> bool {
-        let typed_policy = self
+    ) -> KfsbMultiWavePolicy {
+        // Resolve the canonical/legacy master once at the lower-off base. The
+        // lossless canonical state below then applies the exact round-varying
+        // lower policy without reopening the process environment.
+        let gate_receipt = kfsb_multi_gate_receipt(false);
+        let configured_candidates = kfsb_multi_configured_candidate_count(&self.config);
+        let effective_candidates =
+            kfsb_multi_candidate_count_with_gate(&self.config, gate_receipt.gate);
+        let configured_master = self.config.use_kfsb_multi_branching;
+        let heuristic_eligible = matches!(
+            self.config.branching_heuristic,
+            BranchingHeuristic::Kfsb | BranchingHeuristic::KfsbInterceptOnly
+        );
+        let typed_round_enabled = self
             .config
             .depth_two_branch_lookahead
-            .enabled_at_round(bab_round)
-            && self.depth_two_lookahead_supported_at_round(
-                bab_round,
-                kfsb_multi_candidate_count(self.config.fsb_candidates),
-            );
+            .enabled_at_round(bab_round);
+        // Preserve the historical selector-OFF ordering: policy admission
+        // consulted reducer governance here only for an enabled typed round.
+        // An independently armed selector captures it inside the unbounded
+        // execution closure; a skipped/off wave defers it until its optional
+        // post-publication execution receipt.
+        let reducer_policy = typed_round_enabled.then(|| kfsb_multi_reduce_policy(&self.config));
+        let configured_reduce_op = reducer_policy.map(|policy| policy.0);
+        let effective_reduce_op = reducer_policy.map(|policy| policy.1);
+        let typed_policy = typed_round_enabled
+            && effective_reduce_op.is_some_and(|reduce_op| {
+                self.config.depth_two_lookahead_supported_at_round(
+                    bab_round,
+                    effective_candidates,
+                    reduce_op,
+                )
+            });
         // Shadow is strictly piggyback-only. Letting an observation-only mode
         // OR-arm this selector would replace the historical advisory brancher
         // with one-step kFSB even though typed advice has no authority.
         let typed_select = typed_policy
             && self.config.depth_two_branch_lookahead.mode == DepthTwoBranchLookaheadMode::Select;
-        let armed = kfsb_multi_env_override()
-            .unwrap_or(self.config.use_kfsb_multi_branching || typed_select);
-        armed
-            && matches!(
-                self.config.branching_heuristic,
-                BranchingHeuristic::Kfsb | BranchingHeuristic::KfsbInterceptOnly
-            )
-            && self.config.fsb_candidates > 0
+        let lower_master = configured_master || typed_select;
+        let effective_master = match gate_receipt.canonical_master {
+            crate::execution_telemetry::MoKfsbCanonicalMaster::Absent => {
+                lower_master || gate_receipt.gate.legacy_childsim
+            }
+            crate::execution_telemetry::MoKfsbCanonicalMaster::ExactEnable => true,
+            crate::execution_telemetry::MoKfsbCanonicalMaster::ExactDisable
+            | crate::execution_telemetry::MoKfsbCanonicalMaster::Rejected => false,
+        };
+        let wave_enabled = effective_master && heuristic_eligible && effective_candidates > 0;
+        KfsbMultiWavePolicy {
+            canonical_master: gate_receipt.canonical_master,
+            legacy_childsim: gate_receipt.gate.legacy_childsim,
+            configured_master,
+            configured_candidates,
+            effective_candidates,
+            configured_reduce_op,
+            effective_reduce_op,
+            heuristic_eligible,
+            typed_select,
+            lower_master,
+            effective_master,
+            wave_enabled,
+        }
+    }
+
+    /// Resolve the exact configured/effective reducer pair for a selector-OFF
+    /// execution receipt after ordinary publication has completed.
+    pub(in crate::beta_crown::engine::graph) fn kfsb_multi_reduce_policy_for_receipt(
+        &self,
+    ) -> (
+        crate::beta_crown::KfsbReduceOp,
+        crate::beta_crown::KfsbReduceOp,
+    ) {
+        kfsb_multi_reduce_policy(&self.config)
+    }
+
+    #[cfg(test)]
+    pub(in crate::beta_crown::engine::graph) fn kfsb_multi_wave_enabled_at_round(
+        &self,
+        bab_round: usize,
+    ) -> bool {
+        self.kfsb_multi_wave_policy_at_round(bab_round).wave_enabled
     }
 
     /// Wave-batched kFSB branch selection + child commit (#kfsb-multi).
@@ -4060,10 +4369,43 @@ impl BetaCrownVerifier {
     /// error just drops the affected domain from the map.
     // Justification: the selector threads the same verification context as the
     // caller (graph, wave, relu nodes, objectives, thresholds, engine).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::beta_crown::engine::graph) fn select_graph_branch_kfsb_multi_batched(
         &self,
         bab_round: usize,
+        graph: &GraphNetwork,
+        domains_with_unstable: &[MultiObjDomainWithUnstable<'_>],
+        relu_nodes: &[String],
+        objectives: &[Vec<f32>],
+        thresholds: &[f32],
+        engine: &dyn GemmEngine,
+    ) -> HashMap<usize, KfsbMultiChildren> {
+        let candidates = kfsb_multi_candidate_count(&self.config);
+        let effective_reduce_op = kfsb_multi_reduce_op(&self.config);
+        self.select_graph_branch_kfsb_multi_batched_with_policy(
+            bab_round,
+            candidates,
+            effective_reduce_op,
+            graph,
+            domains_with_unstable,
+            relu_nodes,
+            objectives,
+            thresholds,
+            engine,
+        )
+    }
+
+    /// Production entry using the candidate count and reducer captured by the
+    /// exact same governed policy decision that admitted the selector. The
+    /// wrapper above preserves the historical direct test/research API while
+    /// resolving each governed value exactly once.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::beta_crown::engine::graph) fn select_graph_branch_kfsb_multi_batched_with_policy(
+        &self,
+        bab_round: usize,
+        k: usize,
+        effective_reduce_op: crate::beta_crown::KfsbReduceOp,
         graph: &GraphNetwork,
         domains_with_unstable: &[MultiObjDomainWithUnstable<'_>],
         relu_nodes: &[String],
@@ -4077,13 +4419,16 @@ impl BetaCrownVerifier {
         // `resolve_kfsb_multi_reduce_op`) to isolate selection quality from
         // simulation cost without a preset edit.
         // Candidate budget: explicit `NY_MO_KFSB_K` always wins. Otherwise the
-        // self-contained `NY_BRANCH_KFSB_CHILDSIM` switch pins the measured
-        // throughput/quality sweet spot (k=2 — 4× the domains of k=7 at an
-        // identical verified count on cifar100), while the legacy `NY_MO_KFSB`
-        // path keeps `fsb_candidates` (byte-identical to before this gate).
-        let k = kfsb_multi_candidate_count(self.config.fsb_candidates);
+        // absence-only legacy `NY_BRANCH_KFSB_CHILDSIM` switch pins the
+        // measured throughput/quality sweet spot (k=2 — 4× the domains of k=7
+        // at an identical verified count on cifar100), while the canonical
+        // `NY_MO_KFSB` path keeps its dedicated wave width, inheriting
+        // `fsb_candidates` only when that field is absent (byte-identical for
+        // shipped presets).
         let depth_two_policy = self.config.depth_two_branch_lookahead;
-        let depth_two_requested = self.depth_two_lookahead_supported_at_round(bab_round, k);
+        let depth_two_requested =
+            self.config
+                .depth_two_lookahead_supported_at_round(bab_round, k, effective_reduce_op);
         // Typed support itself requires k>0, so the historical zero-budget
         // early return remains exact and cannot suppress viable typed work.
         if k == 0 || domains_with_unstable.is_empty() {
@@ -4197,6 +4542,7 @@ impl BetaCrownVerifier {
                     objectives,
                     thresholds,
                     k,
+                    effective_reduce_op,
                     layer_quota,
                     cached_la_enabled,
                     authority_deadline,
@@ -4590,9 +4936,13 @@ impl BetaCrownVerifier {
         // wrong bound -- every committed child is still evaluated by the ordinary
         // sound backward, and an unranked candidate is simply not chosen.
         let sim_deadline = {
-            let share = ny_levers::read(&ny_levers::decls::wide_lane::KFSB_SIM_SHARE)
-                .value
-                .as_f64()
+            // DELIVERY SEAM (#lever-reachability): `NY_KFSB_SIM_SHARE` still
+            // wins in BOTH directions where present; absent, the typed
+            // `bab.kfsb_sim_share` key decides; absent from both, the
+            // declaration's 0.35 stands. Branching ORDER decides which
+            // subproblems are ever opened, so this needed a route a scored run
+            // can actually take.
+            let share = crate::preset_gates::kfsb_sim_share_override()
                 .map_or(0.35_f32, |share| share as f32);
             (share > 0.0)
                 .then(|| {
@@ -4919,7 +5269,7 @@ impl BetaCrownVerifier {
                                         result.node_bounds,
                                         &preps[capture.prep_index],
                                         &sim_values,
-                                        kfsb_multi_reduce_op(self.config.kfsb_reduce_op),
+                                        effective_reduce_op,
                                     );
                                 }
                             }
@@ -4987,6 +5337,7 @@ impl BetaCrownVerifier {
             adaptive_depth_capture,
             adaptive_depth_target_prep,
             adaptive_depth_budget,
+            effective_reduce_op,
         );
         // Observation only: the captured maps and every authoritative input are
         // borrowed immutably. The helper can emit telemetry, but it cannot
@@ -5000,6 +5351,7 @@ impl BetaCrownVerifier {
                 &sims,
                 capture,
                 authority_deadline,
+                effective_reduce_op,
             );
         }
 
@@ -5109,7 +5461,7 @@ impl BetaCrownVerifier {
                             // losses. The incumbent winner below still uses its
                             // ordinary available simulations.
                         } else {
-                            let reduce_op = kfsb_multi_reduce_op(self.config.kfsb_reduce_op);
+                            let reduce_op = effective_reduce_op;
                             let historical = pick_attribution_diag_portfolio(
                                 prep,
                                 diag,
@@ -5189,7 +5541,7 @@ impl BetaCrownVerifier {
                 legacy_sides
                     .iter()
                     .map(|sides| (side_value(&sides[0]), side_value(&sides[1]))),
-                kfsb_multi_reduce_op(self.config.kfsb_reduce_op),
+                effective_reduce_op,
             );
             if winner_probe && prep.slot < winner_probe_domains {
                 let format_pick = |pick: Option<(usize, f32, f32)>| {
@@ -5259,7 +5611,7 @@ impl BetaCrownVerifier {
                         prep,
                         &sim_values,
                         &sims,
-                        kfsb_multi_reduce_op(self.config.kfsb_reduce_op),
+                        effective_reduce_op,
                     )
                 });
             let decision = if let Some((winner, score)) = typed_override {
@@ -5466,7 +5818,7 @@ impl BetaCrownVerifier {
                     for (candidate_idx, _) in rank_adaptive_depth_candidates(
                         legacy_candidates,
                         &side_values,
-                        kfsb_multi_reduce_op(self.config.kfsb_reduce_op),
+                        effective_reduce_op,
                     ) {
                         if plan.len() == parent_split_depth {
                             break;
@@ -5659,6 +6011,7 @@ impl BetaCrownVerifier {
         sims: &[Option<MultiObjectiveGraphBabDomain>],
         capture: KfsbF64ShadowCapture,
         authority_deadline: Option<std::time::Instant>,
+        effective_reduce_op: crate::beta_crown::KfsbReduceOp,
     ) {
         let Some(prep) = preps.get(capture.prep_index) else {
             return;
@@ -5687,7 +6040,7 @@ impl BetaCrownVerifier {
             authoritative_objective.as_slice(),
             self.config.verify_upper_bound,
         );
-        let reduce_op = kfsb_multi_reduce_op(self.config.kfsb_reduce_op);
+        let reduce_op = effective_reduce_op;
         let side_value = |side: &SideSlot| -> f32 {
             match side {
                 SideSlot::Infeasible => f32::INFINITY,
@@ -5931,7 +6284,7 @@ impl BetaCrownVerifier {
             relu_nodes,
             domain,
             objective,
-            kfsb_multi_reduce_op(self.config.kfsb_reduce_op),
+            kfsb_multi_reduce_op(&self.config),
             None,
         )
     }
@@ -6284,6 +6637,7 @@ impl BetaCrownVerifier {
         capture: Option<AdaptiveDepthShadowCapture>,
         target_prep: Option<usize>,
         budget: Option<DepthTwoLookaheadBudget>,
+        effective_reduce_op: crate::beta_crown::KfsbReduceOp,
     ) {
         let Some(budget) = budget else {
             return;
@@ -6365,7 +6719,7 @@ impl BetaCrownVerifier {
             };
             values.push((active, inactive));
         }
-        let reduce_op = kfsb_multi_reduce_op(self.config.kfsb_reduce_op);
+        let reduce_op = effective_reduce_op;
         let Some(portfolio) = rank_kfsb_candidate_portfolio_with_budget(
             legacy_candidates,
             &values,
@@ -6976,6 +7330,7 @@ impl BetaCrownVerifier {
         objectives: &[Vec<f32>],
         thresholds: &[f32],
         k: usize,
+        effective_reduce_op: crate::beta_crown::KfsbReduceOp,
         layer_quota: bool,
         cached_la_enabled: bool,
         deadline: Option<std::time::Instant>,
@@ -7008,7 +7363,7 @@ impl BetaCrownVerifier {
             }
             distinct.into_iter().map(str::to_string).collect()
         };
-        let reduce_op = kfsb_multi_reduce_op(self.config.kfsb_reduce_op);
+        let reduce_op = effective_reduce_op;
         let (score_parts, cached_score_keys) = if cached_la_enabled {
             let mut cached_parts = domain
                 .cached_la_for_objective(straggler)

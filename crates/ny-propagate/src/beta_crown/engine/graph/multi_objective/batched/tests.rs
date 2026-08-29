@@ -11,6 +11,7 @@ use ndarray::{arr1, arr2};
 use ny_core::{GemmEngine, NaiveCpuGemmEngine, NyError};
 use ny_tensor::BoundedTensor;
 
+use super::batched_single::surfaced_refusal;
 use super::children::collect_multi_objective_children;
 use crate::batched_domain::CachedLinearBounds;
 use crate::beta_crown::branching::GraphNeuronConstraint;
@@ -213,12 +214,13 @@ fn test_auto_enlarge_off_executor_never_surfaces_retry_refusal() {
     )
     .unwrap();
     let mut verifier = BetaCrownVerifier::new(BetaCrownConfig::default());
-    // This is an executor-unit refusal probe, not a wall-clock verifier run.
-    // A live authoritative deadline deliberately selects the pollable CPU
-    // linear-backward path, so clear it here to force the engine dispatch whose
-    // structured allocation refusal the adaptive caller must observe.
+    // This is an executor-unit probe, not a wall-clock verifier run.
     verifier.config.alpha_config.deadline = None;
     assert!(!verifier.config.auto_enlarge_batch_size);
+
+    // Leg 1 (end-to-end, unchanged): with the gate OFF, an engine that refuses
+    // every GEMM must not blow up the executor — the local fallback/error
+    // mapping still produces one result per domain.
     let results = GraphDomainBatchExecutor::execute_single_objective(
         &verifier,
         SingleObjectiveBatchRequest {
@@ -236,24 +238,44 @@ fn test_auto_enlarge_off_executor_never_surfaces_retry_refusal() {
     .expect("gate-off executor must retain its internal fallback/error mapping");
     assert_eq!(results.len(), 1);
 
-    let adaptive = GraphDomainBatchExecutor::execute_single_objective(
-        &verifier,
-        SingleObjectiveBatchRequest {
-            graph: &graph,
-            domains: &[&root],
-            relu_nodes: &["relu".to_string()],
-            objective: &[1.0],
-            threshold: 0.5,
-            engine: &AllocationRefusingEngine,
-            cut_pool: None,
-            split_depth: 1,
-            retry_refusals: true,
-        },
+    // Leg 2 (the surfacing rule itself).
+    //
+    // This leg used to run the same executor with `retry_refusals: true` and
+    // assert `Err(DeviceAllocation)`, relying on `AllocationRefusingEngine`'s
+    // `GpuMemoryExceeded` travelling up from the multi-domain Linear engine
+    // GEMM. That injection point is gone: the batched backward's Linear arm no
+    // longer calls `gemm_f32` at all (it runs the certified f64 CPU
+    // contraction), and every OTHER layer-local engine consumer treats
+    // `GpuMemoryExceeded` as NON-terminal and silently falls back to CPU
+    // (`crown_batched::engine_error_is_terminal`,
+    // `ops_transpose_gemm::engine_error_is_terminal`). So a mock `GemmEngine`
+    // can no longer produce a device refusal anywhere in this path, and the old
+    // assertion had become unreachable rather than wrong.
+    //
+    // The RULE is still live for a real accelerator backend, so it is asserted
+    // where it now lives — `surfaced_refusal`, the single helper both failure
+    // sites in `batched_single.rs` call. Do not "restore" the end-to-end form
+    // without first restoring an injection point that can actually reach it;
+    // see reports/measured-2026/soa_linear_parity_2026-08-25/README.md.
+    let device_oom = NyError::GpuMemoryExceeded {
+        required_bytes: 2,
+        budget_bytes: 1,
+    };
+    assert_eq!(
+        surfaced_refusal(false, &device_oom),
+        None,
+        "gate OFF must absorb the refusal into the local non-shrinking fallback"
     );
-    assert!(
-        matches!(adaptive, Err(MicrobatchRefusalReason::DeviceAllocation)),
-        "adaptive executor must surface a retryable allocation refusal, got {adaptive:?}"
+    assert_eq!(
+        surfaced_refusal(true, &device_oom),
+        Some(MicrobatchRefusalReason::DeviceAllocation),
+        "gate ON must surface a retryable allocation refusal to the adaptive caller"
     );
+    // The classifier stays narrow: an ordinary propagation failure must NOT be
+    // turned into a shrink-retry, whichever way the gate is set.
+    let not_retryable = NyError::InvalidSpec("ordinary propagation failure".into());
+    assert_eq!(surfaced_refusal(true, &not_retryable), None);
+    assert_eq!(surfaced_refusal(false, &not_retryable), None);
 }
 
 #[test]
@@ -3511,6 +3533,46 @@ mod kfsb_multi_tests {
         });
     }
 
+    /// The production entry must consume the immutable reducer captured by
+    /// wave policy, not reopen config/environment during preparation, winner
+    /// selection, typed override resolution, or multi-depth commit planning.
+    #[ntest::timeout(30000)]
+    #[test]
+    fn kfsb_multi_lane_consumes_captured_reducer_without_reread() {
+        crate::tests::with_env_edits(|env| {
+            env.set("NY_MO_KFSB_REDUCE", "max");
+            let (graph, domain) = kfsb_fixture();
+            let verifier = kfsb_verifier(KfsbReduceOp::Max);
+            let unstable = vec![("relu1".to_string(), 0), ("relu1".to_string(), 1)];
+            let wave = vec![(3usize, &domain, unstable)];
+            let committed = verifier.select_graph_branch_kfsb_multi_batched_with_policy(
+                0,
+                2,
+                KfsbReduceOp::Min,
+                &graph,
+                &wave,
+                &["relu1".to_string()],
+                &[vec![1.0]],
+                &[0.0],
+                &NaiveCpuGemmEngine,
+            );
+
+            let children = committed.get(&3).expect("captured Min must resolve parent");
+            assert_eq!(children.len(), 2, "Min must choose the balanced n0 cover");
+            for (child, is_active, _) in children {
+                let constraint = child.history().iter_all().next().expect("constraint");
+                match &constraint {
+                    crate::beta_crown::branching::GraphConstraint::Relu(nc) => {
+                        assert_eq!(nc.node_name, "relu1");
+                        assert_eq!(nc.neuron_idx, 0, "env/config Max must not be re-read");
+                        assert_eq!(nc.is_active, *is_active);
+                    }
+                    other => panic!("unexpected constraint kind: {other:?}"),
+                }
+            }
+        });
+    }
+
     /// The configured reduce op is authoritative, while the measurement-only
     /// environment override can still bind in either direction.
     #[test]
@@ -3525,12 +3587,18 @@ mod kfsb_multi_tests {
             KfsbReduceOp::Min
         );
         assert_eq!(
+            resolve_kfsb_multi_reduce_op(KfsbReduceOp::Mean, None),
+            KfsbReduceOp::Mean,
+            "the broader typed policy remains valid when the narrow env override is absent"
+        );
+        assert_eq!(
             resolve_kfsb_multi_reduce_op(KfsbReduceOp::Max, Some("mean")),
-            KfsbReduceOp::Max
+            KfsbReduceOp::Min,
+            "environment mean is rejected and fails to the conservative declaration default"
         );
         assert_eq!(
             resolve_kfsb_multi_reduce_op(KfsbReduceOp::Max, Some("")),
-            KfsbReduceOp::Max
+            KfsbReduceOp::Min
         );
         assert_eq!(
             resolve_kfsb_multi_reduce_op(KfsbReduceOp::Max, Some("min")),
@@ -3540,6 +3608,30 @@ mod kfsb_multi_tests {
             resolve_kfsb_multi_reduce_op(KfsbReduceOp::Min, Some("max")),
             KfsbReduceOp::Max
         );
+    }
+
+    #[test]
+    fn kfsb_multi_reduce_receipt_preserves_dedicated_and_effective_policy() {
+        crate::tests::with_env_edits(|env| {
+            env.remove("NY_MO_KFSB_REDUCE");
+            let verifier = BetaCrownVerifier::new(BetaCrownConfig {
+                kfsb_reduce_op: KfsbReduceOp::Min,
+                kfsb_multi_reduce_op: Some(KfsbReduceOp::Mean),
+                ..Default::default()
+            });
+            assert_eq!(
+                verifier.kfsb_multi_reduce_policy_for_receipt(),
+                (KfsbReduceOp::Mean, KfsbReduceOp::Mean),
+                "the dedicated multi-objective reducer must win over fallback config"
+            );
+
+            env.set("NY_MO_KFSB_REDUCE", "max");
+            assert_eq!(
+                verifier.kfsb_multi_reduce_policy_for_receipt(),
+                (KfsbReduceOp::Mean, KfsbReduceOp::Max),
+                "the receipt must retain configured policy beside governed effective policy"
+            );
+        });
     }
 
     #[test]
@@ -3575,10 +3667,13 @@ mod kfsb_multi_tests {
     /// byte-identical to the advisory path.
     #[test]
     fn kfsb_multi_gate_is_default_off() {
-        crate::tests::with_serialized_env_vars_removed(&["NY_MO_KFSB"], || {
-            let verifier = kfsb_verifier(KfsbReduceOp::Max);
-            assert!(!verifier.kfsb_multi_wave_enabled());
-        });
+        crate::tests::with_serialized_env_vars_removed(
+            &["NY_MO_KFSB", "NY_BRANCH_KFSB_CHILDSIM"],
+            || {
+                let verifier = kfsb_verifier(KfsbReduceOp::Max);
+                assert!(!verifier.kfsb_multi_wave_enabled());
+            },
+        );
     }
 
     /// #kfsb-multi tri-state arming (config opt-in + env kill switch):
@@ -3590,6 +3685,8 @@ mod kfsb_multi_tests {
     fn kfsb_multi_gate_tri_state_arming() {
         crate::tests::with_env_edits(|env| {
             env.remove("NY_MO_KFSB");
+            env.remove("NY_BRANCH_KFSB_CHILDSIM");
+            env.remove("NY_MO_KFSB_K");
             let armed = BetaCrownVerifier::new(BetaCrownConfig {
                 branching_heuristic: BranchingHeuristic::Kfsb,
                 fsb_candidates: 2,
@@ -3602,6 +3699,12 @@ mod kfsb_multi_tests {
                 armed.kfsb_multi_wave_enabled(),
                 "config.use_kfsb_multi_branching=true + Kfsb + candidates>0 must arm the wave lane"
             );
+            env.set("NY_MO_KFSB_K", "0");
+            assert!(
+                !armed.kfsb_multi_wave_enabled(),
+                "an explicit zero effective candidate budget must disarm the wave lane"
+            );
+            env.remove("NY_MO_KFSB_K");
 
             // (2) config false, env unset ⇒ off.
             let disarmed = BetaCrownVerifier::new(BetaCrownConfig {
@@ -3615,6 +3718,21 @@ mod kfsb_multi_tests {
                 !disarmed.kfsb_multi_wave_enabled(),
                 "config.use_kfsb_multi_branching=false with no env must keep the wave lane off"
             );
+
+            env.set("NY_BRANCH_KFSB_CHILDSIM", "1");
+            let legacy_policy = disarmed.kfsb_multi_wave_policy_at_round(0);
+            assert_eq!(
+                legacy_policy.canonical_master,
+                crate::execution_telemetry::MoKfsbCanonicalMaster::Absent
+            );
+            assert!(legacy_policy.legacy_childsim);
+            assert!(!legacy_policy.lower_master);
+            assert!(legacy_policy.effective_master);
+            assert_eq!(legacy_policy.effective_candidates, 2);
+            assert_eq!(legacy_policy.configured_reduce_op, None);
+            assert_eq!(legacy_policy.effective_reduce_op, None);
+            assert!(legacy_policy.wave_enabled);
+            env.remove("NY_BRANCH_KFSB_CHILDSIM");
 
             // (3) KILL SWITCH: NY_MO_KFSB=0 forces off despite the config arming.
             env.set("NY_MO_KFSB", "0");
@@ -3653,12 +3771,30 @@ mod kfsb_multi_tests {
                 !verifier.kfsb_multi_wave_enabled(),
                 "legacy round-agnostic gate remains unchanged"
             );
+            let first_policy = verifier.kfsb_multi_wave_policy_at_round(0);
+            assert_eq!(
+                first_policy.canonical_master,
+                crate::execution_telemetry::MoKfsbCanonicalMaster::Absent
+            );
+            assert!(!first_policy.configured_master);
+            assert_eq!(first_policy.configured_reduce_op, Some(KfsbReduceOp::Min));
+            assert_eq!(first_policy.effective_reduce_op, Some(KfsbReduceOp::Min));
+            assert!(first_policy.typed_select);
+            assert!(first_policy.lower_master);
+            assert!(first_policy.effective_master);
             assert!(verifier.kfsb_multi_wave_enabled_at_round(0));
             assert!(verifier.kfsb_multi_wave_enabled_at_round(4));
             assert!(!verifier.kfsb_multi_wave_enabled_at_round(5));
+            let later_policy = verifier.kfsb_multi_wave_policy_at_round(5);
+            assert!(!later_policy.typed_select);
+            assert!(!later_policy.lower_master);
+            assert!(!later_policy.effective_master);
             env.set("NY_MO_KFSB_REDUCE", "max");
+            let max_policy = verifier.kfsb_multi_wave_policy_at_round(0);
+            assert_eq!(max_policy.configured_reduce_op, Some(KfsbReduceOp::Min));
+            assert_eq!(max_policy.effective_reduce_op, Some(KfsbReduceOp::Max));
             assert!(
-                !verifier.kfsb_multi_wave_enabled_at_round(0),
+                !max_policy.wave_enabled,
                 "unsupported Max reduction must not OR-arm a declined typed experiment"
             );
             env.remove("NY_MO_KFSB_REDUCE");
@@ -3763,7 +3899,24 @@ mod kfsb_multi_tests {
                 "unchecked invalid policies must also fail closed at runtime"
             );
             env.set("NY_MO_KFSB", "0");
-            assert!(!verifier.kfsb_multi_wave_enabled_at_round(0));
+            let disabled_policy = verifier.kfsb_multi_wave_policy_at_round(0);
+            assert_eq!(
+                disabled_policy.canonical_master,
+                crate::execution_telemetry::MoKfsbCanonicalMaster::ExactDisable
+            );
+            assert!(disabled_policy.lower_master);
+            assert!(!disabled_policy.effective_master);
+            assert!(!disabled_policy.wave_enabled);
+
+            env.set("NY_MO_KFSB", "true");
+            let rejected_policy = verifier.kfsb_multi_wave_policy_at_round(0);
+            assert_eq!(
+                rejected_policy.canonical_master,
+                crate::execution_telemetry::MoKfsbCanonicalMaster::Rejected
+            );
+            assert!(rejected_policy.lower_master);
+            assert!(!rejected_policy.effective_master);
+            assert!(!rejected_policy.wave_enabled);
         });
     }
 

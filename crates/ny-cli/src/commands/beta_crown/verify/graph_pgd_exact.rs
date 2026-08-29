@@ -17,6 +17,7 @@ use ny_tensor::BoundedTensor;
 use std::time::Instant;
 
 use super::graph_pgd::GraphPgdTarget;
+use super::graph_pgd_fast_gradient_evidence::PgdFastGradientExecution;
 
 // ---------------------------------------------------------------------------
 // Exact-gradient whitelist
@@ -96,9 +97,10 @@ pub(super) fn exact_graph_margin_gradient(
     num_outputs: usize,
     gemm_engine: Option<&dyn GemmEngine>,
     deadline: Option<Instant>,
+    evidence: &PgdFastGradientExecution,
 ) -> Result<Option<ArrayD<f32>>> {
     let spec_row = target.to_spec_row(num_outputs);
-    exact_graph_spec_gradient(graph, x, output, &spec_row, gemm_engine, deadline)
+    exact_graph_spec_gradient(graph, x, output, &spec_row, gemm_engine, deadline, evidence)
 }
 
 /// Exact gradient of an arbitrary single-row linear output functional
@@ -120,14 +122,19 @@ pub(super) fn exact_graph_spec_gradient(
     spec_row: &Array2<f32>,
     gemm_engine: Option<&dyn GemmEngine>,
     deadline: Option<Instant>,
+    evidence: &PgdFastGradientExecution,
 ) -> Result<Option<ArrayD<f32>>> {
     if !graph_supports_exact_gradients(graph) {
         return Ok(None);
     }
 
-    // Fast attack gradient (DEFAULT ON; opt out with `NY_PGD_FAST_GRAD=0`): a plain
+    evidence.begin_decision();
+
+    // Fast attack gradient (default ON in the frozen per-run policy): a plain
     // point-Jacobian VJP that skips the certified two-sided relaxation / coeff-error
-    // carrier / tightness guards. Validated to match this certified path to ~1e-3
+    // carrier / tightness guards. The typed search/preset override and legacy
+    // `NY_PGD_FAST_GRAD=0` compatibility path both resolve before this call.
+    // Validated to match this certified path to ~1e-3
     // (ny-propagate point_vjp gradient-check) AND finite differences to ~1e-2.
     // Strictly better than the certified path for an attack: ~same-or-faster AND it
     // never spuriously falls back to noisy SPSA when the deep-resnet tightness
@@ -135,8 +142,10 @@ pub(super) fn exact_graph_spec_gradient(
     // by revalidate_graph_counterexample + the vnncomp gate). Measured: lifts 13/14
     // cifar100_resnet_medium sat instances that were 0/14 before. Falls through to
     // the certified path on None (non-whitelist fragment / deadline).
-    if std::env::var("NY_PGD_FAST_GRAD").ok().as_deref() != Some("0") {
+    if evidence.configured() {
+        evidence.attempted_fast();
         if let Some(g) = graph.attack_point_gradient(x, spec_row, gemm_engine, deadline)? {
+            evidence.selected_fast();
             return Ok(Some(g));
         }
     }
@@ -218,5 +227,6 @@ pub(super) fn exact_graph_spec_gradient(
     let grad_flat: Vec<f32> = grad_row.row(0).to_vec();
     let grad = ArrayD::from_shape_vec(IxDyn(x.shape()), grad_flat)?;
 
+    evidence.selected_certified();
     Ok(Some(grad))
 }

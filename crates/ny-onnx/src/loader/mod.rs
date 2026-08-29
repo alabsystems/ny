@@ -31,6 +31,16 @@ pub use config::{
 /// Subprocess shape-inference protocol: server entry + hidden subcommand name.
 pub use shape_infer::subprocess::{serve_shape_infer_request, SHAPE_INFER_SUBCOMMAND};
 
+/// Reset the retired interval-carrier compatibility layer at CLI entry.
+///
+/// The supported caller passes `None`: preset validation rejects the retired
+/// `solver.const_matmul_interval` key and the governed axis is Unsafe + EnvOnly.
+/// The optional form remains only for tests proving that the lower layer
+/// refuses typed arming; it is never forwarded into lever resolution.
+pub fn set_const_matmul_interval_preset(value: Option<bool>) {
+    const_fold::set_interval_carrier_preset(value);
+}
+
 /// Result of parsing an ONNX file, including loader-private raw-initializer
 /// provenance captured before graph rewrites.
 type ParsedOnnx = (

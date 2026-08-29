@@ -178,7 +178,7 @@ nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_600_2048_dual.vnnlib,0,tim
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_720_2048_dual.vnnlib,0,timeout,108
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_840_2048_dual.vnnlib,0,timeout,110
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_960_2048_dual.vnnlib,0,timeout,110
-nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_2260_2048_dual.vnnlib,0,timeout,110
+nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_2260_2048_dual.vnnlib,prepared,timeout,296.8,rebank-20260824-r4904-4250d245
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_2890_2048_dual.vnnlib,0,timeout,110
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_3520_2048_dual.vnnlib,0,timeout,110
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_4150_2048_dual.vnnlib,0,timeout,112
@@ -188,8 +188,8 @@ nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_6040_2048_dual.vnnlib,0,ti
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_6670_2048_dual.vnnlib,0,timeout,110
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_7300_2048_dual.vnnlib,0,timeout,110
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_7930_2048_dual.vnnlib,0,timeout,110
-nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_8560_2048_dual.vnnlib,0,timeout,110
+nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_8560_2048_dual.vnnlib,prepared,timeout,557.5,rebank-20260824-r4904-4250d245
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_9190_2048_dual.vnnlib,0,timeout,111
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_9820_2048_dual.vnnlib,0,timeout,110
 nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_10450_2048_dual.vnnlib,0,timeout,111
-nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_11080_2048_dual.vnnlib,0,timeout,110
+nn4sys,onnx/mscn_2048d_dual.onnx,vnnlib/cardinality_1_11080_2048_dual.vnnlib,prepared,timeout,797.2,rebank-20260824-r4904-4250d245

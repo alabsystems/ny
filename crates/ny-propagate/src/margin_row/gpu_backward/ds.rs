@@ -31,9 +31,9 @@
 //! (loosening is safe, tightening is not), so it is set with 8x headroom over
 //! the literature bounds and pinned by the enclosure tests.
 
-// SKELETON: consumed by the unit tests (M0) and by the implementation
-// session's device transaction; no production caller exists yet. Drop this
-// allow when the transaction lands.
+// Production callers exist as of v4 (probe + transaction); the allow stays
+// only for the test-facing reference pieces (`ds_dot`, doc-twin helpers)
+// that deliberately live here beside the algebra they specify.
 #![allow(dead_code)]
 
 use ny_core::eft::{two_prod_f32, two_sum_f32};
@@ -45,9 +45,13 @@ use ny_core::eft::{two_prod_f32, two_sum_f32};
 /// DWPlusFP (Algorithm 4, the shape of [`ds_add_f32`]) has relative error
 /// `<= 2u^2 = 2^-47`; DWTimesFP with fma (Algorithm 9, the shape of
 /// [`ds_mul_f32`]) `<= 2u^2`; ACCURATE DWPlusDW (Algorithm 6, the shape of
-/// [`ds_add`]) `<= 3u^2/(1-4u) < 2^-45.4` — all under round-to-nearest with
-/// no underflow, all UNCONDITIONAL in the inputs (cancellation included).
-/// `2^-44` covers every one with >= 5x headroom on the loosest.
+/// [`ds_add`]) `<= 3u^2/(1-4u) < 2^-45.4`; one-fma DWTimesDW in the
+/// `xl*yl`-DROPPING shape of [`ds_mul`] (DWTimesDW2) `<= 6u^2 < 2^-45.4`
+/// (the tighter `5u^2` belongs to the `xl*yl`-CARRYING Algorithm 12, which
+/// is NOT the implemented sequence — see the [`ds_mul`] note) — all under
+/// round-to-nearest with no underflow, all UNCONDITIONAL in the inputs
+/// (cancellation included). `2^-44 = 16u^2` covers every one with >= 2.6x
+/// headroom on the loosest.
 ///
 /// SOUNDNESS (load-bearing): this constant is only ever used to WIDEN an
 /// error term (design §4.2 "ds algebra's own O(u^2) residue"), so an
@@ -56,6 +60,21 @@ use ny_core::eft::{two_prod_f32, two_sum_f32};
 /// (design §4.1), exactly as `ny_core::eft` separates its `2^-126` floor from
 /// the residual channel.
 pub(crate) const U_DS: f64 = 5.684_341_886_080_802e-14; // 2^-44, exact
+
+/// [`U_DS`] as f32 (2^-44 is a power of two, so the downcast is EXACT). The
+/// host twin of the WGSL `DS_UNIT` constant in `ds_primitives.wgsl` — kernels
+/// charge per-op ds residues with it IN f32, so the twin must too.
+// The f32 literal is the shortest decimal that round-trips to 2^-44; it is the
+// SAME f32 value (0x2980_0000) as the f64 `U_DS` above, which needs more digits
+// only because f64 resolves finer.
+pub(crate) const U_DS_F32: f32 = 5.684_342e-14; // 2^-44, exact
+
+/// Host twin of the WGSL `ds_abs_bound`: `|hi| + |lo| >= |hi + lo|`, one f32
+/// add of nonnegative terms (the E-lane egress widening covers its rounding).
+#[inline]
+pub(crate) fn ds_abs_bound(x: Ds) -> f32 {
+    x.hi.abs() + x.lo.abs()
+}
 
 /// A double-single f32 value: the unevaluated sum `hi + lo`.
 ///
@@ -166,6 +185,35 @@ pub(crate) fn ds_add(x: Ds, y: Ds) -> Ds {
     ds_renorm(vh, w)
 }
 
+/// ds * ds: one-fma DWTimesDW in the `xl*yl`-DROPPING shape (Joldes et al.'s
+/// DWTimesDW2 — Algorithm 12 WITHOUT its `xl*yl` term). Published relative
+/// error for THIS shape: `<= 6u^2`. TRAP (verify-fix, 2026-08-20): the
+/// tighter `5u^2` bound this comment used to cite belongs to the
+/// `xl*yl`-CARRYING Algorithm 12 — a DIFFERENT sequence — and must not be
+/// imported here: a "tighten 10u^2 -> 9u^2/tap" edit derived from `5u^2 + 3u^2`
+/// would UNDERCHARGE [`DS_TAP_EPS`], which correctly charges the `6u^2`
+/// reading. (`U_DS = 16u^2` dominates every published DWTimesDW variant,
+/// `<= 7u^2` worst, with >= 2.2x headroom.)
+///
+/// Exists for the GATE parameters (design M2): the gate slopes/intercepts are
+/// f64 on the CPU lane, and certifying the SAME relaxation on device — the
+/// precondition of the M2 coefficient-overlap assertion — requires carrying
+/// them as ds pairs (exact-split residual `<= 2^-48` relative in the normal
+/// band, charged; the subnormal band rides the transaction's split-floor
+/// channel) and
+/// multiplying in ds, not substituting a downcast relaxation.
+///
+/// WGSL twin: `ds_mul` in `ds_primitives.wgsl`, op-for-op.
+#[inline]
+pub(crate) fn ds_mul(x: Ds, y: Ds) -> Ds {
+    let (ph, e1) = two_prod_f32(x.hi, y.hi);
+    let tl = x.hi * y.lo;
+    let cl2 = x.lo.mul_add(y.hi, tl);
+    let cl3 = e1 + cl2;
+    let (h, l) = fast_two_sum(ph, cl3);
+    Ds { hi: h, lo: l }
+}
+
 /// ds * f32 (DWTimesFP with fma, Joldes et al. Algorithm 9). Relative error
 /// `<= 2u^2`.
 ///
@@ -193,9 +241,11 @@ pub(crate) fn ds_mul_f32(x: Ds, w: f32) -> Ds {
     ds_renorm(p, x.lo.mul_add(w, e))
 }
 
-/// Reference ds dot product `sum_j w_j * a_j` — the executable spec of the
-/// conv/gemm value-lane accumulation (design §4.2), and the M0 harness's
-/// device stand-in until real device streams exist.
+/// Reference ds dot product `sum_j w_j * a_j` with SCALAR f32 weights — the
+/// M0 enclosure reference for the ds fold shape. (Since the error-charge
+/// session the PRODUCTION conv/gemm accumulate with ds-PAIR weights via
+/// [`ds_mul`]; the per-tap envelope both shapes obey is [`gamma_ds_dot`],
+/// and the pair form is enclosure-tested through the kernel twins.)
 ///
 /// Returns `None` on any non-finite intermediate (fail-closed, mirroring
 /// `ny_core::eft::eft_dot_f32`).
@@ -213,6 +263,105 @@ pub(crate) fn ds_dot(w: &[f32], a: &[f32]) -> Option<Ds> {
         }
     }
     Some(acc)
+}
+
+/// Host twin of the WGSL `bias_reduce_wg` TREE reduce (B2), OP-FOR-OP:
+/// lane `l` folds the contiguous block `[l*chunk, min((l+1)*chunk, n))`
+/// serially (same per-element body as the serial twin), then the 256 lane
+/// partials combine by the fixed binary tree (offset 128, 64, .., 1). This
+/// order is the bit-parity contract of the device kernel — any edit here
+/// must move in lock-step with `kernels/bias_reduce.wgsl::bias_reduce_wg`.
+///
+/// Soundness role: comparison reference only (nothing here feeds a
+/// verdict); the charge argument for why `gamma_ds_dot(n+2)` dominates the
+/// TREE fold too lives at `transaction.rs::push_reduce`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bias_reduce_wg_twin(
+    plane: &[Ds],
+    err: &[f32],
+    scale: Option<&[Ds]>,
+    n: usize,
+    rows: usize,
+    berr: f32,
+    g_reduce: f32,
+    bias_acc: &mut [Ds],
+    ebias_acc: &mut [f32],
+) {
+    const LANES: usize = 256;
+    for r in 0..rows {
+        let chunk = n.div_ceil(LANES);
+        let mut lane_acc = [Ds { hi: 0.0, lo: 0.0 }; LANES];
+        let mut lane_esum = [0.0f32; LANES];
+        let mut lane_msum = [0.0f32; LANES];
+        for (lane, ((acc_slot, esum_slot), msum_slot)) in lane_acc
+            .iter_mut()
+            .zip(lane_esum.iter_mut())
+            .zip(lane_msum.iter_mut())
+            .enumerate()
+        {
+            let j0 = lane * chunk;
+            let j1 = (j0 + chunk).min(n);
+            let mut acc = Ds { hi: 0.0, lo: 0.0 };
+            let mut esum = 0.0f32;
+            let mut msum = 0.0f32;
+            for j in j0..j1 {
+                let p = plane[j * rows + r];
+                let w = scale.map_or(Ds { hi: 1.0, lo: 0.0 }, |s| s[j]);
+                let q = ds_mul(p, w);
+                acc = ds_add(acc, q);
+                let labs = ds_abs_bound(p);
+                let e = err[j * rows + r];
+                esum = ds_abs_bound(w).mul_add(e, esum);
+                esum = berr.mul_add(labs + e, esum);
+                msum += ds_abs_bound(q);
+            }
+            *acc_slot = acc;
+            *esum_slot = esum;
+            *msum_slot = msum;
+        }
+        let mut off = LANES / 2;
+        while off > 0 {
+            for lane in 0..off {
+                lane_acc[lane] = ds_add(lane_acc[lane], lane_acc[lane + off]);
+                lane_esum[lane] += lane_esum[lane + off];
+                lane_msum[lane] += lane_msum[lane + off];
+            }
+            off /= 2;
+        }
+        let nb = ds_add(bias_acc[r], lane_acc[0]);
+        bias_acc[r] = nb;
+        let carry = 2.0 * U_DS_F32 * ds_abs_bound(nb);
+        ebias_acc[r] = ebias_acc[r] + lane_esum[0] + g_reduce * lane_msum[0] + carry;
+    }
+}
+
+/// Host twin of the WGSL `collect_abs` kernel (B5), OP-FOR-OP: per position
+/// `p`, fold `|coeff[idx[p] * rows + r]|` over `r = 0..rows` in ds, taking
+/// the magnitude by negating BOTH ds components (exact in every band).
+///
+/// HEURISTIC ONLY — like the kernel it mirrors, this feeds no verdict: the
+/// published `PassOut::coll` is read only by the trunk shortlist and the
+/// tier-0 pool (both rankers). It exists so the kernel has a bit-parity
+/// reference on the running adapter, exactly as `bias_reduce_wg_twin` does.
+pub(crate) fn collect_abs_twin(idx: &[usize], coeff: &[Ds], rows: usize) -> Vec<Ds> {
+    let mut out = Vec::with_capacity(idx.len());
+    for &j in idx {
+        let mut acc = Ds { hi: 0.0, lo: 0.0 };
+        for r in 0..rows {
+            let v = coeff[j * rows + r];
+            let a = if v.hi >= 0.0 {
+                v
+            } else {
+                Ds {
+                    hi: -v.hi,
+                    lo: -v.lo,
+                }
+            };
+            acc = ds_add(acc, a);
+        }
+        out.push(acc);
+    }
+    out
 }
 
 /// M1 harness core: bit-compare a host ds stream against a device `(hi, lo)`
@@ -266,11 +415,66 @@ pub(crate) fn bit_compare_streams(host: &[Ds], device: &[(f32, f32)]) -> Result<
 pub(crate) fn gamma_ds(n: usize) -> f64 {
     #[allow(clippy::cast_precision_loss)]
     let nu = (2 * n) as f64 * U_DS;
+    gamma_from_nu(nu)
+}
+
+/// Per-TAP (one [`ds_mul`] + one accurate [`ds_add`]) relative bound for the
+/// production dot shape: `10 * 2^-48 = 10 u^2`, `u = 2^-24`. Exact in f64
+/// (3-bit mantissa: `5 * 2^-47`).
+///
+/// DOCUMENTED constituents (design §4, the error-charge-tightening session;
+/// constituent citation corrected in the verify-fix, 2026-08-20):
+/// ACCURATE DWPlusDW (the [`ds_add`] shape) `<= 3u^2/(1-4u) < 3.0000008u^2`
+/// unconditional; one-fma DWTimesDW in the `xl*yl`-DROPPING DWTimesDW2
+/// shape (the [`ds_mul`] sequence) has published bound `6u^2` — the `5u^2`
+/// sometimes quoted is the `xl*yl`-CARRYING Algorithm 12's, a different
+/// sequence (see the [`ds_mul`] trap note) — so the per-tap charge is
+/// `6u^2 + 3.0000008u^2 < 9.0000008u^2`,
+/// charged at `10u^2` (>= 11% headroom). This replaces the blanket
+/// 2-ops-at-`U_DS` accounting (`32u^2`/tap) of [`gamma_ds`]: a 3.2x
+/// tightening of the a-priori dot envelope at identical soundness (the
+/// constituent bounds are unconditional, cancellation included; underflow is
+/// discharged by the §4.1 flush floors exactly as for [`U_DS`]).
+pub(crate) const DS_TAP_EPS: f64 = 3.552_713_678_800_501e-14; // 10 * 2^-48, exact
+
+/// A-priori relative envelope for a `taps`-tap ds dot in the PRODUCTION shape
+/// (per tap: one [`ds_mul`] of a ds coefficient by a ds weight, one accurate
+/// [`ds_add`] into the running sum): `nu/(1-nu)` with `nu = taps * DS_TAP_EPS`.
+///
+/// Derivation (mass-relative, the standard Higham composition): each tap's
+/// multiply rounds once relative to ITS term (`<= 6u^2 |t_i|`, the
+/// conservative DWTimesDW reading) and each add rounds relative to the
+/// RESULT partial sum (`<= 3.0000008u^2 |s_i|`, unconditional —
+/// result-relative is STRONGER than mass-relative), and both `|t_i|` and
+/// `|s_i|` are `<=` the absolute mass `sum |t_j|`, so the first-order total
+/// is `<= taps * DS_TAP_EPS * mass`; the `nu/(1-nu)` form absorbs the cross
+/// terms exactly as `gamma_n` does. Callers add `+2` taps of slack for the
+/// zero-init and any final renormalize, mirroring the CPU arms'
+/// `gamma_n(k + 2)`.
+///
+/// Self-domination is inherited from [`gamma_from_nu`]: `nu` is EXACT
+/// (`DS_TAP_EPS` has a 5-bit mantissa, so the product is exact for every
+/// `taps < 2^48`), `1 - nu` is exact in the non-saturated range, and the
+/// `(1 + 2^-50)` inflation plus the final ulp-up dominate the division's and
+/// the inflation's own roundings with no caller help.
+#[inline]
+pub(crate) fn gamma_ds_dot(taps: usize) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let nu = taps as f64 * DS_TAP_EPS;
+    gamma_from_nu(nu)
+}
+
+/// Shared self-dominating `nu -> up(nu/(1-nu))` core of [`gamma_ds`] /
+/// [`gamma_ds_dot`] (see their doc comments for the exactness argument).
+/// Saturates to 1.0 (degrade-to-useless; the NaN/Inf firewall then refuses)
+/// rather than undercharging.
+#[inline]
+fn gamma_from_nu(nu: f64) -> f64 {
     if nu >= 0.5 {
         return 1.0;
     }
     // Inflated up-rounding of nu/(1-nu); same shape as `rounding::gamma_n`
-    // but self-dominating (see the doc comment).
+    // but self-dominating (see the doc comments).
     let g = (nu / (1.0 - nu)) * (1.0 + 2f64.powi(-50));
     f64::from_bits(g.to_bits() + 1)
 }

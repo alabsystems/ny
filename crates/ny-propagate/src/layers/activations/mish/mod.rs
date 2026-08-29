@@ -16,7 +16,7 @@ use crate::layers::common::{
 use crate::{BatchedLinearBounds, LinearBounds};
 
 use super::LinearRelaxation;
-use ny_tensor::{next_down_f32, next_up_f32};
+use ny_tensor::{cast_f64_to_f32_down, cast_f64_to_f32_up, next_down_f32, next_up_f32};
 
 /// Mish layer: y = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
 ///
@@ -35,6 +35,19 @@ impl MishLayer {
 }
 
 /// Evaluate Mish: x * tanh(softplus(x))
+///
+/// TEST ORACLE, not a production path. Since 129e948a4 every relaxation site in
+/// this module evaluates in f64 through [`mish_eval_f64`] and casts outward with
+/// `cast_f64_to_f32_{down,up}`, so nothing in the lib build calls this; its only
+/// callers are `mish/tests.rs`, including the three #1836 regression tests that
+/// pin Mish(-inf)=0, Mish(+inf)=+inf and Mish(NaN)=NaN. Hence `#[cfg(test)]`
+/// rather than deletion — dropping it would silently retire those tests — and
+/// rather than `#[allow(dead_code)]`, which would keep an f32 evaluator sitting
+/// in the shipped lib looking like a callable relaxation primitive.
+///
+/// Note `src/tests/proptest_soundness/mod.rs` defines its OWN `pub(crate)
+/// mish_eval`; the proptest suite uses that one, not this.
+#[cfg(test)]
 #[inline]
 fn mish_eval(x: f32) -> f32 {
     // Guard against 0 * inf = NaN when x = ±inf.
@@ -439,14 +452,25 @@ fn mish_linear_relaxation(l: f32, u: f32) -> LinearRelaxation {
         // l = -inf, u finite: Mish(-inf) -> 0, Mish(u) = fu.
         // Lower: constant at min(MISH_GLOBAL_MIN, Mish(u)).
         // Upper: constant at max(0, Mish(u)) (since Mish -> 0 from below as x -> -inf).
-        let fu = mish_eval(u);
+        // DIRECTED ROUNDING, both directions, from ONE f64 witness. `fu` is
+        // published as a certified constant in BOTH directions at once — the
+        // lower intercept via `min(MISH_GLOBAL_MIN, fu)` and the upper via
+        // `max(fu, 0)` — so a single round-to-NEAREST f32 is unsound on
+        // whichever side it lands, and NO single f32 can be sound for both.
+        // Same defect and same fix as `elu_family.rs`'s l=-inf branch; latent
+        // for the same reason (`non_finite_domain_guard`, mish/mod.rs:984,
+        // rejects every non-finite endpoint before this branch is reachable).
+        // Widening a published bound is unconditionally sound: it only ever
+        // loosens, by at most one f32 ULP.
+        let fu64 = mish_eval_f64(f64::from(u));
         // NaN-propagating: if fu is NaN, the NaN flows through instead of
         // being silently absorbed by IEEE .min()/.max(). (#2714)
+        // Both directed casts are NaN-preserving, so that path is unchanged.
         return LinearRelaxation::new(
             0.0,
-            nan_propagating_min(MISH_GLOBAL_MIN, fu),
+            nan_propagating_min(MISH_GLOBAL_MIN, cast_f64_to_f32_down(fu64)),
             0.0,
-            nan_propagating_max(fu, 0.0),
+            nan_propagating_max(cast_f64_to_f32_up(fu64), 0.0),
         );
     }
     if u.is_infinite() {

@@ -6,6 +6,18 @@
 cargo build --release -p ny-cli    # → target/release/ny
 ```
 
+**Do not drop `--features mip` when building anything you intend to measure.**
+Without it, `try_sign_space_falsify` and `try_ste_pgd_falsify` cfg-compile to
+`None` and both BNN falsification lanes silently vanish — a row that normally
+takes 335 s "reproduces" in 2.9 s because a later lane now runs first. Guard a
+measurement by asserting `mip_compiled=true` in a smoke run's flight sidecar.
+
+**"ny builds under Trust" is not "ny's build is verified."** The build line uses
+`targo --unverified build`, and Trust has an open false-Safe channel
+(`transmute_provenance_repro.rs::provenance_roundtrip_CONTROL_failclosed`
+verifies in a mode its own header says must fail closed). Its 1122-test corpus is
+currently clean on missed bugs, but the verified-build claim is not one to make.
+
 ## Test
 
 ```bash

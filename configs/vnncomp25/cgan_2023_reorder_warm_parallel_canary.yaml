@@ -20,6 +20,14 @@
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
   csv_name: instances.csv
+  # Mirrors production cgan_2023.yaml #cgan-abc-parity (2026-08-26): the
+  # BaB-child-backward conv representation. See production for the measurement.
+  conv_mode: matrix
+
+solver:
+  # Mirrors production: plain CROWN child bounds - the load-bearing key of
+  # the 2026-08-26 conversion factorial. See production cgan_2023.yaml.
+  bound_prop_method: crown
 
 model:
   batch_norm_folding: preserve_raw
@@ -32,6 +40,7 @@ attack:
 
 bab:
   batch_size: 8
+  cgan_reclaim: true
   crown_ibp_per_node_cap_secs: 150
   phase_budget:
     disjunctive_pgd_fraction: 0.10
@@ -46,6 +55,10 @@ bab:
     candidates: 5
     reduceop: max
     input_split:
+      # Mirrors production #cgan-abc-parity: sb selection threshold and the
+      # periodic SAT-only probe (0 ENABLES; -1 disables).
+      sb_coeff_thresh: 1.0e-2
+      adv_check: 0
       reorder_bab: true
       warm_parallel: true
       alpha_iteration: 1
@@ -55,6 +68,9 @@ bab:
   clip:
     relaxed: true
     relaxed_iterations: 20
+    # Mirrors production: the sound exact-domain input clip (abc's
+    # clip_input_domain). See production cgan_2023.yaml for the contract.
+    input_split_fresh_domain_clip: true
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100

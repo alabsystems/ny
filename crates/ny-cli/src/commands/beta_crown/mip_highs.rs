@@ -22,8 +22,8 @@ use std::path::Path;
 
 use super::mip_preprocess::{
     bounded_tensor_to_bounds, convert_intermediate_bounds, extract_linear_relu_params,
-    fold_constant_layers, strip_shape_layers, unfold_conv2d_to_linear,
-    validate_mip_feedforward_topology, FoldedMipNetwork,
+    fold_constant_layers, refuse_mip_feedforward_before_unfold, strip_shape_layers,
+    unfold_conv2d_to_linear, validate_mip_feedforward_topology, FoldedMipNetwork,
 };
 use super::mip_single_hidden::{
     collect_exact_single_hidden_intermediate_bounds, is_single_hidden_linear_relu_linear,
@@ -47,6 +47,14 @@ fn canonicalize_mip_feedforward_network(
     network: &Network,
     input_shape: &[usize],
 ) -> Result<FoldedMipNetwork> {
+    // Screen the layer SEQUENCE before densifying any Conv2d. The topology the
+    // encoder requires is invariant under every step below, so a sequence that
+    // will be refused after canonicalization is refused here at O(layers)
+    // instead of after a dense im2col per Conv2d. Measured on relusplitter
+    // cifar_biasfield (Gemm → Reshape → Conv×8): 14.6-16.5 s of a 51 s internal
+    // grant reclaimed, 3/3 rows. The screen abstains on any layer it does not
+    // model, so `validate_mip_feedforward_topology` below remains the authority.
+    refuse_mip_feedforward_before_unfold(network)?;
     let mip_network = unfold_conv2d_to_linear(network, input_shape)?;
     let mip_network = strip_shape_layers(&mip_network);
     let mip_network = fold_constant_layers(&mip_network)?;
@@ -224,6 +232,12 @@ fn ay_margin_reframe_enabled_from_value(value: Option<&str>) -> bool {
 
 fn ay_margin_reframe_enabled() -> bool {
     ay_margin_reframe_enabled_from_value(std::env::var("NY_AY_MARGIN_REFRAME").ok().as_deref())
+        // #safenlp-cycle: the full-cycle A/B gate arms the SAME reframe — a
+        // marked unsafe row rides `MarginMode::Required` inside the pinned
+        // ay-milp, whose threshold-stop banks UNSAT on a strict bound crossing
+        // with original-model proof replay (the only handoff shape whose dual
+        // bound MOVES on this class, docs/SAFENLP_AY_ARC_2026-08-20.md §5.1).
+        || super::dispatch::safenlp_mip_cycle_enabled()
 }
 
 /// Select the typed direct-first shared-prefix ingress from the third gate.
@@ -231,6 +245,7 @@ fn ay_margin_reframe_enabled() -> bool {
 /// Dispatch has already required exact direct-first and shared-prefix intent.
 /// Only the existing exact margin value `1` composes those gates with AY's
 /// marked-margin API; every other spelling retains required plain feasibility.
+#[cfg(test)]
 fn required_safenlp_shared_prefix_ingress_from_margin_value(
     value: Option<&str>,
 ) -> MipFeasibilityIngress {
@@ -242,9 +257,14 @@ fn required_safenlp_shared_prefix_ingress_from_margin_value(
 }
 
 fn required_safenlp_shared_prefix_ingress() -> MipFeasibilityIngress {
-    required_safenlp_shared_prefix_ingress_from_margin_value(
-        std::env::var("NY_AY_MARGIN_REFRAME").ok().as_deref(),
-    )
+    // #safenlp-cycle: the composed reframe resolver (env OR the one cycle
+    // gate) decides the ingress, so the shared-prefix route and the direct FC
+    // route always agree on whether the unsafe row is marked.
+    if ay_margin_reframe_enabled() {
+        MipFeasibilityIngress::RequireSafeNlpMarkedMarginSharedBinaryPrefix
+    } else {
+        MipFeasibilityIngress::RequireSafeNlpSharedBinaryPrefix
+    }
 }
 
 /// Preserve terminal ownership across the in-process competition capture seam.
@@ -490,6 +510,20 @@ fn timeout_verification_result(num_outputs: usize) -> VerificationResult {
     }
 }
 
+/// Enforce the MIP ingress's terminal wall without manufacturing receipt
+/// provenance. A synchronous solver can return any terminal result after this
+/// wall; late publication suppression does not prove the wall aborted work.
+fn gate_mip_result_at_deadline(
+    result: VerificationResult,
+    num_outputs: usize,
+    deadline: std::time::Instant,
+) -> VerificationResult {
+    if std::time::Instant::now() < deadline {
+        return result;
+    }
+    timeout_verification_result(num_outputs)
+}
+
 /// Exact default-off gate for the AY objective-first SAT candidate lane.
 ///
 /// This is intentionally distinct from `NY_AY_MARGIN_REFRAME`: the latter can
@@ -512,8 +546,18 @@ fn ay_objective_first_sat_enabled() -> bool {
 /// this sequential complete-verifier path have different callers, budgets,
 /// and score evidence.  Malformed values fail closed to the historical
 /// auto-split policy; the measurement launcher independently rejects them.
+#[cfg(test)]
 fn sequential_mip_parallel_split_from_value(value: Option<&str>) -> usize {
-    if value == Some("1") {
+    sequential_mip_parallel_split_from_value_and_cycle(value, false)
+}
+
+/// #safenlp-cycle: within the full-cycle gate the DEFAULT is the serial
+/// one-model solve (the Gurobi-winning shape and the only one that hands AY's
+/// margin reframe a single comparable dual bound). Explicit `NY_MIP_SERIAL=1`
+/// stays serial either way; malformed values keep failing closed to the
+/// gate-appropriate default.
+fn sequential_mip_parallel_split_from_value_and_cycle(value: Option<&str>, cycle: bool) -> usize {
+    if value == Some("1") || cycle {
         1
     } else {
         MipConfig::default().parallel_split
@@ -521,7 +565,10 @@ fn sequential_mip_parallel_split_from_value(value: Option<&str>) -> usize {
 }
 
 fn sequential_mip_parallel_split() -> usize {
-    sequential_mip_parallel_split_from_value(std::env::var("NY_MIP_SERIAL").ok().as_deref())
+    sequential_mip_parallel_split_from_value_and_cycle(
+        std::env::var("NY_MIP_SERIAL").ok().as_deref(),
+        super::dispatch::safenlp_mip_cycle_enabled(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -796,6 +843,18 @@ fn verify_with_mip_inner(
         ay_hard_deadline: (backend == MipBackend::Ay).then_some(deadline),
         ..Default::default()
     };
+    // #safenlp-cycle engagement marker (R9: a null without the lever's own
+    // observable is vacuous). Print-only; every decision above is already
+    // snapshotted into typed state.
+    if super::dispatch::safenlp_mip_cycle_enabled() {
+        eprintln!(
+            "[safenlp-cycle] armed parallel_split={} margin_reframe={} ingress={:?} timeout_s={:.1}",
+            config.parallel_split,
+            ay_margin_reframe_enabled(),
+            feasibility_ingress,
+            initial_timeout_secs,
+        );
+    }
 
     // Canonicalize with the same authority used by pre-route admission.
     // Conv2d is unfolded before shape-only layers are stripped, constants are
@@ -1190,11 +1249,10 @@ fn verify_with_mip_inner(
     // Solver/forward APIs are synchronous and may return a fraction after
     // their requested timeout. A late mathematical decision is not admissible
     // for this bounded attempt.
-    let result = if std::time::Instant::now() >= deadline {
-        timeout_verification_result(num_outputs)
-    } else {
-        result
-    };
+    // This is the MIP ingress's terminal publication check. It never marks
+    // deadline causality: the solver must eventually expose a typed source for
+    // that, rather than relying on the result observed after synchronous work.
+    let result = gate_mip_result_at_deadline(result, num_outputs, deadline);
     let elapsed = reporting_start.elapsed();
 
     // Output results

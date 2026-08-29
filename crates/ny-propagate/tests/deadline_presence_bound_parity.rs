@@ -52,6 +52,34 @@
 //! that exercises those needs an alpha ascent and belongs in a companion guard.
 //! The graph below deliberately includes a residual `Add`, because that is the
 //! node where a cifar100-style resnet's carrier actually dies.
+//!
+//! # Measured blind spots (2026-08-24) — read before trusting this test
+//!
+//! A NINTH instance of the class landed at
+//! `beta_crown/.../batched/backward_core.rs` (`dispatch_node_backward`, the
+//! `Layer::Linear` arm) four months after this guard was written, and this guard
+//! did not catch it. Three independent reasons, all worth knowing:
+//!
+//! 1. **Wrong lane.** This exercises the plain single-domain graph-CROWN
+//!    backward. The ninth site is in the DOMAIN-BATCHED dispatcher
+//!    (`propagate_crown_batched_backward_core`), which this fixture never enters.
+//! 2. **No engine.** It passes `None` for the engine, so any degradation whose
+//!    fast arm *requires* a `GemmEngine` cannot be selected in either arm.
+//! 3. **Tolerance larger than the effect.** The `1e-4` relative tolerance below
+//!    is ~1000x too coarse: the ninth site's arms differ by ~1 ULP in the
+//!    coefficient (measured 1.8e-7 relative) plus a certified-error channel this
+//!    test never inspects at all, because it compares only concretized bounds.
+//!
+//! The companion guard
+//! `beta_crown/engine/graph/propagation/batched/tests_deadline_parity.rs` covers
+//! the batched lane with an ENGINE, compares raw `f32::to_bits` including the
+//! certified-error channel, and adds the wall-clock-ratio half that the
+//! 2026-08-17 audit prescribed and that this file never implemented.
+//!
+//! The tolerance here is deliberately NOT tightened to bit-equality: conv IBP
+//! genuinely computes a certified f64 arm under `sound || deadline.is_some()`
+//! (`graph_ibp.rs:781+`, `conv2d/bound.rs:315`), a documented SOUNDNESS choice
+//! rather than a defect, and bit-equality here would fail on it.
 
 use std::time::{Duration, Instant};
 

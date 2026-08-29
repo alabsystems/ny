@@ -47,6 +47,14 @@ pub struct GraphDomainAlphaState {
     /// is keyed by `&str` (via `HashMap::get`), the inner by `usize`.
     /// Only stores entries for unstable, unconstrained ReLU neurons.
     pub(crate) neurons: AlphaNeuronMaps,
+    /// STRUCTURAL staleness rule (#alpha-split-refresh, default-on): when a
+    /// domain carries split constraints, its inherited per-neuron α values
+    /// were optimized under ANCESTOR boxes that the splits have since
+    /// re-clamped — measured on `mnist_fc 256x4`, the current-box heuristic
+    /// beats those stale values. Set at MO-eval entry for split domains; the
+    /// α array builder then derives slopes from the CURRENT box instead of
+    /// the stale store. No knob: activation is structural (splits present).
+    pub(crate) split_refresh: bool,
     /// Upper-path per-neuron optimization state, mirrored to `neurons`.
     pub(crate) upper_neurons: AlphaNeuronMaps,
 }
@@ -55,6 +63,7 @@ impl GraphDomainAlphaState {
     /// Create empty alpha state.
     pub fn empty() -> Self {
         Self {
+            split_refresh: false,
             neurons: AlphaNeuronMaps::default(),
             upper_neurons: AlphaNeuronMaps::default(),
         }
@@ -127,6 +136,7 @@ impl GraphDomainAlphaState {
         }
 
         Self {
+            split_refresh: false,
             neurons,
             upper_neurons,
         }

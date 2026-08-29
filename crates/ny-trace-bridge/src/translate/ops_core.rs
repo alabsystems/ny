@@ -25,7 +25,8 @@ use crate::schema::{DType, TraceActivation, TraceOp, WeightPayload};
 
 use super::{
     checked_f64_to_f32, dim_as_i64, first_input, insert_payload, insert_scalar_constant, op_name,
-    shape_to_i64, simple_spec, validate_eps, weight_f32, Ctx, NodeOutput,
+    shape_to_i64, simple_spec, validate_constant_variance_eps, validate_eps, weight_f32, Ctx,
+    NodeOutput,
 };
 
 /// Cap translator-owned dense materializations so compact malformed traces
@@ -287,19 +288,151 @@ pub(super) fn translate_dropout(
     translate_identity_add_zero(name, "Dropout", input_tensors, output_tensor, ctx)
 }
 
-/// Refuse `TraceOp::ToDtype` casts.
+/// ONNX `Cast` target-dtype code for `INT32`, as carried on the guarded
+/// `LayerType::Trunc` lowering's `to` attribute.
 ///
-/// The wire format records only the target dtype. Without the source dtype,
-/// even an F32/F64 target may be a precision-losing cast. The bridge therefore
-/// cannot prove that any `ToDtype` is an identity and has no sound lowering for
-/// it.
+/// `ny_build::convert::elementwise` reads exactly this attribute to select
+/// `TruncLayer::for_int32_cast()`, and refuses every other `to` value — so
+/// these two constants are the complete set of integer cast targets the
+/// bridge may emit.
+const ONNX_CAST_TARGET_INT32: i64 = 6;
+
+/// ONNX `Cast` target-dtype code for `INT64` (see [`ONNX_CAST_TARGET_INT32`]).
+const ONNX_CAST_TARGET_INT64: i64 = 7;
+
+/// The ONNX `Cast` `to` code for a target dtype that has a MODELED guarded
+/// `Trunc` lowering, or `None` when the target must stay refused.
+///
+/// Only `INT32` and `INT64` qualify. `ny-build`'s converter rejects any other
+/// `to` value outright, and there is no corresponding domain-guarded
+/// `TruncLayer` constructor for the narrow/unsigned integer types — where a
+/// wrong enclosure would be a wrong `unsat` — so `U32`/`U8`/`Bool` and every
+/// float target stay refused.
+///
+/// Shared with the graph-wide dtype gate
+/// (`super::is_guarded_integer_cast`) so the set of admitted cast targets has
+/// exactly one definition.
+pub(super) fn guarded_integer_cast_target(target_dtype: DType) -> Option<i64> {
+    match target_dtype {
+        DType::I32 => Some(ONNX_CAST_TARGET_INT32),
+        DType::I64 => Some(ONNX_CAST_TARGET_INT64),
+        _ => None,
+    }
+}
+
+/// Translate `TraceOp::ToDtype`.
+///
+/// The cast node records only its target dtype, but the SOURCE dtype is
+/// recoverable from the wire format: the cast's first input tensor is produced
+/// by a node whose recorded `output_dtype` is the source dtype
+/// (`ctx.tensor_dtypes`, populated alongside `tensor_shapes`). Three resolved
+/// families lower; every other combination is refused, because the rounding
+/// semantics of the non-F32 endpoint are not modeled and an identity lowering
+/// would not enclose the true cast. This check is deliberately independent of
+/// the graph-wide F32 gate (which already refuses any reachable non-F32 node)
+/// so a later relaxation of that gate cannot silently turn a lossy cast into an
+/// identity. An unresolvable producer (dangling input) keeps the historic
+/// fail-closed refusal rather than guessing a source dtype.
+///
+/// # The three lowerable families
+///
+/// 1. `F32 -> F32` — a cast between identical dtypes changes no value, emitted
+///    with the same `Add(x, 0)` idiom as Dropout.
+/// 2. `U8`/`Bool -> F32` — a LOSSLESS integer embedding (see the inline note).
+/// 3. `F32 -> I32`/`I64` — the guarded `Trunc` lowering ny-onnx already uses
+///    for the IDENTICAL ONNX `Cast`, argued below.
+///
+/// # Why `F32 -> I32`/`I64` is a guarded `Trunc`, and why that is sound
+///
+/// `ny_build::convert::elementwise` lowers `LayerType::Trunc` carrying
+/// `to = 6` (INT32) / `to = 7` (INT64) to `TruncLayer::for_int32_cast()` /
+/// `for_int64_cast()`: round-toward-zero, plus a PROOF OBLIGATION discharged at
+/// every verdict-bearing IBP / CROWN / Patches / exact-f64-cell boundary that
+/// the whole pre-activation interval is finite and inside `[-2^31, 2^31)` /
+/// `[-2^63, 2^63)`. Out of range the layer raises `SoundnessRefusal` rather
+/// than choosing a value — ONNX leaves float→fixed-point Cast undefined there
+/// and ORT's answer (wraparound) is NOT `trunc`.
+///
+/// Pointwise agreement with the producer. nn's `nn-core`
+/// `dyn_tensor/selection/dtype_convert.rs::f32_to_i64` is
+/// `arr.mapv(|x| x as i64)` — Rust's `as` on floats IS round-toward-zero —
+/// after rejecting non-finite values and anything outside
+/// `[-9_223_372_000_000_000_000.0, 9_223_371_500_000_000_000.0]`. Those two
+/// f32 literals are exactly `-2^63` and `next_down(2^63)`, i.e. nn's accepted
+/// domain and the guarded layer's admitted domain are the SAME closed set of
+/// f32 values. So wherever nn does not itself error, `trunc` is its answer.
+/// (nn's `to_dtype` has no `(F32, I32)` arm at all — it errors — so the INT32
+/// arm cannot arise from an nn trace; it is emitted for other producers of the
+/// wire format under the ONNX semantics `ny-build` models, where the same
+/// in-range/finite guard makes `trunc` the only admitted behaviour.)
+///
+/// Exactness of the F32 mirror. The emitted graph carries the result as f32.
+/// `trunc(x)` of an f32 IS an f32 (for `|x| >= 2^23` the value is already
+/// integral), and inside the guarded domain the mathematical integer
+/// `x as i64` equals that same f32 exactly. So the mirror introduces NO
+/// rounding: downstream layers see precisely the integer nn computed. `Trunc`'s
+/// own IBP is `[trunc(l), trunc(u)]` — the exact interval image of a monotone
+/// step — so the enclosure is exact, not merely sound, and strictly TIGHTER
+/// than the refusal it replaces without weakening anything: the domain guard
+/// keeps every previously-unrepresentable case a hard refusal.
+///
+/// Wider fan-out is the graph gate's job, not this arm's: see
+/// `super::is_guarded_integer_cast` for why an integer-declared cast output may
+/// pass the F32 contract at all.
 pub(super) fn translate_to_dtype(
+    name: &str,
     target_dtype: DType,
     input_tensors: &[String],
+    output_tensor: &str,
+    ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
-    let _ = first_input(input_tensors, "ToDtype")?;
+    let data_input = first_input(input_tensors, "ToDtype")?;
+    let Some(&source_dtype) = ctx.tensor_dtypes.get(&data_input) else {
+        return Err(NyError::UnsupportedOp(format!(
+            "ToDtype target {target_dtype:?} cannot be soundly lowered because the trace does not record the source dtype"
+        )));
+    };
+    if source_dtype == DType::F32 && target_dtype == DType::F32 {
+        return translate_identity_add_zero(name, "ToDtype", input_tensors, output_tensor, ctx);
+    }
+    // F32 -> INT32/INT64: the guarded round-toward-zero `Trunc` (see the doc
+    // comment for the pointwise-agreement and exact-mirror arguments). Every
+    // other integer target stays refused — `ny-build` rejects any other `to`
+    // value and no domain-guarded layer models U32/U8/Bool.
+    if source_dtype == DType::F32 {
+        if let Some(to) = guarded_integer_cast_target(target_dtype) {
+            let mut attrs = HashMap::new();
+            attrs.insert("to".to_string(), AttributeValue::Int(to));
+            return Ok(NodeOutput::one(simple_spec(
+                name,
+                LayerType::Trunc,
+                vec![data_input],
+                output_tensor,
+                attrs,
+            )));
+        }
+    }
+    // U8/Bool -> F32 is a LOSSLESS integer embedding: every value of the
+    // source domain (0..=255 / {0, 1}) is exactly representable in F32, so
+    // there is no rounding to model and the cast is an identity on the value
+    // set. The graph-wide dtype gate only admits U8/Bool producers whose
+    // lowering already models the values as F32 exactly (Compare masks,
+    // value-independent index leaves), so the identity composes soundly.
+    // Wider integer sources (U32/I32/I64) stay refused: beyond 2^24 the
+    // embedding rounds.
+    if matches!(source_dtype, DType::U8 | DType::Bool) && target_dtype == DType::F32 {
+        return translate_identity_add_zero(name, "ToDtype", input_tensors, output_tensor, ctx);
+    }
+    let reason = if source_dtype == DType::F32 {
+        format!(
+            "rounding semantics of the {target_dtype:?} target are not modeled (only I32/I64 \
+             have the guarded round-toward-zero Trunc lowering)"
+        )
+    } else {
+        format!("rounding semantics of the {source_dtype:?} source are not modeled")
+    };
     Err(NyError::UnsupportedOp(format!(
-        "ToDtype target {target_dtype:?} cannot be soundly lowered because the trace does not record the source dtype"
+        "ToDtype {source_dtype:?} -> {target_dtype:?} is refused: {reason}"
     )))
 }
 
@@ -1105,7 +1238,13 @@ pub(super) fn translate_batch_norm(
     output_tensor: &str,
     ctx: &mut Ctx,
 ) -> Result<NodeOutput> {
-    let eps_f32 = validate_eps(eps, "BatchNorm")?;
+    // BatchNorm is the ONE normalization whose variance is a translate-time
+    // constant, so it takes the constant-variance gate (finite eps >= 0 plus
+    // per-channel `var + eps > 0`) rather than the data-variance floor. See
+    // `validate_constant_variance_eps` for why that is the weakest sound rule
+    // here — and why the data-variance family cannot have it.
+    let running_var_data = weight_f32(running_var, "BatchNorm running_var")?;
+    let eps_f32 = validate_constant_variance_eps(eps, &running_var_data, "BatchNorm")?;
     let data_input = first_input(input_tensors, "BatchNorm")?;
 
     let w_name = format!("{name}_weight");
@@ -1607,5 +1746,251 @@ fn round_ties_even(v: f32) -> f32 {
         }
     } else {
         rounded
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A translation context whose sole producer tensor `p_out` carries the
+    /// given recorded dtype (`None` leaves the dtype lookup empty, modeling an
+    /// unresolvable producer).
+    fn ctx_with_source(dtype: Option<DType>) -> Ctx {
+        let mut ctx = Ctx::new(false);
+        if let Some(source_dtype) = dtype {
+            ctx.tensor_dtypes.insert("p_out".to_string(), source_dtype);
+        }
+        ctx
+    }
+
+    /// Unwrap a refusal (`expect_err` needs `NodeOutput: Debug`).
+    fn unwrap_refusal(result: Result<NodeOutput>, what: &str) -> NyError {
+        match result {
+            Ok(_) => panic!("{what}: expected a refusal, got a lowering"),
+            Err(err) => err,
+        }
+    }
+
+    /// F32 -> F32 with an F32-recorded producer is the one lowerable cast:
+    /// the same `Add(x, 0)` identity idiom as Dropout.
+    #[test]
+    fn to_dtype_f32_identity_lowers_as_add_zero() {
+        let mut ctx = ctx_with_source(Some(DType::F32));
+        let output = translate_to_dtype(
+            "layer0_trace_1",
+            DType::F32,
+            &["p_out".to_string()],
+            "layer0_trace_1_out",
+            &mut ctx,
+        )
+        .expect("F32 -> F32 lowers as identity");
+        assert_eq!(output.specs.len(), 1, "one identity Add spec");
+        let spec = &output.specs[0];
+        assert_eq!(spec.layer_type, LayerType::Add);
+        assert_eq!(spec.inputs[0], "p_out");
+        assert_eq!(spec.outputs, vec!["layer0_trace_1_out".to_string()]);
+        assert!(
+            ctx.constant_tensors.contains("layer0_trace_1_zero"),
+            "identity Add registers its +0 constant"
+        );
+    }
+
+    /// A resolved non-identity cast is refused naming BOTH dtypes and the
+    /// offending endpoint — never blamed on a missing source dtype. The
+    /// non-F32-source arm is unreachable through `translate` today (the
+    /// graph-wide F32 gate refuses the producer first) but must stay
+    /// fail-closed on its own.
+    #[test]
+    fn to_dtype_resolved_non_identity_names_both_dtypes() {
+        let mut ctx = ctx_with_source(Some(DType::F16));
+        let err = unwrap_refusal(
+            translate_to_dtype(
+                "cast",
+                DType::F32,
+                &["p_out".to_string()],
+                "cast_out",
+                &mut ctx,
+            ),
+            "F16 -> F32",
+        );
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("ToDtype F16 -> F32 is refused")
+                    && m.contains("F16 source")),
+            "got {err:?}"
+        );
+
+        let mut ctx = ctx_with_source(Some(DType::F32));
+        let err = unwrap_refusal(
+            translate_to_dtype(
+                "cast",
+                DType::U32,
+                &["p_out".to_string()],
+                "cast_out",
+                &mut ctx,
+            ),
+            "F32 -> U32",
+        );
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("ToDtype F32 -> U32 is refused")
+                    && m.contains("U32 target")),
+            "got {err:?}"
+        );
+    }
+
+    /// `F32 -> I32`/`I64` lowers to the guarded round-toward-zero `Trunc`,
+    /// carrying the ONNX Cast target code `ny-build`'s converter reads to
+    /// select `TruncLayer::for_int32_cast()` / `for_int64_cast()` — the same
+    /// layer ny-onnx emits for the identical ONNX `Cast`.
+    #[test]
+    fn to_dtype_f32_to_int_lowers_to_guarded_trunc() {
+        for (target, expected_to) in [(DType::I32, 6_i64), (DType::I64, 7_i64)] {
+            let mut ctx = ctx_with_source(Some(DType::F32));
+            let output = translate_to_dtype(
+                "layer0_trace_1",
+                target,
+                &["p_out".to_string()],
+                "layer0_trace_1_out",
+                &mut ctx,
+            )
+            .unwrap_or_else(|e| panic!("F32 -> {target:?} must lower to a guarded Trunc: {e:?}"));
+            assert_eq!(output.specs.len(), 1, "{target:?}: one Trunc spec");
+            let spec = &output.specs[0];
+            assert_eq!(spec.layer_type, LayerType::Trunc, "{target:?}");
+            assert_eq!(spec.inputs, vec!["p_out".to_string()], "{target:?}");
+            assert_eq!(
+                spec.outputs,
+                vec!["layer0_trace_1_out".to_string()],
+                "{target:?}"
+            );
+            assert_eq!(
+                spec.attributes.get("to"),
+                Some(&AttributeValue::Int(expected_to)),
+                "{target:?}: the Cast target attribute selects the GUARDED TruncLayer; a plain \
+                 Trunc (no `to`) would drop the finite/in-range proof obligation"
+            );
+        }
+    }
+
+    /// The integer-cast relaxation is exactly two targets wide. Every other
+    /// F32 target keeps the standing refusal: `ny-build` rejects any other
+    /// `to` value and no domain-guarded layer models U32/U8/Bool, where a
+    /// wrong enclosure would be a wrong `unsat`.
+    #[test]
+    fn to_dtype_f32_to_other_targets_stay_refused() {
+        for target in [
+            DType::U32,
+            DType::U8,
+            DType::Bool,
+            DType::F16,
+            DType::Bf16,
+            DType::F64,
+        ] {
+            let mut ctx = ctx_with_source(Some(DType::F32));
+            let err = unwrap_refusal(
+                translate_to_dtype("cast", target, &["p_out".to_string()], "cast_out", &mut ctx),
+                &format!("F32 -> {target:?}"),
+            );
+            assert!(
+                matches!(err, NyError::UnsupportedOp(ref m)
+                    if m.contains(&format!("ToDtype F32 -> {target:?} is refused"))
+                        && m.contains("only I32/I64")),
+                "{target:?}: got {err:?}"
+            );
+        }
+    }
+
+    /// The `Trunc` arm is keyed on the RESOLVED source, not just the target:
+    /// a non-F32 source keeps the standing refusal even for an I32/I64 target
+    /// (a `F16 -> I64` cast rounds twice, and neither rounding is modeled).
+    #[test]
+    fn to_dtype_non_f32_source_to_int_stays_refused() {
+        for source in [DType::F16, DType::Bf16, DType::F64, DType::U8, DType::I64] {
+            for target in [DType::I32, DType::I64] {
+                let mut ctx = ctx_with_source(Some(source));
+                let err = unwrap_refusal(
+                    translate_to_dtype(
+                        "cast",
+                        target,
+                        &["p_out".to_string()],
+                        "cast_out",
+                        &mut ctx,
+                    ),
+                    &format!("{source:?} -> {target:?}"),
+                );
+                assert!(
+                    matches!(err, NyError::UnsupportedOp(ref m)
+                        if m.contains(&format!("ToDtype {source:?} -> {target:?} is refused"))
+                            && m.contains(&format!("{source:?} source"))),
+                    "{source:?} -> {target:?}: got {err:?}"
+                );
+            }
+        }
+    }
+
+    /// An unresolvable producer fails closed for an integer target too — the
+    /// guarded `Trunc` is only correct when the source really is F32, and the
+    /// arm must never guess that.
+    #[test]
+    fn to_dtype_unresolvable_source_to_int_fails_closed() {
+        for target in [DType::I32, DType::I64] {
+            let mut ctx = ctx_with_source(None);
+            let err = unwrap_refusal(
+                translate_to_dtype("cast", target, &["p_out".to_string()], "cast_out", &mut ctx),
+                &format!("unresolvable producer -> {target:?}"),
+            );
+            assert!(
+                matches!(err, NyError::UnsupportedOp(ref m)
+                    if m.contains("does not record the source dtype")),
+                "{target:?}: got {err:?}"
+            );
+        }
+    }
+
+    /// The admitted-target table has exactly one definition, shared with the
+    /// graph-wide dtype gate, so the emitter and the gate cannot drift apart.
+    #[test]
+    fn guarded_integer_cast_target_table_is_exactly_int32_and_int64() {
+        assert_eq!(guarded_integer_cast_target(DType::I32), Some(6));
+        assert_eq!(guarded_integer_cast_target(DType::I64), Some(7));
+        for other in [
+            DType::F32,
+            DType::F16,
+            DType::Bf16,
+            DType::F64,
+            DType::U32,
+            DType::U8,
+            DType::Bool,
+        ] {
+            assert_eq!(
+                guarded_integer_cast_target(other),
+                None,
+                "{other:?} has no modeled guarded lowering"
+            );
+        }
+    }
+
+    /// With no recorded producer dtype the cast keeps the historic
+    /// fail-closed refusal — even for an F32 target.
+    #[test]
+    fn to_dtype_unresolvable_source_keeps_fail_closed_refusal() {
+        let mut ctx = ctx_with_source(None);
+        let err = unwrap_refusal(
+            translate_to_dtype(
+                "cast",
+                DType::F32,
+                &["p_out".to_string()],
+                "cast_out",
+                &mut ctx,
+            ),
+            "unresolvable producer",
+        );
+        assert!(
+            matches!(err, NyError::UnsupportedOp(ref m)
+                if m.contains("does not record the source dtype")),
+            "got {err:?}"
+        );
     }
 }

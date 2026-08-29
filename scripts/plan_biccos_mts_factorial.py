@@ -23,8 +23,6 @@ from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any
 
-import yaml
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "benchmarks" / "biccos_mts_factorial_v1.json"
 DEFAULT_ABC_REPO = Path("<home>/alpha-beta-CROWN-reference")
@@ -284,6 +282,13 @@ def _validate_arm_semantics(arm: dict[str, Any], document: dict[str, Any]) -> No
 
 
 def _resolve_arms(manifest: dict[str, Any], *, abc_repo: Path) -> list[dict[str, Any]]:
+    try:
+        import yaml
+    except ImportError as error:
+        raise PlanError(
+            "PyYAML is required to validate upstream arm configurations"
+        ) from error
+
     directories = manifest["category_config_directories"]
     if not isinstance(directories, dict) or set(directories) != {
         "cifar100_2024",

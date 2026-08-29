@@ -305,14 +305,13 @@ fn chunk_aware_alpha_budget_falls_back_without_dispatch_and_keeps_fixed_waves() 
         for key in [
             "NY_NO_CHUNK_ABORT",
             "NY_NO_CHUNK_GROW",
-            "NY_NO_CHUNK_WAVE_PAR",
             "NY_PER_NODE_CAP_SECS",
             "NY_PER_NODE_FLOOR_SECS",
         ] {
             env.remove(key);
         }
-
-        let (graph, input) = make_chunk_aware_alpha_budget_graph();
+        let (mut graph, input) = make_chunk_aware_alpha_budget_graph();
+        graph.set_chunk_wave_parallel_enabled(true);
         let reference = reference_bounds_with_input(&graph, &input);
         let targets = vec!["small_target".to_string(), "wide_target".to_string()];
         let (selected, trace) = run_with_m1_alpha_trace(|| {

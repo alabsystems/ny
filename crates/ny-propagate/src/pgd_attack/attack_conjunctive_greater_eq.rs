@@ -174,7 +174,7 @@ impl PgdAttacker<'_> {
         let mut failed_restarts = 0usize;
 
         for restart in 0..self.config().num_restarts {
-            if self.config().past_deadline() {
+            if self.past_deadline() {
                 break;
             }
 
@@ -255,7 +255,7 @@ impl PgdAttacker<'_> {
                 if found.load(Ordering::Relaxed) {
                     return None;
                 }
-                if self.config().past_deadline() {
+                if self.past_deadline() {
                     return None;
                 }
 

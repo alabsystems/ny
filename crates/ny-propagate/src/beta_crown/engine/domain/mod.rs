@@ -4,7 +4,7 @@
 
 //! Domain processing and split handling.
 
-mod child;
+pub(in crate::beta_crown) mod child;
 // `pub(crate)` for the capability predicate only (see `engine.rs`).
 pub(crate) mod clip;
 mod clip_provenance;

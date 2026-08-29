@@ -9,7 +9,12 @@
 # - 62 instances with timeouts 30-300s
 # - Simple feedforward CNN architecture (small/medium models)
 # - Mix of SAT/UNSAT instances
-# - STATUS: 100% solve rate on 15-instance sample — all solved instantly
+# - STATUS: 62/62 solved. SUPERSEDES the older line here, "100% solve rate on
+#   15-instance sample — all solved instantly", which was true of its sample and
+#   misleading about the category: the eight rows the 2026-08-12 restore
+#   recovered take 24-102s, not "instantly". Source is the checked-in bank
+#   reports/measured/collins_rul_cnn_2022.csv — 62 scored rows, 39 unsat +
+#   23 sat, 0 unsolved, all under run_id `alphacrown-20260812-e818e6d6`.
 # - Reference uses sb branching with input_split
 #
 # NN_rul_full_window_* — bound_prop_method: alpha-crown (RESTORED 2026-08-12)
@@ -72,8 +77,46 @@ general:
   csv_name: instances.csv
 
 solver:
-  # Disable α-CROWN (use plain CROWN) so BaB splits instead of stalling at the
-  # root on the conv NN_rul_full models. See THROUGHPUT NOTE above.
+  # DO NOT "FIX" THIS LINE. It is worth +12.9 normalized points and it took the
+  # category to the FIELD BEST. Read the RESTORED 2026-08-12 note in the header
+  # before changing it.
+  #
+  # WHAT THIS COMMENT USED TO SAY, and why it is recorded rather than deleted:
+  # from the original preset until today it read "Disable alpha-CROWN (use
+  # plain CROWN) so BaB splits instead of stalling at the root on the conv
+  # NN_rul_full models. See THROUGHPUT NOTE above." That was a real observation
+  # about a real failure mode — the alpha-CROWN-in-BaB path did stall at the
+  # root with Domains explored 0-1 — and it was believed for months. The
+  # 2026-08-12 restore rewrote the header block and left this inline rationale
+  # behind, so from then until 2026-08-24 the comment argued AGAINST the setting
+  # directly beneath it, and pointed at a "THROUGHPUT NOTE" the same rewrite had
+  # removed. A reader resolving that inconsistency the obvious way would have
+  # handed back eight solved rows.
+  #
+  # WHY IT IS FALSE ON THE CURRENT BINARY (re-measured 2026-08-12, release
+  # e818e6d6, full benchmark at the official per-instance budgets):
+  #
+  #   plain crown : 54/62 solved, 8 timeouts   (raw 540)
+  #   alpha-crown : 62/62 solved, 0 timeouts   (raw 620 == the field best)
+  #
+  # The old rationale assumed the two arms trade "stalled root" against "working
+  # search". They do not. Under plain CROWN, BaB branches enthusiastically and
+  # gets NOWHERE: on 8perturbations_delta20_w20, NY_BRANCH_TRACE reports 8,531
+  # of 8,706 splits (98.0%) lifting the frontier bound by EXACTLY ZERO across
+  # 17,212 explored domains. Under alpha-crown the root bound is now sufficient
+  # and the row closes with NO BaB AT ALL (frontier frames: 0) — which is how
+  # alpha-beta-CROWN solves it, in 7.10 s. So plain CROWN was trading a stalled
+  # root for a useless search, and losing on both sides.
+  #
+  # STILL TRUE at HEAD (2026-08-24): the checked-in bank
+  # reports/measured/collins_rul_cnn_2022.csv carries 62 scored rows, all under
+  # run_id `alphacrown-20260812-e818e6d6`, 39 unsat + 23 sat, ZERO unsolved.
+  # All 62 verdicts were cross-checked against every tool's published
+  # results.csv: 62 agree, 0 mismatches.
+  #
+  # If a future change makes the root ascent expensive again, RE-MEASURE both
+  # arms before reverting. The stall this line once guarded against is real, but
+  # it is a THROUGHPUT symptom, and plain CROWN is not its cure.
   bound_prop_method: alpha-crown
 
 attack:
@@ -88,6 +131,9 @@ bab:
     method: kfsb
     candidates: 8
     reduceop: max
+    # Exact wave-selector mirrors for governed search; runtime is unchanged.
+    kfsb_multi_candidates: 8
+    kfsb_multi_reduceop: max
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100

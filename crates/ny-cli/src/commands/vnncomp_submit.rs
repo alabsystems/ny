@@ -44,6 +44,16 @@ const MAX_PREBUILT_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREBUILT_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_PREBUILT_CHECKSUM_BYTES: u64 = 1024;
 const MAX_PREBUILT_PROVENANCE_BYTES: u64 = 16 * 1024;
+/// Fail closed before an unexpectedly shaped archive can turn the shebang
+/// verifier into an unbounded decompression pass. The reviewed package has a
+/// few thousand members and is comfortably below both ceilings, including the
+/// optional 512 MiB prebuilt.
+const MAX_SUBMISSION_ARCHIVE_MEMBERS: usize = 100_000;
+const MAX_SUBMISSION_REGULAR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Linux reads a much smaller interpreter buffer; this deliberately generous
+/// ceiling distinguishes a malformed/non-executable shebang from an ordinary
+/// source file without retaining an entire archive member in memory.
+const MAX_SHEBANG_LINE_BYTES: usize = 4096;
 const PREBUILT_MANIFEST_KEYS: [&str; 18] = [
     "schema",
     "target",
@@ -1177,7 +1187,7 @@ fn write_tarball(repo_root: &Path, output: &Path, included_paths: &[String]) -> 
     // other packaging path) that omits a checksummed file breaks Cargo's
     // directory-source build. Verify the ACTUAL archived bytes here.
     verify_vendor_checksums(staged_output.path())?;
-    verify_shell_scripts_are_lf(staged_output.path())?;
+    verify_shebang_files_are_lf(staged_output.path())?;
 
     let archived_source = Command::new("tar")
         .args(["-xOzf"])
@@ -1216,75 +1226,98 @@ fn write_tarball(repo_root: &Path, output: &Path, included_paths: &[String]) -> 
     Ok(())
 }
 
-/// Assert that every file listed in an externally vendored crate's
-/// `.cargo-checksum.json` is actually present in the produced archive. Cargo's
-/// directory-source integrity
-/// check recomputes those hashes at build time and aborts the entire build if a
-/// listed file is missing ("failed to calculate checksum of … No such file or
-/// directory"). Because the source-build submission has no prebuilt fallback on
-/// the evaluator, a single dropped vendored file turns the whole run into a
-/// zero-scoring non-build. We verify the archived bytes (not the working tree) so
-/// any packaging path that drops a checksummed vendored file fails the pack here.
-/// Refuse an archive whose shell scripts carry CRLF.
+/// Refuse an archive whose shebang files carry a CRLF interpreter line.
 ///
 /// The packer tars the WORKING TREE, not `git archive`, so it ships whatever
-/// bytes are on disk. A `.sh` checked out with CRLF on Windows gets a shebang
-/// of `#!/bin/bash\r`, which names an interpreter that does not exist: the
-/// competition host fails the run with a bare "No such file or directory" and
-/// the tarball itself looks perfectly well-formed. `.gitattributes` already
-/// pins `*.sh text eol=lf`, but that only applies at CHECKOUT — a tree written
-/// before the rule landed, or a file produced by a tool, still reaches the
-/// archive uncorrected.
+/// bytes are on disk. A script checked out with CRLF on Windows gets a shebang
+/// such as `#!/bin/bash\r`, which names an interpreter that does not exist: the
+/// competition host fails with a bare "No such file or directory" while the
+/// tarball itself looks well-formed. Attributes only apply at checkout, so the
+/// emitted archive remains the authority this gate must inspect.
 ///
-/// Measured on this repository: 26 tracked `.sh` files, `prepare_instance.sh`
-/// among them, held CRLF in a working tree git reported as clean.
-fn verify_shell_scripts_are_lf(archive: &Path) -> Result<()> {
-    let listing = Command::new("tar").arg("-tzf").arg(archive).output()?;
-    if !listing.status.success() {
-        bail!(
-            "could not list submission archive for line-ending verification: {}",
-            String::from_utf8_lossy(&listing.stderr).trim()
-        );
-    }
-    let scripts: Vec<String> = String::from_utf8_lossy(&listing.stdout)
-        .lines()
-        .map(|raw| raw.strip_prefix("./").unwrap_or(raw).to_string())
-        // Case-insensitive: a `.SH` member is just as unrunnable with CRLF.
-        .filter(|entry| {
-            Path::new(entry)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("sh"))
-        })
-        .collect();
-
+/// Every bounded regular member is streamed exactly once. This is intentionally
+/// independent of extensions: Python scripts and extensionless launchers fail
+/// in exactly the same way as `.sh` files, while CRLF in a non-shebang data file
+/// is harmless and remains accepted.
+fn verify_shebang_files_are_lf(archive: &Path) -> Result<()> {
+    let compressed = fs::File::open(archive)?;
+    let decoder = flate2::read::GzDecoder::new(compressed);
+    let mut tar = tar::Archive::new(decoder);
     let mut offenders = Vec::new();
-    for script in &scripts {
-        let member = Command::new("tar")
-            .args(["-xOzf"])
-            .arg(archive)
-            .arg(script)
-            .output()?;
-        if !member.status.success() {
+    let mut member_count = 0_usize;
+    let mut regular_bytes = 0_u64;
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        member_count = member_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("submission archive member count overflow"))?;
+        if member_count > MAX_SUBMISSION_ARCHIVE_MEMBERS {
+            bail!("submission archive has more than {MAX_SUBMISSION_ARCHIVE_MEMBERS} members");
+        }
+
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let size = entry.header().size()?;
+        regular_bytes = regular_bytes
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("submission archive regular-byte count overflow"))?;
+        if regular_bytes > MAX_SUBMISSION_REGULAR_BYTES {
             bail!(
-                "could not read archived shell script {script:?}: {}",
-                String::from_utf8_lossy(&member.stderr).trim()
+                "submission archive regular members exceed the {}-byte verification bound",
+                MAX_SUBMISSION_REGULAR_BYTES
             );
         }
-        if member.stdout.windows(2).any(|pair| pair == b"\r\n") {
-            offenders.push(script.clone());
+
+        let path = entry.path()?.into_owned();
+        let mut prefix = Vec::with_capacity(MAX_SHEBANG_LINE_BYTES + 1);
+        entry
+            .by_ref()
+            .take((MAX_SHEBANG_LINE_BYTES + 1) as u64)
+            .read_to_end(&mut prefix)?;
+        // Consume the rest so the streaming tar reader validates member
+        // boundaries without retaining a large binary or model in memory.
+        std::io::copy(&mut entry, &mut std::io::sink())?;
+
+        if !prefix.starts_with(b"#!") {
+            continue;
+        }
+        let first_line_end = prefix
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .unwrap_or(prefix.len());
+        if first_line_end > MAX_SHEBANG_LINE_BYTES {
+            bail!(
+                "archived shebang exceeds the {MAX_SHEBANG_LINE_BYTES}-byte verification bound: {}",
+                path.display()
+            );
+        }
+        if first_line_end > 0 && prefix[first_line_end - 1] == b'\r' {
+            offenders.push(path);
         }
     }
     if !offenders.is_empty() {
+        let offenders = offenders
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         bail!(
-            "refusing a submission whose shell scripts carry CRLF; they will not \
-             execute on the evaluation host (shebang becomes `#!/bin/bash\r`). \
-             Re-check out these files with `*.sh text eol=lf` in effect: {}",
-            offenders.join(", ")
+            "refusing a submission whose shebang interpreter lines end in CRLF; \
+             they will not execute on the Linux evaluation host. Re-check out or \
+             rewrite these files with LF interpreter lines: {offenders}"
         );
     }
     Ok(())
 }
 
+/// Assert that every file listed in an externally vendored crate's
+/// `.cargo-checksum.json` is actually present in the produced archive. Cargo's
+/// directory-source integrity check recomputes those hashes at build time and
+/// aborts the entire build if a listed file is missing. Because the source-build
+/// submission has no prebuilt fallback on the evaluator, a single dropped file
+/// turns the whole run into a zero-scoring non-build. Inspect the archived bytes,
+/// not the working tree, so any packaging omission fails here.
 fn verify_vendor_checksums(archive: &Path) -> Result<()> {
     let listing = Command::new("tar").arg("-tzf").arg(archive).output()?;
     if !listing.status.success() {
@@ -1402,6 +1435,100 @@ mod tests {
             let mut permissions = fs::metadata(path).expect("fixture metadata").permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(path, permissions).expect("chmod fixture");
+        }
+    }
+
+    fn make_shebang_archive(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        let root = fixture.path().join("root");
+        fs::create_dir(&root).expect("archive root");
+        for (relative, contents) in files {
+            let path = root.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("archive member parent");
+            }
+            fs::write(path, contents).expect("archive member");
+        }
+        let archive = fixture.path().join("submission.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&root)
+            .arg(".")
+            .status()
+            .expect("create shebang fixture archive");
+        assert!(status.success(), "tar fixture creation failed: {status}");
+        fixture
+    }
+
+    #[test]
+    fn archive_shebang_gate_rejects_shell_python_and_extensionless_crlf() {
+        let fixture = make_shebang_archive(&[
+            ("bad.sh", b"#!/bin/bash\r\nexit 0\r\n"),
+            ("scripts/bad.py", b"#!/usr/bin/env python3\r\npass\r\n"),
+            ("scripts/launcher", b"#!/bin/sh\r\nexit 0\r\n"),
+            // CRLF is data here, not an interpreter-line defect.
+            ("notes.txt", b"first\r\nsecond\r\n"),
+        ]);
+        let error = verify_shebang_files_are_lf(&fixture.path().join("submission.tar.gz"))
+            .expect_err("every CRLF shebang form must fail")
+            .to_string();
+        for offender in ["bad.sh", "scripts/bad.py", "scripts/launcher"] {
+            assert!(
+                error.contains(offender),
+                "error omitted {offender}: {error}"
+            );
+        }
+        assert!(
+            !error.contains("notes.txt"),
+            "non-shebang CRLF must not be classified as an offender: {error}"
+        );
+    }
+
+    #[test]
+    fn archive_shebang_gate_accepts_lf_controls_and_non_shebang_crlf() {
+        let fixture = make_shebang_archive(&[
+            ("good.sh", b"#!/bin/bash\nexit 0\n"),
+            ("scripts/good.py", b"#!/usr/bin/env python3\npass\n"),
+            ("scripts/launcher", b"#!/bin/sh\nexit 0\n"),
+            ("notes.txt", b"first\r\nsecond\r\n"),
+            ("empty", b""),
+        ]);
+        verify_shebang_files_are_lf(&fixture.path().join("submission.tar.gz"))
+            .expect("valid LF shebangs and non-shebang CRLF must pass");
+    }
+
+    #[test]
+    fn archive_shebang_gate_fails_closed_on_unbounded_interpreter_line() {
+        let mut oversized = b"#!".to_vec();
+        oversized.resize(MAX_SHEBANG_LINE_BYTES + 1, b'x');
+        let fixture = make_shebang_archive(&[("oversized", &oversized)]);
+        let error = verify_shebang_files_are_lf(&fixture.path().join("submission.tar.gz"))
+            .expect_err("oversized shebang must fail closed")
+            .to_string();
+        assert!(error.contains("exceeds"), "unexpected error: {error}");
+        assert!(error.contains("oversized"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn repository_eol_policy_is_lf_and_covers_direct_shebang_classes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let attributes = fs::read(root.join(".gitattributes")).expect("read .gitattributes");
+        assert!(
+            !attributes.contains(&b'\r'),
+            ".gitattributes must itself use LF and textual `\\r` examples"
+        );
+        let attributes = String::from_utf8(attributes).expect(".gitattributes must be UTF-8");
+        for rule in [
+            "*.sh text eol=lf",
+            "*.py text eol=lf",
+            "scripts/ny-safe-gpu-run text eol=lf",
+        ] {
+            assert!(
+                attributes.lines().any(|line| line == rule),
+                "missing direct-execution EOL rule: {rule}"
+            );
         }
     }
 

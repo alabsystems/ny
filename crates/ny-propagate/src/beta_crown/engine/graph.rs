@@ -83,6 +83,7 @@ pub(in crate::beta_crown::engine::graph) fn is_finite_constrained_crown_refusal(
 }
 
 pub(crate) mod adaptive_microbatch;
+mod alpha_analytic;
 pub(in crate::beta_crown::engine::graph) mod clip_alpha;
 pub(in crate::beta_crown::engine::graph) mod clip_complete;
 pub(crate) mod domain_batch;

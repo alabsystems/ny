@@ -155,26 +155,22 @@ fn check_deadline(deadline: Option<Instant>) -> Result<(), BatchError> {
     check_deadline_at(deadline, Instant::now())
 }
 
-/// Pure arming predicate — the SPEC of the gate, unit-tested below.
+/// Pure legacy-environment arming predicate, retained as a regression oracle
+/// for the exact parser used before this gate gained a typed preset route.
+#[cfg(test)]
 #[inline]
 fn armed_from_raw(raw: Option<&str>) -> bool {
     raw == Some("1")
 }
 
-/// Latched raw `NY_MARGIN_ROW_GPU_BATCH` string, read once through the
-/// ny-levers chokepoint (latch the STRING, derive the DECISION per call).
-fn env_raw() -> Option<&'static str> {
-    static RAW: OnceLock<Option<String>> = OnceLock::new();
-    RAW.get_or_init(|| ny_levers::read_raw(&ny_levers::decls::sound_channel::MARGIN_ROW_GPU_BATCH))
-        .as_deref()
-}
-
 /// Is domain batching armed? SUBORDINATE: the per-pass seam gate must be armed
 /// too, so this can never be the thing that first sends a verdict-bearing bound
-/// to the device.
+/// to the device. The child decision remains process-wide and first-read
+/// latched, matching the historical raw-string `OnceLock`.
 #[inline]
 pub(crate) fn enabled() -> bool {
-    super::enabled() && armed_from_raw(env_raw())
+    static ON: OnceLock<bool> = OnceLock::new();
+    super::enabled() && *ON.get_or_init(crate::preset_gates::margin_row_gpu_batch_enabled)
 }
 
 /// Report each DISTINCT batched-refusal reason ONCE per process, under

@@ -21,6 +21,29 @@
 general:
   root_path: ../../benchmarks/vnncomp2025/benchmarks/cgan_2023
   csv_name: instances.csv
+  # #cgan-abc-parity. alpha-beta-CROWN sets conv_mode: matrix for this
+  # benchmark; ny defaulted to Auto => Patches. This is a BaB-CHILD-BACKWARD
+  # switch only: the root CROWN-IBP collection runs on lanes that cannot read
+  # it (`network/core/sequential/` has ZERO conv_mode/use_patches references;
+  # the graph side ORs in `collector_patches_override`), so intermediate-bound
+  # collection stays in patches either way. MEASURED on the child bounds:
+  # 3 domains/347 s -> 63/33 s, and the bound stops being invariant to split
+  # depth. NECESSARY BUT NOT SUFFICIENT: matrix alone (with reorder_bab false,
+  # i.e. loop_batch_size 1) still TIMES OUT on nCh_1 prop_3; the conversion
+  # needs the whole set (the 7-arm factorial located the load-bearing key as
+  # solver.bound_prop_method below).
+  conv_mode: matrix
+
+solver:
+  # abc runs cgan on plain CROWN (no alpha authority) for child bounds. THE
+  # LOAD-BEARING KEY of the 2026-08-26 factorial: every arm that converts
+  # nCh_1_prop_3 (banked timeout,895 -> unsat in 513-533 s, 3 reproductions)
+  # carries it, and every arm without it times out. It is ALSO the memory
+  # mechanism located by the same factorial (73-91 GB peak vs 6.3 GB on the
+  # nonlinear_activations 1200 s row, binary 8012f0e7d); re-measured at HEAD
+  # after the objective-chunk governor (4cb8d1797) the same row peaks ~34 GB
+  # uncapped with verdicts delivered.
+  bound_prop_method: crown
 
 model:
   # cGAN is a measured rewrite class: the historical f32 ConvTranspose/Gemm
@@ -41,6 +64,30 @@ attack:
 
 bab:
   batch_size: 64
+  # #cgan-reclaim (docs/CGAN_BUDGET_RECLAIM_2026-08-20.md). ARMED 2026-08-24.
+  #
+  # WITHOUT IT, SEVEN OF THE NINE UNSOLVED ROWS QUIT EARLY. Measured at the
+  # official budgets: nCh_1 prop_1/prop_3 stop at 604/603 s of 900, nCh_3
+  # prop_0/prop_1/prop_2 at 659/620/707, imgSz64 prop_1/prop_3 at 826/825 —
+  # 1456 s of official budget discarded across seven rows. One expired phase
+  # deadline inside a bound walk returns Err(DeadlineExceeded), which escapes
+  # the graph pass and the CLI prints "Verification produced no verdict (sound
+  # unknown)" while holding a perfectly good sound enclosure. Armed, all seven
+  # run to their wall (unused 74-297 s -> 3-4 s).
+  #
+  # The set is five RETENTION sites under one gate, deliberately not separable
+  # (set-mates switch together; partial fixes measure exactly zero — items 1-3
+  # alone left three rows still aborting, and item 4 without item 5 merely
+  # moved the stopper one link along). Every arm is a monotone intersect of
+  # independently certified enclosures, a selection between two sound routes,
+  # or the retention/publication of bounds that were already certified before
+  # the walk started. No arm manufactures a bound and no arm grants new
+  # wall-clock authority, so this can lose proofs, never mint them.
+  #
+  # Scores nothing by itself — `unknown` and `timeout` are both 0. It is
+  # armed because every cgan lever A/B'd on those seven rows was, until now,
+  # run on an instance that aborted before the lever could matter.
+  cgan_reclaim: true
   # Per-node CROWN-IBP time-budget cap (#4413 lever chain, #cgan-bn11-budget):
   # BatchNormalization_11 (28,800 dims) is memory-feasible via the auto-chunked
   # CROWN backward (#cgan-bn11-chunk), but the default 12 s equal-share cap /
@@ -72,8 +119,28 @@ bab:
     # fail-closed headroom; the aggregate alpha refresh cap below prevents it
     # from scaling with the official wall budget.
     initial_bounds_fraction: 0.45
-    # The precheck also exits as soon as the cached forward-linear map is
-    # available, so this is a ceiling rather than reserved/spent time.
+    # CORRECTED 2026-08-24 — the old rationale here ("the precheck also exits
+    # as soon as the cached forward-linear map is available, so this is a
+    # ceiling rather than reserved/spent time") is FALSE for this benchmark,
+    # and it is false STRUCTURALLY, not by tuning.
+    #
+    # cgan's output constraints are constant-threshold (`Y_0 >= c` OR
+    # `Y_0 <= c` on a single scalar output), and `build_spec_row`
+    # (`verify/disjunctive_precheck.rs`) skips constant constraints and returns
+    # `None` — so the cheap spec-guided route ("IBP intermediates, bypassed
+    # CROWN-IBP") can never be taken here. The run falls through to
+    # `crown_precheck_per_output`, commented in-tree as "the slow path —
+    # triggers full CROWN (potentially with CROWN-IBP)". MEASURED run-relative
+    # at the official 900 s budget with reclaim armed: that precheck is
+    # 292-394 s, i.e. 32-44% of the budget, on all four nCh rows.
+    #
+    # DO NOT "cap the precheck". That spend is not waste: it IS the root
+    # CROWN-IBP collection, and `bab.cgan_reclaim`'s cross-mode serve hands it
+    # straight to the BaB root as `stage=complete-cache-hit` (the BaB's own
+    # collection request then costs ~0 s and the whole pre-split phase is paid
+    # ONCE). Capping it only truncates the root bounds the BaB depends on, or
+    # moves the same collection inside `initial_bounds_fraction`. The lever on
+    # this row is BaB throughput after the split, not the pre-split slice.
     disjunctive_precheck_fraction: 0.85
     # Upfront PGD already covers the retained SAT behavior. The official
     # holdout's inherited 10% post-BaB reservation cut off a nearly closed tree
@@ -89,12 +156,21 @@ bab:
     candidates: 5
     reduceop: max
     input_split:
+      # abc parity: sb_coeff_thresh 0.01; adv_check 0 ENABLES periodic
+      # SAT-only probes from the first BaB iteration (-1 disables; upstream
+      # default 0). reorder_bab true is BOTH an abc parity field and the one
+      # unmet prerequisite of the input-domain clip below; it also un-deadens
+      # `bab.batch_size`, which is read ONLY under reorder_bab
+      # (`loop_batch_size = if reorder_bab { batch_size } else { 1 }`,
+      # disjunctive_multi_clause.rs).
+      sb_coeff_thresh: 1.0e-2
+      adv_check: 0
       # Keep the eager best-first path in production until the reordered
       # warm-parallel canary closes an official-budget row. The repaired route
       # is active and sound, but at batch 64 it breadth-expanded to 319 domains
       # without a verified child in 120 s. Batch 8 was much healthier (319
       # explored / 117 verified, queue 104 -> ~90), but did not yet decide.
-      reorder_bab: false
+      reorder_bab: true
       # One warm step is the measured sweet spot on official row 7: 116 explored
       # / 106 verified at 180 s, versus 34 / 23 at 120 s with five steps.
       # Two steps were slower (51 / 40 at 120 s) without tighter convergence.
@@ -114,9 +190,211 @@ bab:
       # enclosures. Fail-closed to the per-domain loop on any unsupported
       # shape/op.
       stacked_rebound: true
+      #
+      # ── STAGED, DARK: the two diagnosed cgan defects ─────────────────────
+      # Both blocks below are ARMING DIFFS, kept commented so the shipped
+      # binary is byte-for-byte today's. Uncommenting either is the one-line
+      # change the measurement pass makes; the pinning tests
+      # `cgan_2023_child_bound_max_secs_is_not_yet_armed` and
+      # `cgan_2023_f64_tail_is_not_yet_armed` (crates/ny-cli/src/preset/tests.rs)
+      # assert the DARK state and must be updated in the same commit that
+      # arms one.
+      #
+      # ── DEFECT 1: the dark tail (#cgan-dark-tail FIX-1) ──────────────────
+      # child_bound_max_secs: per-CALL wall slice for the grouped-disjunctive
+      # per-child bound calls. Composed as min(crown_deadline, now + secs);
+      # the absolute BaB ceiling is never extended, so this can only make a
+      # bound LOOSER, never wrong — and the frozen-root-alpha retry that
+      # catches the Err arm already exists and is already exercised
+      # (`frozen_fallback_completions`, six logs at the 895 s deadline).
+      #
+      # MEASURED (13/13 logs, cgan row 2 at the official 900 s budget):
+      #   * the last ~290 s — 32% of the budget — expands 0-10 domains
+      #     against a running rate of 1.3-3.9/s: a 130x-1000x collapse;
+      #   * tail calls cost ~70 s to >=285 s against a 0.13 s MEDIAN over the
+      #     preceding ~1640 calls;
+      #   * cause: `disjunctive_multi_clause.rs` hands every per-child bound
+      #     the ABSOLUTE run deadline, so ONE child bound may legally consume
+      #     the whole remaining budget — invisibly, because the
+      #     `[disjunctive-trajectory]` line prints only BETWEEN batches.
+      #
+      # WORST CASE IS NOT `secs`. This is a per-CALL slice and cgan screens
+      # each child through TWO bound seams (pass0, post-relaxed-clip — the
+      # polish and f64-tail seams are dark), each of which may spend a warm
+      # attempt AND a frozen-fallback retry. Live worst case ~= 4 x secs.
+      # Keep secs >= 2.0 so every capped call also names itself on the
+      # `[child-bound-slow]` line (CHILD_BOUND_SLOW_SECS = 2.0).
+      #
+      # R9 — the arm is INERT unless ALL THREE move:
+      #   1. `NY_WARM_ALPHA ... status=final ... frozen_fallback_completions=`
+      #      goes 0-1 -> >>1;
+      #   2. the last `[disjunctive-trajectory] t=` goes 565-606s -> >=880s;
+      #   3. `explored=` roughly doubles.
+      # Plus the lever's own line: `[child-bound-cap] final ...
+      # capped_calls=` must be > 0 (armed != engaged).
+      #
+      # A/B'd 2026-08-26 at the official 1200 s on the TWO 1200 s rows, pinned
+      # clean binary (revision=4991, commit=843e860e), cap=20.0, control =
+      # this file at origin/main. Cap fully engaged in both
+      # (`capped_calls` 1855/1901 and 36/38). STILL NOT ARMED: it converts
+      # nothing, and the right dose is ROW-DEPENDENT.
+      #
+      #   nonlinear_activations  explored 2 -> 957, head_depth 1 -> 100,
+      #     best_gap -0.6548 -> -0.0016, ~750 domains closed (control closed
+      #     ZERO), and ZERO `commit-what-you-have` collection truncations.
+      #     The cap removes pure waste here. Still `timeout`.
+      #   upsample               explored 1 -> 19, best_gap UNCHANGED at
+      #     -0.7603, and 37 truncations that cut the 27-layer intermediate
+      #     collection to 5-6 layers (22-23 filled by IBP). Every one of the
+      #     37 calls sat pinned at the cap (median 20.1 s). Here 20 s is FAR
+      #     TOO SHORT: it trades one nearly-complete bound (23/27 layers at
+      #     714 s) for 37 built on ~80% IBP.
+      #
+      # So `[child-bound-slow]` firing is necessary but NOT sufficient to
+      # justify a cap: check whether the capped call still COMPLETES its
+      # intermediate collection (`commit-what-you-have` count == 0). And note
+      # upsample's gap is identical at 23/27 layers with 1 expansion and at
+      # 5/27 with 19 — that row is relaxation-limited, not budget-limited.
+      # Sweep 5.0 / 10.0 was NOT run: on nonlinear_activations 750 further
+      # expansions and 49 further depth levels moved the gap by exactly zero,
+      # so more throughput is answered; on upsample the indicated direction is
+      # a LARGER cap, not a smaller one.
+      # child_bound_max_secs: 10.0
+      #
+      # HONEST CAVEAT, do not lose it: recovering the tail is NECESSARY, NOT
+      # SUFFICIENT. At the cliff the tree is DIVERGING (verified_in_batch=0,
+      # best_gap frozen, queue +1/batch) and other cgan logs already explore
+      # ~1.5x as many domains and still time out. The reason to want this is
+      # that with 0-10 domains expanded in the last third of the budget NO
+      # downstream lever can be measured at all. A converted row is a
+      # surprise, not the hypothesis.
+      #
+      # ── DEFECT 1b: no constant can be right (#cost-observer) ─────────────
+      # Read the A/B above again as a statement about the KEY rather than
+      # about its value. 20.0 is not mis-tuned; it is right on one row and an
+      # order of magnitude wrong on that row's sibling, and the fact that
+      # separates them — the seam's own per-call cost, 0.13 s median versus
+      # >= 300 s — is not written anywhere in the instance and cannot be
+      # known before the run. Sweeping 5.0 / 10.0 / 40.0 would only move
+      # which row is wrong.
+      #
+      # `child_bound_calibration` replaces the number with the measurement.
+      # Each call's allowance is derived as
+      #     min(headroom x median cost of COMPLETED calls on this row,
+      #         max_share_of_remaining x the wall actually REMAINING)
+      #       x growth^consecutive_truncated
+      # and composed by the same min(crown_deadline, now + allowance) law, so
+      # the soundness argument above is unchanged: an allowance can only bring
+      # a deadline FORWARD, and a looser bound cannot certify anything a
+      # tighter one would not have.
+      #
+      # Every field is DIMENSIONLESS and every field is optional, so the
+      # arming diff is the block header alone. What it should do here:
+      #   nonlinear_activations  median 0.13 s => allowance ~= 21 s at the
+      #     default headroom 160 — the same regime as the 20.0 that was
+      #     measured GOOD, arrived at by measurement rather than by hand.
+      #   upsample               nothing completes inside the first probe
+      #     (0.05 x remaining), so the observer stops bounding and hands back
+      #     the caller's own ceiling — i.e. today's uncapped behaviour, minus
+      #     one cheap probe. The 37 collection truncations cannot recur.
+      #
+      # R9 — the lever's own observable, which must appear with NO NY_* set:
+      #   `[wall-calib] ARMED seam=child-bound ... source=bab.branching.
+      #    input_split.child_bound_calibration`
+      # and at exit `[wall-calib] final seam=child-bound derived=N completed=N
+      # truncated=N median_secs=... max_slice_secs=...`. READ THE FIELDS, do
+      # not count lines: `completed=0` with `derived>0` means nothing ever
+      # finished inside an allowance and the observer fell back to the ceiling
+      # — armed but INERT, which is a VOID result and not a negative.
+      #
+      # STALENESS NOTE (2026-08-27): every dose and median above was measured
+      # BEFORE #cgan-abc-parity flipped this preset to `reorder_bab: true` +
+      # `bound_prop_method: crown`. The reordered lane batches child rebounds
+      # (`loop_batch_size = batch_size`) and plain-CROWN child bounds cost
+      # differently, so the 0.13 s median, the 70-285 s tail, and the upsample
+      # regime split may all have moved. That changes NOTHING about the
+      # mechanism — measuring at runtime instead of trusting these very
+      # numbers is its entire point — but the arming decision must be
+      # re-measured under the promoted config, and its reachability proof
+      # (gate7: control armed_lines=0, calib armed_lines=1, zero NY_* set)
+      # was run pre-promotion, so re-confirm `[wall-calib] ARMED` prints on
+      # the reordered route before trusting an engagement null.
+      #
+      # NOT YET ARMED. `cgan_2023_child_bound_calibration_is_not_yet_armed`
+      # (crates/ny-cli/src/preset/tests.rs) asserts the dark state and must be
+      # updated in the same commit that uncomments the block below.
+      # child_bound_calibration: {}
+      #
+      # ── DEFECT 2: the certified f64 tail (#cgan-f64-tail) ────────────────
+      # MEASURED, band = 5e-4 (3 runs): the certified f64 tail closes
+      # EVERYTHING it touches — 484/484 escalations, ZERO residuals. So
+      # cgan's knife edge is f32 RELAXATION, not search depth. But the
+      # frontier sits at gap ~ -8e-4, OUTSIDE that band, so 5e-4 converted
+      # ZERO rows: it is verdict-neutral, and arming it is not "strictly
+      # better", it is "no worse".
+      # MEASURED, band = 2e-3: recovers 87.3% (317/363) at a 0.1235 s mean /
+      # 5.68 s total, and is throughput-POSITIVE (explored 1.05-1.15x
+      # baseline). The 46 that do NOT close have gap_f64 median -1.035e-4 —
+      # real relaxation depth, but SHALLOW. This is the CONVERSION PROBE and
+      # it has not been run ON A GRAPH THIS PASS SUPPORTS.
+      #
+      # MEASURED 2026-08-26 (`nonlinear_activations`, official 1200 s, band
+      # 2e-3 armed from THIS key alongside child_bound_max_secs: 20.0, which
+      # had put the frontier at -1.6e-3, INSIDE the band): the pass declined
+      # EVERY escalation — `graph_supported=false ... unsupported=1
+      # [Tanh_13:Tanh]`. Tanh is absent from the supported-op set in
+      # `graph_crown_f64_tail.rs` (Sigmoid IS present). Result: 8 declines at
+      # `secs=0.00` which EXHAUSTED the 8-escalation budget, then 763
+      # `SKIPPED (escalation cap 8 exhausted)`, ZERO `gap_f64` lines, ZERO
+      # seconds of f64 work. That run is VOID, not a negative.
+      #
+      # Two traps it exposes, both live for the next reader:
+      #   * A DECLINE CHARGES THE BUDGET. `max_escalations` counts attempts,
+      #     not successes, so one unsupported op silently converts the whole
+      #     cap into no-ops.
+      #   * `max_escalations: 8` is PER-RUN and shared by both seams, so even
+      #     fully supported it cannot drain a frontier of ~180 domains. A real
+      #     conversion probe needs 0 (unlimited) plus a wall-parity check.
+      # Any harness reading `escalations=` off the ARMED banner is reading
+      # `max_escalations`, i.e. the CAP, not engagement; demand `escalated=`
+      # / `gap_f64` lines instead.
+      #
+      # Where it IS applicable: the four nCh / imgSz64 900 s graphs are
+      # Conv/ConvTranspose/BatchNorm/ReLU only — entirely inside the supported
+      # set — and `nch3p2_rec1` sits at best_gap -0.0006, inside a 2e-3 band.
+      # The probe has never been armed there (`armed=0` in the 2026-08-23
+      # sweep's own tsv).
+      # Ship gate not yet met either (design B): 3/arm on row 2 at 900 s with
+      # `anchor_source=warm-refined` engagement lines, then the cgan moat —
+      # 12 sat rows + test_nano unsat + the lsnc regression rows.
+      # f64_tail:
+      #   enabled: true
+      #   band: 2.0e-3
+      #   max_escalations: 8
   clip:
+    # NOTE: `relaxed` below is INERT on cgan and has been since the batch-stack
+    # deny-list. cgan carries BatchNorm, so `is_input_split_batch_stack_safe`
+    # is false, `should_disable_disjunctive_relaxed_clip` fires, and
+    # `config_with_disjunctive_clip_routes_disabled` clears enable_relaxed_clip
+    # on the verifier that actually runs. cgan therefore ran with NO
+    # input-domain clipping at all, while abc runs it WITH
+    # `clip_n_verify.clip_input_domain.enabled: True`.
     relaxed: true
     relaxed_iterations: 20
+    # ny's sound port of abc's clip_input_domain. Written to FIX the LSNC
+    # quadrotor2d false-unsats the reused-plane clip caused: one
+    # non-domain-stacked full-spec CROWN on the EXACT source box
+    # (`compute_bounds(exact_domain, None)` - no inherited node bounds), never
+    # reuses a parent/sibling plane, publishes a refutation ONLY when every
+    # clause is independently empty, returns the ORIGINAL box on any error.
+    # Loses proofs, never mints them. MEASURED 2026-08-26: not required for
+    # the nCh_1_prop_3 conversion, but REDUCES peak RSS on the crown route
+    # (73.4 GB with vs 90.8 GB without on the 1200 s nonlinear row) and
+    # engagement is real (attempts=456 applied=456 tightened_dimensions=225).
+    # Requires (beta_config validate): InputSplit + reorder_bab +
+    # ibp_enhancement + relaxed clip + Relaxed type + iterations>0, and
+    # !batch_stack_safe. cgan met FIVE of six; only reorder_bab was false.
+    input_split_fresh_domain_clip: true
   alpha_crown:
     lr_alpha: 0.2
     iterations: 100

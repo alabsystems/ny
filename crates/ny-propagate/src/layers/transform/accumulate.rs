@@ -3,14 +3,90 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Additive indexed accumulation layers: ScatterAdd and IndexAdd.
+//!
+//! # Rounding contract (#vnncomp-aw-soundness)
+//!
+//! Over the REALS `+` is associative and commutative, so a destination cell hit
+//! by several index entries has one well-defined value and needs no union — that
+//! is what separates this family from the overwriting `ScatterND`.
+//!
+//! In f32 it is neither. `a + b` is round-to-NEAREST, so an accumulation both
+//! rounds and depends on visit order, and a plain `+=` used for BOTH endpoints
+//! moves them the same way: the interval is TRANSLATED off the true value rather
+//! than widened around it. Every accumulation in this module therefore rounds
+//! OUTWARD for the endpoint it is building:
+//!
+//! * static indices — `scatter_add_tensor` / `index_add_tensor` take a directed
+//!   combiner (`add_down_f32` for the lower output, `add_up_f32` for the upper);
+//! * dynamic indices — the additive hull folds in f64 with directed adds and
+//!   lands with one directed cast ([`additive_mass_down`] / [`additive_mass_up`]),
+//!   then shifts `data` with `add_down_f32` / `add_up_f32`;
+//! * CROWN — the constant shift is an INTERVAL when the constant operand had to
+//!   accumulate, and the `A @ shift` bias fold is directed end to end (see
+//!   [`additive_scatter_backward`]).
+//!
+//! The directed helpers are exact when the arithmetic is exact, so the common
+//! duplicate-free case costs nothing.
 
 use ndarray::{Array2, ArrayD, Dimension, IxDyn};
+use ny_core::dd::{next_down_f64, next_up_f64, two_sum};
 use ny_core::{checked_shape_product, NyError, Result};
-use ny_tensor::BoundedTensor;
+use ny_tensor::{
+    add_down_f32, add_up_f32, cast_f64_to_f32_down, cast_f64_to_f32_up, BoundedTensor,
+};
 use std::borrow::Cow;
 
 use super::super::common::BoundPropagation;
 use crate::LinearBounds;
+
+/// `a + b` in f64 rounded toward -inf: the largest f64 that is `<= a + b`.
+///
+/// The f64 mirror of [`ny_tensor::add_down_f32`], built on Knuth's `TwoSum`.
+/// The residual `lo` is EXACTLY what the round-to-nearest add discarded, so
+/// this steps only when the add was inexact — an exact add costs nothing.
+///
+/// Needed because a certified accumulation cannot simply "widen to f64 and
+/// hope": f64 round-to-nearest still moves a running sum INWARD, and the
+/// f64 -> f32 store at the end does not necessarily step (it does not when the
+/// f64 value happens to be exactly f32-representable), so nothing downstream
+/// would absorb the drift.
+#[inline]
+fn add_down_f64(a: f64, b: f64) -> f64 {
+    let (hi, lo) = two_sum(a, b);
+    // OVERFLOW first: `TwoSum`'s residual is meaningless once `hi` is not
+    // finite, and `next_down_f64` preserves infinities, so the generic path
+    // would hand back `+inf` as a LOWER bound on a finite sum.
+    if !hi.is_finite() {
+        return if hi == f64::INFINITY && a.is_finite() && b.is_finite() {
+            f64::MAX
+        } else {
+            hi
+        };
+    }
+    if lo < 0.0 {
+        next_down_f64(hi)
+    } else {
+        hi
+    }
+}
+
+/// `a + b` in f64 rounded toward +inf. The mirror of [`add_down_f64`].
+#[inline]
+fn add_up_f64(a: f64, b: f64) -> f64 {
+    let (hi, lo) = two_sum(a, b);
+    if !hi.is_finite() {
+        return if hi == f64::NEG_INFINITY && a.is_finite() && b.is_finite() {
+            f64::MIN
+        } else {
+            hi
+        };
+    }
+    if lo > 0.0 {
+        next_up_f64(hi)
+    } else {
+        hi
+    }
+}
 
 /// Which of the (data, src) operands is the bounded/variable activation input,
 /// for the constant-index CROWN backward of an additive scatter/index-add layer.
@@ -31,8 +107,13 @@ enum VariableOperand {
 ///
 /// * `output_size` — flat size of the layer output (== data tensor size).
 /// * `var_size` — flat size of the variable operand.
-/// * `const_shift[i]` — the constant contribution added to output position `i`
-///   by the constant operand(s). Folds into the bias.
+/// * `const_shift_lo[i]` / `const_shift_up[i]` — an ENCLOSURE of the constant
+///   contribution added to output position `i` by the constant operand(s).
+///   The two slices coincide when that contribution is exactly representable
+///   (the common case: no duplicate destinations, or a constant `data` operand
+///   that is simply copied); they separate only when the constant scatter had
+///   to accumulate several f32 values into one cell, where the accumulation
+///   itself rounds. Folds into the bias.
 /// * `var_to_out[k]` — for [`VariableOperand::Src`], the list of output flat
 ///   positions that variable element `k` flows into (accumulation may map one
 ///   src element to one output element; identity for Data is handled by caller).
@@ -43,13 +124,23 @@ fn additive_scatter_backward(
     node_lb: &LinearBounds,
     output_size: usize,
     var_size: usize,
-    const_shift: &[f32],
+    const_shift_lo: &[f32],
+    const_shift_up: &[f32],
     var_to_out: &VarToOut,
 ) -> Result<LinearBounds> {
     if node_lb.num_inputs() != output_size {
         return Err(NyError::ShapeMismatch {
             expected: vec![output_size],
             got: vec![node_lb.num_inputs()],
+        });
+    }
+    // The bias fold indexes `A[:, col]` for every shift column, so both shift
+    // slices must span exactly the output. Checked rather than debug-asserted:
+    // a mismatch here would index out of bounds in a release build.
+    if const_shift_lo.len() != output_size || const_shift_up.len() != output_size {
+        return Err(NyError::ShapeMismatch {
+            expected: vec![output_size, output_size],
+            got: vec![const_shift_lo.len(), const_shift_up.len()],
         });
     }
     let num_outputs = node_lb.num_outputs();
@@ -84,27 +175,43 @@ fn additive_scatter_backward(
     // Fold the constant operand contribution into the bias: b += A @ const_shift.
     //
     // SOUNDNESS (#vnncomp-aw-soundness): this dot product is part of a CERTIFIED
-    // bound, so it must round OUTWARD. Accumulate the `A @ const_shift` dot in f64
-    // with EXACT f32→f64-widened products (f32×f32 fits in 48 < 53 significand
-    // bits, so each product is exact), add the existing f64-widened bias, and
-    // directed-round the whole f64 sum at the f64→f32 store: `next_down_f32` for
-    // the lower bias (rounds toward -inf), `next_up_f32` for the upper bias (rounds
-    // toward +inf). This guarantees the stored f32 bias encloses the true real
-    // bias despite both the accumulation and the final cast.
+    // bound, so every step must round OUTWARD.
+    //
+    // 1. Each PRODUCT is exact: both factors are f32, and an f32×f32 product needs
+    //    at most 48 < 53 significand bits, so widening to f64 loses nothing (the
+    //    exponent range is nowhere near f64's, even for subnormal f32 factors).
+    // 2. Each ADDITION is directed (`add_down_f64` / `add_up_f64`). Plain f64 `+=`
+    //    is round-to-NEAREST and moves the running sum INWARD; the old code leaned
+    //    on the final `next_down_f32`/`next_up_f32` step to absorb that, which is a
+    //    heuristic, not a bound — under cancellation the f64 drift can exceed one
+    //    f32 ULP, and the f64→f32 cast does not always step at all.
+    // 3. The STORE is a directed cast (`cast_f64_to_f32_down` / `..._up`), which is
+    //    the tightest f32 on the correct side of the f64 value AND handles the
+    //    overflow case `next_down_f32(+inf) == +inf` would have got wrong (that
+    //    would have published `+inf` as a LOWER bias).
+    // 4. The const shift is itself an INTERVAL (see `const_shift_lo/up`): the
+    //    endpoint that drives the bound outward depends on the coefficient's sign,
+    //    so pick `lo` where the coefficient is >= 0 and `up` where it is negative
+    //    for the lower bias, and the mirror for the upper.
     let mut new_lower_b = node_lb.lower_b().clone();
     let mut new_upper_b = node_lb.upper_b().clone();
-    let const_is_zero = const_shift.iter().all(|&v| v == 0.0);
+    let const_is_zero =
+        const_shift_lo.iter().all(|&v| v == 0.0) && const_shift_up.iter().all(|&v| v == 0.0);
     if !const_is_zero {
         for row in 0..num_outputs {
             let mut lo_acc = node_lb.lower_b()[row] as f64;
             let mut up_acc = node_lb.upper_b()[row] as f64;
-            for (col, &c) in const_shift.iter().enumerate() {
-                let cf = c as f64;
-                lo_acc += (lower_a[[row, col]] as f64) * cf;
-                up_acc += (upper_a[[row, col]] as f64) * cf;
+            for col in 0..output_size {
+                let (c_lo, c_up) = (const_shift_lo[col] as f64, const_shift_up[col] as f64);
+                let al = lower_a[[row, col]] as f64;
+                let au = upper_a[[row, col]] as f64;
+                // Minimize `al * c` over c in [c_lo, c_up] for the lower bias,
+                // maximize `au * c` for the upper.
+                lo_acc = add_down_f64(lo_acc, al * if al >= 0.0 { c_lo } else { c_up });
+                up_acc = add_up_f64(up_acc, au * if au >= 0.0 { c_up } else { c_lo });
             }
-            new_lower_b[row] = ny_tensor::next_down_f32(lo_acc as f32);
-            new_upper_b[row] = ny_tensor::next_up_f32(up_acc as f32);
+            new_lower_b[row] = cast_f64_to_f32_down(lo_acc);
+            new_upper_b[row] = cast_f64_to_f32_up(up_acc);
         }
     }
 
@@ -235,6 +342,64 @@ fn broadcast_infinite_bounds(shape: &[usize]) -> Result<BoundedTensor> {
     )
 }
 
+/// The most NEGATIVE additive mass `src` can contribute to any one destination
+/// cell, rounded DOWN (toward -inf).
+///
+/// Under a dynamic (runtime) index every src element routes to exactly one
+/// destination, so a cell's accumulated contribution is `sum over the routed
+/// subset`. That subset is unknown, but each omitted term of `min(lower, 0)` is
+/// `<= 0`, so summing the negative parts of ALL elements is a valid lower bound
+/// on every subset sum.
+///
+/// SOUNDNESS: the old code folded this with a plain f32 `+`, which is
+/// round-to-NEAREST and unbounded in length — a 1001-element fold of
+/// `[-1e8, -1.0 x 1000]` returned exactly `-1e8`, losing all 1000 small terms to
+/// absorption and certifying a lower bound 1000 above the reachable value. The
+/// fold now runs in f64 with DIRECTED addition and lands with ONE directed cast.
+///
+/// Why no `gamma_n` allowance is needed on top: [`add_down_f64`] returns a value
+/// `<= a + b` EXACTLY (Knuth's `TwoSum` reports the discarded residual, so the
+/// step is taken exactly when the add was inexact). By induction the running
+/// `acc` is `<=` the exact real sum of the terms consumed so far, for any length,
+/// with no assumption about magnitudes or cancellation. `cast_f64_to_f32_down`
+/// then returns the largest f32 `<= acc`. A `gamma_n * sum|x|` term would be a
+/// second, looser way to bound the same drift and is redundant here.
+fn additive_mass_down(lower: &ArrayD<f32>) -> f32 {
+    let mut acc = 0.0_f64;
+    for &value in lower.iter() {
+        if value < 0.0 {
+            acc = add_down_f64(acc, f64::from(value));
+        }
+    }
+    cast_f64_to_f32_down(acc)
+}
+
+/// The most POSITIVE additive mass `src` can contribute to any one destination
+/// cell, rounded UP. The mirror of [`additive_mass_down`].
+fn additive_mass_up(upper: &ArrayD<f32>) -> f32 {
+    let mut acc = 0.0_f64;
+    for &value in upper.iter() {
+        if value > 0.0 {
+            acc = add_up_f64(acc, f64::from(value));
+        }
+    }
+    cast_f64_to_f32_up(acc)
+}
+
+/// Widen `data` by the dynamic-index additive hull, rounding each endpoint
+/// OUTWARD (`add_down_f32` below, `add_up_f32` above) — a plain f32 `+` here
+/// would translate both endpoints by the same round-to-nearest error instead of
+/// widening the interval.
+fn shift_by_additive_hull(data: &BoundedTensor, src: &BoundedTensor) -> Result<BoundedTensor> {
+    let additive_lower = additive_mass_down(src.lower());
+    let additive_upper = additive_mass_up(src.upper());
+    finish_bounds(
+        data.lower()
+            .mapv(|value| add_down_f32(value, additive_lower)),
+        data.upper().mapv(|value| add_up_f32(value, additive_upper)),
+    )
+}
+
 fn normalize_index(raw: i64, axis_len: usize, layer: &str) -> Result<usize> {
     let normalized = if raw < 0 { axis_len as i64 + raw } else { raw };
     if normalized < 0 || normalized >= axis_len as i64 {
@@ -349,9 +514,23 @@ impl ScatterAddLayer {
         }
 
         match resolved.indices {
+            // The accumulation is DIRECTED per endpoint: `add_down_f32` builds
+            // the lower output, `add_up_f32` the upper. A plain `+=` here is
+            // round-to-nearest and drifts BOTH endpoints the same way, which
+            // translates the interval instead of widening it.
             ResolvedIndices::Static(indices) => finish_bounds(
-                self.scatter_add_tensor(resolved.data.lower(), &indices, resolved.src.lower())?,
-                self.scatter_add_tensor(resolved.data.upper(), &indices, resolved.src.upper())?,
+                self.scatter_add_tensor(
+                    resolved.data.lower(),
+                    &indices,
+                    resolved.src.lower(),
+                    add_down_f32,
+                )?,
+                self.scatter_add_tensor(
+                    resolved.data.upper(),
+                    &indices,
+                    resolved.src.upper(),
+                    add_up_f32,
+                )?,
             ),
             ResolvedIndices::Dynamic => {
                 self.propagate_dynamic_indices(&resolved.data, &resolved.src)
@@ -367,27 +546,23 @@ impl ScatterAddLayer {
         if src.lower().is_empty() {
             return Ok(data.clone());
         }
-
-        let additive_lower = src
-            .lower()
-            .iter()
-            .fold(0.0_f32, |acc, &value| acc + value.min(0.0));
-        let additive_upper = src
-            .upper()
-            .iter()
-            .fold(0.0_f32, |acc, &value| acc + value.max(0.0));
-
-        finish_bounds(
-            data.lower().mapv(|value| value + additive_lower),
-            data.upper().mapv(|value| value + additive_upper),
-        )
+        shift_by_additive_hull(data, src)
     }
 
+    /// Accumulate `src` into a copy of `data` at the (static) scatter indices.
+    ///
+    /// `accumulate` is the DIRECTED combiner for the endpoint being built —
+    /// `add_down_f32` for a lower bound, `add_up_f32` for an upper. Mirrors
+    /// `ScatterNdLayer::scatter_tensor`'s `combine_duplicate` parameter. It is
+    /// applied to EVERY src element, not only to duplicate destinations: even a
+    /// single `data + src` add is round-to-nearest and can land on the wrong
+    /// side of the true sum.
     fn scatter_add_tensor(
         &self,
         data: &ArrayD<f32>,
         indices: &ArrayD<i64>,
         src: &ArrayD<f32>,
+        accumulate: fn(f32, f32) -> f32,
     ) -> Result<ArrayD<f32>> {
         let axis = self.resolve_axis(data.ndim())?;
         if indices.ndim() != src.ndim() {
@@ -427,7 +602,8 @@ impl ScatterAddLayer {
             let scatter_idx = normalize_index(indices[coord.clone()], axis_len, "ScatterAdd")?;
             let mut dst_coord = coord.slice().to_vec();
             dst_coord[axis] = scatter_idx;
-            output[IxDyn(&dst_coord)] += value;
+            let slot = &mut output[IxDyn(&dst_coord)];
+            *slot = accumulate(*slot, value);
         }
         Ok(output)
     }
@@ -480,13 +656,19 @@ impl ScatterAddLayer {
                 })?;
                 let data_shape = self.infer_data_shape_for_data_variable(output_size)?;
                 let zeros = ArrayD::<f32>::zeros(IxDyn(&data_shape));
-                let shift = self.scatter_add_tensor(&zeros, indices, src_const)?;
-                let shift_flat = flatten_row_major(&shift);
+                // The constant scatter itself accumulates in f32, so it is an
+                // INTERVAL, not a number, whenever two src elements land on one
+                // cell. Build both sides and let the bias fold pick per sign.
+                // With no duplicate destinations `0 + v` is exact and the two
+                // agree bit-for-bit, so the common case is not widened.
+                let shift_lo = self.scatter_add_tensor(&zeros, indices, src_const, add_down_f32)?;
+                let shift_up = self.scatter_add_tensor(&zeros, indices, src_const, add_up_f32)?;
                 additive_scatter_backward(
                     node_lb,
                     output_size,
                     output_size,
-                    &shift_flat,
+                    &flatten_row_major(&shift_lo),
+                    &flatten_row_major(&shift_up),
                     &VarToOut::Identity,
                 )
             }
@@ -509,11 +691,14 @@ impl ScatterAddLayer {
                     NyError::InvalidSpec("ScatterAdd: src shape overflow".to_string())
                 })?;
                 let map = build_scatter_add_src_map(&data_shape, &src_shape, axis, indices)?;
+                // `data_const` is copied, never accumulated, so its constant
+                // contribution is exact: the enclosure is the degenerate point.
                 let shift_flat = flatten_row_major(data_const);
                 additive_scatter_backward(
                     node_lb,
                     output_size,
                     var_size,
+                    &shift_flat,
                     &shift_flat,
                     &VarToOut::Map(map),
                 )
@@ -658,9 +843,21 @@ impl IndexAddLayer {
         }
 
         match resolved.indices {
+            // Directed per endpoint — see the matching comment in
+            // `ScatterAddLayer::propagate_ibp_with_inputs`.
             ResolvedIndices::Static(indices) => finish_bounds(
-                self.index_add_tensor(resolved.data.lower(), &indices, resolved.src.lower())?,
-                self.index_add_tensor(resolved.data.upper(), &indices, resolved.src.upper())?,
+                self.index_add_tensor(
+                    resolved.data.lower(),
+                    &indices,
+                    resolved.src.lower(),
+                    add_down_f32,
+                )?,
+                self.index_add_tensor(
+                    resolved.data.upper(),
+                    &indices,
+                    resolved.src.upper(),
+                    add_up_f32,
+                )?,
             ),
             ResolvedIndices::Dynamic => {
                 self.propagate_dynamic_indices(&resolved.data, &resolved.src)
@@ -676,27 +873,18 @@ impl IndexAddLayer {
         if src.lower().is_empty() {
             return Ok(data.clone());
         }
-
-        let additive_lower = src
-            .lower()
-            .iter()
-            .fold(0.0_f32, |acc, &value| acc + value.min(0.0));
-        let additive_upper = src
-            .upper()
-            .iter()
-            .fold(0.0_f32, |acc, &value| acc + value.max(0.0));
-
-        finish_bounds(
-            data.lower().mapv(|value| value + additive_lower),
-            data.upper().mapv(|value| value + additive_upper),
-        )
+        shift_by_additive_hull(data, src)
     }
 
+    /// Accumulate `src` into a copy of `data` at the (static) 1-D index map.
+    /// `accumulate` is the DIRECTED combiner for the endpoint being built —
+    /// see [`ScatterAddLayer::scatter_add_tensor`].
     fn index_add_tensor(
         &self,
         data: &ArrayD<f32>,
         indices: &ArrayD<i64>,
         src: &ArrayD<f32>,
+        accumulate: fn(f32, f32) -> f32,
     ) -> Result<ArrayD<f32>> {
         let axis = self.resolve_axis(data.ndim())?;
         if indices.ndim() != 1 {
@@ -735,7 +923,8 @@ impl IndexAddLayer {
             let dst_index = normalize_index(indices[IxDyn(&[coord[axis]])], axis_len, "IndexAdd")?;
             let mut dst_coord = coord.slice().to_vec();
             dst_coord[axis] = dst_index;
-            output[IxDyn(&dst_coord)] += value;
+            let slot = &mut output[IxDyn(&dst_coord)];
+            *slot = accumulate(*slot, value);
         }
         Ok(output)
     }
@@ -783,13 +972,15 @@ impl IndexAddLayer {
                     indices.len(),
                 )?;
                 let zeros = ArrayD::<f32>::zeros(IxDyn(&data_shape));
-                let shift = self.index_add_tensor(&zeros, indices, src_const)?;
-                let shift_flat = flatten_row_major(&shift);
+                // Interval constant shift — see the ScatterAdd counterpart.
+                let shift_lo = self.index_add_tensor(&zeros, indices, src_const, add_down_f32)?;
+                let shift_up = self.index_add_tensor(&zeros, indices, src_const, add_up_f32)?;
                 additive_scatter_backward(
                     node_lb,
                     output_size,
                     output_size,
-                    &shift_flat,
+                    &flatten_row_major(&shift_lo),
+                    &flatten_row_major(&shift_up),
                     &VarToOut::Identity,
                 )
             }
@@ -814,11 +1005,13 @@ impl IndexAddLayer {
                     NyError::InvalidSpec("IndexAdd: src shape overflow".to_string())
                 })?;
                 let map = build_index_add_src_map(&data_shape, &src_shape, axis, indices)?;
+                // `data_const` is copied, never accumulated: exact.
                 let shift_flat = flatten_row_major(data_const);
                 additive_scatter_backward(
                     node_lb,
                     output_size,
                     var_size,
+                    &shift_flat,
                     &shift_flat,
                     &VarToOut::Map(map),
                 )

@@ -62,6 +62,15 @@ attack:
 #     f32 path (50c044f5) halves the streamed width and charges every f32
 #     rounding into a certified additive concretize slack — pure loosening, so
 #     it can lose a proof but never invent one.
+#     STALE PARENTHETICAL (2026-08-24): "the BaB tree is 0.5 s / 2 expansions"
+#     was measured on the f64 lane BEFORE root_f32 shipped, and it is quoted in
+#     three more places in this file as if it were a property of the category.
+#     On the current binary the tree is 117+ expansions over ~40 s of a 93.2 s
+#     lane, reaching depth 8 and open 48. The root_f32 DECISION is unaffected —
+#     it was measured on its own A/B (prop_idx_5478 timeout -> UNSAT) — but the
+#     "~99% of the lane" framing is not the current split, which is root build
+#     48.9 s vs tree ~40 s. Root-build seconds are the currency on this
+#     category; see the correction block under `bi_secs` below.
 #
 # A/B on prop_idx_5478 at the official 100 s budget through `ny vnncomp`:
 #     concurrent, f64 root   -> timeout (load 6.8)
@@ -77,10 +86,219 @@ margin_row:
   #   pre-registered at-risk list (11 slow/flaky banked unsats x3: 7689/4674/
   #   4500/1496/1759/3115/4528/9535/6679/7403/5478) + sat sentinels
   #   6827/9558/6252. Shrink-only by construction; parity refuses.
+  #
+  # bi_secs — PROVISIONAL, shipped 2026-08-22 (b4b77868d) on CIFAR100 rows and
+  # on no tinyimagenet row. The sentence that stood here ("same lane and phase
+  # as cifar100; large-model truncation applies") was a transfer, not a
+  # measurement of this category, and BOTH halves of the cifar argument have
+  # now been checked against this model and only one of them survives.
+  #
+  # WHICH SIDE TINY IS ON — from the shipped ONNX, not from the file name. The
+  # BI phase costs two `run_prefix` passes per 256-column chunk, at most
+  # topk=1024 columns per trunk ReLU (so 4 chunks on every layer of all three
+  # nets), and one pass costs ~cols x (conv MACs in the frozen prefix). The
+  # resulting work proxy, sum over trunk ReLUs of chunks x prefix MACs:
+  #     CIFAR100_resnet_medium   3072 in,  55 460 ReLU elems,  90.8M MACs -> 1.9 G
+  #     CIFAR100_resnet_large    3072 in, 286 820 ReLU elems, 359.3M MACs -> 7.8 G
+  #     TinyImageNet_resnet_med  9408 in, 172 296 ReLU elems, 278.2M MACs -> 5.9 G
+  # The proxy predicts cifar large/medium = 4.05x; the MEASURED cifar ratio is
+  # 24-35s vs 6.6-8.4s, i.e. ~3.9x, so the model is calibrated to ~3% on the one
+  # ratio we have. Applied to tiny it gives 3.06 x 6.6-8.4s = 20-26 s.
+  # => TinyImageNet is LARGE-LIKE, not medium-like: this phase is TRUNCATED at
+  # the 20 s default, and only just — it sits ON the boundary. At ~78% of the
+  # work done the casualties are trunk layer 8 and the 200-wide HEAD ReLU, i.e.
+  # the last layer before the output Gemm.
+  #
+  # WHY THE cifar "FREE" ARGUMENT DOES NOT TRANSFER.
+  # [SUPERSEDED — the "no tree to repay them with" premise below is measured
+  #  FALSE on the current binary. Read the correction block ~40 lines down
+  #  before using any number in this paragraph.]
+  # On resnet_large the extra
+  # seconds were repaid by a smaller tree (idx_5410 39->28 expansions, idx_496
+  # 2->1). This lane has no tree to repay them with: the measured tinyimagenet
+  # BaB is 0.5 s / 2 expansions (measured on the 128.8 s f64 lane above; the
+  # same lane is 58.1 s with root_f32), and `root_f32` halves the forward
+  # tableau only — the BI backward engine is f64 and gets no speedup — so BI
+  # seconds come straight out of what is left for the tree, which at 58 s of
+  # root plus 20-26 s of BI is only ~16-22 s of a 100 s budget. And this
+  # category's banked unsats hug the wall: 60
+  # of the 64 publish at 89.5-97.1 s of a 100 s budget, and the 2026-08-11
+  # 200-row parity sweep (075a344ff) lost banked idx_9535 by ONE second on a
+  # re-run. Up to +6 s of additive root cost is therefore a live regression
+  # risk, not a no-op.
+  #
+  # WHY IT IS NOT SIMPLY REVERTED. `out_of_time()` stops the phase on wall
+  # clock, so a category sitting exactly on the boundary gets a LOAD-DEPENDENT
+  # root and a nondeterministic verdict — the same pathology 40 de-randomised
+  # on cifar idx_5308. Reverting is also a change, and to the worse-conditioned
+  # side of the boundary.
+  # (CORRECTION 2026-08-24: "mid-chunk" was wrong. The clock is polled BETWEEN
+  # passes and never inside one, which is why #bi-adaptive-chunk now sizes each
+  # pass from a measured per-layer rate so the unavoidable one-pass overshoot is
+  # bounded. The load-dependence argument survives and is in fact stronger: the
+  # cut now lands on a 16-column boundary rather than a 256-column one.)
+  #
+  # ==> THE THREE PARAGRAPHS ABOVE ARE MEASURED-FALSE. READ THIS FIRST. <==
+  # Every quantitative claim above about what this phase COSTS was read off
+  # `[backward-interm] done: ... secs=`. That clock is `BiState::t0`, which
+  # starts immediately before the forward tableau op walk, not at the phase.
+  # It is op-walk wall, not full-build wall or phase compute. MEASURED
+  # DIRECTLY 2026-08-24 on idx_5451_sidx_5891 at the official 100 s budget from
+  # the phase's own per-layer lines:
+  #     layer=1 cols=553/553 secs=1.05 total_secs=6.76
+  #     layer=2 cols=387/387 secs=1.78 total_secs=14.05
+  #     done: ... last_chunk=0.64s secs=48.88 exhausted=true
+  #     tree_loop entry root_bound=-0.601745
+  #     [trace] exp 117 worst -0.00929 depth 7 open 12 (40.1s); lane 93.2 s
+  #   * The phase's OWN compute is 2.83 s of a 48.9 s walk interval (~3% of the
+  #     lane), NOT the 20-26 s the conv-MAC proxy predicted and NOT 45%.
+  #   * The predicted casualties ("trunk layer 8 and the 200-wide HEAD ReLU, at
+  #     ~78% of the work done") are wrong by a mile: the phase gets TWO layers
+  #     of ~10 before `exhausted=true`, because the FORWARD BUILD spends the
+  #     shared 20 s clock. The phase is STARVED here, not truncated at 78%.
+  #   * "This lane has no tree to repay them with: the measured tinyimagenet
+  #     BaB is 0.5 s / 2 expansions" is DEAD. 117+ expansions over 40 s, the
+  #     frontier draining 48 -> 32 -> 12, the worst margin closing
+  #     -0.60174 -> -0.00929 and STILL improving when the lane runs out of
+  #     wall. This lane is root-build-bound (48.9 s of 93.2 s) with a tree that
+  #     is working, which is the opposite of the picture assumed here.
+  # `work_secs=` on the done line now reports phase compute, so the pre-
+  # registered A/B below must read THAT, not `secs=`.
+  #
+  # BI_SECS CURRENT DECISION. The 2026-08-24 pre-tableau-f32 dose response did
+  # run: a higher, deadline-capped dose solved idx_5185 once, then validated
+  # 0/3 (1/4 total), was row-dependent/non-monotone, and did not bank. idx_9611
+  # failed in every dose on that dirty binary, so it is not evidence that the
+  # higher dose caused the loss. Tiny therefore remains at the measured 20 s
+  # default; it does not inherit CIFAR100's 40.
+  #
+  # The 2026-08-25 tableau-f32 shipment then cut the root build by ~17.9 s and
+  # invalidated the old bank-wall and 0.5 s / 2-expansion premises. A new dose
+  # decision needs a clean CURRENT-binary A/B, not another reading of those
+  # stale walls. Exact reviewed arms are 20 vs 30: 40 is CIFAR's shipped point,
+  # while 60 can never execute exactly under the 40%-of-remaining deadline cap.
+  # Require the versioned backward-intermediate receipt on every row:
+  # `deadline_capped=false`, `budget_exhausted=true`, and live completed chunks.
+  # At minimum include the current marginal controls 1126/6700/9611/5451 plus
+  # sat sentinels; do not add a YAML value without a retained moat-qualified win.
   backward_interm: true
   reserve_secs: 0
   concurrent: true
   root_f32: true
+  # #tableau-f32 — f32 STORAGE for the root tableau walk, on TINY'S OWN
+  # evidence (alloc-trio rule: NOT transferred to cifar100, which sets
+  # root_f32 too but has no A/B of its own).
+  #
+  # WHAT IT DOES. `root_f32` made the forward conv COMPUTE in f32 but left
+  # every tensor STORED f64, so each conv still allocated a multi-GB f32
+  # scratch, ran a full read-f64/write-f32 cast pass over the whole tableau,
+  # and wrote an f64 dst. This stores the M and D lanes as f32 end-to-end:
+  # the scratch and the cast pass are DELETED and the dst write halves.
+  #
+  # MEASURED 2026-08-25, scored tier (mip,cuda, rev 4982, commit fd88088c),
+  # official 100 s budgets, 3 rows x 4 arms + 3-run banks:
+  #     forward conv   41.4 s -> 24.6 s   (-40.5%)
+  #     root build     46.9 s -> 29.1 s   (-38.1%, ~17.9 s freed)
+  #     idx_5451   banked timeout -> UNSAT 3/3 (84.7/86.7/85.3 s, certified)
+  #     idx_9611   banked unsat preserved 3/3, and proves 17.7 s EARLIER
+  #
+  # THE MECHANISM IS NOT "MORE EXPANSIONS" — that framing is wrong. idx_9611
+  # proves in BOTH arms at the SAME depth (127 vs 118 expansions), just
+  # 17.7 s sooner: the tree does the same work and the whole gain is root
+  # build. idx_5451 converted because the control arm was ~2 s SHORT of the
+  # tree time it already needed. Rows that are ROOT-bound rather than
+  # TREE-bound do not flip: idx_8472 got the BEST root bound of any arm
+  # (-0.4749 vs control -0.5167) and still timed out with its worker
+  # mid-expansion.
+  #
+  # SOUNDNESS. Pure loosening: conv-lane stores are bit-exact, radius-role
+  # stores are directed UP, and every remaining store perturbation is charged
+  # into the certified `g_err` concretize slack (additive on BOTH endpoints).
+  # It can lose a proof; it cannot manufacture one. Oracles:
+  # tableau_f32_store_per_site_containment_oracle (31,845 exact checks),
+  # _dj_encloses_true_margin, _boxes_contain_f64_and_off_arm_is_bitwise,
+  # conv_f32_native_store_is_bitwise_the_widened_path.
+  #
+  # SHIP GATE (docs/TABLEAU_F32_2026-08-20.md:149-168), the one that can
+  # actually falsify a LOOSENING lever: the 11 at-risk banked unsats that
+  # publish at 90.5-97.1 s of 100 s, x3, plus sat sentinels 6827/9558/6252.
+  # All held 3/3. A moat of comfortable rows would NOT have tested this —
+  # see the commit message.
+  tableau_f32: true
+  # FIELDS DELIBERATELY ABSENT (the alloc-trio rule, stated as a diff against
+  # cifar100_2024.yaml — the only other preset with a `margin_row:` section).
+  # Pinned executably by `margin_row_wall_preset_field_diff_is_deliberate`.
+  #
+  # * k_head / k_trunk: 16 — NOT transferred. cifar's evidence is a frontier
+  #   EXPLOSION on resnet_medium (idx_8600: open 18->41->156->415 at k=8, proves
+  #   at k=16 with the frontier draining 424->2). This lane never gets near that
+  #   regime: the measured tinyimagenet BaB is 0.5 s / 2 expansions, and after
+  #   the root build plus the ~20-26 s BI phase the tree has ~16-22 s of the
+  #   100 s budget left — a handful of expansions, each ~3x cifar's cost if
+  #   per-expansion work tracks conv MACs as the BI phase does. Fixed k=16
+  #   doubles candidate scoring on every one of them and buys a width a 2-deep
+  #   frontier cannot use.
+  #   `margin_row.k_adaptive` is the better-shaped candidate here — a one-way
+  #   ratchet that fires at open>=32 and is BIT-IDENTICAL below it, so on a
+  #   frontier this shallow it is a provable no-op with upside only — but it is
+  #   env-only and unmeasured on this category. Measure before arming.
+  #
+  #   !! EVERY NUMBER IN THE PARAGRAPH ABOVE IS FALSE ON THE CURRENT BINARY. !!
+  #   Re-measured 2026-08-24, idx_5451_sidx_5891, official 100 s, pinned binary,
+  #   box lock held, instance line verified. From the run's own [trace] lines:
+  #       exp   0 worst -0.60174 depth 0 open  1  (0.0s)
+  #       exp  37 worst -0.13608 depth 6 open 32  (13.7s)
+  #       exp  57 worst -0.09242 depth 7 open 44  (20.4s)
+  #       exp  77 worst -0.05253 depth 8 open 48  (27.7s)
+  #       exp  97 worst -0.02365 depth 8 open 32  (34.3s)
+  #       exp 117 worst -0.00929 depth 7 open 12  (40.1s)
+  #     - "0.5 s / 2 expansions"  -> 117+ expansions over ~40 s.
+  #     - "a handful of expansions" -> 117+, at ~0.34 s each, not ~3x cifar's.
+  #     - "a 2-deep frontier"     -> depth 8, open PEAKING AT 48.
+  #     - "the tree has ~16-22 s" -> it has ~40 s (root build 48.9 s of 93.2 s;
+  #       the BI phase is 2.83 s, not 20-26 s — see the correction above).
+  #   AND THE CONCLUSION ABOUT k_adaptive INVERTS. It is dismissed here as "a
+  #   provable no-op with upside only" because it fires at open>=32 and this
+  #   frontier was believed to be 2 wide. The frontier reaches open=48 and sits
+  #   at or above 32 from exp 37 to exp 97 — roughly HALF the tree's wall — so
+  #   the ratchet is live on this category, not inert. That makes k_adaptive a
+  #   real unmeasured candidate rather than a safe no-op, and it must be
+  #   measured before it is armed, for the opposite reason to the one given.
+  #   NOT ACTED ON HERE: this file's k_head/k_trunk absence stands untouched
+  #   until someone A/Bs it. The rationale is what was wrong, and a rationale
+  #   that is false on the current binary is exactly the shape that was worth
+  #   +12.9 normalized points on collins when it was finally re-measured.
+  #
+  # * adaptive_reserve: true — NOT transferred, and it is NOT interchangeable
+  #   with the `reserve_secs: 0` above even though both hand the internal
+  #   verifier the whole budget. `margin_row_reserve_decision` short-circuits on
+  #   `configured_secs == 0` to route `NotApplicable`, and
+  #   `enables_scored_sparse_crown()` is true ONLY for
+  #   `AdaptiveReleasedAlphaBetaTier`. So the single observable difference is
+  #   that cifar additionally arms the scored sparse root CROWN pass inside the
+  #   internal verifier. On this category that verifier reports
+  #   `domains_explored: 0` and has never produced a verdict (see
+  #   `complete_clip_experiment_is_scoped_to_cifar100_not_tinyimagenet`), so the
+  #   pass would spend host time competing with the lane that does. Also already
+  #   pinned absent by `tinyimagenet_2024_rejects_the_regressive_cifar100_allocation_trio`.
+  #
+  # * verifier_threads — unset, i.e. no cap, on both presets. This is the
+  #   #verifier-thread-cap seam from the closure program's Front B and it is the
+  #   most promising unmeasured scheduling lever for this category precisely
+  #   because the lane is root-bound and CPU-bound while the verifier that proves
+  #   nothing shares the same unbounded rayon pool. Ship only after an A/B.
+  #
+  # * concurrent_threads — unset on both presets. Without a positive verifier
+  #   request this preserves the shared global pool; with one it derives only
+  #   from observed host parallelism minus actual global width. Explicit `0`
+  #   would instead force the shared global pool. Neither width has a closed
+  #   allocation A/B, so no shipped preset chooses it.
+  #
+  # * early_exit — unset, which means ON (`early_exit_armed` defaults true). No
+  #   key needed; the kill switch is `margin_row.early_exit: false`.
+  #
+  # * reserve_max_frac / release_frac — unset by design: with `reserve_secs: 0`
+  #   the reserve arithmetic is never reached, so a value here would be inert.
 
 bab:
   batch_size: 128
@@ -91,6 +309,9 @@ bab:
     # is hopeless. candidates/reduceop still tune kFSB. See branching.rs.
     candidates: 10
     reduceop: max
+    # Exact wave-selector mirrors for governed search; runtime is unchanged.
+    kfsb_multi_candidates: 10
+    kfsb_multi_reduceop: max
   alpha_crown:
     lr_alpha: 0.2
     iterations: 20

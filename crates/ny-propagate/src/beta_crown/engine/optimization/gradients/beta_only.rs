@@ -166,9 +166,14 @@ impl BetaCrownVerifier {
                 // Analytical β gradients only support Linear/ReLU networks.
                 Layer::Conv1d(_)
                 | Layer::Conv2d(_)
+                | Layer::Conv3d(_)
                 | Layer::ConvTranspose1d(_)
                 | Layer::ConvTranspose2d(_)
                 | Layer::Transpose(_)
+                // Interval-valued frozen constant: this gradient backward builds
+                // `A*W` open-coded from `linear.weight()`, which has no place to
+                // put the enclosure. Take the sound concretize-through-IBP arm.
+                | Layer::IntervalConst(_)
                 | Layer::Tile(_)
                 | Layer::Slice(_)
                 | Layer::Gather(_)
@@ -185,6 +190,7 @@ impl BetaCrownVerifier {
                 | Layer::SkipMerge(_)
                 | Layer::OpaqueSkip(_)
                 | Layer::QdqPerturbation(_)
+                | Layer::EpsilonExpand(_)
                 | Layer::MulBinary(_)
                 | Layer::Where(_)
                 | Layer::Div(_)
@@ -360,9 +366,14 @@ impl BetaCrownVerifier {
                 // === All other layers: exhaustive error (#3424) ===
                 Layer::Conv1d(_)
                 | Layer::Conv2d(_)
+                | Layer::Conv3d(_)
                 | Layer::ConvTranspose1d(_)
                 | Layer::ConvTranspose2d(_)
                 | Layer::Transpose(_)
+                // Interval-valued frozen constant: this gradient backward builds
+                // `A*W` open-coded from `linear.weight()`, which has no place to
+                // put the enclosure. Take the sound concretize-through-IBP arm.
+                | Layer::IntervalConst(_)
                 | Layer::Tile(_)
                 | Layer::Slice(_)
                 | Layer::Gather(_)
@@ -379,6 +390,7 @@ impl BetaCrownVerifier {
                 | Layer::SkipMerge(_)
                 | Layer::OpaqueSkip(_)
                 | Layer::QdqPerturbation(_)
+                | Layer::EpsilonExpand(_)
                 | Layer::MulBinary(_)
                 | Layer::Where(_)
                 | Layer::Div(_)

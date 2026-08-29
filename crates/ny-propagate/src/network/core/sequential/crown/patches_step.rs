@@ -48,6 +48,32 @@ impl From<NyError> for SpecPatchesStepError {
     }
 }
 
+/// #cgan-reclaim item 4 — R9 observable for the ConvTranspose2d mid-step
+/// expiry seam. UNCONDITIONAL, because telemetry is not a lever: a null
+/// measured without this line cannot be told apart from "the lane was never
+/// entered", which is the failure mode that VOIDed four measurements on this
+/// campaign in one day.
+///
+/// `lane` is the walk's own label — `CROWN` (sequential full backward),
+/// `CROWN-IBP` (sequential partial collector), `DAG-CROWN`, `SPEC-CROWN` —
+/// so the line names WHICH caller saw the expiry, not merely that one did.
+/// Rate limited: first three events, then powers of two.
+fn record_convtranspose_expiry(lane: &str, layer_idx: usize, salvaged: bool, message: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let count = SEEN.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    if count <= 3 || count.is_power_of_two() {
+        eprintln!(
+            "[convtranspose-expiry] lane={lane} layer={layer_idx} action={} count={count} err={message}",
+            if salvaged {
+                "ibp-fallback-salvage"
+            } else {
+                "propagate-err"
+            }
+        );
+    }
+}
+
 /// Default-dark cooperative deadline polling for the explicit-row ReLU
 /// Patches leaf. Exact `1` is the only enabling spelling.
 fn patches_deadline_relu_enabled() -> bool {
@@ -301,11 +327,7 @@ fn hard_finite_authority_refuses_patches(
 /// margin-row readers), and the value cannot change mid-run anyway.
 pub(crate) fn expiry_authority_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| {
-        ny_levers::read(&ny_levers::decls::diagnostics::PATCHES_FINITE_EXPIRY)
-            .value
-            .as_bool()
-    })
+    *ARMED.get_or_init(crate::preset_gates::patches_finite_expiry_enabled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,6 +341,36 @@ pub(crate) fn crown_backward_step_patches_with_deadline_authority(
     deadline: Option<Instant>,
     deadline_is_hard: bool,
 ) -> Result<CrownStepResult> {
+    let flat_bias_enabled =
+        ny_levers::read(&ny_levers::decls::crown_ibp_budget::PATCHES_DEADLINE_FLAT_BIAS)
+            .value
+            .as_bool();
+    crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy(
+        layer,
+        crown_bounds,
+        pre_activation,
+        engine,
+        layer_idx,
+        label,
+        deadline,
+        deadline_is_hard,
+        flat_bias_enabled,
+    )
+}
+
+/// Graph-policy variant that never reopens process-global parameter state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn crown_backward_step_patches_with_deadline_authority_and_flat_bias_policy(
+    layer: &Layer,
+    crown_bounds: &mut CrownBounds,
+    pre_activation: &BoundedTensor,
+    engine: Option<&dyn GemmEngine>,
+    layer_idx: usize,
+    label: &str,
+    deadline: Option<Instant>,
+    deadline_is_hard: bool,
+    flat_bias_enabled: bool,
+) -> Result<CrownStepResult> {
     match crown_backward_step_patches_impl(
         layer,
         crown_bounds,
@@ -329,6 +381,7 @@ pub(crate) fn crown_backward_step_patches_with_deadline_authority(
         deadline,
         deadline_is_hard,
         ReluDeadlineRequest::Disabled,
+        flat_bias_enabled,
     ) {
         Ok(result) => Ok(result),
         Err(SpecPatchesStepError::Ordinary(error @ NyError::CpuMemoryExceeded { .. })) => {
@@ -360,6 +413,10 @@ pub(crate) fn crown_backward_step_patches_spec_crown(
     label: &str,
     deadline: Option<Instant>,
 ) -> std::result::Result<CrownStepResult, SpecPatchesStepError> {
+    let flat_bias_enabled =
+        ny_levers::read(&ny_levers::decls::crown_ibp_budget::PATCHES_DEADLINE_FLAT_BIAS)
+            .value
+            .as_bool();
     crown_backward_step_patches_impl(
         layer,
         crown_bounds,
@@ -370,6 +427,7 @@ pub(crate) fn crown_backward_step_patches_spec_crown(
         deadline,
         deadline.is_some(),
         ReluDeadlineRequest::SpecCrown,
+        flat_bias_enabled,
     )
 }
 
@@ -384,6 +442,7 @@ fn crown_backward_step_patches_impl(
     deadline: Option<Instant>,
     deadline_is_hard: bool,
     relu_deadline_request: ReluDeadlineRequest,
+    flat_bias_enabled: bool,
 ) -> std::result::Result<CrownStepResult, SpecPatchesStepError> {
     if let Some(limit) = deadline {
         if Instant::now() >= limit {
@@ -445,6 +504,7 @@ fn crown_backward_step_patches_impl(
             | Layer::AveragePool(_)
             | Layer::MaxPool2d(_)
             | Layer::Linear(_)
+            | Layer::IntervalConst(_)
             | Layer::Flatten(_)
             | Layer::Reshape(_)
     );
@@ -588,11 +648,12 @@ fn crown_backward_step_patches_impl(
                     // or the soundness guard against composing through padded incoming
                     // patches — #hotpath), fall back to the exact dense CROWN path
                     // rather than propagating the error.
-                    match c.propagate_patches_engine_and_deadline_for_input_shape(
+                    match c.propagate_patches_engine_and_deadline_for_input_shape_with_flat_bias_policy(
                         pb,
                         engine,
                         deadline,
                         (in_h, in_w),
+                        flat_bias_enabled,
                     ) {
                         Ok(result) => *crown_bounds = result,
                         Err(NyError::UnsupportedConfiguration(msg)) => {
@@ -762,6 +823,55 @@ fn crown_backward_step_patches_impl(
                             if let Cow::Owned(next) = next {
                                 *lb = next;
                             }
+                        }
+                        // #cgan-reclaim item 4: ABSORB the mid-step expiry.
+                        //
+                        // The Anchored planners poll one node deadline from
+                        // admission through publication, so a deadline that
+                        // crosses DURING the walk surfaces here as
+                        // `DeadlineExceeded`. Handing it back to the walk is
+                        // not a fallback, it is a KILL: `SequentialNetwork::
+                        // propagate_crown_*` takes it with `?` (crown.rs), and
+                        // from there it propagates all the way to the CLI's
+                        // "Verification produced no verdict (sound unknown)"
+                        // with up to a third of the instance budget unspent
+                        // (measured: cGAN_imgSz64_nCh_3 prop_1/prop_3 stop at
+                        // 826/825 s of 900 s). Note the SAME walk already
+                        // returns the forward enclosure when the deadline is
+                        // found expired at the step's own ENTRY check, one
+                        // branch earlier — this arm only makes the mid-step
+                        // case behave like the pre-step case.
+                        //
+                        // SOUNDNESS. `IbpFallback` does not produce a bound: it
+                        // tells the walk to DISCARD its partial CROWN relation
+                        // and keep the enclosure it already holds — the
+                        // sequential walk's `output_bounds`
+                        // (`clone_crown_forward_fallback`), the partial
+                        // collector's incumbent `ibp_bound`, the graph lanes'
+                        // node IBP bound. Every one of those is an
+                        // independently certified enclosure of the same node,
+                        // computed BEFORE this walk started, so a valid
+                        // fallback value is in hand at each of the four
+                        // callers. A looser enclosure can only lose proofs,
+                        // never manufacture one, and no new wall-clock
+                        // authority is granted: the arm returns immediately and
+                        // every caller re-checks expiry on the next step.
+                        // `PerNodeDeadlineExceeded` is already a reachable
+                        // reason at all four call sites.
+                        Err(NyError::DeadlineExceeded(msg)) => {
+                            let salvage = crate::cgan_reclaim::cgan_reclaim_armed();
+                            record_convtranspose_expiry(label, layer_idx, salvage, &msg);
+                            if salvage {
+                                return Ok(CrownStepResult::IbpFallback(CrownStepFallback {
+                                    reason: CrownIbpFallbackReason::PerNodeDeadlineExceeded,
+                                    details: format!(
+                                        "layer {layer_idx} ({}) ConvTranspose2d Patches backward expired mid-step; \
+                                         abandoning this CROWN walk for the caller's already-certified forward/IBP enclosure: {msg}",
+                                        layer.layer_type()
+                                    ),
+                                }));
+                            }
+                            return Err(NyError::DeadlineExceeded(msg).into());
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -933,7 +1043,15 @@ fn crown_backward_step_patches_impl(
         // These layers flatten spatial structure, so Patches representation has no benefit.
         // Making this explicit rather than relying on the catch-all improves clarity.
         // Part of #2613 Phase 3.
-        Layer::Linear(_) | Layer::Flatten(_) | Layer::Reshape(_) | Layer::Resize(_) => {
+        // `IntervalConst` joins the Patches->Dense terminators for the same
+        // reason `Linear` does: it contracts the feature axis, so the sparse
+        // patches representation has nothing left to preserve. It then takes the
+        // ordinary dense dispatch, which routes to its scalar backward.
+        Layer::Linear(_)
+        | Layer::IntervalConst(_)
+        | Layer::Flatten(_)
+        | Layer::Reshape(_)
+        | Layer::Resize(_) => {
             if matches!(crown_bounds, CrownBounds::Patches(_)) {
                 debug!(
                     "{}: Patches→Dense termination at layer {} ({})",
@@ -941,6 +1059,7 @@ fn crown_backward_step_patches_impl(
                     layer_idx,
                     match layer {
                         Layer::Linear(_) => "Linear",
+                        Layer::IntervalConst(ic) => ic.kind_name(),
                         Layer::Flatten(_) => "Flatten",
                         Layer::Reshape(_) => "Reshape",
                         Layer::Resize(_) => "Resize",
@@ -994,8 +1113,10 @@ fn crown_backward_step_patches_impl(
         // Normalization:
         | Layer::LayerNorm(_) | Layer::RmsNorm(_) | Layer::InstanceNorm1d(_)
         | Layer::GroupNorm(_) | Layer::AdaIN1d(_)
-        // Convolutions (non-2D):
-        | Layer::Conv1d(_) | Layer::ConvTranspose1d(_)
+        // Convolutions (non-2D). Conv3d has no CROWN backward at all, so the
+        // dense step below gets `UnsupportedOp` and degrades to IBP — the same
+        // sound fallback every other refusing layer in this arm takes.
+        | Layer::Conv1d(_) | Layer::Conv3d(_) | Layer::ConvTranspose1d(_)
         // Constant arithmetic:
         | Layer::AddConstant(_) | Layer::MulConstant(_) | Layer::DivConstant(_)
         | Layer::SubConstant(_)
@@ -1009,6 +1130,7 @@ fn crown_backward_step_patches_impl(
         | Layer::Slice(_) | Layer::Pad(_)
         | Layer::Squeeze(_) | Layer::Unsqueeze(_)
         | Layer::QdqPerturbation(_)
+        | Layer::EpsilonExpand(_)
         // Positional encoding:
         | Layer::RoPE(_)
         // Binary / multi-input ops:
